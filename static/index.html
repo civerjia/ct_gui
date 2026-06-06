@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Multi-Source CT Control</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <div>
+          <h1>Multi-Source CT Control</h1>
+          <p>
+            96-source ring CT · 341&nbsp;mm source circle · 35-filament collimator window ·
+            256&times;256 PCD detector on the 280&nbsp;mm ring · &plusmn;10&deg; gantry sweep.
+          </p>
+        </div>
+        <div class="header-badges">
+          <div id="modeBadge" class="badge online" title="Active scan mode">Mode: Stationary</div>
+          <div id="progressBadge" class="badge heartbeat-idle" title="Scan progress">Idle</div>
+        </div>
+      </header>
+
+      <div id="statusBar" class="status-bar idle">Ready. Use the motion bar under the geometry to animate; control modules are on the right.</div>
+
+      <section class="grid layout-ct">
+        <!-- LEFT: geometry + (collapsed) motion controls -->
+        <section class="card geo-card">
+          <div class="section-head">
+            <h2>CT Geometry</h2>
+            <div id="geoSummary" class="summary">filament 0 @ y+</div>
+          </div>
+
+          <div class="geo-stage">
+            <canvas id="ctCanvas"></canvas>
+          </div>
+
+          <div class="legend geo-legend states">
+            <span class="legend-cap">state</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#3b444c"></span> Stop</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#4d6fae"></span> Sleep</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#c79a3a"></span> Standby</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#3fb6a0"></span> Idle</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#ff5d5d"></span> Active</span>
+          </div>
+          <div class="legend geo-legend">
+            <span class="legend-cap">rings</span>
+            <span class="legend-item"><span class="legend-bar" style="background:#3fb6a0"></span> voltage</span>
+            <span class="legend-item"><span class="legend-bar" style="background:#f2c14e"></span> current <span class="hint">— outer ring</span></span>
+            <span class="legend-item"><span class="legend-bar" style="background:#9a6ed2"></span> mAs <span class="hint">— inner ring</span></span>
+            <span class="legend-item"><span class="legend-dot" style="background:none;border:1px solid #f2c14e"></span> collimator window</span>
+          </div>
+
+          <div class="row compact geo-dims">
+            <label class="numlabel">Source Ø <input id="sourceDiaInput" type="number" min="80" max="600" step="1" value="341" /> mm</label>
+            <label class="numlabel">Detector Ø <input id="detDiaInput" type="number" min="20" max="500" step="1" value="280" /> mm</label>
+          </div>
+
+          <!-- Motion bar: always-visible animation transport -->
+          <div class="motion-bar">
+            <div class="seg" id="modeSeg">
+              <button class="seg-btn active" data-mode="stationary">Stationary</button>
+              <button class="seg-btn" data-mode="precision">Precision</button>
+            </div>
+            <div class="spacer"></div>
+            <button id="playBtn" class="quick">▶ Play</button>
+            <button id="stepBtn">Step ▸</button>
+            <button id="resetBtn">⟲ Reset</button>
+          </div>
+
+          <!-- Collapsed: detailed scan/motion setup (only drives the animation) -->
+          <details class="motion-setup">
+            <summary>
+              <span>Motion &amp; scan setup</span>
+              <span class="hint">— drives the animation only</span>
+            </summary>
+
+            <p id="modeHelp" class="hint mode-help">
+              Gantry fixed. Scan the 35 covered filaments, then step the collimator+detector to the
+              next filament center — 96 steps around the ring.
+            </p>
+
+            <div class="setup-grid">
+              <div class="ctrl-block">
+                <div class="block-title">Collimator center filament</div>
+                <div class="row compact">
+                  <input id="collimatorSlider" type="range" min="0" max="95" value="0" />
+                  <span id="collimatorVal" class="mono-val">0</span>
+                </div>
+                <div class="row compact">
+                  <div class="seg sm" id="collDirSeg">
+                    <button id="dirCcwBtn" class="seg-btn active" title="Step collimator ring CCW">Coll CCW &#8634;</button>
+                    <button id="dirCwBtn" class="seg-btn" title="Step collimator ring CW">Coll CW &#8635;</button>
+                  </div>
+                  <span class="hint">covers <span id="windowRange" class="mono-val">79…17</span></span>
+                </div>
+              </div>
+
+              <div class="ctrl-block">
+                <div class="block-title">Filament gantry rotation</div>
+                <div class="row compact">
+                  <div class="seg sm" id="filDirSeg">
+                    <button id="filCcwBtn" class="seg-btn active" title="Rotate filament gantry CCW">Fil CCW &#8634;</button>
+                    <button id="filCwBtn" class="seg-btn" title="Rotate filament gantry CW">Fil CW &#8635;</button>
+                  </div>
+                  <span class="hint">sets the gantry rock / sweep direction</span>
+                </div>
+                <div class="row compact" id="gantryBlock">
+                  <input id="gantrySlider" type="range" min="-10" max="10" step="0.25" value="0" />
+                  <span id="gantryVal" class="mono-val">0.00°</span>
+                </div>
+                <div class="row compact">
+                  <label class="numlabel">±max <input id="gantryMaxInput" type="number" min="1" max="30" step="0.5" value="10" /></label>
+                  <label class="numlabel">steps/side <input id="gantryStepsInput" type="number" min="1" max="40" value="5" /></label>
+                </div>
+              </div>
+
+              <div class="ctrl-block">
+                <div class="block-title">Active filament <span class="hint">(within window)</span></div>
+                <div class="row compact">
+                  <input id="windowSlider" type="range" min="0" max="34" value="17" />
+                  <span id="activeVal" class="mono-val">0</span>
+                </div>
+                <div class="row compact">
+                  <label class="numlabel">speed <input id="speedInput" type="range" min="1" max="60" value="12" /></label>
+                  <span id="speedVal" class="hint">12 fil/s</span>
+                </div>
+              </div>
+
+              <div class="ctrl-block readouts">
+                <div class="block-title">State</div>
+                <div class="kv"><span>Active filament</span><b id="roActive">0</b></div>
+                <div class="kv"><span>Filament angle</span><b id="roAngle">90.00°</b></div>
+                <div class="kv"><span>Collimator center</span><b id="roColl">0</b></div>
+                <div class="kv"><span>Detector center</span><b id="roDet">−90.00°</b></div>
+                <div class="kv"><span>Gantry angle</span><b id="roGantry">0.00°</b></div>
+                <div class="kv"><span>Window scan</span><b id="roScan">1 / 35</b></div>
+                <div class="kv"><span>Ring step</span><b id="roRing">1 / 96</b></div>
+                <div class="kv"><span>Source ⟶ detector</span><b id="roSdd">— mm</b></div>
+              </div>
+            </div>
+
+            <div class="row geo-toggles wrap">
+              <label class="chk"><input id="showBeamChk" type="checkbox" checked /> Beam fan</label>
+              <label class="chk"><input id="showIndexChk" type="checkbox" /> Filament indices</label>
+              <label class="chk"><input id="showWindowChk" type="checkbox" checked /> Collimator block</label>
+              <label class="chk"><input id="showDetGridChk" type="checkbox" checked /> Detector pixels</label>
+            </div>
+          </details>
+        </section>
+
+        <!-- RIGHT: control modules (hardware control — scaffolded) -->
+        <aside class="ctrl-column">
+          <section class="card module" data-module="power">
+            <div class="section-head">
+              <h2>Power Controllers</h2>
+              <span class="badge stub">scaffold</span>
+            </div>
+            <div class="bridge-row">
+              <span class="dot offline" id="p1Dot"></span>
+              <label class="numlabel grow">Power 1 <span class="hint">fil 0–47</span>
+                <input id="p1Host" type="text" value="192.168.4.1" placeholder="ESP32 #1 host" disabled />
+              </label>
+              <button disabled>Connect</button>
+            </div>
+            <div class="bridge-row">
+              <span class="dot offline" id="p2Dot"></span>
+              <label class="numlabel grow">Power 2 <span class="hint">fil 48–95</span>
+                <input id="p2Host" type="text" value="192.168.4.2" placeholder="ESP32 #2 host" disabled />
+              </label>
+              <button disabled>Connect</button>
+            </div>
+            <p class="hint">2 ESP32 bridges (:3333). 6 of 8 channels × 8 boards = 48 filaments each.
+              filament → P{1|2} · CH{1–6}.{1–8}.</p>
+          </section>
+
+          <section class="card module" data-module="selected">
+            <div class="section-head">
+              <h2 id="selFilTitle">Filament 0 (active)</h2>
+              <span id="selFilState" class="badge state-pill">Stop</span>
+            </div>
+            <div class="kv"><span>Address</span><b id="selFilHw">P1 · CH1.1</b></div>
+            <div class="kv"><span>Bus voltage</span><b id="selFilV">0.000 V</b></div>
+            <div class="kv"><span>Current</span><b id="selFilI">0.0 mA</b></div>
+            <div class="kv"><span>Accumulated</span><b id="selFilMas">0.000 mAs</b></div>
+            <p class="hint">Hover any filament on the ring to inspect it; otherwise shows the active filament. V/I from INA219; mAs integrated host-side.</p>
+          </section>
+
+          <section class="card module" data-module="heating">
+            <div class="section-head">
+              <h2>Filament Heating Power</h2>
+              <span class="badge stub">scaffold</span>
+            </div>
+            <div class="kv"><span>Target</span><b id="heatTarget">filament 0</b></div>
+            <label class="field">
+              Heating current <span id="heatCurrentVal" class="mono-val">1.20 A</span>
+              <input id="heatCurrent" type="range" min="0" max="3" step="0.05" value="1.2" disabled />
+            </label>
+            <label class="field">
+              Pre-heat duty <span id="heatDutyVal" class="mono-val">60 %</span>
+              <input id="heatDuty" type="range" min="0" max="100" step="1" value="60" disabled />
+            </label>
+            <div class="row wrap">
+              <button class="quick" disabled>Enable heating</button>
+              <button disabled>Read back</button>
+            </div>
+            <p class="hint">Per-filament cathode pre-heat. Wires to the RP2350B/STM32 power stage next.</p>
+          </section>
+
+          <section class="card module" data-module="emission">
+            <div class="section-head">
+              <h2>Electron Emission Pulse</h2>
+              <span class="badge stub">scaffold</span>
+            </div>
+            <div class="row wrap">
+              <label class="numlabel">Pulse width <input type="number" value="50" disabled /> µs</label>
+              <label class="numlabel">Emission <input type="number" value="200" disabled /> µA</label>
+            </div>
+            <div class="row wrap">
+              <label class="numlabel">Rep rate <input type="number" value="100" disabled /> Hz</label>
+              <label class="numlabel">Pulses/fil <input type="number" value="1" disabled /></label>
+            </div>
+            <div class="row wrap">
+              <button class="quick" disabled>Arm</button>
+              <button disabled>Fire window</button>
+              <button disabled>Stop</button>
+            </div>
+            <p class="hint">Grid/extraction pulse per active filament, gated to the detector exposure.</p>
+          </section>
+
+          <section class="card module" data-module="pcd">
+            <div class="section-head">
+              <h2>PCD Detector</h2>
+              <span class="badge stub">scaffold</span>
+            </div>
+            <div class="row wrap">
+              <label class="numlabel">Exposure <input type="number" value="2.0" disabled /> ms</label>
+              <label class="numlabel">Frames/view <input type="number" value="1" disabled /></label>
+            </div>
+            <div class="row wrap">
+              <label class="numlabel">Low thr <input type="number" value="20" disabled /> keV</label>
+              <label class="numlabel">High thr <input type="number" value="60" disabled /> keV</label>
+            </div>
+            <div class="row wrap">
+              <button class="quick" disabled>Capture frame</button>
+              <button disabled>Live view</button>
+            </div>
+            <p class="hint">256×256 photon-counting readout, energy-binned. Frame trigger syncs to emission.</p>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
