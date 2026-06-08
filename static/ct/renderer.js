@@ -10,12 +10,11 @@
 
 import { CT, D2R, mod, filamentBaseAngle } from './constants.js';
 import { drawBackground } from './scene/background.js';
-import { drawSpectrum } from './scene/spectrum.js';
+import { drawFilaments } from './scene/filaments.js';
 import { drawCollimator } from './scene/collimator.js';
 import { drawDetectorRing, drawFOV, drawDetector } from './scene/detector.js';
 import { drawBeam } from './scene/beam.js';
 import { drawRotationCues } from './scene/cues.js';
-import { drawAxisLabels } from './scene/axes.js';
 import { drawHud } from './scene/hud.js';
 
 export class CTGeometry {
@@ -32,7 +31,7 @@ export class CTGeometry {
   setOptions(o) { Object.assign(this.opts, o); this.draw(); }
   update(state) { this.state = state; this.draw(); }
 
-  // radii of the two spectrum bands (mm)
+  // radii of the two spectrum bands (mm), both growing outward from the ring
   _bands() {
     const masBase = CT.R_SOURCE + CT.MAS_GAP;
     const masTop = masBase + CT.MAS_LEN;
@@ -40,6 +39,7 @@ export class CTGeometry {
     const viTop = viBase + CT.VI_LEN;
     return { masBase, masTop, viBase, viTop, outer: viTop };
   }
+  _outerR() { return this._bands().outer; }
 
   _resize() {
     const box = this.canvas.parentElement.getBoundingClientRect();
@@ -49,9 +49,16 @@ export class CTGeometry {
     this.canvas.style.width = w + 'px';
     this.canvas.style.height = h + 'px';
     this.cssW = w; this.cssH = h;
-    const worldR = this._bands().outer + 20;
+    const worldR = this._outerR() + 48; // room for filament labels + gantry indicator + readout
     this.scale = Math.min(w, h) / (2 * worldR);
     this.draw();
+  }
+
+  // screen (css px) -> world (mm), plus polar form for drag hit-testing
+  screenToWorld(cssX, cssY) {
+    const x = (cssX - this._cx) / this.scale;
+    const y = -(cssY - this._cy) / this.scale;
+    return { x, y, r: Math.hypot(x, y), ang: Math.atan2(y, x) / D2R };
   }
 
   // world (mm) -> screen (css px); y flipped
@@ -74,11 +81,10 @@ export class CTGeometry {
       drawCollimator(this);
       drawDetector(this);
       drawBeam(this);
-      drawSpectrum(this);
+      drawFilaments(this);
       drawRotationCues(this);
     }
     this._ring(CT.R_SOURCE, 'rgba(150,170,180,0.28)', 1.2);
-    drawAxisLabels(this);
     if (this.state) drawHud(this);
     ctx.restore();
   }
@@ -133,8 +139,13 @@ export class CTGeometry {
   }
 
   // --- machine-geometry helpers ----------------------------------------------
+  // The gantry rock rotates the whole imaging assembly (filaments + collimator
+  // + detector + beam) rigidly, so everything stays aligned and the rotation is
+  // visible. _gantry() is that shared rotation offset (deg).
+  _gantry() { return this.state ? (this.state.gantryAngle || 0) : 0; }
+  _filamentAngle(i) { return filamentBaseAngle(i) + this._gantry(); }
   _filamentPos(i) {
-    const a = filamentBaseAngle(i) * D2R;
+    const a = this._filamentAngle(i) * D2R;
     return { x: CT.R_SOURCE * Math.cos(a), y: CT.R_SOURCE * Math.sin(a) };
   }
   _windowIndices() {
@@ -142,23 +153,21 @@ export class CTGeometry {
     for (let k = -half; k <= half; k++) out.push(mod(c + k, CT.N_FILAMENTS));
     return out;
   }
-  _collimatorAngle() { return filamentBaseAngle(this.state.collimatorCenter); }
+  _collimatorAngle() { return filamentBaseAngle(this.state.collimatorCenter) + this._gantry(); }
   _detectorAngle() { return this._collimatorAngle() + 180; }
   _detectorCenter() {
     const a = this._detectorAngle() * D2R;
     return { x: CT.R_DETECTOR * Math.cos(a), y: CT.R_DETECTOR * Math.sin(a) };
   }
 
-  // map a canvas px to the nearest filament index, or -1 if outside the rings
+  // map a canvas px to the nearest filament index, or -1 if off the source ring
   hitTest(cssX, cssY) {
     if (!this.state) return -1;
-    const wx = (cssX - this._cx) / this.scale, wy = -(cssY - this._cy) / this.scale;
-    const r = Math.hypot(wx, wy);
+    const { r, ang } = this.screenToWorld(cssX, cssY);
     if (r < CT.R_SOURCE - 6 || r > this._bands().outer + 6) return -1;
-    const ang = Math.atan2(wy, wx) / D2R;
     let best = -1, bestd = 1e9;
     for (let i = 0; i < CT.N_FILAMENTS; i++) {
-      const d = Math.abs(((filamentBaseAngle(i) - ang + 540) % 360) - 180);
+      const d = Math.abs(((this._filamentAngle(i) - ang + 540) % 360) - 180);
       if (d < bestd) { bestd = d; best = i; }
     }
     return bestd <= CT.STEP_DEG / 2 + 0.3 ? best : -1;

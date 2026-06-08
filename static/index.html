@@ -24,16 +24,39 @@
 
       <div id="statusBar" class="status-bar idle">Ready. Use the motion bar under the geometry to animate; control modules are on the right.</div>
 
+      <!-- TOP: heating Gantt (full-width live overview) -->
+      <section class="card gantt-top">
+        <div class="section-head">
+          <h2>Heating Gantt <span class="hint">— filament × trigger timeline, live</span></h2>
+          <span id="schGanttLabel" class="summary"></span>
+        </div>
+        <div class="sch-gantt" id="schGanttWrap">
+          <canvas id="schGantt"></canvas>
+          <div class="gantt-legend">
+            <span><span class="g-sw act"></span> ACTIVE (heated)</span>
+            <span><span class="g-sw emit"></span> emission pulse</span>
+            <span><span class="g-sw head"></span> now</span>
+            <span class="hint">Y = filament · X = trigger · scroll = zoom · drag = pan · dbl-click = reset</span>
+          </div>
+        </div>
+      </section>
+
       <section class="grid layout-ct">
         <!-- LEFT: geometry + (collapsed) motion controls -->
         <section class="card geo-card">
           <div class="section-head">
             <h2>CT Geometry</h2>
-            <div id="geoSummary" class="summary">filament 0 @ y+</div>
+            <div class="seg sm" id="viewModeSeg">
+              <button class="seg-btn" data-view="live" title="Reflect the actual gantry position + live sensor data">Live</button>
+              <button class="seg-btn active" data-view="plan" title="Edit the scan schedule and play it (simulated)">Plan</button>
+              <button class="seg-btn" data-view="debug" title="Per-filament heating / debug pulses; right-click the rings to edit heating power">Debug</button>
+            </div>
           </div>
+          <div id="geoSummary" class="summary geo-sub">filament 0 @ y+</div>
 
           <div class="geo-stage">
             <canvas id="ctCanvas"></canvas>
+            <button id="resetGantryBtn" class="plot-btn" title="Reset gantry rotation to 0°">⟲ gantry 0°</button>
           </div>
 
           <div class="legend geo-legend states">
@@ -150,29 +173,98 @@
           </details>
         </section>
 
+        <!-- MIDDLE: scan schedule details (lists) -->
+        <section class="card module sched-card" data-module="schedule">
+          <div class="section-head">
+            <h2>Scan Schedule</h2>
+            <span id="schCount" class="summary">0 rows</span>
+          </div>
+          <div class="row compact sch-actions">
+            <button id="schSyncBtn" class="sm">Sync</button>
+            <button id="schUploadBtn" class="sm quick">Upload</button>
+            <span id="schStatus" class="hint"></span>
+          </div>
+          <details class="sch-section heat-plan" id="heatPlanDetails" open>
+            <summary title="The GUI derives the heating layer from the emission schedule and checks settle.">Heating plan <span class="hint">— settle-checked</span></summary>
+            <div class="heat-params">
+              <label class="numlabel" title="Thermal settle: how long a filament must sit at stable ACTIVE before its X-ray pulse. Larger = promote earlier.">T settle <input id="hsSettle" type="number" min="0" max="60000" value="1000" /> ms</label>
+              <label class="numlabel" title="Hold: stay ACTIVE this long after the last pulse before dropping back to IDLE (avoids re-cycling during a burst).">T hold <input id="hsHold" type="number" min="0" max="60000" value="200" /> ms</label>
+              <label class="numlabel" title="Gantry rotation period — one full 96-angle turn. Sets the per-trigger time (≈ rotation ÷ total triggers).">rotation <input id="hsRot" type="number" min="100" max="600000" value="30000" /> ms</label>
+            </div>
+            <div id="planVerdict" class="plan-verdict"></div>
+          </details>
+          <details class="sch-section" id="filListDetails">
+            <summary>Per-filament settings (96) <span class="hint">— pulses, duration, idle/active current</span></summary>
+            <div class="fil-bulk">
+              <label># pulses<input id="schPulses" type="number" min="1" max="65535" value="1" /></label>
+              <label>dur µs<input id="schDuration" type="number" min="1" max="1000000" value="1000" /></label>
+              <label>idle A<input id="hsIdleA" type="number" min="0" max="10" step="0.1" value="1" /></label>
+              <label>active A<input id="hsActiveA" type="number" min="0" max="10" step="0.1" value="3" /></label>
+              <button id="schApplyBtn" class="xs">Apply all</button>
+            </div>
+            <div class="row compact fil-save">
+              <button id="filSaveBtn" class="xs">Save to host</button>
+              <button id="filLoadBtn" class="xs">Load</button>
+              <span class="hint">currents download with the schedule.</span>
+            </div>
+            <div class="fil-list-head"><span>Fil</span><span>#Pul</span><span>Dur µs</span><span>Idle A</span><span>Act A</span></div>
+            <div id="filList" class="fil-list"></div>
+          </details>
+          <div class="sch-viewbar">
+            <div class="seg sm" id="schViewSeg">
+              <button class="seg-btn active" data-view="emission">Emission</button>
+              <button class="seg-btn" data-view="heating">Heating</button>
+            </div>
+          </div>
+          <div class="sch-table" id="schTableWrap">
+            <div class="sch-head" id="schHead"><span>Seq Idx</span><span>Filament Idx</span><span># Pulses</span><span>Pulse Duration</span></div>
+            <div id="schBody"></div>
+          </div>
+        </section>
+
         <!-- RIGHT: control modules (hardware control — scaffolded) -->
         <aside class="ctrl-column">
           <section class="card module" data-module="power">
             <div class="section-head">
               <h2>Power Controllers</h2>
-              <span class="badge stub">scaffold</span>
+              <button id="scanBtn" class="sm">Scan :3333</button>
             </div>
-            <div class="bridge-row">
-              <span class="dot offline" id="p1Dot"></span>
-              <label class="numlabel grow">Power 1 <span class="hint">fil 0–47</span>
-                <input id="p1Host" type="text" value="192.168.4.1" placeholder="ESP32 #1 host" disabled />
-              </label>
-              <button disabled>Connect</button>
+            <div id="scanHint" class="hint compact-hint">Scan finds ESP32 bridges on TCP :3333.</div>
+            <datalist id="bridgeHosts"></datalist>
+
+            <div class="pc" data-ctrl="1">
+              <div class="pc-head">
+                <span class="dot offline" data-dot></span>
+                <b>Power 1</b><span class="hint">fil 0–47</span>
+                <span class="pc-badges">
+                  <span class="hb idle" data-hb="rp" title="RP2350B controller heartbeat (PING on :3333)">RP2350&nbsp;♥</span>
+                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age)">STM32&nbsp;♥</span>
+                </span>
+              </div>
+              <div class="pc-row">
+                <input data-host list="bridgeHosts" type="text" value="192.168.4.1" placeholder="ESP32 #1 IP" />
+                <label class="numlabel">offset <input data-offset type="number" min="0" max="95" value="0" /></label>
+                <button data-connect class="quick">Connect</button>
+              </div>
             </div>
-            <div class="bridge-row">
-              <span class="dot offline" id="p2Dot"></span>
-              <label class="numlabel grow">Power 2 <span class="hint">fil 48–95</span>
-                <input id="p2Host" type="text" value="192.168.4.2" placeholder="ESP32 #2 host" disabled />
-              </label>
-              <button disabled>Connect</button>
+
+            <div class="pc" data-ctrl="2">
+              <div class="pc-head">
+                <span class="dot offline" data-dot></span>
+                <b>Power 2</b><span class="hint">fil 48–95</span>
+                <span class="pc-badges">
+                  <span class="hb idle" data-hb="rp" title="RP2350B controller heartbeat (PING on :3333)">RP2350&nbsp;♥</span>
+                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age)">STM32&nbsp;♥</span>
+                </span>
+              </div>
+              <div class="pc-row">
+                <input data-host list="bridgeHosts" type="text" value="192.168.4.2" placeholder="ESP32 #2 IP" />
+                <label class="numlabel">offset <input data-offset type="number" min="0" max="95" value="48" /></label>
+                <button data-connect class="quick">Connect</button>
+              </div>
             </div>
-            <p class="hint">2 ESP32 bridges (:3333). 6 of 8 channels × 8 boards = 48 filaments each.
-              filament → P{1|2} · CH{1–6}.{1–8}.</p>
+
+            <p class="hint compact-hint">Offset maps a global filament index onto the bridge (0–47 ⇒ 0, 48–95 ⇒ 48).</p>
           </section>
 
           <section class="card module" data-module="selected">
@@ -184,7 +276,16 @@
             <div class="kv"><span>Bus voltage</span><b id="selFilV">0.000 V</b></div>
             <div class="kv"><span>Current</span><b id="selFilI">0.0 mA</b></div>
             <div class="kv"><span>Accumulated</span><b id="selFilMas">0.000 mAs</b></div>
-            <p class="hint">Hover any filament on the ring to inspect it; otherwise shows the active filament. V/I from INA219; mAs integrated host-side.</p>
+
+            <div class="fil-edit">
+              <div class="block-title">This filament <span class="hint">(applies to its schedule rows)</span></div>
+              <div class="row compact">
+                <label class="numlabel"># pulses <input id="selFilPulses" type="number" min="1" max="65535" value="1" /></label>
+                <label class="numlabel">duration <input id="selFilDur" type="number" min="1" max="1000000" value="1000" /> µs</label>
+                <button id="selFilDebugBtn" class="sm dbg-only">Debug…</button>
+              </div>
+            </div>
+            <p class="hint">Hover/click any filament on the ring to inspect it. V/I from INA219; mAs integrated host-side. In <b>Debug</b> mode, right-click the rings (or Debug…) to set heating/OCP/HV and fire pulses.</p>
           </section>
 
           <section class="card module" data-module="heating">
@@ -251,6 +352,55 @@
         </aside>
       </section>
     </main>
+
+    <!-- Debug: per-filament power/pulse editor (right-click the rings, or the
+         Debug… button in the Selected Filament card) -->
+    <div id="heatPopup" class="heat-popup" hidden>
+      <div class="heat-head">
+        <span>Filament <b id="heatFil">0</b> · <span id="heatAddr" class="mono">P1·CH1.1</span></span>
+        <button id="heatClose" class="icon-btn" title="Close">✕</button>
+      </div>
+
+      <div class="heat-sec">Power state <span class="hint" id="heatStateNow">— · fault —</span></div>
+      <div class="seg6" id="heatStateSeg">
+        <button data-state="1">Stop</button>
+        <button data-state="2">Sleep</button>
+        <button data-state="3">Standby</button>
+        <button data-state="4">Idle</button>
+        <button data-state="5">Active</button>
+        <button data-state="6">Voltage</button>
+      </div>
+      <p class="hint heat-help">Idle/Active drive the closed-loop <b>heating current</b> (mA). Voltage drives a manual mV.</p>
+
+      <div class="heat-field">
+        <label>Heating I</label>
+        <span class="u"><input id="heatI" type="number" min="0" max="6000" step="50" value="1000" />mA</span>
+        <span class="hint">CC target (Idle/Active)</span>
+      </div>
+      <div class="heat-field">
+        <label>Heating V</label>
+        <span class="u"><input id="heatV" type="number" min="800" max="15000" step="50" value="800" />mV</span>
+        <span class="hint">Voltage mode</span>
+      </div>
+      <div class="heat-field">
+        <label>OCP</label>
+        <span class="u"><input id="heatOcp" type="number" min="0" max="6000" step="50" value="4000" />mA</span>
+        <button id="heatSetOcp" class="sm">Set</button>
+      </div>
+
+      <div class="heat-sec">Measured (INA219) <button id="heatReadI" class="sm">Read</button></div>
+      <div class="heat-meas"><b id="heatImeas">— mA</b> · <b id="heatVmeas">— mV</b></div>
+
+      <div class="heat-sec">HV emission</div>
+      <div class="heat-field">
+        <label>Pulse</label>
+        <span class="u"><input id="heatPw" type="number" min="1" max="1000000" value="1000" />µs</span>
+        <button id="heatPulse" class="sm quick">Fire</button>
+      </div>
+      <button id="heatHv" class="sm hv-btn unknown">read DC HV status…</button>
+
+      <div id="heatStatus" class="hint heat-status"></div>
+    </div>
 
     <script type="module" src="/app.js"></script>
   </body>

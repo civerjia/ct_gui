@@ -68,9 +68,17 @@ export function drawDetector(r) {
     ctx.stroke();
   }
 
+  // label — parallel to the panel (tangent), rotating with the detector
+  const lr = CT.R_DETECTOR + depth + 9;
+  let rot = Math.atan2(-Math.cos(a), -Math.sin(a)); // tangent in screen space
+  if (rot > Math.PI / 2) rot -= Math.PI;            // keep upright
+  if (rot < -Math.PI / 2) rot += Math.PI;
+  ctx.save();
+  ctx.translate(r._x(lr * Math.cos(a)), r._y(lr * Math.sin(a)));
+  ctx.rotate(rot);
   ctx.fillStyle = 'rgba(180,210,240,0.85)'; ctx.font = '9px var(--mono, monospace)';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  const lr = CT.R_DETECTOR + depth + 8;
-  ctx.fillText('256×256 PCD', r._x(lr * Math.cos(a)), r._y(lr * Math.sin(a)));
+  ctx.fillText('256×256 PCD', 0, 0);
+  ctx.restore();
   r._detEdges = { e0, e1, c };
 }

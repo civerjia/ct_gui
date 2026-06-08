@@ -8,8 +8,10 @@ import { filamentBaseAngle } from '../constants.js';
 
 export function drawHud(r) {
   const ctx = r.ctx, s = r.state;
-  const f = (s.filaments && s.filaments[s.activeFilament]) || { state: 1, voltage_mV: 0, current_mA: 0, mAs: 0 };
-  const ang = filamentBaseAngle(s.activeFilament) + (s.gantryAngle || 0);
+  // show the hovered filament in any mode; fall back to the current/active one
+  const idx = (s.hover != null && s.hover >= 0) ? s.hover : s.activeFilament;
+  const f = (s.filaments && s.filaments[idx]) || { state: 1, voltage_mV: 0, current_mA: 0, mAs: 0 };
+  const ang = filamentBaseAngle(idx) + (s.gantryAngle || 0);
   const V = f.voltage_mV / 1000;                   // V
   const I = f.current_mA;                           // mA
   const R = I > 0.5 ? f.voltage_mV / I : null;      // mV/mA = Ω
@@ -40,7 +42,7 @@ export function drawHud(r) {
 
   ctx.font = '700 10.5px var(--mono, monospace)';
   ctx.textAlign = 'left'; ctx.fillStyle = sc;
-  ctx.fillText(`FIL ${s.activeFilament}`, colL, yy);
+  ctx.fillText(`FIL ${idx}`, colL, yy);
   kv(colR, 'θ', ang.toFixed(1) + '°', neutral); yy += lh;
   kv(colL, 'V', V.toFixed(2) + ' V', '#5fd0bb');
   kv(colR, 'I', I.toFixed(0) + ' mA', '#f2c14e'); yy += lh;

@@ -1,15 +1,18 @@
 /*
  * Filament-ring spectrum.
  *
- * Each filament is a glyph: a state-colored marker on the source ring, plus two
- * concentric bands growing outward — inner = accumulated mAs (violet), outer =
- * voltage (teal) + current (amber) side by side. Dim baseline stubs keep the
- * ring reading full even when most filaments are asleep.
+ * Per filament: a state-colored marker on the source ring (color = firmware
+ * PowerState) plus two outward bands — inner mAs (violet), outer V+I (teal/
+ * amber). Dim baseline stubs keep the ring reading full. Index labels every 24
+ * filaments (0/24/48/72); the "indices" option adds one every 4. No band text
+ * labels (the colors are explained in the page legend).
  */
 
-import { CT, D2R, clamp01, filamentBaseAngle } from '../constants.js';
+import { CT, D2R, clamp01 } from '../constants.js';
 
-export function drawSpectrum(r) {
+const LABEL_EVERY = CT.N_FILAMENTS / 4; // 24
+
+export function drawFilaments(r) {
   const s = r.state, ctx = r.ctx;
   const covered = new Set(r._windowIndices());
   const fil = s.filaments || [];
@@ -25,7 +28,7 @@ export function drawSpectrum(r) {
 
   for (let i = 0; i < CT.N_FILAMENTS; i++) {
     const f = fil[i] || { state: 1, voltage_mV: 0, current_mA: 0, mAs: 0 };
-    const a = filamentBaseAngle(i);
+    const a = r._filamentAngle(i); // rocks with the gantry
     const isActive = i === s.activeFilament;
     const isHover = i === s.hover;
 
@@ -45,10 +48,12 @@ export function drawSpectrum(r) {
     if (mFrac > 0.004) r._radialBar(a, masBase, masBase + CT.MAS_LEN * mFrac, hwM, 0,
       isActive ? '#c48cff' : '#9a6ed2');
 
-    // hover highlight: brighten the slot
+    // hover indicators: the slot arc (between the rings) plus a second arc on
+    // the mAs-ring side, close to the filament
     if (isHover) {
-      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1;
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1.4;
       r._annulusStroke((masBase + viTop) / 2, a - CT.STEP_DEG / 2, a + CT.STEP_DEG / 2);
+      r._annulusStroke(masBase, a - CT.STEP_DEG / 2, a + CT.STEP_DEG / 2);
     }
 
     // state marker on the source ring
@@ -62,19 +67,14 @@ export function drawSpectrum(r) {
     ctx.shadowBlur = 0;
     if (covered.has(i) && !isActive) { ctx.strokeStyle = 'rgba(242,193,78,0.7)'; ctx.lineWidth = 1; ctx.stroke(); }
 
-    if (r.opts.indices && (i % 4 === 0 || isActive || i === s.collimatorCenter)) {
+    // index labels every 24 (bold), plus every-4 when the option is on
+    const label = (i % LABEL_EVERY === 0) || (r.opts.indices && i % 4 === 0) || isActive;
+    if (label) {
       const lr = viTop + 9, ar = a * D2R;
-      ctx.fillStyle = isActive ? '#ff9a9a' : 'rgba(160,185,195,0.6)';
-      ctx.font = '9px var(--mono, monospace)';
+      ctx.fillStyle = isActive ? '#ff9a9a' : 'rgba(170,190,200,0.7)';
+      ctx.font = (i % LABEL_EVERY === 0 ? '700 ' : '') + '9px var(--mono, monospace)';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(String(i), r._x(lr * Math.cos(ar)), r._y(lr * Math.sin(ar)));
     }
   }
-
-  // band labels near +x
-  ctx.fillStyle = 'rgba(63,182,160,0.7)'; ctx.font = '9px var(--mono, monospace)';
-  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-  ctx.fillText('V·I', r._x(viTop + 4), r._cy);
-  ctx.fillStyle = 'rgba(154,110,210,0.75)';
-  ctx.fillText('mAs', r._x(masTop + 3), r._cy + 12);
 }

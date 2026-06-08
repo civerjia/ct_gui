@@ -1,10 +1,27 @@
 # Multi-Source CT Control GUI
 
-Browser GUI for the 96-source ring CT. The left panel is a **filament-ring
-monitor** (geometry + live per-filament telemetry); the right column holds the
-**hardware control modules**. The motion controls (collapsed under the ring)
-only drive the on-screen animation. Hardware control (two ESP32 bridges →
-RP2350B controllers) grafts onto `backend.py` `/api/*` and `ingestTelemetry()`.
+Browser GUI for the 96-source ring CT. Layout: a full-width **Heating Gantt**
+on top, then three columns — the **filament-ring monitor** (geometry), the
+**Scan Schedule** (emission + derived heating plan), and the **hardware control
+modules**. Two ESP32 bridges → RP2350B controllers; hardware I/O goes through
+`backend.py` `/api/*` (and simulated telemetry drops into `ingestTelemetry()`).
+
+## View modes (Live / Plan / Debug)
+
+A selector on the geometry card switches what the ring reflects:
+
+- **Plan** (default) — edit the scan + schedule and Play it (simulated). The hot
+  band, schedule, and Gantt are all driven by the plan.
+- **Live** — read-only; reflects the actual gantry position + INA219 telemetry.
+- **Debug** — pick any filament to set power state / heating / OCP / HV / pulses.
+  Right-click the V·I or mAs rings (or the **Debug…** button) to open the editor.
+
+## Direct manipulation (on the ring)
+
+- drag a **filament** → rotate the gantry (the whole assembly rocks together);
+- drag the **collimator block** or **detector** → move the collimator+detector ring;
+- drag in the inner **beam** region → switch the collimated (active) filament;
+- hover any filament for its live readout; **⟲ gantry 0°** resets the rock.
 
 ## Filament-ring monitor
 
@@ -21,17 +38,75 @@ Hover any filament to inspect it in the **Selected Filament** card. Telemetry is
 simulated until the bridges are wired; real data drops into
 `window.ingestTelemetry([{index, state, bus_mV, current_mA}])` unchanged.
 
-## Power topology
+## Power controllers (two ESP32 bridges)
 
-Two power controllers (two ESP32 bridges on TCP :3333):
+Two power controllers, each an ESP32 bridge serving the RP2350B protocol on TCP
+:3333 and the STM32 transparent bridge on :80 (`/stm32`):
 
-| Controller | Filaments | Channels × boards |
-|------------|-----------|-------------------|
-| Power 1    | 0–47      | 6 of 8 ch × 8     |
-| Power 2    | 48–95     | 6 of 8 ch × 8     |
+| Controller | Filaments | Offset | Channels × boards |
+|------------|-----------|--------|-------------------|
+| Power 1    | 0–47      | 0      | 6 of 8 ch × 8     |
+| Power 2    | 48–95     | 48     | 6 of 8 ch × 8     |
 
 Mapping: `filament i → P{1|2} · CH{1–6}.{1–8}`, i.e. `channel = (i%48)//8`,
-`board = (i%48)%8`.
+`board = (i%48)%8`. The **offset** is what ties a global filament index to a
+bridge; it is editable per controller.
+
+In the **Power Controllers** card: **Scan :3333** sweeps the LAN / `CTPower`
+AP for hosts exposing TCP :3333 and fills the host fields; **Connect** opens
+each bridge. Two heartbeat badges per controller track liveness — **RP2350 ♥**
+(periodic PING through the bridge) and **STM32 ♥** (HTTP `/stm32` age). Badges
+go green/pulsing when fresh (<3 s), amber when stale, red when dead.
+
+The backend (`backend.py`) holds two independent `TcpProtocolClient`s — reused
+from `../wifi_gui/net_protocol.py` — and exposes:
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/api/scan` | GET | hosts with :3333 open (`{host, name, controller_responsive}`) |
+| `/api/status` | GET | both controllers: connected, host, offset, RP2350/STM32 heartbeat ages |
+| `/api/connect` | POST | `{controller, host, offset}` → open a bridge |
+| `/api/disconnect` | POST | `{controller}` → close a bridge |
+| `/api/offset` | POST | `{controller, offset}` → retarget filament mapping |
+| `/api/cmd` | POST | `{controller, command, …}` → one RP2350B command on a board |
+| `/api/schedule` | POST | stage the bound schedule (emission rows + heating deltas) |
+| `/api/geometry` | GET | machine geometry constants |
+
+## Scan schedule + bound heating plan
+
+The **Scan Schedule** is the materialized scan (one burst row per firing); the
+geometry IS the schedule's current row, so Play/Step/row-click stay in sync.
+The timeline is **pulse-indexed**: each burst spans its filament's pulse count,
+so `trigger` = cumulative pulses (not 1 per burst).
+
+The **heating plan** is *derived* from the emission schedule (the doc's bound
+schedule, Approach B): every filament rests at IDLE and is promoted to ACTIVE a
+**T_settle** lead before its window, held **T_hold** ms after its last pulse,
+then demoted. The plan is **settle-checked** (every emission reaches stable
+ACTIVE ≥ T_settle earlier) and the per-filament idle/active currents ride in the
+heating deltas (`arg16`) — so they download with the schedule.
+
+Three views: **Gantt** (full-width, filament × pulse-trigger, ACTIVE bars +
+emission bursts + live playhead; scroll = zoom, drag = pan, dbl-click = reset),
+**Emission** list, and **Heating** list (Trigger · Filament · → State · Current).
+**Save to host** persists per-filament settings (localStorage); **Upload** sends
+the bound schedule (emission rows + heating deltas) to the controller.
+
+## Debug power panel (real RP2350B commands)
+
+In Debug, the editor maps each control to a firmware command
+(`docs/power_state_and_cc.md`) on the owning controller:
+
+- **Power state** ladder (Stop/Sleep/Standby/Idle/Active/Voltage) →
+  `CH_SET_POWER_STATE` 0x35. Idle/Active carry the **heating current** (mA, the
+  closed-loop CC target); Voltage carries mV. `CH_GET_POWER_STATE` 0x36 reads
+  state + fault on open.
+- **OCP** → `CH_SET_TPS_OCP_THRESHOLD` 0x28 · **Heating I (measured)** →
+  `CH_GET_INA219` 0x24 · **DC HV** read/toggle → `HV_GET_ALL_BYTES` 0x13 /
+  `HV_SET_BIT` 0x10 · **Fire pulse** → `HV_PULSE` 0x16.
+
+Frames are built in `backend.py` (the firmware protocol is ahead of the WiFi
+GUI's `net_protocol`) and proxied via `POST /api/cmd {controller, command, …}`.
 
 ## Machine geometry
 

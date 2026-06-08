@@ -1,7 +1,7 @@
 // Collimator — a physical block INSIDE the source ring, over the 35-filament
 // window, with one slit per covered filament; the active slit glows open.
 
-import { CT, filamentBaseAngle } from '../constants.js';
+import { CT } from '../constants.js';
 
 export function drawCollimator(r) {
   if (!r.opts.wedge) return;
@@ -19,15 +19,23 @@ export function drawCollimator(r) {
   ctx.fillStyle = grad; ctx.fill();
   ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(242,193,78,0.5)'; ctx.stroke();
 
-  // slits — one per covered filament; the active slit glows open
+  // slits — one neutral tick per covered filament (no colored boundary line)
+  ctx.strokeStyle = 'rgba(10,16,22,0.8)'; ctx.lineWidth = 0.7;
   for (const i of r._windowIndices()) {
-    const a = filamentBaseAngle(i) * Math.PI / 180;
-    const isActive = i === r.state.activeFilament;
-    ctx.strokeStyle = isActive ? 'rgba(255,150,150,0.95)' : 'rgba(10,16,22,0.85)';
-    ctx.lineWidth = isActive ? 1.8 : 0.7;
+    const a = r._filamentAngle(i) * Math.PI / 180; // rocks with the gantry
     ctx.beginPath();
     ctx.moveTo(r._x(rIn * Math.cos(a)), r._y(rIn * Math.sin(a)));
     ctx.lineTo(r._x(rOut * Math.cos(a)), r._y(rOut * Math.sin(a)));
     ctx.stroke();
   }
+
+  // center divider — marks the collimator-center filament; stops short of the
+  // filament dot so it doesn't touch the ring marker.
+  const ca = cAng * Math.PI / 180;
+  const cIn = CT.R_SOURCE * 0.85, cOut = CT.R_SOURCE * 0.965;
+  ctx.strokeStyle = 'rgba(242,193,78,0.95)'; ctx.lineWidth = 1.8;
+  ctx.beginPath();
+  ctx.moveTo(r._x(cIn * Math.cos(ca)), r._y(cIn * Math.sin(ca)));
+  ctx.lineTo(r._x(cOut * Math.cos(ca)), r._y(cOut * Math.sin(ca)));
+  ctx.stroke();
 }
