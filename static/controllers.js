@@ -31,24 +31,33 @@ export function initControllers() {
 
   scanBtn.addEventListener('click', async () => {
     scanBtn.disabled = true;
-    scanHint.textContent = 'Scanning for :3333 …';
+    scanHint.textContent = 'Scanning LAN + 192.168.4.0/24 …';
     try {
       const { results } = await api('/api/scan');
+      // responsive controllers first, then port-open — so the best host wins.
+      const found = (results || []).slice().sort(
+        (a, b) => (b.controller_responsive ? 1 : 0) - (a.controller_responsive ? 1 : 0));
       datalist.innerHTML = '';
-      for (const r of results) {
+      for (const r of found) {
         const o = document.createElement('option');
         o.value = r.host;
         o.label = (r.name ? r.name + ' · ' : '') + (r.controller_responsive ? 'RP2350 ✓' : 'port open');
         datalist.appendChild(o);
       }
-      scanHint.textContent = results.length
-        ? `Found ${results.length} bridge(s) on :3333 — pick a host below.`
-        : 'No :3333 hosts found. Check the ESP32 is powered and on this LAN/AP.';
-      // auto-fill blank host fields with discovered IPs, in order
-      results.forEach((r, i) => {
-        const h = cards[i] && cards[i].querySelector('[data-host]');
-        if (h && !h.value) h.value = r.host;
+      // Assign discovered IPs to the cards (OVERWRITE — the defaults are only
+      // valid on the AP and were masking real LAN IPs). Distinct host per card.
+      cards.forEach((card, i) => {
+        const h = card.querySelector('[data-host]');
+        if (h && found[i]) h.value = found[i].host;
       });
+      if (!found.length) {
+        scanHint.textContent = 'No bridge found. Join the CTPower-XXXXXX AP or check the ESP32 is powered, then scan again.';
+      } else {
+        const live = found.filter((r) => r.controller_responsive).length;
+        scanHint.textContent = found.length === 1
+          ? `Found ${found[0].name || found[0].host}${found[0].controller_responsive ? ' — controller alive' : ' — controller silent'} @ ${found[0].host}.`
+          : `Found ${found.length} bridge(s), ${live} with a live controller — filled the cards (adjust if needed).`;
+      }
     } catch (e) {
       scanHint.textContent = 'Scan failed: ' + e;
     } finally {
@@ -91,10 +100,32 @@ export function initControllers() {
       const c = st.controllers[card.dataset.ctrl];
       if (!c) continue;
       connected[card.dataset.ctrl] = c.connected;
+      // Restore the host field from the backend's live state — the connection
+      // outlives a page refresh, so the IP must reappear when still connected.
+      if (c.connected && c.host) {
+        const h = card.querySelector('[data-host]');
+        if (h && h.value !== c.host) h.value = c.host;
+      }
       card.querySelector('[data-dot]').className = 'dot ' + (c.connected ? 'online' : 'offline');
       const btn = card.querySelector('[data-connect]');
       btn.textContent = c.connected ? 'Disconnect' : 'Connect';
       btn.classList.toggle('quick', !c.connected);
+
+      // identity (MAC-derived AP SSID) + flash-persisted offset — so two boards
+      // can be told apart and each one's configured role is visible.
+      const ident = card.querySelector('[data-ident]');
+      if (ident) ident.textContent = c.connected && c.bridge_name ? c.bridge_name : '';
+      const devoff = card.querySelector('[data-devoff]');
+      if (devoff) {
+        if (!c.connected || c.device_offset == null) { devoff.textContent = ''; devoff.classList.remove('bad'); }
+        else {
+          const want = parseInt(card.querySelector('[data-offset]').value, 10);
+          const match = c.device_offset === want;
+          devoff.textContent = `flash ${c.device_offset}` + (match ? ' ✓' : ' ⚠');
+          devoff.classList.toggle('bad', !match);
+          devoff.title = match ? 'Board flash offset matches' : `Board flash offset is ${c.device_offset}, field is ${want} — change the field to write flash.`;
+        }
+      }
       const rp = card.querySelector('[data-hb="rp"]');
       const stm = card.querySelector('[data-hb="stm"]');
       if (!c.connected) {

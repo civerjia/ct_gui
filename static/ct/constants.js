@@ -7,8 +7,8 @@
 
 export const CT = {
   N_FILAMENTS: 96,
-  R_SOURCE: 341 / 2,        // 170.5 mm (mutable: source-ring diameter / 2)
-  R_DETECTOR: 280 / 2,      // 140.0 mm (mutable: detector-ring diameter / 2)
+  R_SOURCE: 436 / 2,        // 218.0 mm (mutable: source-ring diameter / 2)
+  R_DETECTOR: 308 / 2,      // 154.0 mm (mutable: detector-ring diameter / 2)
   COVERAGE: 35,             // filaments under the collimator
   DET_PIXELS: 256,
   DET_PIXEL_MM: 0.1,        // -> 25.6 mm panel

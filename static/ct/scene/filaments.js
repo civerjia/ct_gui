@@ -32,6 +32,18 @@ export function drawFilaments(r) {
     const isActive = i === s.activeFilament;
     const isHover = i === s.hover;
 
+    // dead/disabled filament: a hollow gray ✕ on the ring, no bars
+    if (f.dead) {
+      const p = r._filamentPos(i), sx = r._x(p.x), sy = r._y(p.y), d = 3;
+      ctx.strokeStyle = 'rgba(120,130,138,0.85)'; ctx.lineWidth = 1.3;
+      ctx.beginPath();
+      ctx.moveTo(sx - d, sy - d); ctx.lineTo(sx + d, sy + d);
+      ctx.moveTo(sx + d, sy - d); ctx.lineTo(sx - d, sy + d);
+      ctx.stroke();
+      if (isHover) { ctx.strokeStyle = 'rgba(255,255,255,0.5)'; r._annulusStroke(masBase, a - CT.STEP_DEG / 2, a + CT.STEP_DEG / 2); }
+      continue;
+    }
+
     // dim baseline stubs so the ring always reads full
     r._radialBar(a, viBase, viBase + 2, hw, offV, 'rgba(120,150,162,0.16)');
     r._radialBar(a, viBase, viBase + 2, hw, offI, 'rgba(120,150,162,0.16)');

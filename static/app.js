@@ -20,10 +20,11 @@ import { CTGeometry } from './ct/renderer.js';
 import { initControllers } from './controllers.js';
 import { initScheduleTable } from './schedule.js';
 import { ScheduleGantt } from './gantt.js';
+import { initPower } from './power.js';
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (msg) => { $('statusBar').textContent = msg; };
-const HALF = (CT.COVERAGE - 1) / 2; // 17
+let HALF = (CT.COVERAGE - 1) / 2; // window half-width (# active = 2·HALF+1)
 const N = CT.N_FILAMENTS;
 
 // ---- firmware PowerState mirror --------------------------------------------
@@ -62,6 +63,7 @@ const filaments = Array.from({ length: N }, () => ({
   pulses: DEFAULT_PULSES, durationUs: DEFAULT_DUR_US,
   idleA: 1, activeA: 3,      // cathode heating currents (A)
   ocp: 4000, dcHv: false, // debug: per-board OCP (mA, firmware default 4 A), DC HV bit
+  dead: false,            // disabled filament — omitted from the schedule (§8.4)
 }));
 
 // Heating plan — bound to the emission schedule. Per the firmware design
@@ -69,13 +71,16 @@ const filaments = Array.from({ length: N }, () => ({
 // promoted to ACTIVE T_settle (a trigger lead) before its emission window and
 // demoted after, with a per-controller power cap. idle/active currents are the
 // per-filament defaults; the rest are plan-wide.
-// confirmed system constants (docs/heating_schedule_design.md v2), not GUI inputs.
 // holdMs = stay ACTIVE this long after the last pulse before demoting to IDLE.
-const heatingSchedule = { tSettleMs: 1000, rotationMs: 30000, holdMs: 200 };
+// activeCount = max filaments allowed ACTIVE at once (the hot-band cap).
+const heatingSchedule = { tSettleMs: 1000, rotationMs: 30000, holdMs: 200, activeCount: 40 };
+// per-filament power for the PLAN total-power estimate (W). Live mode uses the
+// real measured P = V·I instead.
+const powerEst = { idleW: 1.8, activeW: 32 };
 
 // view mode: 'live' (hardware position + sensors), 'plan' (edit + play sim),
 // 'debug' (per-filament heating / debug pulses, right-click to edit power)
-let viewMode = 'plan';
+let viewMode = 'live';
 
 const state = {
   mode: 'stationary',
@@ -124,17 +129,20 @@ function refreshStates() {
   // Bound-schedule heating: every filament rests at IDLE (warm pool); the
   // derived plan promotes the hot band (collimator window + T_settle lead) to
   // ACTIVE at the current pulse trigger. The firing filament emits.
+  // Deterministic design values (NOT fake telemetry): the planned operating
+  // point implied by the per-filament currents + configured power.
   const t = currentTrigger();
   for (let i = 0; i < N; i++) {
     const f = filaments[i];
+    if (f.dead) { f.state = STATE.STOP; f.voltage_mV = 0; f.current_mA = 0; continue; }
     if (isActiveAt(i, t)) {
       f.state = STATE.ACTIVE;
-      f.voltage_mV = 4500 + (Math.random() - 0.5) * 120;
-      f.current_mA = f.activeA * 1000 + (Math.random() - 0.5) * 80;
+      f.current_mA = f.activeA * 1000;
+      f.voltage_mV = f.activeA > 0 ? powerEst.activeW / f.activeA * 1000 : 0; // V·I = activeW
     } else {
       f.state = STATE.IDLE;       // warm pool — ready to promote
-      f.voltage_mV = 1500 + (Math.random() - 0.5) * 40;
-      f.current_mA = f.idleA * 1000 + (Math.random() - 0.5) * 40;
+      f.current_mA = f.idleA * 1000;
+      f.voltage_mV = f.idleA > 0 ? powerEst.idleW / f.idleA * 1000 : 0;       // V·I = idleW
     }
   }
 }
@@ -220,18 +228,20 @@ function buildSchedule() {
   while (sim.ringStep < N) {
     if (rows.length >= MAX_ROWS) { scheduleTruncated = true; break; }
     const fil = ctMod(sim.collimatorCenter - HALF + sim.windowPos, N);
-    const burstLen = Math.max(1, filaments[fil].pulses);
-    rows.push({
-      seq: rows.length,
-      trigger: trig,                        // start pulse of this burst
-      burstLen,                             // # pulses in this burst
-      filament: fil,
-      pulses: burstLen,
-      duration: filaments[fil].durationUs,  // per-filament duration (µs)
-      coll: sim.collimatorCenter, gantry: sim.gantryAngle,
-      windowPos: sim.windowPos, ringStep: sim.ringStep,
-    });
-    trig += burstLen;
+    if (!filaments[fil].dead) { // dead filaments fire nothing — a known gap
+      const burstLen = Math.max(1, filaments[fil].pulses);
+      rows.push({
+        seq: rows.length,
+        trigger: trig,                        // start pulse of this burst
+        burstLen,                             // # pulses in this burst
+        filament: fil,
+        pulses: burstLen,
+        duration: filaments[fil].durationUs,  // per-filament duration (µs)
+        coll: sim.collimatorCenter, gantry: sim.gantryAngle,
+        windowPos: sim.windowPos, ringStep: sim.ringStep,
+      });
+      trig += burstLen;
+    }
     stepScan(sim, cfg, angles);
   }
   totalTriggers = trig;
@@ -302,11 +312,27 @@ function setScheduleView(view) {
 // emission run and demoted IDLE after (cyclic), then validated for power/settle.
 let heatingPlan = null;
 
+// peak filaments ACTIVE at once for a given pre-heat lead (cyclic diff sweep).
+// Monotonic non-decreasing in `lead`, so we can binary-search a target peak.
+function peakForLead(runs, len, lead, hold) {
+  const diff = new Array(len + 1).fill(0);
+  for (const run of runs) {
+    const promote = ctMod(run.firstStart - lead, len);
+    const demote = ctMod(run.lastEnd + hold, len);
+    const span = ctMod(demote - promote, len) || len;
+    if (promote + span <= len) { diff[promote]++; diff[promote + span]--; }
+    else { diff[promote]++; diff[len]--; diff[0]++; diff[promote + span - len]--; }
+  }
+  let cur = 0, peak = 0;
+  for (let t = 0; t < len; t++) { cur += diff[t]; if (cur > peak) peak = cur; }
+  return peak;
+}
+
 function planHeating() {
   const len = totalTriggers;   // timeline is in pulses, not bursts
   if (!schedule.length || !len) { heatingPlan = null; renderValidation(); return; }
   const pulseMs = heatingSchedule.rotationMs / len;
-  const leadBursts = Math.max(1, Math.ceil(heatingSchedule.tSettleMs / pulseMs));
+  const triggersPerAngle = len / N;
   const holdBursts = Math.max(1, Math.ceil(heatingSchedule.holdMs / pulseMs));
 
   // emission bursts per filament, in pulse-trigger units {start, end}
@@ -317,8 +343,8 @@ function planHeating() {
     a.push({ start: r.trigger, end: r.trigger + r.burstLen });
   }
   // each filament's window run = the arc complementary to its largest dark gap
-  const intervals = new Map();
-  const deltas = [];
+  // (lead-independent: just the first/last pulse of the run)
+  const runs = [];
   for (const [fil, bursts] of burstsByFil) {
     bursts.sort((a, b) => a.start - b.start);
     let maxGap = -1, gapAt = 0;
@@ -327,17 +353,35 @@ function planHeating() {
       const gap = ctMod(next.start - bursts[i].end, len); // dark pulses between bursts
       if (gap > maxGap) { maxGap = gap; gapAt = i; }
     }
-    const lastEnd = bursts[gapAt].end;                  // end of the run (last pulse)
-    const firstStart = bursts[(gapAt + 1) % bursts.length].start; // start of the run
-    const promote = ctMod(firstStart - leadBursts, len);
-    const demote = ctMod(lastEnd + holdBursts, len);    // hold ACTIVE holdMs after the last pulse
-    intervals.set(fil, { promote, demote });
+    runs.push({
+      fil,
+      lastEnd: bursts[gapAt].end,                          // end of run (last pulse)
+      firstStart: bursts[(gapAt + 1) % bursts.length].start, // start of run
+    });
+  }
+
+  // Solve for the pre-heat lead so the ACTUAL peak ACTIVE count lands on
+  // `# active`: binary-search the largest lead whose computed peak ≤ # active.
+  let lo = 0, hi = len, leadBursts = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (peakForLead(runs, len, mid, holdBursts) <= heatingSchedule.activeCount) { leadBursts = mid; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  const leadAngles = leadBursts / triggersPerAngle;
+
+  const intervals = new Map();
+  const deltas = [];
+  for (const run of runs) {
+    const promote = ctMod(run.firstStart - leadBursts, len);
+    const demote = ctMod(run.lastEnd + holdBursts, len); // hold ACTIVE holdMs after last pulse
+    intervals.set(run.fil, { promote, demote });
     // arg16 = CC target current (mA) carried in the heating delta -> downloaded
-    deltas.push({ seq: promote, filament: fil, state: STATE.ACTIVE, arg: Math.round(filaments[fil].activeA * 1000) });
-    deltas.push({ seq: demote, filament: fil, state: STATE.IDLE, arg: Math.round(filaments[fil].idleA * 1000) });
+    deltas.push({ seq: promote, filament: run.fil, state: STATE.ACTIVE, arg: Math.round(filaments[run.fil].activeA * 1000) });
+    deltas.push({ seq: demote, filament: run.fil, state: STATE.IDLE, arg: Math.round(filaments[run.fil].idleA * 1000) });
   }
   deltas.sort((a, b) => a.seq - b.seq);
-  heatingPlan = { len, leadBursts, holdBursts, intervals, deltas };
+  heatingPlan = { len, leadBursts, leadAngles, holdBursts, runs, intervals, deltas };
   buildHeatRows();
   validatePlan();
 }
@@ -364,20 +408,24 @@ function isActiveAt(fil, t) {
 // so the worst-case actual lead = min over filaments. It fails only if T_settle
 // can't fit in a rotation, or a filament's emission run leaves no room.
 function validatePlan() {
-  const len = heatingPlan.len, lead = heatingPlan.leadBursts;
-  const burstMs = heatingSchedule.rotationMs / len;
-  let minLead = Infinity, worst = -1;
-  for (const [fil, iv] of heatingPlan.intervals) {
-    // actual ACTIVE-before-first-emission = the promote→firstEmission distance,
-    // capped by the filament's own active span (can't exceed its run length).
-    const span = ctMod(iv.demote - iv.promote, len) || len;
-    const actual = Math.min(lead, span);
-    if (actual < minLead) { minLead = actual; worst = fil; }
-  }
-  if (!isFinite(minLead)) minLead = 0;
-  const actualMs = minLead * burstMs;
-  const ok = lead < len && actualMs + 1e-6 >= heatingSchedule.tSettleMs;
-  heatingPlan.validation = { lead, minLead, actualMs, worst, burstMs, ok };
+  const len = heatingPlan.len;
+  const pulseMs = heatingSchedule.rotationMs / len;
+  const leadMs = heatingPlan.leadBursts * pulseMs;        // pre-heat time before firing
+  const settleOk = leadMs + 1e-6 >= heatingSchedule.tSettleMs;
+
+  // the actual peak ACTIVE at once for the chosen lead (== what the ring shows)
+  const peak = peakForLead(heatingPlan.runs, len, heatingPlan.leadBursts, heatingPlan.holdBursts);
+
+  // decompose the REAL peak into window + lead + hold so the breakdown always
+  // adds up: window is the collimator coverage, hold the post-fire tail, and the
+  // pre-heat lead is whatever remains.
+  const msPerAngle = heatingSchedule.rotationMs / N;
+  const holdAngles = Math.max(1, Math.ceil(heatingSchedule.holdMs / msPerAngle));
+  const windowN = Math.min(CT.COVERAGE, peak);
+  const holdN = Math.max(0, Math.min(holdAngles, peak - windowN));
+  const leadN = peak - windowN - holdN;   // window + lead + hold === peak by construction
+
+  heatingPlan.validation = { leadMs, peak, windowN, leadN, holdN, settleOk, ok: settleOk };
   renderValidation();
 }
 
@@ -386,15 +434,15 @@ function renderValidation() {
   if (!el) return;
   const v = heatingPlan && heatingPlan.validation;
   if (!v) { el.textContent = ''; el.className = 'plan-verdict'; return; }
-  const angles = (heatingPlan.len ? v.lead / heatingPlan.len * N : 0).toFixed(1); // 96 angles / rotation
   el.className = 'plan-verdict ' + (v.ok ? 'ok' : 'bad');
-  el.title = v.ok
-    ? 'Each filament reaches stable ACTIVE at least T settle before its first pulse.'
-    : `Filament ${v.worst} can't reach T settle of ACTIVE before firing — shorten T settle or slow the rotation.`;
+  el.title = '# active is the target hot-band size. The pre-heat lead is solved so the actual ' +
+    'peak ACTIVE count lands on it = collimator window + filaments pre-heated ahead + post-fire hold tail.';
+  const tgt = v.peak === heatingSchedule.activeCount ? '' : ` (target ${heatingSchedule.activeCount})`;
   el.innerHTML =
-    `<b>${v.ok ? '✓ settle OK' : '✗ settle FAILS'}</b> · turn each filament ACTIVE ` +
-    `<b>${v.lead}</b> triggers (~${angles} angles) before its window` +
-    (v.ok ? `.` : ` — short on filament ${v.worst}.`);
+    `<div>Hot band <b>${v.peak}</b> ACTIVE${tgt} = ${v.windowN} window + ${v.leadN} lead + ${v.holdN} hold.</div>` +
+    `<div><b>${v.settleOk ? '✓ settle OK' : '✗ settle short'}</b> — pre-heat ` +
+    `<b>${Math.round(v.leadMs)} ms</b> ${v.settleOk ? '≥' : '<'} ${heatingSchedule.tSettleMs} ms T settle` +
+    (v.settleOk ? '.' : ' — raise # active or rotation time.') + `</div>`;
 }
 
 // move the geometry to schedule[seq]; fire its filament when stepping
@@ -481,7 +529,7 @@ function sync() {
   $('roSdd').textContent = sourceToDetectorMM().toFixed(1) + ' mm';
 
   $('geoSummary').textContent = `filament ${state.activeFilament} @ ${famAngle.toFixed(1)}°`;
-  renderDetail(hoverFil >= 0 ? hoverFil : state.activeFilament, hoverFil >= 0);
+  renderPower();
 
   $('modeBadge').textContent = 'Mode: ' + (state.mode === 'precision' ? 'Precision' : 'Stationary');
   const pct = Math.round((state.ringStep / N) * 100);
@@ -490,26 +538,22 @@ function sync() {
   else { pb.textContent = `ring ${pct}%`; pb.className = 'badge heartbeat-idle'; }
 }
 
-// selected/hovered filament detail card
-let selFil = 0; // filament currently shown in the detail card
-function renderDetail(i, isHover) {
-  selFil = i;
-  const f = filaments[i];
-  const hw = filamentToHw(i);
-  $('selFilTitle').textContent = isHover ? `Filament ${i} (hover)` : `Filament ${i} (active)`;
-  $('selFilHw').textContent = hw.label;
-  const sc = STATE_COLOR[f.state];
-  const sb = $('selFilState');
-  sb.textContent = STATE_NAME[f.state];
-  sb.style.background = sc + '33';
-  sb.style.color = sc;
-  $('selFilV').textContent = (f.voltage_mV / 1000).toFixed(3) + ' V';
-  $('selFilI').textContent = f.current_mA.toFixed(1) + ' mA';
-  $('selFilMas').textContent = f.mAs.toFixed(3) + ' mAs';
-  // per-filament plan inputs (don't clobber a field being typed in)
-  const ae = document.activeElement;
-  if (ae !== $('selFilPulses')) $('selFilPulses').value = f.pulses;
-  if (ae !== $('selFilDur')) $('selFilDur').value = f.durationUs;
+// total heating power, split by ACTIVE vs IDLE.
+//  · Plan  — ESTIMATE: per-filament configured power (powerEst.idleW/activeW)
+//            × the number of filaments in each state.
+//  · Live  — MEASURED: real P = V·I (voltage_mV × current_mA / 1e6), present only.
+function renderPower() {
+  let active = 0, idle = 0;
+  const live = viewMode === 'live';
+  for (const f of filaments) {
+    if (!f || f.dead) continue;
+    if (f.state === STATE.ACTIVE) active += live ? (f.voltage_mV * f.current_mA) / 1e6 : powerEst.activeW;
+    else if (f.state === STATE.IDLE) idle += live ? (f.voltage_mV * f.current_mA) / 1e6 : powerEst.idleW;
+  }
+  const fmt = (w) => (w >= 1000 ? (w / 1000).toFixed(2) + ' kW' : w.toFixed(1) + ' W');
+  $('pwTotal').textContent = fmt(active + idle);
+  $('pwActive').textContent = fmt(active);
+  $('pwIdle').textContent = fmt(idle);
 }
 
 // ---- play loop --------------------------------------------------------------
@@ -546,9 +590,62 @@ function setViewMode(mode) {
     ? 'Live — reflects the actual gantry position and INA219 sensor data from the controllers.'
     : mode === 'debug'
       ? 'Debug — pick any filament to set heating / fire pulses. Right-click the V·I or mAs rings to edit heating power.'
-      : 'Plan — edit the scan schedule and Play it (simulated).');
+      : 'Plan — edit the scan schedule and Play it. Right-click a filament to disable/enable it.');
   if (plan) refreshStates();
+  else clearLiveData();   // plan placeholder V/I must NOT carry into live/debug
+  if (mode === 'live') startLiveTelemetry(); else stopLiveTelemetry();
   sync();
+}
+
+// blank all telemetry-derived fields — real hardware data fills them in Live,
+// per-board reads in Debug. Prevents Plan's design values from lingering.
+function clearLiveData() {
+  for (const f of filaments) {
+    if (f.dead) continue;
+    f.state = STATE.STOP; f.voltage_mV = 0; f.current_mA = 0;
+  }
+}
+
+// ---- live telemetry: drive the ring from real hardware ----------------------
+// Batch INA219 V/I per controller + the live firing filament from ShvGetStatus.
+// There is no batch power-state read, so each filament's state is INFERRED from
+// its measured heating current (relative to its configured idle/active target).
+let liveTelemetryTimer = null;
+function startLiveTelemetry() {
+  if (liveTelemetryTimer) return;
+  liveTelemetryTimer = setInterval(pollTelemetry, 1000);
+  pollTelemetry();
+}
+function stopLiveTelemetry() { if (liveTelemetryTimer) { clearInterval(liveTelemetryTimer); liveTelemetryTimer = null; } }
+
+function inferState(f, mA, present) {
+  if (!present) return STATE.STOP;
+  const idle = f.idleA * 1000, act = f.activeA * 1000;
+  if (mA >= (idle + act) / 2) return STATE.ACTIVE;
+  if (mA >= idle * 0.4) return STATE.IDLE;
+  return STATE.STOP;
+}
+
+async function pollTelemetry() {
+  if (viewMode !== 'live') return;
+  let data;
+  try { data = await (await fetch('/api/telemetry')).json(); } catch { return; }
+  const tele = data.telemetry || [];
+  const running = Object.values(data.run || {}).some((s) => s && s.state === 2);
+  if (!tele.length && !running) { setStatus('Live — no telemetry (controllers disconnected or bridge slot busy).'); return; }
+  const present = tele.filter((t) => t.present).length;
+  const rows = tele.map((t) => {
+    const f = filaments[t.index]; if (!f) return null;
+    return { index: t.index, state: inferState(f, t.current_mA, t.present), bus_mV: t.bus_mV, current_mA: t.current_mA };
+  }).filter(Boolean);
+  // the firmware-reported firing filament(s) are authoritative ACTIVE
+  const firing = data.firing || [];
+  for (const fi of firing) { const r = rows.find((x) => x.index === fi); if (r) r.state = STATE.ACTIVE; }
+  if (firing.length) state.activeFilament = firing[0];
+  ingestTelemetry(rows);   // calls sync()
+  setStatus(present === 0 && !running
+    ? `Live — connected, but 0/${tele.length} boards present (no filament daughter-boards detected). Run I2C Self-Test to check the controller chips.`
+    : `Live — ${present}/${tele.length} boards present${firing.length ? `, firing ${firing.join(',')}` : ''}.`);
 }
 
 // ---- debug power/pulse editor: wired to the real RP2350B commands ----------
@@ -568,6 +665,9 @@ async function cmd(fil, command, extra) {
 const heatMsg = (m) => { $('heatStatus').textContent = m; };
 function highlightState(st) {
   document.querySelectorAll('#heatStateSeg button').forEach((b) => b.classList.toggle('active', +b.dataset.state === st));
+  // Active/Idle expose the CC current; Voltage exposes the manual mV.
+  $('heatIField').hidden = !(st === STATE.IDLE || st === STATE.ACTIVE);
+  $('heatVField').hidden = st !== STATE.VOLTAGE;
 }
 
 // Set PowerState — the firmware closed-loop driver. IDLE/ACTIVE carry the
@@ -588,21 +688,32 @@ async function dbgSetState(i, st) {
   const unit = st === STATE.VOLTAGE ? ' mV' : (st === STATE.IDLE || st === STATE.ACTIVE) ? ' mA' : '';
   heatMsg(j.ok ? `${STATE_NAME[st]}${arg ? ' @ ' + arg + unit : ''} set.` : `State: ${j.error}`);
 }
+// "Set" the CC heating current: re-issue the power state carrying heatI. Keep
+// Idle if already Idle, else apply as Active.
+async function dbgSetI(i) {
+  await dbgSetState(i, filaments[i].state === STATE.IDLE ? STATE.IDLE : STATE.ACTIVE);
+}
+// "Set" the manual voltage: switch the channel to Voltage state with heatV.
+async function dbgSetV(i) { await dbgSetState(i, STATE.VOLTAGE); }
 async function dbgSetOcp(i) {
   const ma = Math.max(0, parseInt($('heatOcp').value, 10) || 0);
   filaments[i].ocp = ma;
   const j = await cmd(i, 'CH_SET_TPS_OCP_THRESHOLD', { threshold_mA: ma });
   heatMsg(j.ok ? `OCP set to ${ma} mA.` : `OCP: ${j.error}`);
 }
-async function dbgReadIna(i) {
+// INA219 is polled continuously while the popup is open (quiet = no status line).
+async function dbgReadIna(i, quiet) {
   const j = await cmd(i, 'CH_GET_INA219', {});
   const d = j.ok && j.response && j.response.decoded;
-  if (d) {
+  if (d && d.present) {
     filaments[i].current_mA = d.current_mA; filaments[i].voltage_mV = d.bus_mV; sync();
     $('heatImeas').textContent = `${d.current_mA} mA`;
     $('heatVmeas').textContent = `${d.bus_mV} mV`;
-    heatMsg(`INA219: ${d.bus_mV} mV / ${d.current_mA} mA.`);
-  } else heatMsg(`Read: ${j.error || 'no data'}`);
+    if (!quiet) heatMsg(`INA219: ${d.bus_mV} mV / ${d.current_mA} mA.`);
+  } else if (d && !d.present) {
+    $('heatImeas').textContent = 'absent'; $('heatVmeas').textContent = '—';
+    if (!quiet) heatMsg('INA219 not present on this board (no daughter-board?).');
+  } else if (!quiet) heatMsg(`Read: ${j.error || 'no data'}`);
 }
 async function dbgReadState(i) {
   const j = await cmd(i, 'CH_GET_POWER_STATE', {});
@@ -621,12 +732,12 @@ async function dbgFire(i) {
   if (j.ok) { f.mAs += f.activeA * (f.durationUs / 1e6) * 1000; sync(); }
   heatMsg(j.ok ? `Pulsed ${f.durationUs} µs.` : `Fire: ${j.error}`);
 }
-async function dbgReadHv(i) {
+async function dbgReadHv(i, quiet) {
   const hw = filamentToHw(i);
   const j = await cmd(i, 'HV_GET_ALL_BYTES', {});
   const d = j.ok && j.response && j.response.decoded;
   if (d && d.feedback) { setHvButton(i, !!(d.feedback[hw.channel] & (1 << hw.mux))); }
-  else { setHvButton(i, null); if (!j.ok) heatMsg(`HV: ${j.error}`); }
+  else { setHvButton(i, null); if (!j.ok && !quiet) heatMsg(`HV: ${j.error}`); }
 }
 async function dbgToggleHv(i) {
   const next = !filaments[i].dcHv;
@@ -639,7 +750,7 @@ function setHvButton(i, on) {
   filaments[i].dcHv = !!on;
   const b = $('heatHv');
   b.className = 'sm hv-btn ' + (on == null ? 'unknown' : on ? 'on' : 'off');
-  b.textContent = on == null ? 'read DC HV status…' : on ? 'DC HV ON — click to turn off' : 'DC HV off — click to turn on';
+  b.textContent = on == null ? 'DC HV …' : on ? 'DC HV ON — click to turn off' : 'DC HV off — click to turn on';
 }
 
 function showHeatPopup(clientX, clientY, fil) {
@@ -663,9 +774,17 @@ function showHeatPopup(clientX, clientY, fil) {
   p.style.left = Math.max(8, Math.min(clientX, window.innerWidth - w - 8)) + 'px';
   p.style.top = Math.max(8, Math.min(clientY, window.innerHeight - h - 8)) + 'px';
   dbgReadState(fil); // pull live power-state + fault
-  dbgReadHv(fil);    // and DC HV status
+  // INA219 + DC HV auto-poll while the popup is open (like wifi_gui).
+  if (heatPollTimer) clearInterval(heatPollTimer);
+  const poll = () => { if (heatTarget >= 0) { dbgReadIna(heatTarget, true); dbgReadHv(heatTarget, true); } };
+  poll();
+  heatPollTimer = setInterval(poll, 1000);
 }
-function hideHeatPopup() { $('heatPopup').hidden = true; heatTarget = -1; }
+let heatPollTimer = null;
+function hideHeatPopup() {
+  $('heatPopup').hidden = true; heatTarget = -1;
+  if (heatPollTimer) { clearInterval(heatPollTimer); heatPollTimer = null; }
+}
 
 // ---- mode -------------------------------------------------------------------
 function setMode(mode) {
@@ -706,7 +825,7 @@ function setFilamentDir(d) {
 // drag a filament    -> rotate the gantry
 // drag collimator/det-> move the detector (rotate the collimator+detector ring)
 const STEP = 360 / N;
-const WIN_HALF_DEG = HALF * STEP; // 63.75° half-span of the collimator window
+let WIN_HALF_DEG = HALF * STEP; // half-span of the collimator window (deg)
 let drag = null;
 const angDist = (a, b) => Math.abs(((a - b + 540) % 360) - 180);
 // The whole assembly rocks by gantryAngle, so a screen angle maps back to a
@@ -765,15 +884,17 @@ function attachPlotDrag(cv) {
     cv.style.cursor = 'grabbing';
     e.preventDefault();
   });
-  // Debug: right-click the V·I / mAs ring region to edit heating power
+  // Right-click a filament: Plan = disable/enable (dead), Debug = power editor.
   cv.addEventListener('contextmenu', (e) => {
-    if (viewMode !== 'debug') return;
+    if (viewMode === 'live') return;
     const p = at(e);
-    if (p.r < CT.R_SOURCE || p.r > geo._bands().outer + 4) return; // only the ring bands
-    const i = geo.hitTest(e.clientX - cv.getBoundingClientRect().left, e.clientY - cv.getBoundingClientRect().top);
+    if (p.r < CT.R_SOURCE - 8 || p.r > geo._bands().outer + 4) return; // on/near the ring
+    const rect = cv.getBoundingClientRect();
+    const i = geo.hitTest(e.clientX - rect.left, e.clientY - rect.top);
     const fil = i >= 0 ? i : filFromAngle(p.ang);
     e.preventDefault();
-    showHeatPopup(e.clientX, e.clientY, fil);
+    if (viewMode === 'debug') showHeatPopup(e.clientX, e.clientY, fil);
+    else toggleDead(fil); // plan mode
   });
   cv.addEventListener('mousemove', (e) => {
     const rect = cv.getBoundingClientRect();
@@ -785,6 +906,26 @@ function attachPlotDrag(cv) {
   });
   window.addEventListener('mouseup', () => { if (drag) { drag = null; cv.style.cursor = 'crosshair'; resyncSchedule(); } });
   cv.addEventListener('mouseleave', () => { if (!drag && hoverFil !== -1) { hoverFil = -1; sync(); } });
+}
+
+// Collimator coverage = how many filaments the collimator covers (geometry).
+// Kept odd so the window centers on a filament. Re-derives scan + geometry.
+function setCoverage(n) {
+  HALF = Math.round((Math.max(1, Math.min(N - 1, n | 0)) - 1) / 2); // nearest odd
+  CT.COVERAGE = 2 * HALF + 1;
+  WIN_HALF_DEG = HALF * STEP;
+  $('covInput').value = CT.COVERAGE;
+  $('windowSlider').max = CT.COVERAGE - 1;
+  rebuildSchedule();
+}
+
+// Plan mode: disable/enable a filament. Dead filaments are omitted from the
+// emission schedule (and so from the heating plan) — a known projection gap.
+function toggleDead(i) {
+  filaments[i].dead = !filaments[i].dead;
+  if (filaments[i].dead) { filaments[i].state = STATE.STOP; filaments[i].mAs = 0; }
+  rebuildSchedule();
+  setStatus(`Filament ${i} ${filaments[i].dead ? 'disabled (dead) — omitted from the schedule' : 'enabled'}.`);
 }
 
 function resetGantry() {
@@ -837,7 +978,7 @@ function refreshFilList() {
 // host-side persistence of the per-filament plan (pulses / duration / currents)
 const FIL_STORE = 'ct_fil_settings';
 function saveFilSettings() {
-  const data = filaments.map((f) => ({ pulses: f.pulses, durationUs: f.durationUs, idleA: f.idleA, activeA: f.activeA }));
+  const data = filaments.map((f) => ({ pulses: f.pulses, durationUs: f.durationUs, idleA: f.idleA, activeA: f.activeA, dead: f.dead }));
   try { localStorage.setItem(FIL_STORE, JSON.stringify(data)); $('schStatus').textContent = 'Saved per-filament settings to host.'; }
   catch (e) { $('schStatus').textContent = 'Save failed: ' + e; }
 }
@@ -874,9 +1015,192 @@ async function uploadSchedule() {
   }
 }
 
+// ---- real-hardware bound schedule: download / arm / trigger / monitor -------
+const hwMsg = (m) => { const e = $('hwRunStatus'); if (e) e.innerHTML = m; };
+const postJSON = async (path, body) => (await fetch(path, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+})).json();
+
+// Translate the GUI's bound schedule into the host plan (logical filament 0-95;
+// the backend maps to global 0-127 + per-controller split).
+function buildPlan() {
+  const emission = schedule.map((r) => ({
+    filament: r.filament, numPulses: r.burstLen, widthUs: Math.round(r.duration),
+  }));
+  const heating = (heatingPlan ? heatingPlan.deltas : []).map((d) => ({
+    filament: d.filament, triggerIndex: d.seq, state: d.state, milliamps: d.arg,
+  }));
+  const currents = {};
+  filaments.forEach((f, i) => {
+    if (f.dead) return;
+    currents[i] = { idle_mA: Math.round(f.idleA * 1000), active_mA: Math.round(f.activeA * 1000) };
+  });
+  return {
+    emission, heating, currents,
+    config: { interPulseMs: 3000, maxOnMs: 40, totalMs: 60000, triggerEdge: 0 },
+  };
+}
+
+async function hwDownload() {
+  if (!schedule.length) { hwMsg('No schedule to download — build one first.'); return; }
+  const v = heatingPlan && heatingPlan.validation;
+  if (v && !v.ok && !confirm('Settle time is NOT satisfied. Download anyway?')) { hwMsg('Download cancelled.'); return; }
+  hwMsg(`Downloading ${schedule.length} emission + ${heatRows.length} heating…`);
+  try {
+    const j = await postJSON('/api/download', { plan: buildPlan() });
+    if (!j.ok && j.error) { hwMsg(`Download failed: ${j.error}`); return; }
+    const parts = (j.results || []).map((r) => `P${r.controller + 1}: ${r.ok ? '✓' : '✗'} ${r.emit} emit/${r.heat} heat`);
+    hwMsg(`${j.ok ? '✓ Downloaded' : '✗ Partial'} — ${parts.join(' · ')}`);
+  } catch (e) { hwMsg('Download failed: ' + e); }
+}
+
+async function hwArm() {
+  const repeats = Math.max(1, parseInt($('hwRepeats').value, 10) || 1);
+  hwMsg('Arming…');
+  try {
+    const j = await postJSON('/api/arm', { repeats });
+    const parts = Object.entries(j.results || {}).map(([k, r]) => `P${k}: ${r.ok ? 'armed' : (r.error || 'reject ' + r.reject)}`);
+    hwMsg(`${j.ok ? '✓ Armed' : '✗'} (×${repeats}) — ${parts.join(' · ')} — waiting for SyncIn.`);
+    if (j.ok) startRunMonitor();
+  } catch (e) { hwMsg('Arm failed: ' + e); }
+}
+
+async function hwDisarm() {
+  try { await postJSON('/api/disarm', {}); hwMsg('Disarmed — participants → IDLE.'); }
+  catch (e) { hwMsg('Disarm failed: ' + e); }
+  stopRunMonitor();
+}
+
+async function hwTrigger() {
+  const count = Math.max(1, parseInt($('hwTrigCount').value, 10) || 1);
+  try {
+    const j = await postJSON('/api/trigger', { count });
+    hwMsg(`Fired ${j.fired}/${count} SyncIn pulse(s)${j.ok ? '.' : ' — ' + ((j.last && j.last.message) || j.error || 'stalled')}`);
+  } catch (e) { hwMsg('Trigger failed: ' + e); }
+}
+
+// Poll ShvGetStatus: totalPulsesDone → schedule playhead, firmware filament/state.
+let runMonitorTimer = null;
+const SHV_STATE_NAME = { 0: 'Idle', 1: 'Armed', 2: 'Running', 3: 'Complete', 4: 'Fault' };
+function startRunMonitor() {
+  if (runMonitorTimer) return;
+  runMonitorTimer = setInterval(pollRunStatus, 500);
+  pollRunStatus();
+}
+function stopRunMonitor() { if (runMonitorTimer) { clearInterval(runMonitorTimer); runMonitorTimer = null; } }
+
+async function pollRunStatus() {
+  let data;
+  try { data = await (await fetch('/api/run-status')).json(); } catch { return; }
+  const ctrls = data.controllers || {};
+  let cursor = null, anyRunning = false, fault = null, statePieces = [];
+  for (const [k, c] of Object.entries(ctrls)) {
+    if (!c.connected || !c.status) continue;
+    const s = c.status;
+    if (cursor == null) cursor = s.totalPulsesDone;
+    if (s.state === 2) anyRunning = true;
+    if (s.state === 4) fault = { ctrl: k, fil: s.faultFilament };
+    statePieces.push(`P${k}:${SHV_STATE_NAME[s.state] || s.state}@${s.totalPulsesDone}/${s.totalPulsesTarget || '?'}`);
+  }
+  if (cursor != null && schedule.length) {
+    // map global pulse cursor → the schedule row whose burst contains it
+    let idx = 0;
+    for (let i = 0; i < schedule.length; i++) { if (schedule[i].trigger <= cursor) idx = i; else break; }
+    if (viewMode === 'live') { gotoSeq(idx, false); updateTableActive(); }
+  }
+  const f = fault ? ` — ⚠ FAULT P${fault.ctrl} fil ${fault.fil}` : '';
+  hwMsg(`${statePieces.join(' · ') || 'no controller'}${f}`);
+  if (!anyRunning && !fault && runMonitorTimer && cursor != null) {
+    // schedule complete / idle — keep polling slowly only while armed
+  }
+}
+
+// ---- I2C self-test / channel mask / diagnosis (ported from wifi_gui) ---------
+const i2cMsg = (m) => { const e = $('i2cResult'); if (e) e.innerHTML = m; };
+
+// channel enable mask — 8 toggle bits (default 0x3F = first 6 channels)
+let i2cMask = 0x3F;
+function buildMaskBits() {
+  const el = $('i2cMaskBits'); if (!el) return;
+  el.innerHTML = '';
+  for (let ch = 0; ch < 8; ch++) {
+    const b = document.createElement('button');
+    b.className = 'mask-bit' + ((i2cMask >> ch) & 1 ? ' on' : '');
+    b.textContent = ch + 1;
+    b.title = `Channel ${ch + 1} ${(i2cMask >> ch) & 1 ? 'enabled' : 'disabled'}`;
+    b.addEventListener('click', () => { i2cMask ^= (1 << ch); buildMaskBits(); });
+    el.appendChild(b);
+  }
+}
+function reflectMask(mask) { if (mask != null) { i2cMask = mask & 0xFF; buildMaskBits(); } }
+
+function renderI2C(data) {
+  const ctrls = (data && data.controllers) || {};
+  const keys = Object.keys(ctrls);
+  if (!keys.length) { i2cMsg('No controller connected.'); return; }
+  for (const k of keys) if (ctrls[k].channel_mask != null) { reflectMask(ctrls[k].channel_mask); break; }
+  let html = '';
+  for (const k of keys) {
+    const c = ctrls[k];
+    html += `<div class="i2c-ctrl"><b>Power ${k}</b>`;
+    if (c.channel_mask != null) html += ` <span class="hint">mask 0x${c.channel_mask.toString(16).toUpperCase().padStart(2, '0')}</span>`;
+    if (c.error) html += ` <span class="bad">${c.error}</span>`;
+    if (c.present_error) html += ` <span class="bad">present: ${c.present_error}</span>`;
+    if (c.present_hex) html += `<div class="i2c-st">raw: ${c.present_hex}</div>`;
+    const pc = c.present_counts;
+    if (pc) {
+      html += '<div class="i2c-grid">' +
+        ['mux', 'tps', 'ina', 'enable_io', 'iso_io', 'fault_io', 'hv_io'].map((p) =>
+          `<span class="i2c-chip ${pc[p] > 0 ? 'on' : 'off'}">${p.replace('_io', '')}<b>${pc[p]}</b></span>`).join('') +
+        '</div>';
+    }
+    const dc = c.diagnosis_counts;
+    if (dc) html += `<div class="i2c-st">diagnosis: op <b>${dc.op}</b> · reg-only <b>${dc.reg}</b> · addr-only <b>${dc.addr}</b> · missing <b>${dc.missing}</b></div>`;
+    if (c.selftest_error) html += `<div class="bad">self-test: ${c.selftest_error}</div>`;
+    const sc = c.selftest_counts;
+    if (sc) html += `<div class="i2c-st">toggle: enable <b>${sc.enable_toggle}</b> · iso <b>${sc.iso_toggle}</b> · outputs tested <b>${sc.outputs_tested_channels}</b> ch</div>`;
+    html += '</div>';
+  }
+  i2cMsg(html);
+}
+
+async function i2cPresent() {
+  i2cMsg('Scanning I2C bus…');
+  try { renderI2C(await postJSON('/api/present', {})); }
+  catch (e) { i2cMsg('Scan failed: ' + e); }
+}
+async function i2cDiagnose() {
+  i2cMsg('Running deep I2C diagnosis… ~300 ms');
+  try { renderI2C(await postJSON('/api/diagnosis', {})); }
+  catch (e) { i2cMsg('Diagnosis failed: ' + e); }
+}
+async function i2cSetMask() {
+  try {
+    const j = await postJSON('/api/channel-mask', { mask: i2cMask });
+    const parts = Object.entries(j.controllers || {}).map(([k, r]) =>
+      `P${k}: ${r.ok ? '0x' + (r.mask).toString(16).toUpperCase().padStart(2, '0') : (r.error || '✗')}`);
+    i2cMsg('Channel mask set — ' + (parts.join(' · ') || 'no controller') + '.');
+  } catch (e) { i2cMsg('Set mask failed: ' + e); }
+}
+async function i2cSelftest() {
+  i2cMsg('Running TCA9554 self-test…');
+  try { renderI2C(await postJSON('/api/selftest', {}), 'selftest'); }
+  catch (e) { i2cMsg('Self-test failed: ' + e); }
+}
+async function i2cMuxReset() {
+  if (!confirm('Reset all TCA9548A muxes? This pulses the shared reset line and CUTS POWER to every board (outputs drop low). Continue?')) return;
+  i2cMsg('Resetting muxes…');
+  try {
+    const j = await postJSON('/api/mux-reset', {});
+    const parts = Object.entries(j.controllers || {}).map(([k, r]) => `P${k}: ${r.ok ? '✓ reset' : (r.error || '✗')}`);
+    i2cMsg('Mux reset — ' + (parts.join(' · ') || 'no controller') + '. Re-scan presence.');
+  } catch (e) { i2cMsg('Mux reset failed: ' + e); }
+}
+
 function init() {
   geo = new CTGeometry($('ctCanvas'));
   initControllers();
+  initPower();
 
   // scan schedule
   scheduleTable = initScheduleTable({
@@ -884,6 +1208,7 @@ function init() {
     onRowClick: (row) => { stopPlay(); gotoSeq(row.seq, false); },
   });
   gantt = new ScheduleGantt($('schGantt'));
+  window.ctRedrawGantt = () => { try { gantt._resize(); drawGantt(); } catch (e) {} };
   document.querySelectorAll('#schViewSeg .seg-btn').forEach((b) =>
     b.addEventListener('click', () => setScheduleView(b.dataset.view)));
   $('filSaveBtn').addEventListener('click', saveFilSettings);
@@ -896,6 +1221,16 @@ function init() {
   });
   $('schSyncBtn').addEventListener('click', () => rebuildSchedule());
   $('schUploadBtn').addEventListener('click', uploadSchedule);
+  buildMaskBits();
+  $('i2cPresentBtn').addEventListener('click', i2cPresent);
+  $('i2cDiagnoseBtn').addEventListener('click', i2cDiagnose);
+  $('i2cSelftestBtn').addEventListener('click', i2cSelftest);
+  $('i2cMuxResetBtn').addEventListener('click', i2cMuxReset);
+  $('i2cMaskSetBtn').addEventListener('click', i2cSetMask);
+  $('hwDownloadBtn').addEventListener('click', hwDownload);
+  $('hwArmBtn').addEventListener('click', hwArm);
+  $('hwDisarmBtn').addEventListener('click', hwDisarm);
+  $('hwTrigBtn').addEventListener('click', hwTrigger);
   $('schApplyBtn').addEventListener('click', () => {
     const pulses = Math.max(1, parseInt($('schPulses').value, 10) || 1);
     const dur = Math.max(1, parseInt($('schDuration').value, 10) || 1);
@@ -915,28 +1250,26 @@ function init() {
   onPlanParam('hsSettle', 'tSettleMs');
   onPlanParam('hsHold', 'holdMs');
   onPlanParam('hsRot', 'rotationMs');
+  $('hsActive').addEventListener('input', (e) => {
+    heatingSchedule.activeCount = Math.max(1, parseInt(e.target.value, 10) || 40);
+    planHeating(); applyScheduleView(); updateScheduleHeader(); sync();
+  });
+  const onPowerW = (id, key) => $(id).addEventListener('input', (e) => {
+    powerEst[key] = Math.max(0, parseFloat(e.target.value) || 0); sync();
+  });
+  onPowerW('pwActiveW', 'activeW');
+  onPowerW('pwIdleW', 'idleW');
 
   // view mode (live / plan / debug)
   document.querySelectorAll('#viewModeSeg .seg-btn').forEach((b) =>
     b.addEventListener('click', () => setViewMode(b.dataset.view)));
 
-  // per-filament pulse / duration / heating (Selected Filament card)
-  $('selFilPulses').addEventListener('input', (e) => {
-    filaments[selFil].pulses = Math.max(1, parseInt(e.target.value, 10) || 1); refreshFilList(); rebuildSchedule();
-  });
-  $('selFilDur').addEventListener('input', (e) => {
-    filaments[selFil].durationUs = Math.max(1, parseInt(e.target.value, 10) || 1); refreshFilList(); rebuildSchedule();
-  });
-  $('selFilDebugBtn').addEventListener('click', () => {
-    const b = $('selFilDebugBtn').getBoundingClientRect();
-    showHeatPopup(b.left - 200, b.bottom + 6, selFil);
-  });
-
   // debug popup — power-state ladder + per-field commands
   document.querySelectorAll('#heatStateSeg button').forEach((b) =>
     b.addEventListener('click', () => { if (heatTarget >= 0) dbgSetState(heatTarget, +b.dataset.state); }));
+  $('heatSetI').addEventListener('click', () => { if (heatTarget >= 0) dbgSetI(heatTarget); });
+  $('heatSetV').addEventListener('click', () => { if (heatTarget >= 0) dbgSetV(heatTarget); });
   $('heatSetOcp').addEventListener('click', () => { if (heatTarget >= 0) dbgSetOcp(heatTarget); });
-  $('heatReadI').addEventListener('click', () => { if (heatTarget >= 0) dbgReadIna(heatTarget); });
   $('heatPulse').addEventListener('click', () => { if (heatTarget >= 0) dbgFire(heatTarget); });
   $('heatHv').addEventListener('click', () => { if (heatTarget >= 0) dbgToggleHv(heatTarget); });
   $('heatClose').addEventListener('click', hideHeatPopup);
@@ -991,6 +1324,7 @@ function init() {
     const d = parseFloat(e.target.value);
     if (d > 0) { CT.R_DETECTOR = d / 2; geo._resize(); sync(); }
   });
+  $('covInput').addEventListener('change', (e) => setCoverage(parseInt(e.target.value, 10) || 35));
 
   $('showBeamChk').addEventListener('change', (e) => geo.setOptions({ beam: e.target.checked }));
   $('showIndexChk').addEventListener('change', (e) => geo.setOptions({ indices: e.target.checked }));
@@ -1009,8 +1343,8 @@ function init() {
 
   $('gantrySlider').min = -state.gantryMax;
   $('gantrySlider').max = state.gantryMax;
-  document.body.setAttribute('data-view', 'plan');
   if (!loadFilSettings(true)) rebuildSchedule(); // restore host settings, else fresh build
+  setViewMode('live');  // start on real hardware — no simulated data until Plan is chosen
 }
 
 document.addEventListener('DOMContentLoaded', init);

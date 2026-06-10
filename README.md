@@ -70,7 +70,40 @@ from `../wifi_gui/net_protocol.py` — and exposes:
 | `/api/offset` | POST | `{controller, offset}` → retarget filament mapping |
 | `/api/cmd` | POST | `{controller, command, …}` → one RP2350B command on a board |
 | `/api/schedule` | POST | stage the bound schedule (emission rows + heating deltas) |
+| `/api/download` | POST | translate the bound schedule (logical 0–95) → per-controller frames and download to all connected controllers |
+| `/api/arm` | POST | `{repeats}` → `ShvArm` both controllers (they wait for SyncIn) |
+| `/api/disarm` | POST | `ShvDisarm` both → participants return to IDLE |
+| `/api/run-status` | GET | poll `ShvGetStatus 0x79` per controller (shared `totalPulsesDone` playhead + live filament + state/fault) |
+| `/api/telemetry` | GET | Live ring data: batch INA219 V/I per controller (mapped to filament 0–95) + live firing filament; INA sweep skipped while a controller is firing |
+| `/api/present` | POST | I2C presence scan (`CH_GET_PRESENT 0x25`): which mux/TPS/INA/IO chips respond, per controller |
+| `/api/selftest` | POST | TCA9554 toggle self-test (`0x60`) + presence; refused while a controller is running |
+| `/api/mux-reset` | POST | pulse the TCA9548A reset line (`CH_RESET_MUX 0x5F`) and re-detect (power-cutting) |
+| `/api/trigger` | POST | `{count}` → bench test: pulse SyncIn via the ESP32 `/sync/fire` |
 | `/api/geometry` | GET | machine geometry constants |
+
+## Real-hardware bound schedule (download · arm · trigger · monitor)
+
+The firmware executes the bound schedule **autonomously** (PIO/ISR, sub-µs);
+the host's job is config-download + passive monitoring, never per-pulse driving.
+`backend.py` is the **translation/planning layer** (heating doc §9): the GUI works
+in logical filament **0–95**, the firmware in global **0–127** = `controller*64 +
+channel*8 + position` (offset 0 / 64, default first-6-channels mask `0x3F`).
+
+The **Hardware run** panel (schedule card):
+
+- **Download** — builds the plan from the GUI's bound schedule and pushes, per
+  connected controller: offset (`ShvSetOffset 0x70`), channel mask (`0x34`),
+  per-filament IDLE/ACTIVE currents (`ChFilamentCurrents 0x39`), config (`0x75`),
+  the **full global emission table to *both*** (`ShvSetEntries 0x73`, chunked), and
+  **each controller's half** of the heating deltas (`ShvHeatSetEntries 0x7D`).
+- **Arm / Disarm** — `ShvArm 0x77` (`repeats`) / `ShvDisarm 0x78`.
+- **Fire SyncIn** — bench trigger: the ESP32 pulses SyncIn (`/sync/fire`). When the
+  ESP32 isn't driving, leave SyncIn hi-Z for an external pulse source.
+- **Monitor** — polls `ShvGetStatus 0x79`. Because both controllers fire the same
+  full table (each fires its scope, *counts* the rest), `totalPulsesDone` is an
+  identical **global cursor** → the ring playhead; `filamentIndex` is the live
+  firing filament; `state`/`faultFilament` surface completion/abort. In **Live**
+  view the ring tracks the firmware cursor.
 
 ## Scan schedule + bound heating plan
 
