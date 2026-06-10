@@ -61,6 +61,26 @@ body {
 @media (max-width: 1240px) { .layout-ct { grid-template-columns: minmax(0, 460px) 1fr; } }
 @media (max-width: 900px) { .layout-ct { grid-template-columns: 1fr; } }
 
+/* folded heating Gantt */
+.gantt-top > summary { cursor: pointer; list-style: none; }
+.gantt-top > summary::-webkit-details-marker { display: none; }
+.gantt-summary::before { content: '▸'; color: var(--muted); margin-right: 6px; font-size: 12px; }
+.gantt-top[open] .gantt-summary::before { content: '▾'; }
+.gantt-top:not([open]) { padding-bottom: 12px; }
+
+/* divider between CT control and direct power control */
+.section-divider {
+  display: flex; align-items: center; gap: 14px; margin: 26px 0 16px;
+  border-top: 2px solid var(--line); padding-top: 14px;
+}
+.divider-label { font-size: 16px; font-weight: 800; color: var(--ink); white-space: nowrap; }
+.divider-target { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+/* 3-column direct power control */
+.layout-power { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.1fr); align-items: start; }
+@media (max-width: 1100px) { .layout-power { grid-template-columns: 1fr; } }
+.power-card-body { display: flex; flex-direction: column; gap: 10px; }
+
 .geo-sub { margin: -4px 2px 10px; }
 .seg.sm .seg-btn { padding: 5px 11px; font-size: 12px; }
 
@@ -72,7 +92,7 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 
 /* debug power/pulse popup */
 .heat-popup {
-  position: fixed; z-index: 50; width: 232px;
+  position: fixed; z-index: 50; width: 250px;
   background: var(--card); border: 1px solid var(--line); border-radius: 14px;
   box-shadow: var(--shadow); padding: 14px;
 }
@@ -90,12 +110,12 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
   background: #efece5; color: var(--muted); border: 1px solid transparent;
 }
 .seg6 button.active { background: var(--accent); color: #fff; }
-.heat-field { display: grid; grid-template-columns: 56px 1fr auto; align-items: center; gap: 8px; margin-bottom: 7px; }
+.heat-field { display: grid; grid-template-columns: 52px 1fr auto; align-items: center; gap: 8px; margin-bottom: 7px; }
 .heat-field > label { font-size: 11px; color: var(--muted); font-weight: 700; }
-.heat-field .u { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
-.heat-field .u input { width: 100%; padding: 6px 7px; font-size: 12px; }
-.heat-field .hint { font-size: 10px; }
-.heat-field button.sm { padding: 6px 10px; }
+.heat-field .u { display: flex; flex: 1; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+.heat-field .u input { flex: 1; min-width: 0; padding: 7px 8px; font-size: 13px; }
+.heat-field button.sm { padding: 7px 11px; }
+.heat-field[hidden] { display: none; }
 .heat-meas { font-family: var(--mono); font-size: 13px; color: var(--ink); margin-bottom: 2px; }
 .hv-btn { width: 100%; text-align: center; margin-top: 4px; }
 .hv-btn.on { background: linear-gradient(180deg, #c4efd9 0, #9ad9b7 100%); color: #124a2c; }
@@ -122,6 +142,148 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .geo-dims { justify-content: center; gap: 18px; margin-top: 10px; }
 .geo-dims input { width: 64px; }
 .geo-stage canvas { display: block; width: 100%; height: 100%; }
+
+/* hardware run panel (schedule card) */
+.hw-run > summary { cursor: pointer; font-weight: 700; font-size: 13px; }
+.hw-actions { gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.hw-actions .numlabel input { width: 64px; }
+.hw-status { margin-top: 8px; font-family: var(--mono); font-size: 11px; line-height: 1.5; word-break: break-word; }
+
+/* total heating power strip (under the ring) */
+.geo-power { display: flex; gap: 8px; margin: 10px 2px 2px; }
+.geo-power .pw-item {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 7px 6px; border-radius: 10px;
+  background: #0d141a; border: 1px solid #243038;
+}
+.geo-power .pw-cap {
+  font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em;
+  color: #8b97a0;
+}
+.geo-power .pw-item b { font-family: var(--mono); font-size: 15px; }
+.geo-power .pw-item.total b { color: #e9eff3; }
+.geo-power .pw-item.act { border-color: rgba(255,93,93,0.45); }
+.geo-power .pw-item.act b { color: #ff7a7a; }
+.geo-power .pw-item.idle { border-color: rgba(63,182,160,0.4); }
+.geo-power .pw-item.idle b { color: #3fb6a0; }
+.pw-config { gap: 12px; margin: 6px 2px 0; align-items: center; }
+.pw-config .numlabel input { width: 52px; }
+
+/* I2C self-test panel */
+.i2c-actions { gap: 8px; flex-wrap: wrap; }
+.i2c-result { margin-top: 8px; font-size: 11px; line-height: 1.5; }
+.i2c-ctrl { padding: 6px 0; border-top: 1px solid var(--line); }
+.i2c-ctrl:first-child { border-top: none; }
+.i2c-grid { display: flex; flex-wrap: wrap; gap: 5px; margin: 5px 0; }
+.i2c-chip { font-family: var(--mono); font-size: 10px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--line); }
+.i2c-chip b { margin-left: 4px; }
+.i2c-chip.on { background: rgba(63,182,160,0.15); border-color: rgba(63,182,160,0.5); color: #2c7a6b; }
+.i2c-chip.off { color: var(--muted); }
+.i2c-st { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+.i2c-result .bad { color: #c0392b; }
+/* direct power control — boards matrix */
+.bm-legend { font-size: 11px; margin: 4px 0 8px; }
+.bm-legend .dot { width: 14px; height: 14px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 800; color: #fff; }
+.dot.on { background: #3fb6a0; }
+.dot.off { background: #b8c0c6; }
+.dot.fault { background: #c0392b; }
+.dot.absent { background: #d8d0c3; color: var(--muted); }
+.selection-toolbar { gap: 6px; flex-wrap: wrap; background: #f3f0ea; border-radius: 8px; padding: 6px 8px; }
+.board-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 3px; margin: 8px 0; }
+.status-tile { border: 1px solid var(--line); border-radius: 6px; padding: 3px 2px; display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer; background: #fbf9f4; min-width: 0; }
+.status-tile.present { background: #eef7f3; }
+.status-tile.fault { background: #fbeae9; border-color: rgba(192,57,43,0.4); }
+.status-tile.absent { background: #f2efe9; opacity: 0.6; }
+.status-tile.selected { outline: 2px solid var(--accent); }
+.status-tile.active { box-shadow: 0 0 0 2px #ff9a3d; }
+.tile-title { font-family: var(--mono); font-size: 8px; color: var(--muted); }
+.tile-dots { display: flex; gap: 1px; }
+.tile-dots .dot { width: 11px; height: 11px; border-radius: 3px; display: inline-flex; align-items: center; justify-content: center; font-size: 7px; font-weight: 800; color: #fff; }
+.tile-measure { font-family: var(--mono); font-size: 7px; color: var(--muted); white-space: nowrap; }
+.batch-box { border: 1px dashed var(--line); border-radius: 8px; padding: 8px; margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.batch-box .row { margin: 0; gap: 6px; }
+.batch-box .numlabel input { width: 60px; }
+/* full-width, equally distributed batch/single action buttons */
+.bm-btn-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+.bm-btn-row button { width: 100%; padding: 5px 2px; }
+.bm-set-row { display: flex; gap: 6px; align-items: center; }
+.bm-set-row .numlabel { flex: 1; gap: 4px; }
+.bm-set-row .numlabel input, .bm-set-row .numlabel select { flex: 1; min-width: 0; width: auto; }
+.bm-set-row > button { flex: 0 0 auto; }
+/* HV-setpoint rows (Emission −V / Focus −V / Emission I): a shared 5-column grid
+   so caption, input box and readout line up across all three rows and can't
+   overlap. Both buttons share one fixed width so they're equal size.
+   display:contents lets the <label>'s caption+input become grid cells. */
+.hv-set { display: grid; grid-template-columns: 88px 60px minmax(0, 1fr) 52px 52px; gap: 6px; align-items: center; }
+.hv-set > .numlabel { display: contents; }
+.hv-set .cap { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hv-set input { width: 100%; min-width: 0; box-sizing: border-box; }
+.hv-set > .pot-est { min-width: 0; margin-left: 0; overflow: hidden; text-overflow: ellipsis; }
+.hv-set > button { width: 100%; }
+.detail-top { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
+.detail-top .metric { display: flex; flex-direction: column; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: #fbf9f4; }
+.metric-label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.metric-value { font-family: var(--mono); font-size: 12px; font-weight: 700; }
+/* HV grid action rows — full card width, children equal */
+.hv-row { display: flex; gap: 4px; margin-top: 6px; align-items: center; }
+.hv-row > * { flex: 1; min-width: 0; }
+.hv-row .numlabel input { width: 100%; min-width: 0; }
+.pot-est { font-family: var(--mono); font-size: 10px; color: #2c7a6b; margin-left: 4px; white-space: nowrap; }
+/* Row-level readouts (emVmeas/focVmeas) shrink + clip with ellipsis so a long
+   status string can never shove the Set/Clr buttons out of the row. */
+.bm-set-row > .pot-est { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.hv-state { font-family: var(--mono); font-size: 13px; font-weight: 800; }
+.status-tile.present .hv-state { color: #2c7a6b; }
+.status-tile.fault .hv-state { color: #c0392b; }
+.adc-plot { width: 100%; height: auto; border-radius: 8px; border: 1px solid #243038; background: #070b0e; display: block; }
+.pulse-wrap { max-height: 180px; overflow: auto; margin-top: 4px; }
+.pulse-table { width: 100%; font-family: var(--mono); font-size: 10px; border-collapse: collapse; }
+.pulse-table th { text-align: left; color: var(--muted); border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--card); }
+.pulse-table td { padding: 1px 4px; border-bottom: 1px solid #f0ece4; }
+.shv-entries { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 11px; }
+.shv-btncol { display: flex; flex-direction: column; gap: 4px; }
+/* ShV schedule grouped layout */
+.shv-group { padding: 6px 0; border-top: 1px solid #f0ece4; }
+.shv-group:first-of-type { border-top: none; }
+.shv-grouplabel { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 4px; }
+.shv-grouplabel .hint { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.shv-grouplabel.shv-warn { color: #c9a227; }
+.shv-result { white-space: pre-wrap; max-height: 160px; overflow: auto; font-family: var(--mono); font-size: 10px; margin-top: 6px; }
+button.danger { background: var(--ink); color: #fff; }
+button.off { background: #efece5; color: var(--muted); }
+/* HV enable toggle — unmistakable: red = energized, green = off/safe, gray = unknown */
+.hv-en { font-weight: 700; display: inline-flex; align-items: center; gap: 5px; }
+.hv-en .hv-en-dot { font-size: 11px; }
+.hv-en .hv-en-act { opacity: 0.7; }
+.hv-en.on  { background: #c0392b; color: #fff; }                                 /* HV ON  = red */
+.hv-en.on .hv-en-dot { color: #ffd9d4; }
+.hv-en.off { background: #eef7f3; color: #2c7a6b; border: 1px solid rgba(63,182,160,0.55); }  /* OFF = green */
+.hv-en.off .hv-en-dot { color: #3fb6a0; }
+.hv-en.unk { background: #efece5; color: var(--muted); }
+.hv-en.unk .hv-en-dot { color: #b8c0c6; }
+/* prominent HV-setpoint feedback line */
+.hv-fb { margin-top: 6px; padding: 5px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; background: #f3f0ea; }
+.hv-fb.ok { background: #eef7f3; color: #2c7a6b; }
+.hv-fb.bad { background: #fbeae9; color: #c0392b; }
+/* HV monitor on/off status (from ADS1115 flags) */
+.metric-value.st-on { color: #c0392b; }   /* energized */
+.metric-value.st-off { color: #3fb6a0; }   /* off/safe */
+/* power-state ladder in the single-board card */
+#bmStateSeg { margin-bottom: 6px; }
+/* single-board status badges (Present/TPS/ISO/Fault) — compact, frees space */
+.bm-badges { display: flex; gap: 12px; flex-wrap: wrap; font-size: 10px; color: var(--muted); margin: 4px 0 6px; align-items: center; }
+.b-badge { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; font-size: 10px; font-weight: 800; color: #fff; background: #b8c0c6; }
+.b-badge.on { background: #3fb6a0; }
+.b-badge.off { background: #b8c0c6; }
+.b-badge.fault { background: #c0392b; }
+/* impedance-fit formula (MathML, below the sweep plot) */
+.z-formula { text-align: center; margin: 6px 0 2px; font-size: 15px; color: var(--ink); }
+.z-formula math { font-size: 1.05em; }
+
+.i2c-mask { gap: 6px; align-items: center; margin-top: 6px; }
+.i2c-mask-bits { display: inline-flex; gap: 3px; }
+.mask-bit { font-family: var(--mono); font-size: 10px; width: 20px; height: 20px; padding: 0; border-radius: 4px; border: 1px solid var(--line); background: #f3f0ea; color: var(--muted); cursor: pointer; }
+.mask-bit.on { background: rgba(63,182,160,0.2); border-color: rgba(63,182,160,0.6); color: #2c7a6b; font-weight: 700; }
 .plot-btn {
   position: absolute; bottom: 12px; left: 12px;
   padding: 6px 11px; font-size: 12px; font-weight: 700; border-radius: 9px;
@@ -225,6 +387,10 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .pc-row .numlabel { font-size: 11px; gap: 4px; }
 .pc-row .numlabel input { width: 44px; padding: 6px 6px; }
 .pc-row button { padding: 7px 12px; }
+.pc-row .numlabel input[data-offset] { width: 52px; }
+.pc-ident { font-family: var(--mono); font-size: 10px; color: var(--accent); font-weight: 700; }
+.pc-devoff { font-family: var(--mono); font-size: 10px; color: var(--muted); white-space: nowrap; }
+.pc-devoff.bad { color: #c0392b; }
 
 .hb { font-family: var(--mono); font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 999px; white-space: nowrap; }
 .hb.idle { background: #efece5; color: var(--muted); }
@@ -258,9 +424,10 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 .heat-plan { margin-bottom: 8px; }
-.heat-params { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-bottom: 8px; }
-.heat-params .numlabel { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 700; color: var(--muted); cursor: help; }
-.heat-params .numlabel input { width: 54px; }
+.heat-params { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; margin-bottom: 8px; }
+.heat-params .numlabel { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; color: var(--muted); cursor: help; white-space: nowrap; }
+.heat-params .numlabel input { flex: 1; min-width: 0; width: auto; }
+.heat-params .numlabel .u { color: var(--muted); flex: 0 0 auto; }
 .plan-verdict { font-size: 11.5px; line-height: 1.55; padding: 8px 10px; border-radius: 9px; }
 
 /* aligned per-filament bulk row */
