@@ -186,32 +186,19 @@
           </details>
         </section>
 
-        <!-- MIDDLE: scan schedule details (lists) -->
-        <section class="card module sched-card" data-module="schedule">
-          <div class="section-head">
+        <!-- MIDDLE: scan schedule + calibration, stacked & foldable -->
+        <div class="mid-stack">
+        <details class="card module sched-card foldable" data-module="schedule" open>
+          <summary class="section-head foldable-summary">
             <h2>Scan Schedule</h2>
             <span id="schCount" class="summary">0 rows</span>
-          </div>
+          </summary>
           <div class="row compact sch-actions">
             <button id="schSyncBtn" class="sm">Sync</button>
             <button id="schUploadBtn" class="sm quick">Upload</button>
             <span id="schStatus" class="hint"></span>
           </div>
 
-          <details class="sch-section hw-run" id="hwRunDetails">
-            <summary title="Download the bound schedule to the connected controllers, arm, and run/monitor it on real hardware.">Hardware run <span class="hint">— download · arm · trigger · monitor</span></summary>
-            <div class="row compact hw-actions">
-              <button id="hwDownloadBtn" class="sm quick" title="Translate logical 0–95 → per-controller frames and download emission + heating + currents to all connected controllers.">Download</button>
-              <label class="numlabel" title="Loop the one-rotation schedule this many times.">repeats <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
-              <button id="hwArmBtn" class="sm" title="Arm both controllers (ShvArm). They wait for SyncIn.">Arm</button>
-              <button id="hwDisarmBtn" class="sm" title="Disarm / stop (ShvDisarm) — returns participants to IDLE.">Disarm</button>
-            </div>
-            <div class="row compact hw-actions">
-              <label class="numlabel" title="Bench test: pulse SyncIn this many times via the ESP32 (/sync/fire). When the ESP32 isn't driving, leave SyncIn hi-Z for an external pulse source.">test trig <input id="hwTrigCount" type="number" min="1" max="100000" value="1" /></label>
-              <button id="hwTrigBtn" class="sm" title="Fire N SyncIn pulses now (ESP32-driven bench trigger).">Fire SyncIn</button>
-            </div>
-            <div id="hwRunStatus" class="hw-status hint"></div>
-          </details>
           <details class="sch-section heat-plan" id="heatPlanDetails" open>
             <summary title="The GUI derives the heating layer from the emission schedule and checks settle.">Heating plan <span class="hint">— settle-checked</span></summary>
             <div class="heat-params">
@@ -249,7 +236,16 @@
             <div class="sch-head" id="schHead"><span>Seq Idx</span><span>Filament Idx</span><span># Pulses</span><span>Pulse Duration</span></div>
             <div id="schBody"></div>
           </div>
-        </section>
+        </details>
+
+        <!-- Calibration & test — below the schedule, foldable to free space -->
+        <details class="card module cal-card foldable" data-module="tests">
+          <summary class="section-head foldable-summary">
+            <h2>Calibration &amp; Test <span class="hint">— resistance · emission · short / leak (energises HV)</span></h2>
+          </summary>
+          <div id="testsCard"></div>
+        </details>
+        </div>
 
         <!-- RIGHT: control modules (hardware control — scaffolded) -->
         <aside class="ctrl-column">
@@ -264,17 +260,16 @@
             <div class="pc" data-ctrl="1">
               <div class="pc-head">
                 <span class="dot offline" data-dot></span>
-                <b>Power 1</b><span class="hint">fil 0–47</span>
+                <b>Power 1</b>
+                <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">master</button>
                 <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)"></span>
                 <span class="pc-badges">
                   <span class="hb idle" data-hb="rp" title="RP2350B controller heartbeat (PING on :3333)">RP2350&nbsp;♥</span>
-                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age)">STM32&nbsp;♥</span>
+                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age) — only the master has an STM32">STM32&nbsp;♥</span>
                 </span>
               </div>
               <div class="pc-row">
                 <input data-host list="bridgeHosts" type="text" value="" placeholder="ESP32 #1 IP — Scan to fill" />
-                <label class="numlabel" title="Global board offset persisted in the controller's flash (0 = filaments 0–47, 64 = 48–95). Changing it writes flash.">offset <input data-offset type="number" min="0" max="127" step="64" value="0" /></label>
-                <span class="pc-devoff hint" data-devoff title="Offset read back from the board's flash"></span>
                 <button data-connect class="quick">Connect</button>
               </div>
             </div>
@@ -282,40 +277,70 @@
             <div class="pc" data-ctrl="2">
               <div class="pc-head">
                 <span class="dot offline" data-dot></span>
-                <b>Power 2</b><span class="hint">fil 48–95</span>
+                <b>Power 2</b>
+                <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">master</button>
                 <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)"></span>
                 <span class="pc-badges">
                   <span class="hb idle" data-hb="rp" title="RP2350B controller heartbeat (PING on :3333)">RP2350&nbsp;♥</span>
-                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age)">STM32&nbsp;♥</span>
+                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age) — only the master has an STM32">STM32&nbsp;♥</span>
                 </span>
               </div>
               <div class="pc-row">
                 <input data-host list="bridgeHosts" type="text" value="" placeholder="ESP32 #2 IP — Scan to fill" />
-                <label class="numlabel" title="Global board offset persisted in the controller's flash (0 = filaments 0–47, 64 = 48–95). Changing it writes flash.">offset <input data-offset type="number" min="0" max="127" step="64" value="64" /></label>
-                <span class="pc-devoff hint" data-devoff title="Offset read back from the board's flash"></span>
                 <button data-connect class="quick">Connect</button>
               </div>
             </div>
 
-            <p class="hint compact-hint">Offset maps a global filament index onto the bridge (0–47 ⇒ 0, 48–95 ⇒ 48).</p>
+            <p class="hint compact-hint">The <b>master</b> badge picks which bridge owns the STM32 (HV/ADC). Filament→power mapping is set in the Mapping card.</p>
           </section>
 
-          <section class="card module" data-module="i2c">
+          <!-- Hardware run — own card: download · arm · trigger · scan prep -->
+          <section class="card module hw-run-card" data-module="hwrun">
             <div class="section-head">
-              <h2>I2C Self-Test <span class="hint">— chip health</span></h2>
+              <h2>Hardware Run <span class="hint">— download · arm · trigger · prep</span></h2>
             </div>
-            <div class="row compact i2c-actions">
-              <button id="i2cPresentBtn" class="sm quick" title="Scan the I2C bus: which mux / TPS / INA219 / IO-expander chips respond (read-only).">Scan present</button>
-              <button id="i2cDiagnoseBtn" class="sm" title="Deep diagnosis (CH_GET_DIAGNOSIS): classify every board as operational / register-only / address-only / missing.">Diagnose</button>
-              <button id="i2cSelftestBtn" class="sm" title="TCA9554 per-pin toggle self-test. Drives output pins — refused while a schedule is running.">Self-test</button>
-              <button id="i2cMuxResetBtn" class="sm" title="Pulse the TCA9548A reset line and re-detect. Power-cutting: all outputs drop low.">Mux reset</button>
+            <p class="hint compact-hint">Runs the bound schedule on the connected controllers. Order: Download → prep ladder → Arm → trigger.</p>
+
+            <div class="row compact hw-actions">
+              <button id="hwDownloadBtn" class="sm quick" title="Translate the logical 0–95 schedule into per-controller frames and download the emission table, heating deltas, and per-filament idle/active currents to every connected controller.">Download</button>
+              <label class="numlabel" title="Loop the one-rotation schedule this many times when armed (1 = a single rotation).">repeats <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
+              <button id="hwArmBtn" class="sm" title="Arm both controllers (ShvArm). Participants drop to IDLE and the controllers wait for the SyncIn trigger to start firing.">Arm</button>
+              <button id="hwDisarmBtn" class="sm" title="Disarm / stop the run (ShvDisarm). Aborts firing and returns participating filaments to IDLE.">Disarm</button>
             </div>
-            <div class="row compact i2c-mask" title="Channel enable mask — which of the 8 I2C channels this controller uses (default first 6 = 0x3F). Disabled channels skip all I2C polling.">
-              <span class="hint">channels</span>
-              <span id="i2cMaskBits" class="i2c-mask-bits"></span>
-              <button id="i2cMaskSetBtn" class="xs">Set mask</button>
+            <div class="row compact hw-actions">
+              <label class="numlabel" title="Bench test: how many SyncIn pulses to emit from the ESP32 (/sync/fire). Use only when the ESP32 drives SyncIn; for an external trigger source leave SyncIn hi-Z.">test trig <input id="hwTrigCount" type="number" min="1" max="100000" value="1" /></label>
+              <button id="hwTrigBtn" class="sm" title="Fire N SyncIn pulses now from the ESP32 (bench trigger). Each pulse advances the armed schedule by one step.">Fire SyncIn</button>
             </div>
-            <div id="i2cResult" class="i2c-result hint">Connect a controller, then Scan present to see what hardware responds.</div>
+            <div class="row compact hw-actions hw-prep">
+              <span class="hint" title="CT-scan prep ladder — applied to ALL filaments on BOTH connected controllers. Click left→right to warm up before arming. Refused while a schedule is running.">prep ↓</span>
+              <button id="hwPrepStop" class="sm" title="All filaments → STOP. TPS output disabled (off). The fully cold rest state.">Stop all</button>
+              <button id="hwPrepSleep" class="sm" title="All filaments → SLEEP. Low-power rest state, output off.">Sleep all</button>
+              <button id="hwPrepStandby" class="sm" title="All filaments → STANDBY. Output held at the 0.8 V minimum for presence/short detection — not yet heating to current.">Standby all</button>
+              <button id="hwPrepIdle" class="sm" title="All filaments → IDLE. Closed-loop heating at each filament's configured idle current (the schedule's warm-pool resting state).">Idle all</button>
+              <button id="hwPrepActive" class="sm quick" title="Pre-heat the first batch → ACTIVE at each filament's active current. The batch = the heating plan's cold-start band (collimator window + pre-heat lead + hold, ≈ # active) that must already be hot when the first trigger fires. Build a schedule first.">Active first batch</button>
+            </div>
+            <div id="hwRunStatus" class="hw-status hint"></div>
+          </section>
+
+          <!-- Filament → power mapping (host active-list, editable) -->
+          <section class="card module map-card" data-module="mapping">
+            <div class="section-head">
+              <h2>Filament → Power <span class="hint">— active-list mapping</span></h2>
+              <span id="mapCounts" class="summary"></span>
+            </div>
+            <p class="hint compact-hint">Each filament is driven by one controller (a power slot = channel·position; downloaded as the 64-byte active list). Default = alternating groups. Click a cell to reassign: P1 → P2 → unassigned.</p>
+            <div class="row compact map-actions">
+              <label class="numlabel" title="Alternating-group size: filaments 0..g-1 → P1, g..2g-1 → P2, repeating across all 96.">group <input id="mapGroup" type="number" min="1" max="96" value="12" /></label>
+              <button id="mapAltBtn" class="xs" title="Reset the whole map to alternating groups of the chosen size.">Alt groups</button>
+              <button id="mapApplyBtn" class="xs quick" title="Save the mapping on the host and upload the 64-byte active list + channel mask to every connected controller.">Apply &amp; upload</button>
+            </div>
+            <div class="legend map-legend">
+              <span class="legend-item"><span class="g-sw p1"></span> Power 1</span>
+              <span class="legend-item"><span class="g-sw p2"></span> Power 2</span>
+              <span class="legend-item"><span class="g-sw none"></span> unassigned</span>
+            </div>
+            <div id="mapGrid" class="map-grid"></div>
+            <div id="mapStatus" class="summary"></div>
           </section>
 
         </aside>
@@ -343,15 +368,47 @@
 
         <!-- MIDDLE: HV grid + setpoint + monitor -->
         <section class="card module" data-module="hv">
-          <div class="section-head"><h2>High Voltage <span class="hint">— grid · setpoint · monitor</span></h2></div>
+          <div class="section-head"><h2>High Voltage <span class="hint">— grid (target) · setpoint/monitor (master STM32)</span></h2></div>
           <div id="hvCard" class="power-card-body"><p class="hint">HV grid + setpoint + monitor — porting next.</p></div>
         </section>
 
         <!-- RIGHT: emission waveform + per-pulse + Simple HV schedule -->
         <section class="card module" data-module="emission2">
-          <div class="section-head"><h2>Emission &amp; Schedule <span class="hint">— waveform · pulses · ShV</span></h2></div>
+          <div class="section-head"><h2>Emission &amp; Schedule <span class="hint">— waveform/pulses (master STM32) · ShV (target)</span></h2></div>
           <div id="emissionCard" class="power-card-body"><p class="hint">Emission waveform + per-pulse + Simple HV schedule — porting next.</p></div>
         </section>
+      </section>
+
+
+      <!-- ===== divider: hardware diagnostics / I²C chip health ===== -->
+      <div class="section-divider" id="diagDivider">
+        <span class="divider-label">I²C Chip Health &amp; Diagnostics</span>
+        <div class="divider-target">
+          <button id="i2cPresentBtn" class="sm quick" title="Scan the I²C bus: which mux / TPS / INA219 / IO-expander chips respond (read-only).">I²C scan</button>
+          <button id="i2cDiagnoseBtn" class="sm" title="Deep diagnosis (CH_GET_DIAGNOSIS): classify every board+chip as operational / register-only / address-only / missing.">Run diagnosis</button>
+          <button id="i2cTcaReadBtn" class="sm" title="Read raw TCA9554 registers via CH_READ_TCA9554 (0x61), per channel: config (dir) / input (live GPIO) / output / polarity + per-read ACK. Read-only.">Read TCA9554</button>
+          <button id="i2cSelftestBtn" class="sm" title="TCA9554 per-pin toggle self-test. Drives output pins — refused while a schedule is running.">Pin toggle</button>
+          <button id="i2cMuxResetBtn" class="sm" title="Pulse the TCA9548A reset line and re-detect. Power-cutting: all outputs drop low.">Mux reset</button>
+        </div>
+      </div>
+
+      <section class="card module" data-module="i2c">
+        <div class="row compact i2c-mask" title="Channel enable mask — which of the 8 I²C channels each controller uses (default first 6 = 0x3F). Disabled channels skip all I²C polling.">
+          <span class="hint">channels enabled</span>
+          <span id="i2cMaskBits" class="i2c-mask-bits"></span>
+          <button id="i2cMaskGetBtn" class="xs">Get</button>
+          <button id="i2cMaskSetBtn" class="xs">Set mask</button>
+        </div>
+        <div class="chip-legend">
+          <span class="legend-item"><span class="chip-cell op">●</span> op (read+write)</span>
+          <span class="legend-item"><span class="chip-cell ok">◉</span> reg read OK</span>
+          <span class="legend-item"><span class="chip-cell addr">◐</span> addr ACK only</span>
+          <span class="legend-item"><span class="chip-cell missing">○</span> no response</span>
+          <span class="legend-item"><span class="chip-cell na">·</span> unreachable</span>
+          <span class="legend-item">TCA9554 cols (per board 1‥8): status ✓ read-OK / ✗ NACK (else diag dot) · dir O/I (config reg) · level H/L (input=live GPIO / output=drive) — via "Read TCA9554"</span>
+        </div>
+        <div id="i2cResult" class="i2c-result hint">Connect a controller, then <b>I²C scan</b> to see what hardware responds. <b>Run diagnosis</b> + <b>Read TCA9554</b> fill the per-chip detail.</div>
+        <div id="i2cHealthHost"></div>
       </section>
     </main>
 

@@ -58,6 +58,14 @@ body {
 .gantt-top .section-head { margin-bottom: 6px; }
 
 .layout-ct { grid-template-columns: minmax(0, 480px) minmax(320px, 380px) 1fr; align-items: start; }
+/* middle column = scan schedule + calibration, stacked & individually foldable */
+.mid-stack { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.foldable > summary.foldable-summary { cursor: pointer; list-style: none; }
+.foldable > summary.foldable-summary::-webkit-details-marker { display: none; }
+.foldable-summary h2::before { content: '▾'; color: var(--muted); margin-right: 6px; font-size: 12px; }
+.foldable:not([open]) > .foldable-summary h2::before { content: '▸'; }
+.foldable:not([open]) { padding-bottom: 14px; }
+.foldable > summary.foldable-summary h2 { display: inline; }
 @media (max-width: 1240px) { .layout-ct { grid-template-columns: minmax(0, 460px) 1fr; } }
 @media (max-width: 900px) { .layout-ct { grid-template-columns: 1fr; } }
 
@@ -144,9 +152,9 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .geo-stage canvas { display: block; width: 100%; height: 100%; }
 
 /* hardware run panel (schedule card) */
-.hw-run > summary { cursor: pointer; font-weight: 700; font-size: 13px; }
 .hw-actions { gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 .hw-actions .numlabel input { width: 64px; }
+.hw-prep { border-top: 1px dashed var(--line); padding-top: 8px; }
 .hw-status { margin-top: 8px; font-family: var(--mono); font-size: 11px; line-height: 1.5; word-break: break-word; }
 
 /* total heating power strip (under the ring) */
@@ -190,16 +198,21 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .dot.absent { background: #d8d0c3; color: var(--muted); }
 .selection-toolbar { gap: 6px; flex-wrap: wrap; background: #f3f0ea; border-radius: 8px; padding: 6px 8px; }
 .board-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 3px; margin: 8px 0; }
-.status-tile { border: 1px solid var(--line); border-radius: 6px; padding: 3px 2px; display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer; background: #fbf9f4; min-width: 0; }
+.status-tile { position: relative; border: 1px solid var(--line); border-radius: 6px; padding: 3px 2px; display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer; background: #fbf9f4; min-width: 0; }
 .status-tile.present { background: #eef7f3; }
 .status-tile.fault { background: #fbeae9; border-color: rgba(192,57,43,0.4); }
 .status-tile.absent { background: #f2efe9; opacity: 0.6; }
 .status-tile.selected { outline: 2px solid var(--accent); }
 .status-tile.active { box-shadow: 0 0 0 2px #ff9a3d; }
-.tile-title { font-family: var(--mono); font-size: 8px; color: var(--muted); }
+.tile-title { font-family: var(--mono); font-size: 8px; color: var(--muted); align-self: flex-start; padding-right: 16px; }
 .tile-dots { display: flex; gap: 1px; }
 .tile-dots .dot { width: 11px; height: 11px; border-radius: 3px; display: inline-flex; align-items: center; justify-content: center; font-size: 7px; font-weight: 800; color: #fff; }
 .tile-measure { font-family: var(--mono); font-size: 7px; color: var(--muted); white-space: nowrap; }
+/* HV-current badge — top-right of each board tile (and inline in the legend) */
+.hv-badge { font-family: var(--mono); font-size: 7px; font-weight: 800; line-height: 1; padding: 1px 3px; border-radius: 4px; border: 1px solid var(--line); }
+.hv-badge.on { background: #f3d6e6; color: #8a1056; border-color: #d98ab5; }
+.hv-badge.off { background: #efece5; color: #b8b0a2; }
+.status-tile .hv-badge { position: absolute; top: 2px; right: 2px; }
 .batch-box { border: 1px dashed var(--line); border-radius: 8px; padding: 8px; margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .batch-box .row { margin: 0; gap: 6px; }
 .batch-box .numlabel input { width: 60px; }
@@ -284,6 +297,24 @@ button.off { background: #efece5; color: var(--muted); }
 .i2c-mask-bits { display: inline-flex; gap: 3px; }
 .mask-bit { font-family: var(--mono); font-size: 10px; width: 20px; height: 20px; padding: 0; border-radius: 4px; border: 1px solid var(--line); background: #f3f0ea; color: var(--muted); cursor: pointer; }
 .mask-bit.on { background: rgba(63,182,160,0.2); border-color: rgba(63,182,160,0.6); color: #2c7a6b; font-weight: 700; }
+
+/* I²C chip-health matrix (ported from wifi_gui) */
+.chip-legend { display: flex; flex-wrap: wrap; gap: 10px 14px; margin: 8px 0; font-size: 10px; color: var(--muted); }
+.chip-legend .legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.table-wrap { overflow-x: auto; margin-top: 6px; }
+.data-table { border-collapse: collapse; font-size: 12px; }
+.data-table th, .data-table td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; vertical-align: middle; }
+.data-table thead th { background: #f3f0ea; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; }
+.data-table.chip-health td { padding: 4px 6px; }
+.chip-cell { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 3px; font-size: 11px; line-height: 1; }
+.chip-cell.op { background: #2ea861; color: #fff; border: 1px solid #1f7a45; }
+.chip-cell.ok { background: #c4efd9; color: #124a2c; border: 1px solid #5fba88; }
+.chip-cell.addr { background: #fff1c7; color: #6a4b00; border: 1px solid #d9b443; }
+.chip-cell.missing { background: #fde3e9; color: #8a1030; border: 1px solid #e3a7b5; }
+.chip-cell.na { background: transparent; color: #cac4b7; border: 1px dashed #cac4b7; }
+.chip-row { display: inline-flex; gap: 3px; font-family: var(--mono); font-weight: 700; }
+.tca-bits { border-collapse: collapse; font-family: var(--mono); font-size: 10px; line-height: 1.15; }
+.tca-bits td { width: 13px; min-width: 13px; text-align: center; padding: 0; }
 .plot-btn {
   position: absolute; bottom: 12px; left: 12px;
   padding: 6px 11px; font-size: 12px; font-weight: 700; border-radius: 9px;
@@ -397,6 +428,62 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .hb.alive { background: var(--accent-soft); color: var(--accent); animation: pulse 1s ease-in-out infinite; }
 .hb.stale { background: var(--warn-soft); color: var(--warn); }
 .hb.dead { background: var(--danger-soft); color: var(--danger); }
+.hb.na { background: #f1eee7; color: #b7b1a5; opacity: 0.7; }   /* no STM32 on non-master */
+
+/* ---- master badge (pick the STM32-bearing controller) ---- */
+.master-badge {
+  font-family: var(--mono); font-size: 9.5px; font-weight: 800; letter-spacing: 0.04em;
+  text-transform: uppercase; padding: 2px 7px; border-radius: 999px; cursor: pointer;
+  background: #efece5; color: var(--muted); border: 1px solid var(--line);
+}
+.master-badge:hover { border-color: var(--accent); color: var(--accent); }
+.master-badge.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.master-badge.active::before { content: '★ '; }
+
+/* ---- filament → power mapping ---- */
+.map-actions { gap: 8px; align-items: center; margin: 4px 0 8px; flex-wrap: wrap; }
+.map-actions .numlabel input { width: 56px; }
+.map-legend { display: flex; gap: 12px; margin-bottom: 8px; font-size: 11px; color: var(--muted); }
+.map-legend .g-sw { width: 14px; height: 10px; border-radius: 3px; display: inline-block; margin-right: 4px; vertical-align: middle; }
+.g-sw.p1 { background: var(--accent); }
+.g-sw.p2 { background: var(--warn); }
+.g-sw.none { background: #d8d0c3; }
+.map-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 3px; margin-bottom: 8px; }
+.map-cell {
+  font-family: var(--mono); font-size: 10px; font-weight: 700; padding: 4px 0; border-radius: 4px;
+  border: 1px solid transparent; cursor: pointer; color: #fff; min-width: 0;
+}
+.map-cell.p1 { background: var(--accent); }
+.map-cell.p2 { background: var(--warn); }
+.map-cell.none { background: #e7e2d8; color: var(--muted); border-color: var(--line); }
+.map-cell:hover { outline: 2px solid var(--ink); outline-offset: -1px; }
+
+/* ---- calibration & test ---- */
+.test-seg { margin: 2px 0 6px; flex-wrap: wrap; }
+.test-seg .seg-btn { font-size: 11px; padding: 5px 6px; }
+.test-block { display: none; padding: 6px 0 2px; }
+.test-block.show { display: block; }
+.test-block .block-title[title] { cursor: help; }
+.test-block .block-title[title] .hint { font-weight: 400; }
+/* aligned field row: label-above-input, Run button pushed to the right edge */
+.test-params { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 14px; margin: 8px 0; }
+.test-params .numlabel {
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 10.5px; font-weight: 700; color: var(--muted); text-transform: none;
+}
+.test-params .numlabel input { width: 72px; }
+.test-params .test-run { margin-left: auto; align-self: flex-end; padding: 6px 16px; }
+.test-plot { width: 100%; height: 132px; display: block; border-radius: 6px; margin: 4px 0 6px; background: #070b0e; }
+.test-legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.test-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.test-legend .sw { width: 12px; height: 10px; border-radius: 2px; display: inline-block; }
+.test-legend .sw.ok { background: #3fb6a0; }
+.test-legend .sw.short { background: #ff5d5d; }
+.test-legend .sw.open { background: #f2c14e; }
+.test-legend .sw.leak { background: #b07ce8; }
+.test-foot { gap: 10px; align-items: center; margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px; }
+.summary .good, b.good { color: var(--accent); }
+.summary .bad, b.bad { color: var(--danger); }
 
 /* ---- scan schedule ---- */
 .sch-actions { gap: 8px; align-items: center; margin: 4px 0 8px; }

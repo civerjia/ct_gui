@@ -2,9 +2,10 @@
  * Power-controller connection panel.
  *
  * Scans the LAN for ESP32 bridges exposing TCP :3333, connects up to two of
- * them (each with a filament-index offset — 0 for fil 0-47, 48 for 48-95), and
- * polls /api/status to drive the per-controller RP2350 + STM32 heartbeat
- * badges. All hardware I/O lives in the backend; this just talks to /api/*.
+ * them, lets the user pick the MASTER (the bridge that carries the STM32 — all
+ * STM32/HV/ADC commands route there), and polls /api/status to drive the
+ * per-controller RP2350 + STM32 heartbeat badges. The filament→power mapping is
+ * the host active-list (Mapping card). All hardware I/O lives in the backend.
  */
 
 const api = async (path, opts) => (await fetch(path, opts)).json();
@@ -65,22 +66,18 @@ export function initControllers() {
     }
   });
 
+  let master = 1;
   for (const card of cards) {
     const cid = parseInt(card.dataset.ctrl, 10);
     const btn = card.querySelector('[data-connect]');
     const host = card.querySelector('[data-host]');
-    const offset = card.querySelector('[data-offset]');
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       try {
         if (connected[cid]) {
           await post('/api/disconnect', { controller: cid });
         } else {
-          const res = await post('/api/connect', {
-            controller: cid,
-            host: host.value.trim(),
-            offset: parseInt(offset.value, 10) || 0,
-          });
+          const res = await post('/api/connect', { controller: cid, host: host.value.trim() });
           if (!res.ok) scanHint.textContent = `Power ${cid}: ${res.error}`;
         }
       } finally {
@@ -88,15 +85,21 @@ export function initControllers() {
         refresh();
       }
     });
-    offset.addEventListener('change', () => {
-      if (connected[cid]) post('/api/offset', { controller: cid, offset: parseInt(offset.value, 10) || 0 });
+    // master badge — pick which bridge carries the STM32 (all STM32/ADC commands route there)
+    const mb = card.querySelector('[data-master]');
+    if (mb) mb.addEventListener('click', async () => {
+      const res = await post('/api/master', { controller: cid });
+      if (res && res.master) master = res.master;
+      refresh();
     });
   }
 
   async function refresh() {
     let st;
     try { st = await api('/api/status'); } catch { return; }
+    if (st.master) master = st.master;
     for (const card of cards) {
+      const cid = parseInt(card.dataset.ctrl, 10);
       const c = st.controllers[card.dataset.ctrl];
       if (!c) continue;
       connected[card.dataset.ctrl] = c.connected;
@@ -111,31 +114,28 @@ export function initControllers() {
       btn.textContent = c.connected ? 'Disconnect' : 'Connect';
       btn.classList.toggle('quick', !c.connected);
 
-      // identity (MAC-derived AP SSID) + flash-persisted offset — so two boards
-      // can be told apart and each one's configured role is visible.
       const ident = card.querySelector('[data-ident]');
       if (ident) ident.textContent = c.connected && c.bridge_name ? c.bridge_name : '';
-      const devoff = card.querySelector('[data-devoff]');
-      if (devoff) {
-        if (!c.connected || c.device_offset == null) { devoff.textContent = ''; devoff.classList.remove('bad'); }
-        else {
-          const want = parseInt(card.querySelector('[data-offset]').value, 10);
-          const match = c.device_offset === want;
-          devoff.textContent = `flash ${c.device_offset}` + (match ? ' ✓' : ' ⚠');
-          devoff.classList.toggle('bad', !match);
-          devoff.title = match ? 'Board flash offset matches' : `Board flash offset is ${c.device_offset}, field is ${want} — change the field to write flash.`;
-        }
-      }
+
+      // master badge: highlight the active master; the badge is always clickable
+      const mb = card.querySelector('[data-master]');
+      if (mb) mb.classList.toggle('active', cid === master);
+
       const rp = card.querySelector('[data-hb="rp"]');
       const stm = card.querySelector('[data-hb="stm"]');
+      // Only the master has an STM32 — dim the STM32 badge on the non-master.
+      const isMaster = cid === master;
+      stm.classList.toggle('na', !isMaster);
+      stm.title = isMaster ? 'STM32 heartbeat (HTTP /stm32 age)' : 'No STM32 on this controller (not master)';
       if (!c.connected) {
         rp.className = 'hb idle';
-        stm.className = 'hb idle';
+        stm.className = 'hb idle' + (isMaster ? '' : ' na');
       } else {
         rp.className = 'hb ' + hbClass(c.rp2350.age_ms, c.rp2350.age_ms != null);
-        stm.className = 'hb ' + hbClass(c.stm32.age_ms, c.stm32.ever_seen);
+        stm.className = 'hb ' + (isMaster ? hbClass(c.stm32.age_ms, c.stm32.ever_seen) : 'na');
       }
     }
+    window.ctMaster = master;   // expose for power.js STM32/ADC routing
   }
 
   setInterval(refresh, 1500);

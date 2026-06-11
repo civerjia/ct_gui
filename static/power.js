@@ -18,7 +18,11 @@ const postJ = async (path, body) => {
   } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 };
 
-let pwTarget = 1;                       // selected controller (1 or 2)
+let pwTarget = 1;                       // selected controller (1 or 2) — boards/HV-grid
+// The STM32 (HV monitor/setpoints + ADC waveform/pulses) lives only on the MASTER
+// controller; those calls route there regardless of the selected target.
+const masterId = () => window.ctMaster || 1;
+const masterConnected = () => !!connectedSet[masterId()];
 const POLL_MS = 2000;                    // board snapshot + HV grid refresh period
 const REFRESH_S = (POLL_MS / 1000).toFixed(0) + ' s';
 const powerCmd = (command, extra) => postJ('/api/power-cmd', { controller: pwTarget, command, ...extra });
@@ -31,7 +35,8 @@ function emptyBoards() {
     out.push({
       channel: ch, mux_port: mux, label: `CH${ch + 1}.${mux + 1}`,
       present: false, tps_present: false, ina_present: false,
-      iso_enabled: false, tps_enabled: false, tps_fault: false, bus_mV: 0, current_mA: 0,
+      iso_enabled: false, tps_enabled: false, tps_fault: false, hv_overcurrent: false,
+      bus_mV: 0, current_mA: 0,
     });
   }
   return out;
@@ -82,6 +87,7 @@ const BOARDS_HTML = `
     <span class="legend-item"><span class="dot on">I</span> ISO</span>
     <span class="legend-item"><span class="dot on">T</span> TPS</span>
     <span class="legend-item"><span class="dot fault">F</span> fault</span>
+    <span class="legend-item"><span class="hv-badge on">HV</span> HV current</span>
     <span class="legend-item"><span class="dot absent">·</span> absent</span>
     <span class="hint">Shift/Ctrl-click = multi-select</span>
   </div>
@@ -198,7 +204,9 @@ function renderBoardGrid() {
     tile.className = 'status-tile ' + cls + (boardSel.has(k) ? ' selected' : '')
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');
     const dot = (on, ch, fa) => `<span class="dot ${fa ? 'fault' : on ? 'on' : 'off'}">${ch}</span>`;
-    tile.innerHTML = `<span class="tile-title">${b.label}</span>`
+    const hv = `<span class="hv-badge ${b.hv_overcurrent ? 'on' : 'off'}" title="HV current ${b.hv_overcurrent ? 'sensed (>1 mA)' : 'none'}">HV</span>`;
+    tile.innerHTML = hv
+      + `<span class="tile-title">${b.label}</span>`
       + `<span class="tile-dots">${dot(b.present, 'P')}${dot(b.iso_enabled, 'I')}${dot(b.tps_enabled, 'T', b.tps_fault)}${dot(b.tps_fault, 'F', b.tps_fault)}</span>`
       + `<span class="tile-measure">${b.present ? (b.bus_mV / 1000).toFixed(2) + 'V ' + b.current_mA + 'mA' : '—'}</span>`;
     tile.addEventListener('click', (e) => {
@@ -230,8 +238,11 @@ function renderOneBoard() {
   const v = (b && b.present) ? b.bus_mV : 0, i = (b && b.present) ? b.current_mA : 0;
   $p('bmOneV').textContent = (b && b.present) ? (v / 1000).toFixed(3) + ' V' : '—';
   $p('bmOneI').textContent = (b && b.present) ? i + ' mA' : '—';
-  $p('bmOneP').textContent = (b && b.present && i) ? (v * i / 1e6).toFixed(2) + ' W' : '—';   // P = V·I
-  const R = (b && b.present && i) ? (v / i) : null;                                            // R = V/I (Ω)
+  const P = (b && b.present && i) ? (v * i / 1e6) : null;                                       // P = V·I (W)
+  $p('bmOneP').textContent = P != null ? P.toFixed(2) + ' W' : '—';
+  // Below 0.1 W the V/I resistance (and the temperature derived from it) is
+  // dominated by sense noise/offset, so report Load R and Temp as invalid.
+  const R = (P != null && P >= 0.1) ? (v / i) : null;                                          // R = V/I (Ω)
   $p('bmOneR').textContent = R != null ? R.toFixed(2) + ' Ω' : '—';
   const R0room = +$p('bmZR0').value;
   const T = R != null ? estimateTempK(R, R0room) : null;
@@ -580,14 +591,14 @@ function wireHv() {
   $p('dsSet').onclick = async () => {
     if (!hvConnGuard()) return;
     hvFb('Em-I: setting …');
-    const j = await postJ('/api/stm32/ds3502-set', { controller: pwTarget, ch: 'ei', wiper: +$p('dsEi').value });
+    const j = await postJ('/api/stm32/ds3502-set', { controller: masterId(), ch: 'ei', wiper: +$p('dsEi').value });
     hvFb(j.ok ? `Em-I wiper ${+$p('dsEi').value} set` : `Em-I ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
   };
   $p('dsRead').onclick = async () => {
     if (!hvConnGuard()) return;
     hvFb('reading …');
     let j;
-    try { j = await (await fetch(`/api/stm32/ds3502?controller=${pwTarget}&ch=ei`)).json(); }
+    try { j = await (await fetch(`/api/stm32/ds3502?controller=${masterId()}&ch=ei`)).json(); }
     catch (e) { hvFb(`Em-I read error — ${String((e && e.message) || e)}`, 'bad'); return; }
     if (j.ok && j.wiper != null) { $p('dsEi').value = j.wiper; updatePotEsts(); }
     hvFb(j.ok ? `Em-I wiper = ${j.wiper}` : `read ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
@@ -602,7 +613,7 @@ function wireHv() {
     const next = $p(id).dataset.on !== '1';
     setHvEnBtn(id, label, next);               // flip immediately — no waiting for the round-trip
     hvFb(`${label}: turning ${next ? 'ON' : 'OFF'} …`);
-    const j = await postJ('/api/stm32/hv-enable', { controller: pwTarget, ch: chan, on: next });
+    const j = await postJ('/api/stm32/hv-enable', { controller: masterId(), ch: chan, on: next });
     if (!j.ok) setHvEnBtn(id, label, !next);   // command failed → undo the flip
     hvFb(j.ok ? `${label} ${next ? 'ON' : 'OFF'}` : `${label} ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
   };
@@ -638,8 +649,8 @@ const countsToVolts = (chan, counts) => Math.round(-(counts * ADS_MV_PER_COUNT) 
 // prominent, immediate feedback for every HV-setpoint action
 function hvFb(msg, kind) { const e = $p('dsStatus'); if (e) { e.textContent = msg; e.className = 'summary hv-fb ' + (kind || ''); } }
 function hvConnGuard() {
-  if (boardTargetConnected()) return true;
-  hvFb(`Power ${pwTarget} not connected — Scan & Connect first.`, 'bad'); return false;
+  if (masterConnected()) return true;
+  hvFb(`Master (Power ${masterId()}) not connected — Scan & Connect it first.`, 'bad'); return false;
 }
 const hvErr = (j) => `${j.error || j.message || 'failed'}${j.status ? ' [HTTP ' + j.status + ']' : ''}`;
 
@@ -648,7 +659,7 @@ async function hvSetTarget(chan, inputId) {
   const mag = Math.abs(+$p(inputId).value);
   const target = hvVoltToCount(chan, mag);
   hvFb(`${chan}: setting −${mag} V …`);
-  const j = await postJ('/api/stm32/hv-set-target', { controller: pwTarget, chan, target, tol: 8, max_step: 2 });
+  const j = await postJ('/api/stm32/hv-set-target', { controller: masterId(), chan, target, tol: 8, max_step: 2 });
   // The command only ARMS the loop; the STM32 then walks the wiper toward target
   // over time. pollHvLoop() (2 Hz) shows the live convergence / at-target /
   // unreachable state in emVmeas/focVmeas — kick it once now for immediacy.
@@ -658,7 +669,7 @@ async function hvSetTarget(chan, inputId) {
 async function hvClearTarget(chan) {
   if (!hvConnGuard()) return;
   hvFb(`${chan}: clearing …`);
-  const j = await postJ('/api/stm32/hv-clear-target', { controller: pwTarget, chan });
+  const j = await postJ('/api/stm32/hv-clear-target', { controller: masterId(), chan });
   // Loop goes inactive; pollHvLoop() will reflect "loop off". Wiper stays put.
   hvFb(j.ok ? `${chan} closed-loop off` : `clear ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
   if (j.ok) pollHvLoop();
@@ -676,10 +687,10 @@ function blankAds(msg, kind) {
   const s = $p('adsStatus'); if (s) { s.textContent = msg; s.className = 'summary ' + (kind || ''); }
 }
 async function adsRead() {
-  if (adsBusy || !boardTargetConnected()) return;   // never overlap / flood the bridge
+  if (adsBusy || !masterConnected()) return;   // never overlap / flood the bridge (STM32 on master)
   adsBusy = true;
   try {
-    const j = await (await fetch(`/api/stm32/ads1115?controller=${pwTarget}`)).json();
+    const j = await (await fetch(`/api/stm32/ads1115?controller=${masterId()}`)).json();
     if (!j.ok) { blankAds(j.error || 'read failed', 'bad'); return; }
     const f = (v, u) => (v == null ? '—' : (+v).toFixed(2) + u);
     $p('adsRef').textContent = f(j.ref_mv, ' mV');
@@ -707,7 +718,7 @@ async function adsRead() {
 // −350 V, which is why showing "~−350 V" from the wiper was wrong.
 let loopBusy = false;
 async function getTarget(chan) {
-  try { const r = await (await fetch(`/api/stm32/hv-target?controller=${pwTarget}&chan=${chan}`)).json(); return r.ok ? r : null; } catch { return null; }
+  try { const r = await (await fetch(`/api/stm32/hv-target?controller=${masterId()}&chan=${chan}`)).json(); return r.ok ? r : null; } catch { return null; }
 }
 // Compact readout (must fit inline before the Set/Clr buttons) + full detail in
 // the hover tooltip. JSON fields (config_portal /stm32/hv_get_target): target,
@@ -725,7 +736,7 @@ function hvLoopText(chan, t) {
 async function pollHvLoop() {
   if (loopBusy) return;
   const set = (id, r) => { const e = $p(id); if (e) { e.textContent = r.txt; e.title = r.title; } };
-  if (!boardTargetConnected()) { set('emVmeas', { txt: '—', title: '' }); set('focVmeas', { txt: '—', title: '' }); return; }
+  if (!masterConnected()) { set('emVmeas', { txt: '—', title: '' }); set('focVmeas', { txt: '—', title: '' }); return; }
   loopBusy = true;
   try {
     const [em, fo] = await Promise.all([getTarget('emission'), getTarget('focus')]);
@@ -744,9 +755,9 @@ function setHvEnBtn(id, label, on) {
   b.title = on == null ? `${label}: unknown` : `${label}: ${on ? 'ON (energized)' : 'OFF'} — click to toggle`;
 }
 async function readHvStatus() {
-  if (!boardTargetConnected()) { setHvEnBtn('hvEnEm', 'Emission', null); setHvEnBtn('hvEnFoc', 'Focus', null); return; }
+  if (!masterConnected()) { setHvEnBtn('hvEnEm', 'Emission', null); setHvEnBtn('hvEnFoc', 'Focus', null); return; }
   let j;
-  try { j = await (await fetch(`/api/stm32/hv-status?controller=${pwTarget}`)).json(); }
+  try { j = await (await fetch(`/api/stm32/hv-status?controller=${masterId()}`)).json(); }
   catch { setHvEnBtn('hvEnEm', 'Emission', null); setHvEnBtn('hvEnFoc', 'Focus', null); return; }
   setHvEnBtn('hvEnEm', 'Emission', j.ok ? j.emission_on : null);
   setHvEnBtn('hvEnFoc', 'Focus', j.ok ? j.focus_on : null);
@@ -755,24 +766,38 @@ async function readHvStatus() {
 // ---- Emission & Schedule card: waveform + per-pulse + ShV -------------------
 const EMI_HTML = `
   <div class="batch-box">
-    <div class="block-title">Emission current waveform <span class="hint">— STM32 SPI ADC burst</span></div>
+    <div class="block-title">Emission current waveform <span class="hint">— STM32 ADC (SPI ring)</span></div>
     <div class="row wrap">
       <label class="numlabel">samples <input id="wfN" type="number" min="64" max="32768" value="2048" /></label>
+      <label class="numlabel">kSPS <input id="wfRate" type="number" min="1" max="1000" value="1000" /></label>
       <button id="wfCapture" class="xs">Capture</button>
-      <label class="chk"><input id="wfAuto" type="checkbox" /> Auto</label>
+      <button id="wfTrig" class="xs" title="Continuous → trigger → retrieve: fire SyncOut and pull the full-rate window around the trigger from the running ring. Requires Live.">Trig ▶</button>
+      <label class="chk" title="Continuous rolling capture from the STM32 ADC ring. While live the same stream also feeds per-pulse measurements."><input id="wfLive" type="checkbox" /> Live</label>
     </div>
     <canvas id="wfCanvas" class="adc-plot" width="600" height="160"></canvas>
     <div id="wfStatus" class="summary">no capture yet</div>
   </div>
 
   <div class="batch-box">
-    <div class="block-title">Per-pulse measurements <span class="hint">— STM32, 1 MSPS</span></div>
+    <div class="block-title">Per-pulse measurements <span class="hint">— STM32 1 MSPS · events flow while Live (or a Capture) runs</span></div>
     <div class="row wrap">
       <button id="pulseStream" class="xs">Stream</button>
       <button id="pulseClear" class="xs">Clear</button>
       <span id="pulseSummary" class="hint">no events</span>
     </div>
     <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th>peak</th><th>bg±σ</th><th>∫</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
+  </div>
+
+  <div class="batch-box">
+    <div class="block-title">Record measurement <span class="hint">— raw ADC waveform + per-pulse → host files</span></div>
+    <div class="row wrap" title="Records the raw STM32 ADC samples (ring tap → .bin) AND the per-pulse measurements (→ .csv) to host files for the whole session. Use decim to fit the WiFi link if you see drops.">
+      <label class="numlabel">kSPS <input id="recRate" type="number" min="1" max="1000" value="1000" /></label>
+      <label class="numlabel">decim <input id="recDecim" type="number" min="1" max="2048" value="1" /></label>
+      <button id="recStart" class="xs quick">● Record</button>
+      <button id="recStop" class="xs" disabled>Stop</button>
+    </div>
+    <div id="recStatus" class="summary">idle</div>
+    <div id="recFiles" class="summary"></div>
   </div>
 
   <details class="batch-box" id="syncDetails">
@@ -798,11 +823,10 @@ const EMI_HTML = `
     <summary class="block-title">Simple HV schedule <span class="hint">— ShV 0x70–0x7B</span></summary>
 
     <div class="shv-group">
-      <div class="shv-grouplabel">Offset (NV)</div>
+      <div class="shv-grouplabel">Active list <span class="hint">— mapping → power slots</span></div>
       <div class="hv-row">
-        <input id="shvOffset" type="number" min="0" max="127" value="0" />
-        <button id="shvSetOff" class="xs">Set</button>
-        <button id="shvGetOff" class="xs">Get</button>
+        <button id="shvPushList" class="xs" title="Push the host filament→power mapping (64-byte ShvSetActiveList) to this target controller. Edit it in the Filament → Power card.">Push mapping</button>
+        <button id="shvGetList" class="xs" title="Read this controller's active list and count how many of its 64 power slots map to a filament.">Read</button>
       </div>
     </div>
 
@@ -852,13 +876,19 @@ const EMI_HTML = `
 
 let pulseList = [], pulseSince = 0, pulseTimer = null, wfTimer = null;
 
-function drawWaveform(samples, rate) {
+function drawWaveform(samples, rate, trigIdx) {
   const c = $p('wfCanvas'); if (!c || !samples.length) return;
   const ctx = c.getContext('2d'), W = c.width, H = c.height;
   ctx.clearRect(0, 0, W, H); ctx.fillStyle = '#070b0e'; ctx.fillRect(0, 0, W, H);
   let lo = Infinity, hi = -Infinity;
   for (const s of samples) { if (s < lo) lo = s; if (s > hi) hi = s; }
   const span = Math.max(1, hi - lo);
+  // trigger marker (vertical amber line at the trigger sample)
+  if (trigIdx != null && trigIdx >= 0 && trigIdx < samples.length) {
+    const tx = (trigIdx / (samples.length - 1)) * W;
+    ctx.strokeStyle = '#f2c14e'; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(tx, 0); ctx.lineTo(tx, H); ctx.stroke(); ctx.setLineDash([]);
+  }
   ctx.strokeStyle = '#3fb6a0'; ctx.lineWidth = 1; ctx.beginPath();
   for (let i = 0; i < samples.length; i++) {
     const x = (i / (samples.length - 1)) * W;
@@ -866,14 +896,105 @@ function drawWaveform(samples, rate) {
     i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
   }
   ctx.stroke();
-  $p('wfStatus').textContent = `${samples.length} samples · ${lo}–${hi} raw${rate ? ' · ' + rate + ' Hz' : ''}`;
+  const tg = trigIdx != null ? ` · trig@${trigIdx}` : '';
+  $p('wfStatus').textContent = `${samples.length} samples · ${lo}–${hi} raw${rate ? ' · ' + rate + ' Hz' : ''}${tg}`;
 }
+let wfBusy = false;
 async function wfCapture() {
-  if (!boardTargetConnected()) { $p('wfStatus').textContent = `Power ${pwTarget} not connected`; return; }
+  if (wfBusy) return;                                   // shots are synchronous — never overlap
+  if (!masterConnected()) { $p('wfStatus').textContent = `Master (Power ${masterId()}) not connected`; return; }
+  wfBusy = true;
+  try { await wfCaptureInner(); } finally { wfBusy = false; }
+}
+async function wfCaptureInner() {
   const n = +$p('wfN').value;
-  let j; try { j = await (await fetch(`/api/adc/burst?controller=${pwTarget}&n=${n}`)).json(); } catch { return; }
+  const rate = Math.max(1, +$p('wfRate').value || 1000) * 1000;   // kSPS → SPS
+  $p('wfStatus').textContent = `capturing ${n} @ ${rate / 1000} kSPS…`;
+  // Bounded STM32 ADC shot over SPI (the only ADC) — blocks ~n/fs s server-side.
+  let j;
+  try { j = await (await fetch(`/api/adc/spi-shot?controller=${masterId()}&n=${n}&rate=${rate}`)).json(); }
+  catch (e) { $p('wfStatus').textContent = `capture error — ${String((e && e.message) || e)}`; return; }
   if (!j.ok) { $p('wfStatus').textContent = j.error || 'capture failed'; return; }
   drawWaveform(j.samples || [], j.rate_hz);
+}
+// ---- live rolling waveform from the continuous STM32 ADC ring ---------------
+let wfLive = false;
+async function wfLiveTick() {
+  if (wfBusy) return;
+  wfBusy = true;
+  try {
+    const n = +$p('wfN').value;
+    const j = await (await fetch(`/api/adc/ring-peek?controller=${pwTarget}&n=${n}`)).json();
+    if (j.ok) drawWaveform(j.samples || [], j.rate_hz);
+    else $p('wfStatus').textContent = j.error || 'ring peek failed';
+  } catch (e) { /* keep the live loop alive */ } finally { wfBusy = false; }
+}
+async function wfSetLive(on) {
+  const cb = $p('wfLive');
+  if (on) {
+    const rate = Math.max(1, +$p('wfRate').value || 1000) * 1000;
+    $p('wfStatus').textContent = 'starting ring…';
+    const j = await postJ('/api/adc/ring-start', { controller: pwTarget, rate });
+    if (!j.ok) { if (cb) cb.checked = false; $p('wfStatus').textContent = `ring start failed — ${j.error || j.message || ''}`; return; }
+    wfLive = true;
+    clearInterval(wfTimer); wfTimer = setInterval(wfLiveTick, 250);   // 4 Hz rolling
+    $p('wfStatus').textContent = `live @ ${rate / 1000} kSPS — rolling (also feeds per-pulse)`;
+  } else {
+    wfLive = false;
+    clearInterval(wfTimer); wfTimer = null;
+    await postJ('/api/adc/ring-stop', { controller: pwTarget });
+    $p('wfStatus').textContent = 'live stopped';
+  }
+}
+// Continuous → trigger → retrieve: fire SyncOut and pull the trigger-aligned
+// full-rate window out of the running ring. Needs Live (the ring) running.
+const WF_RING_CAP = 16384;   // adc_spi kRingSamples — pre+post+1 must fit the ring
+async function wfTrigCapture() {
+  if (wfBusy) return;
+  if (!wfLive) { $p('wfStatus').textContent = 'turn Live on first (the ring must be running)'; return; }
+  wfBusy = true;
+  try {
+    // Window must fit the ring (pre+post+1 ≤ cap); clamp the requested count.
+    const total = Math.min(+$p('wfN').value, WF_RING_CAP - 1);
+    const pre = Math.max(0, Math.round(total * 0.25)), post = Math.max(1, total - pre);
+    const clamp = (+$p('wfN').value > WF_RING_CAP - 1) ? ' (clamped to ring)' : '';
+    $p('wfStatus').textContent = `triggering — pre ${pre} / post ${post}${clamp}…`;
+    const j = await postJ('/api/adc/ring-window', { controller: pwTarget, pre, post, fire: true });
+    if (!j.ok) { $p('wfStatus').textContent = `trigger ${j.error || j.message || 'failed'}`; return; }
+    drawWaveform(j.samples || [], j.rate_hz, j.pre);
+  } finally { wfBusy = false; }
+}
+// ---- measurement recorder: raw ADC waveform + per-pulse → host files --------
+let recTimer = null;
+async function recPoll() {
+  let j; try { j = await (await fetch('/api/record/status')).json(); } catch { return; }
+  if (!j.ok || !j.recording) { if (!j.recording) $p('recStatus').textContent = 'idle'; return; }
+  const M = (j.adc_samples || 0) / 1e6;
+  const obs = j.rate_hz_obs ? `${Math.round(j.rate_hz_obs / 1000)} kSPS` : '—';
+  const drop = (j.drops || j.missed_packets) ? ` · ⚠ drops ${j.drops}/miss ${j.missed_packets}` : '';
+  $p('recStatus').textContent = `● REC ${j.duration_s || 0}s · ADC ${M.toFixed(2)}M samp @ ${obs} · pulses ${j.pulse_events}${drop}`;
+}
+function wireRecord() {
+  $p('recStart').onclick = async () => {
+    const rate = Math.max(1, +$p('recRate').value || 1000) * 1000;
+    const decim = Math.max(1, +$p('recDecim').value || 1);
+    $p('recStatus').textContent = 'starting…';
+    const j = await postJ('/api/record/start', { controller: pwTarget, rate, decim });
+    if (!j.ok) { $p('recStatus').textContent = `start failed — ${j.error || ''}`; return; }
+    $p('recStart').disabled = true; $p('recStop').disabled = false; $p('recStart').classList.add('danger');
+    $p('recFiles').textContent = `recording → ${j.adc_file} · ${j.pulse_file}`;
+    clearInterval(recTimer); recTimer = setInterval(recPoll, 1000); recPoll();
+  };
+  $p('recStop').onclick = async () => {
+    const j = await postJ('/api/record/stop', { controller: pwTarget });
+    clearInterval(recTimer); recTimer = null;
+    $p('recStart').disabled = false; $p('recStop').disabled = true; $p('recStart').classList.remove('danger');
+    if (j.ok) {
+      $p('recStatus').textContent = `saved · ADC ${(((j.adc_samples || 0)) / 1e6).toFixed(2)}M samp · ${j.pulse_events || 0} pulses`;
+      const dl = (f) => `<a href="/api/record/download?file=${f}" download>${f}</a>`;
+      $p('recFiles').innerHTML = j.adc_file ? `${dl(j.adc_file)} · ${dl(j.pulse_file)}` : '';
+    } else { $p('recStatus').textContent = j.error || 'stop failed'; }
+  };
 }
 function renderPulses() {
   const body = $p('pulseBody'); if (!body) return;
@@ -882,8 +1003,8 @@ function renderPulses() {
   $p('pulseSummary').textContent = `${pulseList.length} events`;
 }
 async function pulseTick() {
-  if (!boardTargetConnected()) return;
-  let j; try { j = await (await fetch(`/api/pulse-events?controller=${pwTarget}&since=${pulseSince}`)).json(); } catch { return; }
+  if (!masterConnected()) return;
+  let j; try { j = await (await fetch(`/api/pulse-events?controller=${masterId()}&since=${pulseSince}`)).json(); } catch { return; }
   if (j.ok && j.events && j.events.length) {
     pulseList.push(...j.events); if (pulseList.length > 4096) pulseList = pulseList.slice(-4096);
     pulseSince = j.events[j.events.length - 1].id; renderPulses();
@@ -913,8 +1034,8 @@ function shvShow(j) {
     t = `entries ${j.entryCount} · crc 0x${(j.crc >>> 0).toString(16).toUpperCase()}`;
   } else if (j && j.interPulseMs != null) {                    // get config
     t = `inter ${j.interPulseMs} ms · maxOn ${j.maxOnMs} ms · total ${j.totalMs} ms · edge ${j.triggerEdge ? 'falling' : 'rising'}`;
-  } else if (j && j.offset != null) {                          // get offset
-    t = `offset ${j.offset}`;
+  } else if (j && j.mapped != null) {                          // active-list read
+    t = `active list: ${j.mapped}/64 power slots mapped`;
   } else {
     t = j && j.ok ? 'ok' : (j && j.error) ? j.error : JSON.stringify(j);
   }
@@ -929,15 +1050,18 @@ function parseShvEntries() {
 
 function wireEmission() {
   $p('emissionCard').innerHTML = EMI_HTML;
-  $p('wfCapture').onclick = wfCapture;
-  $p('wfAuto').onchange = (e) => { if (e.target.checked) wfTimer = setInterval(wfCapture, 1000); else { clearInterval(wfTimer); wfTimer = null; } };
+  // Capture: a single frame — peek the live ring if running, else a bounded shot.
+  $p('wfCapture').onclick = () => (wfLive ? wfLiveTick() : wfCapture());
+  $p('wfTrig').onclick = wfTrigCapture;
+  $p('wfLive').onchange = (e) => wfSetLive(e.target.checked);
   $p('pulseStream').onclick = () => {
     if (pulseTimer) { clearInterval(pulseTimer); pulseTimer = null; $p('pulseStream').classList.remove('danger'); }
     else { pulseTimer = setInterval(pulseTick, 500); $p('pulseStream').classList.add('danger'); pulseTick(); }
   };
   $p('pulseClear').onclick = () => { pulseList = []; pulseSince = 0; renderPulses(); };
-  $p('shvSetOff').onclick = async () => shvShow(await shv('set_offset', { offset: +$p('shvOffset').value }));
-  $p('shvGetOff').onclick = async () => { const j = await shv('get_offset'); if (j.offset != null) $p('shvOffset').value = j.offset; shvShow(j); };
+  wireRecord();
+  $p('shvPushList').onclick = async () => shvShow(await shv('push_active_list'));
+  $p('shvGetList').onclick = async () => shvShow(await shv('get_active_list'));
   $p('shvSetCfg').onclick = async () => shvShow(await shv('set_config', { interPulseMs: +$p('shvInter').value, maxOnMs: +$p('shvMaxOn').value, totalMs: +$p('shvTotal').value, triggerEdge: 0 }));
   $p('shvUpload').onclick = async () => shvShow(await shv('set_entries', { entries: parseShvEntries() }));
   $p('shvClear').onclick = async () => shvShow(await shv('clear_table'));

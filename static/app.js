@@ -21,6 +21,8 @@ import { initControllers } from './controllers.js';
 import { initScheduleTable } from './schedule.js';
 import { ScheduleGantt } from './gantt.js';
 import { initPower } from './power.js';
+import { initMapping } from './mapping.js';
+import { initTests } from './tests.js';
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (msg) => { $('statusBar').textContent = msg; };
@@ -1079,6 +1081,34 @@ async function hwTrigger() {
   } catch (e) { hwMsg('Trigger failed: ' + e); }
 }
 
+// ---- CT-scan prep ladder: batch PowerState across BOTH controllers ----------
+// Stop → Sleep → Standby → Idle warms every filament up to the schedule's rest
+// state; "Active first batch" then pre-heats the cold-start band so the lead
+// filaments are already hot when the first trigger fires.
+async function hwPrep(state, label, opts) {
+  hwMsg(`${label}…`);
+  try {
+    const j = await postJSON('/api/filament-prep', { state, ...(opts || {}) });
+    if (!j.ok && j.error) { hwMsg(`${label} failed: ${j.error}`); return; }
+    const parts = Object.entries(j.results || {}).map(([k, r]) =>
+      `P${k}: ${r.ok ? '✓' : '✗'}${r.applied != null ? ' ' + r.applied : ''}${r.error ? ' ' + r.error : ''}`);
+    hwMsg(`${j.ok ? '✓' : '✗'} ${label} — ${parts.join(' · ')}`);
+  } catch (e) { hwMsg(`${label} failed: ` + e); }
+}
+// per-filament CC current (mA) so Idle/Active land on the right setpoint
+function prepCurrents(field) {
+  const out = {};
+  filaments.forEach((f, i) => { if (!f.dead) out[i] = Math.round(f[field] * 1000); });
+  return out;
+}
+// the schedule's cold-start band = filaments the heating plan has ACTIVE at trigger 0
+function firstBatchFilaments() {
+  if (!heatingPlan) return null;
+  const fils = [];
+  for (let f = 0; f < N; f++) if (isActiveAt(f, 0)) fils.push(f);
+  return fils;
+}
+
 // Poll ShvGetStatus: totalPulsesDone → schedule playhead, firmware filament/state.
 let runMonitorTimer = null;
 const SHV_STATE_NAME = { 0: 'Idle', 1: 'Armed', 2: 'Running', 3: 'Complete', 4: 'Fault' };
@@ -1134,45 +1164,183 @@ function buildMaskBits() {
 }
 function reflectMask(mask) { if (mask != null) { i2cMask = mask & 0xFF; buildMaskBits(); } }
 
-function renderI2C(data) {
+// Per-controller diagnostic caches, keyed by controller id (string). Holds the
+// raw present masks, the deep-diagnosis map, the TCA9554 register read, and the
+// pin-toggle self-test — each action merges into here, then we re-render.
+const i2cState = {};
+const i2cCtx = (cid) => (i2cState[cid] ||= {});
+
+const STATE_RANK = { op: 3, reg: 2, addr: 1, missing: 0, na: -1 };
+const TCA_READ_MAP = {
+  enable_io: { readKey: 'enable', testKey: 'enable_toggle', kind: 'out' },
+  fault_io:  { readKey: 'fault',  testKey: 'fault_live',   kind: 'in' },
+  iso_io:    { readKey: 'iso',    testKey: 'iso_toggle',   kind: 'out' },
+  hv_io:     { readKey: 'hv',     testKey: 'hv_live',      kind: 'in' },
+};
+function chipDotForState(s) {
+  switch (s) {
+    case 'op':      return { cls: 'chip-cell op',      glyph: '●' };
+    case 'reg':     return { cls: 'chip-cell ok',      glyph: '◉' };
+    case 'addr':    return { cls: 'chip-cell addr',    glyph: '◐' };
+    case 'missing': return { cls: 'chip-cell missing', glyph: '○' };
+    default:        return { cls: 'chip-cell na',      glyph: '·' };
+  }
+}
+// mux + 4× TCA9554 are channel-scoped (one chip per channel): collapse the 8
+// per-port diagnosis results into the best state seen. Fall back to the present
+// mask (addr-level) when no deep scan is cached.
+function channelChipState(ctx, channel, chipKey, maskByte) {
+  if (ctx.diag) {
+    let best = 'missing';
+    for (let p = 0; p < 8; p++) {
+      const e = ctx.diag.get(`${channel}.${p}`);
+      const s = e ? e[`${chipKey}_state`] : 'missing';
+      if ((STATE_RANK[s] ?? -1) > (STATE_RANK[best] ?? -1)) best = s;
+    }
+    return best;
+  }
+  return (maskByte || 0) !== 0 ? 'addr' : 'missing';
+}
+function boardChipState(ctx, channel, port, chipKey, maskByte) {
+  if (ctx.diag) {
+    const e = ctx.diag.get(`${channel}.${port}`);
+    return e ? e[`${chipKey}_state`] : 'missing';
+  }
+  return ((maskByte || 0) & (1 << port)) ? 'addr' : 'missing';
+}
+// TPS + INA are the only per-board chips → the true board-presence signal.
+function boardPresence(ctx, channel, port, tpsByte, inaByte) {
+  const tps = boardChipState(ctx, channel, port, 'tps', tpsByte);
+  const ina = boardChipState(ctx, channel, port, 'ina', inaByte);
+  const at = tps !== 'missing' && tps !== 'na', ai = ina !== 'missing' && ina !== 'na';
+  if (!at && !ai) return 'empty';
+  return (at && ai) ? 'ok' : 'fault';
+}
+// 3-row mini-table (status / dir / level) for one TCA9554 across its 8 boards.
+// Driven by the full register dump (CH_READ_TCA9554 0x61) when available:
+//   status ← per-pin I²C ACK (✓ read OK / ✗ NACK), else diagnosis dot (0x2E)
+//   dir    ← config register (1=Input, 0=Output); warn if an output pin reads I
+//   level  ← input register (live GPIO) for inputs, output latch for outputs
+function tcaBitCell(ctx, channel, chipKey, maskByte) {
+  const map = TCA_READ_MAP[chipKey];
+  const rch = map && ctx.read && ctx.read[channel] && ctx.read[channel].chips && ctx.read[channel].chips[map.readKey];
+  const COL = { ok: '#2c7a6b', fail: '#c0392b', warn: '#b8860b', dim: '#9aa0a6', mute: '#bdbdbd' };
+  const sRow = [], dRow = [], lRow = [];
+  for (let b = 0; b < 8; b++) {
+    const tip = [`CH${channel + 1} board ${b + 1} · ${map ? map.readKey : chipKey}`];
+    let dir = '·', dc = COL.mute, lvl = '·', lc = COL.mute, status = '·', sc = COL.mute;
+    const readOk = !!rch && (rch.ok || 0) !== 0;
+    const readNack = !!rch && (rch.ok || 0) === 0;
+    if (readOk) {
+      const ok = rch.ok, c = (rch.config >> b) & 1, o = (rch.output >> b) & 1, i = (rch.input >> b) & 1;
+      if (ok & 0x01) { dir = c ? 'I' : 'O'; dc = (map.kind === 'out' && c === 1) ? COL.warn : COL.dim; }
+      const bitVal = map.kind === 'out' ? ((ok & 0x04) ? o : null) : ((ok & 0x02) ? i : null);
+      if (bitVal !== null) { lvl = bitVal ? 'H' : 'L'; lc = bitVal ? COL.ok : COL.dim; }
+      status = '✓'; sc = COL.ok;
+      tip.push(`dir=${dir} pin=${(ok & 0x02) ? (i ? 'H' : 'L') : '?'} drive=${(ok & 0x04) ? (o ? 'H' : 'L') : '?'}`);
+    } else if (readNack) {
+      status = '✗'; sc = COL.fail; tip.push('no I²C response (NACK)');
+    } else {
+      const s = boardChipState(ctx, channel, b, chipKey, maskByte);
+      status = chipDotForState(s).glyph;
+      sc = (s === 'op' || s === 'reg') ? COL.ok : s === 'addr' ? COL.warn : s === 'missing' ? COL.fail : COL.mute;
+      tip.push(`diagnosis: ${s} (Read TCA9554 for live regs)`);
+    }
+    const t = tip.join(' · ');
+    sRow.push(`<td style="color:${sc}" title="${t}">${status}</td>`);
+    dRow.push(`<td style="color:${dc}" title="${t}">${dir}</td>`);
+    lRow.push(`<td style="color:${lc};font-weight:bold" title="${t}">${lvl}</td>`);
+  }
+  return `<table class="tca-bits"><tbody><tr>${sRow.join('')}</tr><tr>${dRow.join('')}</tr><tr>${lRow.join('')}</tr></tbody></table>`;
+}
+function chipHealthTable(cid, ctx) {
+  const pm = ctx.masks || {};
+  const M = (k) => pm[k] || [0, 0, 0, 0, 0, 0, 0, 0];
+  const mux = M('mux_present_mask'), en = M('enable_io_present_mask'), ft = M('fault_io_present_mask');
+  const iso = M('iso_io_present_mask'), hv = M('hv_io_present_mask'), tps = M('tps_present_mask'), ina = M('ina_present_mask');
+  const chanMaskOf = { enable_io: en, fault_io: ft, iso_io: iso, hv_io: hv };
+  const goodRank = ctx.diag ? STATE_RANK.reg : STATE_RANK.addr;
+  let channelsGood = 0, boardsPresent = 0, boardFaults = 0;
+  const boardCell = (ch, chipKey, byte) => {
+    const parts = [];
+    for (let p = 0; p < 8; p++) {
+      if (boardPresence(ctx, ch, p, tps[ch], ina[ch]) === 'empty') { parts.push('<span class="chip-cell missing" title="no board">○</span>'); continue; }
+      const st = boardChipState(ctx, ch, p, chipKey, byte), { cls, glyph } = chipDotForState(st);
+      parts.push(`<span class="${cls}" title="port ${p + 1}: ${chipKey} ${st}">${glyph}</span>`);
+    }
+    return `<span class="chip-row">${parts.join('')}</span>`;
+  };
+  let rows = '';
+  for (let ch = 0; ch < 8; ch++) {
+    const muxState = channelChipState(ctx, ch, 'mux', mux[ch]);
+    const muxLive = muxState !== 'missing' && muxState !== 'na';
+    let channelOk = (STATE_RANK[muxState] ?? -1) >= goodRank;
+    let tca = '';
+    for (const k of ['enable_io', 'fault_io', 'iso_io', 'hv_io']) {
+      tca += `<td>${tcaBitCell(ctx, ch, k, chanMaskOf[k][ch])}</td>`;
+      if ((STATE_RANK[channelChipState(ctx, ch, k, chanMaskOf[k][ch])] ?? -1) < goodRank) channelOk = false;
+    }
+    if (channelOk) channelsGood++;
+    const muxTag = muxLive ? '<span class="summary">✓</span>' : '<span class="bad">✗</span>';
+    const tpsCell = muxLive ? boardCell(ch, 'tps', tps[ch]) : '<span class="chip-cell na" title="mux dead">·</span>';
+    const inaCell = muxLive ? boardCell(ch, 'ina', ina[ch]) : '<span class="chip-cell na" title="mux dead">·</span>';
+    if (muxLive) for (let p = 0; p < 8; p++) { const pr = boardPresence(ctx, ch, p, tps[ch], ina[ch]); if (pr === 'ok') boardsPresent++; else if (pr === 'fault') { boardsPresent++; boardFaults++; } }
+    rows += `<tr><td><b>CH${ch + 1}</b></td><td>${muxTag} ${chipDotForState(muxState).glyph}</td>${tca}<td>${tpsCell}</td><td>${inaCell}</td></tr>`;
+  }
+  const err = ctx.present_error || ctx.error || ctx.selftest_error || ctx.tca_error;
+  const maskTag = ctx.channel_mask != null ? `mask 0x${ctx.channel_mask.toString(16).toUpperCase().padStart(2, '0')}` : '';
+  const summary = err ? `<span class="bad">${err}</span>`
+    : `<span class="summary">channels good ${channelsGood}/8 · boards ${boardsPresent}/64 · faults ${boardFaults}</span>`;
+  return `<div class="i2c-ctrl"><b>Power ${cid}</b> <span class="hint">${maskTag}</span> ${summary}`
+    + `<div class="table-wrap"><table class="data-table chip-health"><thead><tr>`
+    + '<th>Ch</th><th>mux</th><th>enable</th><th>fault</th><th>ISO</th><th>HV</th><th>TPS</th><th>INA</th>'
+    + `</tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+function renderI2C() {
+  const host = $('i2cHealthHost'); if (!host) return;
+  const cids = Object.keys(i2cState);
+  host.innerHTML = cids.length ? cids.map((cid) => chipHealthTable(cid, i2cState[cid])).join('') : '';
+}
+// merge an /api endpoint's {controllers:{cid:{...}}} response into the caches
+function mergeI2C(data) {
   const ctrls = (data && data.controllers) || {};
   const keys = Object.keys(ctrls);
-  if (!keys.length) { i2cMsg('No controller connected.'); return; }
-  for (const k of keys) if (ctrls[k].channel_mask != null) { reflectMask(ctrls[k].channel_mask); break; }
-  let html = '';
+  if (!keys.length) { i2cMsg('No controller connected.'); return false; }
   for (const k of keys) {
-    const c = ctrls[k];
-    html += `<div class="i2c-ctrl"><b>Power ${k}</b>`;
-    if (c.channel_mask != null) html += ` <span class="hint">mask 0x${c.channel_mask.toString(16).toUpperCase().padStart(2, '0')}</span>`;
-    if (c.error) html += ` <span class="bad">${c.error}</span>`;
-    if (c.present_error) html += ` <span class="bad">present: ${c.present_error}</span>`;
-    if (c.present_hex) html += `<div class="i2c-st">raw: ${c.present_hex}</div>`;
-    const pc = c.present_counts;
-    if (pc) {
-      html += '<div class="i2c-grid">' +
-        ['mux', 'tps', 'ina', 'enable_io', 'iso_io', 'fault_io', 'hv_io'].map((p) =>
-          `<span class="i2c-chip ${pc[p] > 0 ? 'on' : 'off'}">${p.replace('_io', '')}<b>${pc[p]}</b></span>`).join('') +
-        '</div>';
-    }
-    const dc = c.diagnosis_counts;
-    if (dc) html += `<div class="i2c-st">diagnosis: op <b>${dc.op}</b> · reg-only <b>${dc.reg}</b> · addr-only <b>${dc.addr}</b> · missing <b>${dc.missing}</b></div>`;
-    if (c.selftest_error) html += `<div class="bad">self-test: ${c.selftest_error}</div>`;
-    const sc = c.selftest_counts;
-    if (sc) html += `<div class="i2c-st">toggle: enable <b>${sc.enable_toggle}</b> · iso <b>${sc.iso_toggle}</b> · outputs tested <b>${sc.outputs_tested_channels}</b> ch</div>`;
-    html += '</div>';
+    const c = ctrls[k], ctx = i2cCtx(k);
+    if (c.channel_mask != null) { ctx.channel_mask = c.channel_mask; reflectMask(c.channel_mask); }
+    if (c.present_masks) { ctx.masks = c.present_masks; ctx.present_error = null; }
+    if (c.present_error) ctx.present_error = c.present_error;
+    if (c.error) ctx.error = c.error;
+    if (c.diagnosis_bits) ctx.diag = new Map(c.diagnosis_bits.map((e) => [`${e.channel}.${e.mux_port}`, e]));
+    if (c.tca9554_channels) { ctx.read = c.tca9554_channels; ctx.tca_error = null; }
+    if (c.tca9554_error) ctx.tca_error = c.tca9554_error;
+    if (c.selftest_boards) ctx.test = { byKey: new Map(c.selftest_boards.map((b) => [`${b.channel}.${b.mux_port}`, b])), channels_tested: c.channels_tested || [] };
+    if (c.selftest_error) ctx.selftest_error = c.selftest_error;
   }
-  i2cMsg(html);
+  renderI2C();
+  return true;
 }
 
 async function i2cPresent() {
-  i2cMsg('Scanning I2C bus…');
-  try { renderI2C(await postJSON('/api/present', {})); }
+  i2cMsg('Scanning I²C bus…');
+  try { if (mergeI2C(await postJSON('/api/present', {}))) i2cMsg('I²C scan done. <b>Run diagnosis</b> + <b>Read TCA9554</b> for per-chip detail.'); }
   catch (e) { i2cMsg('Scan failed: ' + e); }
 }
 async function i2cDiagnose() {
-  i2cMsg('Running deep I2C diagnosis… ~300 ms');
-  try { renderI2C(await postJSON('/api/diagnosis', {})); }
+  i2cMsg('Running deep I²C diagnosis… ~300 ms');
+  try { if (mergeI2C(await postJSON('/api/diagnosis', {}))) i2cMsg('Diagnosis complete — per-chip states shown.'); }
   catch (e) { i2cMsg('Diagnosis failed: ' + e); }
+}
+async function i2cTcaRead() {
+  i2cMsg('Reading TCA9554 registers (per channel, 0x61)…');
+  try { if (mergeI2C(await postJSON('/api/tca9554-read', {}))) i2cMsg('TCA9554 read — status/dir/level rows updated (config/input/output regs).'); }
+  catch (e) { i2cMsg('TCA9554 read failed: ' + e); }
+}
+async function i2cSelftest() {
+  i2cMsg('Running TCA9554 pin-toggle self-test…');
+  try { if (mergeI2C(await postJSON('/api/selftest', {}))) i2cMsg('Self-test complete — pass/fail in the matrix.'); }
+  catch (e) { i2cMsg('Self-test failed: ' + e); }
 }
 async function i2cSetMask() {
   try {
@@ -1182,18 +1350,15 @@ async function i2cSetMask() {
     i2cMsg('Channel mask set — ' + (parts.join(' · ') || 'no controller') + '.');
   } catch (e) { i2cMsg('Set mask failed: ' + e); }
 }
-async function i2cSelftest() {
-  i2cMsg('Running TCA9554 self-test…');
-  try { renderI2C(await postJSON('/api/selftest', {}), 'selftest'); }
-  catch (e) { i2cMsg('Self-test failed: ' + e); }
-}
 async function i2cMuxReset() {
   if (!confirm('Reset all TCA9548A muxes? This pulses the shared reset line and CUTS POWER to every board (outputs drop low). Continue?')) return;
   i2cMsg('Resetting muxes…');
   try {
     const j = await postJSON('/api/mux-reset', {});
+    for (const k of Object.keys(i2cState)) { i2cState[k].diag = null; i2cState[k].read = null; i2cState[k].test = null; }  // stale after reset
     const parts = Object.entries(j.controllers || {}).map(([k, r]) => `P${k}: ${r.ok ? '✓ reset' : (r.error || '✗')}`);
-    i2cMsg('Mux reset — ' + (parts.join(' · ') || 'no controller') + '. Re-scan presence.');
+    i2cMsg('Mux reset — ' + (parts.join(' · ') || 'no controller') + '. Re-scanning…');
+    i2cPresent();
   } catch (e) { i2cMsg('Mux reset failed: ' + e); }
 }
 
@@ -1201,6 +1366,8 @@ function init() {
   geo = new CTGeometry($('ctCanvas'));
   initControllers();
   initPower();
+  initMapping();
+  initTests();
 
   // scan schedule
   scheduleTable = initScheduleTable({
@@ -1224,13 +1391,24 @@ function init() {
   buildMaskBits();
   $('i2cPresentBtn').addEventListener('click', i2cPresent);
   $('i2cDiagnoseBtn').addEventListener('click', i2cDiagnose);
+  $('i2cTcaReadBtn').addEventListener('click', i2cTcaRead);
   $('i2cSelftestBtn').addEventListener('click', i2cSelftest);
   $('i2cMuxResetBtn').addEventListener('click', i2cMuxReset);
+  $('i2cMaskGetBtn').addEventListener('click', i2cPresent);
   $('i2cMaskSetBtn').addEventListener('click', i2cSetMask);
   $('hwDownloadBtn').addEventListener('click', hwDownload);
   $('hwArmBtn').addEventListener('click', hwArm);
   $('hwDisarmBtn').addEventListener('click', hwDisarm);
   $('hwTrigBtn').addEventListener('click', hwTrigger);
+  $('hwPrepStop').addEventListener('click', () => hwPrep(STATE.STOP, 'Stop all'));
+  $('hwPrepSleep').addEventListener('click', () => hwPrep(STATE.SLEEP, 'Sleep all'));
+  $('hwPrepStandby').addEventListener('click', () => hwPrep(STATE.STANDBY, 'Standby all'));
+  $('hwPrepIdle').addEventListener('click', () => hwPrep(STATE.IDLE, 'Idle all', { currents: prepCurrents('idleA') }));
+  $('hwPrepActive').addEventListener('click', () => {
+    const fils = firstBatchFilaments();
+    if (!fils || !fils.length) { hwMsg('No heating plan — build a schedule first.'); return; }
+    hwPrep(STATE.ACTIVE, `Active first batch (${fils.length})`, { filaments: fils, currents: prepCurrents('activeA') });
+  });
   $('schApplyBtn').addEventListener('click', () => {
     const pulses = Math.max(1, parseInt($('schPulses').value, 10) || 1);
     const dur = Math.max(1, parseInt($('schDuration').value, 10) || 1);
