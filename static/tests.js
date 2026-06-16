@@ -50,23 +50,123 @@ const setState = (ctrl, ch, pos, state, arg) =>
   tPostJ('/api/cmd', { controller: ctrl, command: 'CH_SET_POWER_STATE', channel: ch, mux_port: pos, state, arg: arg || 0 });
 const firePulse = (ctrl, ch, pos, widthUs) =>
   tPostJ('/api/cmd', { controller: ctrl, command: 'HV_PULSE', channel: ch, bit: pos, width_us: widthUs });
-const ringStart = () => tPostJ('/api/adc/ring-start', { rate: 1000000 });
-const ringStop = () => tPostJ('/api/adc/ring-stop', {});
+// Per-pulse tests only need the STM32 detector armed (EVT_PULSE over UART), NOT
+// the ESP32 continuous SPI ring read — the ring's 20 MHz read competes with WiFi
+// and drops the link mid-test. pulse-arm arms the STM32 ADC alone.
+const pulseArm = () => tPostJ('/api/adc/pulse-arm', { rate: 1000000 });
+const pulseDisarm = () => tPostJ('/api/adc/pulse-disarm', {});
 const hvEnable = (chan, on) => tPostJ('/api/stm32/hv-enable', { ch: chan, on });
-const hvClear = (chan) => tPostJ('/api/stm32/hv-clear-target', { chan });
 const setEmiLimit = (mA) => tPostJ('/api/stm32/ds3502-set', { ch: 'ei', wiper: emiLimitWiper(mA) });
 const readAds = () => tGetJ('/api/stm32/ads1115');
 
-async function setHvAndWait(chan, magV, timeoutMs = 8000) {
-  await tPostJ('/api/stm32/hv-set-target', { chan, target: voltToCount(chan, magV), tol: 8, max_step: 2 });
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    if (abortFlag) return false;
-    const r = await tGetJ(`/api/stm32/hv-target?chan=${chan}`);
-    if (r && r.ok && (r.at_target || r.hw_limit)) return !r.hw_limit;
-    await tSleep(300);
+// ---- HV setpoint LUT --------------------------------------------------------
+// The firmware closed loop (hv_set_target) walks the DS3502 toward an ADS target
+// and drifts / never settles reliably. Instead we calibrate once: sweep the
+// wiper, read the measured ADS voltage at each step, and store a wiper→V LUT.
+// Setting a voltage then becomes a stable, repeatable direct wiper write — no
+// loop, no drift. The LUT lives on the host (backend /api/hv-lut), keyed by the
+// master controller + channel.
+const HV_V_CH = {
+  emission: { ds: 'ev', ads: 'emiss_v' },
+  focus:    { ds: 'fv', ads: 'focus_v' },
+};
+const lutCache = { emission: null, focus: null };          // {points:[{wiper,v}], max_mag, ts}
+const lutLoad = async (chan) => {
+  const j = await tGetJ(`/api/hv-lut?chan=${chan}`);
+  lutCache[chan] = (j && j.ok && Array.isArray(j.points) && j.points.length >= 2) ? j : null;
+  return lutCache[chan];
+};
+const lutSave = (chan, points, maxMag) => tPostJ('/api/hv-lut/save', { chan, points, max_mag: maxMag });
+// Direct DS3502 wiper write (loop bypassed). One quick retry on the busy-bus 502.
+async function dsWrite(ch, wiper) {
+  let j = await tPostJ('/api/stm32/ds3502-set', { ch, wiper: Math.max(0, Math.min(127, Math.round(wiper))) });
+  if (!j.ok && j.status === 502) { await tSleep(500); j = await tPostJ('/api/stm32/ds3502-set', { ch, wiper: Math.max(0, Math.min(127, Math.round(wiper))) }); }
+  return j;
+}
+// Interpolate a target magnitude (V, positive) → wiper using the cached LUT.
+// Points are (wiper, signed-V); we work in magnitudes which rise with the wiper.
+// Returns {wiper, expectV (signed), clamped}. null if no LUT.
+function lutWiperForV(chan, magV) {
+  const lut = lutCache[chan]; if (!lut) return null;
+  const sign = (lut.points.find((p) => p.v !== 0) || { v: -1 }).v < 0 ? -1 : 1;
+  const pts = lut.points.map((p) => ({ w: p.wiper, m: Math.abs(p.v) }))
+    .sort((a, b) => a.m - b.m);                              // by magnitude, ascending
+  const T = Math.abs(magV);
+  if (T <= pts[0].m) return { wiper: pts[0].w, expectV: sign * pts[0].m, clamped: T < pts[0].m && pts[0].m > 0 };
+  const last = pts[pts.length - 1];
+  if (T >= last.m) return { wiper: last.w, expectV: sign * last.m, clamped: T > last.m };
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    if (T >= a.m && T <= b.m) {
+      const f = (b.m === a.m) ? 0 : (T - a.m) / (b.m - a.m);
+      return { wiper: Math.round(a.w + f * (b.w - a.w)), expectV: sign * T, clamped: false };
+    }
   }
-  return false;
+  return { wiper: last.w, expectV: sign * last.m, clamped: true };
+}
+// Set a channel to a target magnitude via the LUT (loop bypassed). Loads the LUT
+// on demand. Returns {ok, wiper, expectV, clamped} or {ok:false, error}.
+async function lutSetV(chan, magV) {
+  if (!lutCache[chan]) await lutLoad(chan);
+  const hit = lutWiperForV(chan, magV);
+  if (!hit) return { ok: false, error: `no ${chan} LUT — Calibrate first` };
+  const j = await dsWrite(HV_V_CH[chan].ds, hit.wiper);
+  return { ...j, ok: j.ok, wiper: hit.wiper, expectV: hit.expectV, clamped: hit.clamped };
+}
+// Safe teardown: zero the voltage wiper (replaces the old hv-clear-target).
+const lutZeroV = (chan) => dsWrite(HV_V_CH[chan].ds, 0);
+// Read the measured channel voltage (signed V), averaged over a few samples.
+async function lutMeasV(chan, samples = 3) {
+  let sum = 0, n = 0;
+  for (let i = 0; i < samples; i++) {
+    const a = await readAds();
+    const v = a && a.ok ? a[HV_V_CH[chan].ads] : null;
+    if (v != null) { sum += +v; n++; }
+    await tSleep(80);
+  }
+  return n ? sum / n : null;
+}
+// Sweep the wiper in `steps` even increments across 0..127, read the measured
+// voltage at each, and build + save the LUT. Requires HV already enabled on the
+// channel (we refuse to silently energise). onStep(i, total, wiper, v) for UI.
+async function lutCalibrate(chan, opts = {}) {
+  const steps = Math.max(2, opts.steps || 10);
+  const settleMs = opts.settleMs || 700;
+  const onStep = opts.onStep || (() => {});
+  const isAbort = opts.isAbort || (() => false);
+  const st = await tGetJ(`/api/stm32/hv-status`);
+  const on = st && st.ok && (chan === 'focus' ? st.focus_on : st.emission_on);
+  if (!on) return { ok: false, error: `enable ${chan} HV first (sweep won't energise it)` };
+  const wipers = [];
+  for (let i = 0; i <= steps; i++) wipers.push(Math.round((i / steps) * 127));
+  const points = [];
+  try {
+    for (let i = 0; i < wipers.length; i++) {
+      if (isAbort()) return { ok: false, error: 'aborted', points };
+      const w = wipers[i];
+      const dw = await dsWrite(HV_V_CH[chan].ds, w);
+      if (!dw.ok) return { ok: false, error: `wiper ${w} write failed: ${dw.error || dw.status}`, points };
+      await tSleep(settleMs);
+      const v = await lutMeasV(chan);
+      points.push({ wiper: w, v: v == null ? 0 : +v.toFixed(2) });
+      onStep(i + 1, wipers.length, w, v);
+    }
+  } finally {
+    await lutZeroV(chan);                                    // leave it safe
+  }
+  const maxMag = Math.max(...points.map((p) => Math.abs(p.v)));
+  const save = await lutSave(chan, points, +maxMag.toFixed(1));
+  if (save.ok) { lutCache[chan] = { points, max_mag: +maxMag.toFixed(1), ts: save.ts }; }
+  return { ok: save.ok, error: save.error, points, max_mag: +maxMag.toFixed(1) };
+}
+
+// Set a channel via the LUT and let it settle (replaces the closed-loop wait).
+async function setHvAndWait(chan, magV, timeoutMs = 8000) {
+  const r = await lutSetV(chan, magV);
+  if (!r.ok) { tMsg(`HV ${chan} not set: ${r.error || 'no LUT'} — calibrate the ${chan} LUT first.`, 'bad'); return false; }
+  if (r.clamped) tMsg(`⚠ ${chan} −${Math.abs(magV)} V is outside the LUT range — clamped to wiper ${r.wiper}.`, 'bad');
+  await tSleep(Math.min(timeoutMs, 600));                    // direct wiper settles fast
+  return !r.clamped;
 }
 async function pulseCursor() { const j = await tGetJ('/api/pulse-events?since=0'); return (j && j.last_id) || 0; }
 async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
@@ -77,7 +177,18 @@ async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
   if (evs.length) {
     cur.id = (j.last_id != null) ? j.last_id : evs[evs.length - 1].id;
     const e = evs[evs.length - 1];
-    return { peak: e.peak, mA: peakToMa(e.peak) };
+    // Per-pulse summary carries raw ADC counts: peak (highest), plateau (steady
+    // "high"), bg (background/baseline). Convert each to mA on the same scale.
+    // peakToMa is affine, so the offset cancels in (peak − bg) → net = real
+    // emission current with the dark/background level subtracted out.
+    const peakMa = peakToMa(e.peak);
+    const bgMa = (e.bg != null) ? peakToMa(e.bg) : 0;
+    const plateauMa = (e.plateau != null) ? peakToMa(e.plateau) : peakMa;
+    return {
+      peak: e.peak, plateau: e.plateau, bg: e.bg,
+      mA: peakMa, peakMa, plateauMa, bgMa,
+      netMa: peakMa - bgMa,
+    };
   }
   return null;
 }
@@ -87,6 +198,9 @@ let testBusy = false, abortFlag = false;
 const tMsg = (m, cls) => { const e = $t('testStatus'); if (e) { e.textContent = m; e.className = 'summary' + (cls ? ' ' + cls : ''); } };
 function setRunning(on) {
   testBusy = on;
+  // Pause the GUI's background pollers so they don't pile load on the master
+  // ESP32 while a (HV-energising, ring-streaming) test runs.
+  window.ctTestRunning = on;
   document.querySelectorAll('.test-run').forEach((b) => { b.disabled = on; });
   const ab = $t('testAbort'); if (ab) ab.disabled = !on;
 }
@@ -132,24 +246,38 @@ function drawBars(canvasId, items, opt) {
   ctx.fillStyle = '#566069'; ctx.textAlign = 'center';
   for (let f = 0; f <= 95; f += 12) ctx.fillText(String(f), x0 + (f + 0.5) * bw, H - 5);
 }
-// line plot for the live calibration curve (emission mA vs heat A)
+// line plot for a live x/y curve (calibration: Ie vs heat A; impedance: V vs I)
 function drawCurve(canvasId, pts, opt) {
   const c = $t(canvasId); if (!c) return;
   const W = c.width = c.clientWidth || 680, H = c.height = 132, ctx = c.getContext('2d');
   ctx.clearRect(0, 0, W, H); ctx.fillStyle = '#070b0e'; ctx.fillRect(0, 0, W, H);
   const padL = 38, padB = 16, padT = 8, x0 = padL, y0 = H - padB, plotW = W - padL - 6, plotH = H - padB - padT;
-  const xMax = opt.xMax || 2.5, yMax = Math.max(opt.yMin || 10, ...pts.map((p) => p.y)) * 1.15;
+  const xMax = opt.xMax || Math.max(0.001, ...pts.map((p) => p.x)) * 1.05;
+  const yMax = Math.max(0.001, ...pts.map((p) => p.y)) * 1.15;
   ctx.strokeStyle = '#243038'; ctx.beginPath(); ctx.moveTo(x0, padT); ctx.lineTo(x0, y0); ctx.lineTo(W - 4, y0); ctx.stroke();
   ctx.fillStyle = '#8b97a0'; ctx.font = '9px monospace';
-  ctx.textAlign = 'right'; ctx.fillText(yMax.toFixed(0), x0 - 3, padT + 6); ctx.fillText('0', x0 - 3, y0);
-  ctx.textAlign = 'left'; ctx.fillText(opt.yLabel || 'Ie (mA)', x0 + 2, padT + 8);
-  ctx.textAlign = 'center'; ctx.fillText(xMax.toFixed(2) + ' A', W - 18, H - 5);
+  ctx.textAlign = 'right'; ctx.fillText(yMax.toFixed(yMax < 10 ? 2 : 0), x0 - 3, padT + 6); ctx.fillText('0', x0 - 3, y0);
+  ctx.textAlign = 'left'; ctx.fillText(opt.yLabel || '', x0 + 2, padT + 8);
+  ctx.textAlign = 'center'; ctx.fillText(xMax.toFixed(2) + ' ' + (opt.xUnit || 'A'), W - 22, H - 5);
   const X = (x) => x0 + (x / xMax) * plotW, Y = (y) => y0 - (y / yMax) * plotH;
   ctx.strokeStyle = '#3fb6a0'; ctx.lineWidth = 1.4; ctx.beginPath();
   pts.forEach((p, i) => { i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y)); });
   ctx.stroke();
   ctx.fillStyle = '#f2c14e';
   for (const p of pts) { ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), 2.5, 0, 7); ctx.fill(); }
+}
+
+// least-squares fit V = (a·I² + R0)·I  → R0 = cold resistance (Ω). Reused from
+// power.js measureImpedance: basis [I³, I], curve = [{v(volts), i(amps)}].
+function fitR0(curve) {
+  if (!curve || curve.length < 3) return null;
+  let sI6 = 0, sI4 = 0, sI2 = 0, sI3V = 0, sIV = 0;
+  for (const p of curve) { const i = p.i, i2 = i * i, i3 = i2 * i; sI6 += i3 * i3; sI4 += i2 * i2; sI2 += i2; sI3V += i3 * p.v; sIV += i * p.v; }
+  const det = sI6 * sI2 - sI4 * sI4;
+  let a = det ? (sI3V * sI2 - sI4 * sIV) / det : 0;
+  let R0 = det ? (sI6 * sIV - sI4 * sI3V) / det : 0;
+  if (R0 < 0) { R0 = 0; a = sI6 ? sI3V / sI6 : 0; }
+  return R0;
 }
 
 // =========================================================================
@@ -199,7 +327,7 @@ async function test2() {
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
     tMsg(`Emission → −${magV} V @ ${limMa} mA…`);
     await setHvAndWait('emission', magV); await setEmiLimit(limMa); await hvEnable('emission', true);
-    await ringStart(); await tSleep(150);
+    await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
       const f = fils[i], m = fmap[f];
@@ -212,7 +340,7 @@ async function test2() {
     $t('t2Result').innerHTML = shorts.length ? `<b class="bad">${shorts.length} short</b> · ` + shorts.slice(0, 30).join(' · ')
       : `<b class="good">✓ all green</b> — no short on ${fils.length} filaments`;
     tMsg(`Emission short scan done — ${shorts.length ? shorts.length + ' short' : 'all green'}.`, shorts.length ? 'bad' : '');
-  } finally { await hvEnable('emission', false); await hvClear('emission'); await ringStop(); }
+  } finally { await hvEnable('emission', false); await lutZeroV('emission'); await pulseDisarm(); }
 }
 
 // =========================================================================
@@ -225,12 +353,12 @@ async function test3() {
   const items = [], leaks = [], cur = { id: await pulseCursor() }; let maxV = 0;
   try {
     tMsg('Emission OFF, all → SLEEP…');
-    await hvEnable('emission', false); await hvClear('emission');
+    await hvEnable('emission', false); await lutZeroV('emission');
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
     tMsg(`Focus → −${magV} V (emission stays OFF)…`);
     await setHvAndWait('focus', magV); await hvEnable('focus', true);
-    await ringStart(); await tSleep(150);
+    await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
       const f = fils[i], m = fmap[f];
@@ -248,14 +376,16 @@ async function test3() {
     $t('t3Result').innerHTML = leaks.length ? `<b class="bad">${leaks.length} leak</b> · peak Vem ${maxV.toFixed(1)} V · ` + leaks.slice(0, 20).join(' · ')
       : `<b class="good">✓ no leak</b> — emission V/I unaffected (peak Vem ${maxV.toFixed(1)} V)`;
     tMsg(`Focus leak scan done — ${leaks.length ? leaks.length + ' leak' : 'no leak'}.`, leaks.length ? 'bad' : '');
-  } finally { await hvEnable('focus', false); await hvClear('focus'); await ringStop(); }
+  } finally { await hvEnable('focus', false); await lutZeroV('focus'); await pulseDisarm(); }
 }
 
 // =========================================================================
 // 4 — Emission current test (heat each filament, check the range)
 // =========================================================================
 async function test4() {
-  const heatMa = parseInt($t('t4Heat').value, 10) || 2600, emV = Math.abs(parseFloat($t('t4V').value) || 200);
+  // heating current entered in A (scan units); firmware CC target is mA.
+  const heatA = parseFloat($t('t4Heat').value) || 2.6, heatMa = Math.round(heatA * 1000);
+  const emV = Math.abs(parseFloat($t('t4V').value) || 200);
   const settle = Math.max(0, parseInt($t('t4Settle').value, 10) || 1500);
   const widthUs = parseInt($t('t4Width').value, 10) || 1000;
   const nMin = parseFloat($t('t4Min').value) || 2, nMax = parseFloat($t('t4Max').value) || 40;
@@ -264,16 +394,16 @@ async function test4() {
   try {
     tMsg(`Emission → −${emV} V…`);
     await setHvAndWait('emission', emV); await hvEnable('emission', true);
-    await ringStart(); await tSleep(150);
+    await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
       const f = fils[i], m = fmap[f]; cer = m;
-      tMsg(`Emission current test: ${i + 1}/${fils.length} (F${f}) heating ${heatMa} mA…`);
+      tMsg(`Emission current test: ${i + 1}/${fils.length} (F${f}) heating ${heatA} A…`);
       await setState(m.ctrl, m.ch, m.pos, 5, heatMa);     // ACTIVE
       await tSleep(settle);
-      if (abortFlag) { await setState(m.ctrl, m.ch, m.pos, 1, 0); break; }
+      if (abortFlag) { await setState(m.ctrl, m.ch, m.pos, 2, 0); break; }
       const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs), mA = r ? r.mA : 0;
-      await setState(m.ctrl, m.ch, m.pos, 1, 0);          // STOP before next
+      await setState(m.ctrl, m.ch, m.pos, 2, 0);          // STOP before next
       const cls = (mA >= nMin && mA <= nMax) ? 'ok' : (mA < nMin ? 'open' : 'short');
       items.push({ f, value: Math.max(0, mA), cls });
       if (cls !== 'ok') bad.push(`F${f}: ${mA.toFixed(1)} mA`);
@@ -283,8 +413,8 @@ async function test4() {
       : `<b class="good">✓ all in range</b> (${nMin}–${nMax} mA) on ${fils.length} filaments`;
     tMsg(`Emission current test done — ${bad.length ? bad.length + ' out of range' : 'all in range'}.`, bad.length ? 'bad' : '');
   } finally {
-    if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 1, 0);
-    await hvEnable('emission', false); await hvClear('emission'); await ringStop();
+    if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 2, 0);
+    await hvEnable('emission', false); await lutZeroV('emission'); await pulseDisarm();
   }
 }
 
@@ -293,7 +423,7 @@ async function test4() {
 // =========================================================================
 async function test5() {
   const fromA = parseFloat($t('t5From').value) || 1.0, toA = parseFloat($t('t5To').value) || 2.5;
-  const stepA = parseFloat($t('t5Step').value) || 0.25, settle = Math.max(0, parseInt($t('t5Settle').value, 10) || 200);
+  const stepA = Math.max(0.001, parseFloat($t('t5Step').value) || 0.25), settle = Math.max(0, parseInt($t('t5Settle').value, 10) || 200);
   const emV = Math.abs(parseFloat($t('t5V').value) || 200), widthUs = parseInt($t('t5Width').value, 10) || 1000;
   const levels = []; for (let a = fromA; a <= toA + 1e-6; a += stepA) levels.push(+a.toFixed(3));
   const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
@@ -302,7 +432,7 @@ async function test5() {
   try {
     tMsg(`Calibration — emission → −${emV} V (${fils.length} filaments × ${levels.length} levels)…`);
     await setHvAndWait('emission', emV); await hvEnable('emission', true);
-    await ringStart(); await tSleep(150);
+    await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted — saving partial…'); break; }
       const f = fils[i], m = fmap[f]; cer = m; const pts = []; curves[f] = [];
@@ -316,11 +446,11 @@ async function test5() {
         pts.push({ x: a, y: Math.max(0, mA) });
         drawCurve('t5Plot', pts, { xMax: toA, yLabel: `Ie (mA) · F${f}` });
       }
-      await setState(m.ctrl, m.ch, m.pos, 1, 0);   // STOP before the next filament
+      await setState(m.ctrl, m.ch, m.pos, 2, 0);   // STOP before the next filament
     }
   } finally {
-    if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 1, 0);
-    await hvEnable('emission', false); await hvClear('emission'); await ringStop();
+    if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 2, 0);
+    await hvEnable('emission', false); await lutZeroV('emission'); await pulseDisarm();
   }
   // persist whatever we collected (full or partial)
   if (Object.keys(curves).length) {
@@ -332,6 +462,52 @@ async function test5() {
   } else { tMsg('Calibration produced no data.', 'bad'); }
 }
 
+// =========================================================================
+// 6 — Impedance sweep per filament (reuses power.js measureImpedance + fit)
+// =========================================================================
+async function test6() {
+  const startMv = 800;
+  const endMv = Math.round(Math.min(15, Math.max(0.9, parseFloat($t('t6End').value) || 1.5)) * 1000);
+  const stepMv = Math.round(Math.min(2, Math.max(0.02, parseFloat($t('t6Step').value) || 0.1)) * 1000);
+  const dwell = Math.max(100, Math.round((parseFloat($t('t6Dwell').value) || 1.5) * 1000));
+  const shortR = parseFloat($t('t6Short').value) || 0.02;
+  const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
+  const curves = {}, r0s = {}, bars = []; let done = 0;
+  const params = { startMv, endMv, stepMv, dwellMs: dwell };
+  try {
+    for (let i = 0; i < fils.length; i++) {
+      if (abortFlag) { tMsg('Aborted — saving partial…'); break; }
+      const f = fils[i], m = fmap[f]; const pts = []; curves[f] = [];
+      for (let mv = startMv; mv <= endMv && !abortFlag; mv += stepMv) {
+        tMsg(`Impedance: F${f} (${i + 1}/${fils.length}) @ ${mv} mV…`);
+        await setState(m.ctrl, m.ch, m.pos, 6, mv);               // VOLTAGE mode
+        await tSleep(dwell);
+        const r = await tPostJ('/api/cmd', { controller: m.ctrl, command: 'CH_GET_INA219', channel: m.ch, mux_port: m.pos });
+        const d = r && r.response && r.response.decoded;
+        if (d && d.present && d.current_mA > 0) {
+          const v = d.bus_mV / 1000, iA = d.current_mA / 1000;
+          pts.push({ x: iA, y: v }); curves[f].push({ v: +v.toFixed(4), i: +iA.toFixed(4) });
+          drawCurve('t6Curve', pts, { yLabel: `V · F${f}`, xUnit: 'A' });
+        }
+      }
+      await setState(m.ctrl, m.ch, m.pos, 2, 0);                   // STOP before next
+      const R0 = fitR0(curves[f]); r0s[f] = R0; done++;
+      bars.push({ f, value: R0 == null ? Infinity : R0, cls: R0 == null ? 'open' : (R0 < shortR ? 'short' : 'ok') });
+      drawBars('t6Plot', bars, { yLabel: 'R₀ (Ω)', yMax: 0.6, fmt: (v) => v.toFixed(2) });
+    }
+  } finally {
+    for (const f of Object.keys(curves).map(Number)) { const m = fmap[f]; if (m) await setState(m.ctrl, m.ch, m.pos, 2, 0); }
+  }
+  if (done) {
+    const save = await tPostJ('/api/calibration/save', { name: 'impedance_sweep', data: { params, curves, r0: r0s } });
+    const r0vals = Object.values(r0s).filter((x) => x != null);
+    const lo = r0vals.length ? Math.min(...r0vals) : 0, hi = r0vals.length ? Math.max(...r0vals) : 0;
+    $t('t6Result').innerHTML = (save.ok ? `<b class="good">✓ ${done} swept, saved</b>` : `<b class="bad">saved failed</b>`)
+      + ` · R₀ ${lo.toFixed(3)}–${hi.toFixed(3)} Ω` + (save.csv ? `<br>${save.csv}` : '');
+    tMsg(`Impedance sweep done — ${done} filaments ${save.ok ? 'saved to disk' : 'NOT saved'}.`, save.ok ? '' : 'bad');
+  } else { tMsg('Impedance sweep produced no data.', 'bad'); }
+}
+
 // ---- markup (descriptions live in the title tooltip, not on-screen) ---------
 const TESTS_HTML = `
   <div class="seg sm test-seg" id="testSeg">
@@ -340,6 +516,7 @@ const TESTS_HTML = `
     <button class="seg-btn" data-test="3" title="Focus leak scan">Focus</button>
     <button class="seg-btn" data-test="4" title="Emission current test">Emis I</button>
     <button class="seg-btn" data-test="5" title="Emission current calibration">Calib</button>
+    <button class="seg-btn" data-test="6" title="Impedance sweep (per filament)">Imped</button>
   </div>
   <div class="test-block show" id="testBlock1">
     <div class="block-title" title="Drives every filament to STANDBY (0.8 V), settles, then reads each board's INA219 V/I and computes R = V/I. Near-zero R or an OCP trip = short; no current = open.">1 · Filament Resistance <span class="hint">ⓘ</span></div>
@@ -385,7 +562,7 @@ const TESTS_HTML = `
   <div class="test-block" id="testBlock4">
     <div class="block-title" title="Heats each filament (one at a time) to the heat current, sets emission −200 V, fires a 1 ms pulse, and checks the per-pulse emission current is inside the normal window. Out-of-range = low (amber) / high (red).">4 · Emission current test <span class="hint">ⓘ</span></div>
     <div class="test-params">
-      <label class="numlabel">heat mA<input id="t4Heat" type="number" min="0" max="4000" value="2600" /></label>
+      <label class="numlabel">heat A<input id="t4Heat" type="number" min="0" max="4" step="0.05" value="2.6" /></label>
       <label class="numlabel">emis −V<input id="t4V" type="number" min="0" max="350" value="200" /></label>
       <label class="numlabel">settle ms<input id="t4Settle" type="number" min="0" max="10000" value="1500" /></label>
       <label class="numlabel">pulse µs<input id="t4Width" type="number" min="1" max="100000" value="1000" /></label>
@@ -399,7 +576,7 @@ const TESTS_HTML = `
   </div>
 
   <div class="test-block" id="testBlock5">
-    <div class="block-title" title="LONG. Per filament, sweeps the heating current from→to in steps (200 ms settle each), fires a pulse at each level, and records the emission-current curve. Saves all curves to the host disk (JSON + CSV).">5 · Emission current calibration <span class="hint">— slow · saves to disk · ⓘ</span></div>
+    <div class="block-title" title="LONG. Per filament, sweeps the heating current from→to in steps (200 ms settle each), fires a pulse at each level, and records the emission-current curve. Slow. Saves all curves to the host disk (JSON + CSV).">5 · Emission current calibration <span class="hint">ⓘ</span></div>
     <div class="test-params">
       <label class="numlabel">from A<input id="t5From" type="number" min="0" max="4" step="0.05" value="1.0" /></label>
       <label class="numlabel">to A<input id="t5To" type="number" min="0" max="4" step="0.05" value="2.5" /></label>
@@ -414,15 +591,45 @@ const TESTS_HTML = `
     <div id="t5Result" class="summary"></div>
   </div>
 
+  <div class="test-block" id="testBlock6">
+    <div class="block-title" title="Per filament, voltage-mode sweep from 0.8 V to End V (dwell at each step for thermal equilibrium), reads INA219, and least-squares fits V = a·I² + R₀ to get the cold resistance R₀. Reuses the single-board impedance sweep. Slow. Saves V-I curves + R₀ to disk.">6 · Impedance sweep <span class="hint">ⓘ</span></div>
+    <div class="test-params">
+      <label class="numlabel">end V<input id="t6End" type="number" min="0.9" max="15" step="0.1" value="1.5" /></label>
+      <label class="numlabel">step V<input id="t6Step" type="number" min="0.02" max="2" step="0.05" value="0.1" /></label>
+      <label class="numlabel">dwell s<input id="t6Dwell" type="number" min="0.1" max="20" step="0.1" value="1.5" /></label>
+      <label class="numlabel">short Ω<input id="t6Short" type="number" min="0" step="0.01" value="0.02" /></label>
+      <button class="xs quick test-run" id="t6Run">Run</button>
+    </div>
+    <canvas id="t6Curve" class="test-plot" title="Live V-I curve of the filament being swept."></canvas>
+    <canvas id="t6Plot" class="test-plot" title="Fitted cold resistance R₀ per filament."></canvas>
+    <div class="test-legend"><span><i class="sw ok"></i>R₀ ok</span><span><i class="sw short"></i>short</span><span><i class="sw open"></i>no fit</span></div>
+    <div id="t6Result" class="summary"></div>
+  </div>
+
   <div class="row compact test-foot">
     <button class="xs" id="testAbort" disabled title="Stop after the current step and tear down HV (calibration saves the partial set).">Abort</button>
     <span id="testStatus" class="summary"></span>
   </div>`;
 
 function showTest(n) {
-  for (let i = 1; i <= 5; i++) { const b = $t('testBlock' + i); if (b) b.classList.toggle('show', i === n); }
+  for (let i = 1; i <= 6; i++) { const b = $t('testBlock' + i); if (b) b.classList.toggle('show', i === n); }
   document.querySelectorAll('#testSeg .seg-btn').forEach((x) => x.classList.toggle('active', +x.dataset.test === n));
 }
+
+// Reusable primitives for the single-board Cal & Test panel (power.js). Stateless
+// (no shared abort) — the single-board caller runs its own short loops.
+export const calApi = {
+  tSleep, voltToCount, peakToMa, emiLimitWiper, fitR0, drawCurve, drawBars,
+  setState, firePulse, pulseArm, pulseDisarm, hvEnable, setEmiLimit, readAds,
+  pulseCursor, fireAndMeasure, loadFilMap,
+  inaSingle: (ctrl, ch, pos) => tPostJ('/api/cmd', { controller: ctrl, command: 'CH_GET_INA219', channel: ch, mux_port: pos }),
+  // HV setpoint via host LUT (replaces the unstable firmware closed loop).
+  lutLoad, lutSave, lutSetV, lutZeroV, lutCalibrate, lutWiperForV,
+  lutGet: (chan) => lutCache[chan],
+  setHvAndWait,
+  saveCalibration: (name, data) => tPostJ('/api/calibration/save', { name, data }),
+  anyRunning,
+};
 
 export function initTests() {
   const host = $t('testsCard'); if (!host) return;
@@ -435,5 +642,6 @@ export function initTests() {
   $t('t3Run').onclick = () => runTest(test3, true);
   $t('t4Run').onclick = () => runTest(test4, true);
   $t('t5Run').onclick = () => runTest(test5, true);
+  $t('t6Run').onclick = () => runTest(test6, false);   // voltage-mode, no HV
   $t('testAbort').onclick = () => { abortFlag = true; tMsg('Aborting after the current step…'); };
 }

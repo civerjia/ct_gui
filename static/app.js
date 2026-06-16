@@ -43,6 +43,9 @@ const STATE_COLOR = {
 const FAULT_NAME = { 0: 'none', 1: 'open', 2: 'OCP' };
 const V_MAX = 5000;   // mV full-scale for the outward voltage bar
 const I_MAX = 3500;   // mA full-scale for the outward current bar (heating ≤ ~3 A)
+// Scan-schedule UI shows V/A (firmware payloads stay mV/mA). Trim trailing zeros.
+const maToA = (ma) => (ma / 1000).toFixed(3).replace(/\.?0+$/, '') + ' A';
+const mvToV = (mv) => (mv / 1000).toFixed(3).replace(/\.?0+$/, '') + ' V';
 const SHOT_S = 0.0005; // demo dwell per fired filament (s) for mAs integration
 
 // ---- hardware topology ------------------------------------------------------
@@ -272,7 +275,7 @@ function applyScheduleView() {
   if (!scheduleTable) return;
   if (scheduleView === 'heating') {
     scheduleTable.setColumns(['Trigger', 'Filament', '→ State', 'Current'],
-      (r) => [r.seq, r.filament, STATE_NAME[r.state], r.arg + ' mA']);
+      (r) => [r.seq, r.filament, STATE_NAME[r.state], maToA(r.arg)]);
     scheduleTable.setRows(heatRows);
   } else {
     scheduleTable.setColumns(['Seq Idx', 'Filament Idx', '# Pulses', 'Pulse Duration'],
@@ -676,9 +679,10 @@ function highlightState(st) {
 // heating-current (mA) target, VOLTAGE carries a manual mV; others arg=0.
 async function dbgSetState(i, st) {
   const f = filaments[i];
+  // UI is in A / V; the firmware arg is mA (Idle/Active) or mV (Voltage).
   let arg = 0;
-  if (st === STATE.IDLE || st === STATE.ACTIVE) arg = Math.max(0, parseInt($('heatI').value, 10) || 0);
-  else if (st === STATE.VOLTAGE) arg = Math.max(0, parseInt($('heatV').value, 10) || 0);
+  if (st === STATE.IDLE || st === STATE.ACTIVE) arg = Math.round(Math.max(0, parseFloat($('heatI').value) || 0) * 1000);
+  else if (st === STATE.VOLTAGE) arg = Math.round(Math.max(0, parseFloat($('heatV').value) || 0) * 1000);
   f.state = st;
   if (st === STATE.IDLE) f.current_mA = arg || f.idleA * 1000;
   else if (st === STATE.ACTIVE) f.current_mA = arg || f.activeA * 1000;
@@ -687,8 +691,8 @@ async function dbgSetState(i, st) {
   else { f.voltage_mV = 0; f.current_mA = 0; }
   highlightState(st); sync();
   const j = await cmd(i, 'CH_SET_POWER_STATE', { state: st, arg });
-  const unit = st === STATE.VOLTAGE ? ' mV' : (st === STATE.IDLE || st === STATE.ACTIVE) ? ' mA' : '';
-  heatMsg(j.ok ? `${STATE_NAME[st]}${arg ? ' @ ' + arg + unit : ''} set.` : `State: ${j.error}`);
+  const argTxt = st === STATE.VOLTAGE ? mvToV(arg) : (st === STATE.IDLE || st === STATE.ACTIVE) ? maToA(arg) : '';
+  heatMsg(j.ok ? `${STATE_NAME[st]}${arg ? ' @ ' + argTxt : ''} set.` : `State: ${j.error}`);
 }
 // "Set" the CC heating current: re-issue the power state carrying heatI. Keep
 // Idle if already Idle, else apply as Active.
@@ -698,10 +702,10 @@ async function dbgSetI(i) {
 // "Set" the manual voltage: switch the channel to Voltage state with heatV.
 async function dbgSetV(i) { await dbgSetState(i, STATE.VOLTAGE); }
 async function dbgSetOcp(i) {
-  const ma = Math.max(0, parseInt($('heatOcp').value, 10) || 0);
+  const ma = Math.round(Math.max(0, parseFloat($('heatOcp').value) || 0) * 1000);   // A → mA
   filaments[i].ocp = ma;
   const j = await cmd(i, 'CH_SET_TPS_OCP_THRESHOLD', { threshold_mA: ma });
-  heatMsg(j.ok ? `OCP set to ${ma} mA.` : `OCP: ${j.error}`);
+  heatMsg(j.ok ? `OCP set to ${maToA(ma)}.` : `OCP: ${j.error}`);
 }
 // INA219 is polled continuously while the popup is open (quiet = no status line).
 async function dbgReadIna(i, quiet) {
@@ -709,9 +713,9 @@ async function dbgReadIna(i, quiet) {
   const d = j.ok && j.response && j.response.decoded;
   if (d && d.present) {
     filaments[i].current_mA = d.current_mA; filaments[i].voltage_mV = d.bus_mV; sync();
-    $('heatImeas').textContent = `${d.current_mA} mA`;
-    $('heatVmeas').textContent = `${d.bus_mV} mV`;
-    if (!quiet) heatMsg(`INA219: ${d.bus_mV} mV / ${d.current_mA} mA.`);
+    $('heatImeas').textContent = maToA(d.current_mA);
+    $('heatVmeas').textContent = mvToV(d.bus_mV);
+    if (!quiet) heatMsg(`INA219: ${mvToV(d.bus_mV)} / ${maToA(d.current_mA)}.`);
   } else if (d && !d.present) {
     $('heatImeas').textContent = 'absent'; $('heatVmeas').textContent = '—';
     if (!quiet) heatMsg('INA219 not present on this board (no daughter-board?).');
@@ -760,12 +764,13 @@ function showHeatPopup(clientX, clientY, fil) {
   const f = filaments[fil], hw = filamentToHw(fil);
   $('heatFil').textContent = fil;
   $('heatAddr').textContent = hw.label;
-  $('heatI').value = f.current_mA ? Math.round(f.current_mA) : f.activeA * 1000;
-  $('heatV').value = f.voltage_mV > 0 ? Math.round(f.voltage_mV) : 800;
-  $('heatOcp').value = f.ocp;
+  // inputs in A / V (model stays mV/mA)
+  $('heatI').value = +((f.current_mA ? f.current_mA / 1000 : f.activeA)).toFixed(2);
+  $('heatV').value = +((f.voltage_mV > 0 ? f.voltage_mV / 1000 : 0.8)).toFixed(2);
+  $('heatOcp').value = +(f.ocp / 1000).toFixed(2);
   $('heatPw').value = f.durationUs;
-  $('heatImeas').textContent = f.current_mA ? `${f.current_mA.toFixed(0)} mA` : '— mA';
-  $('heatVmeas').textContent = f.voltage_mV ? `${f.voltage_mV.toFixed(0)} mV` : '— mV';
+  $('heatImeas').textContent = f.current_mA ? maToA(f.current_mA) : '— A';
+  $('heatVmeas').textContent = f.voltage_mV ? mvToV(f.voltage_mV) : '— V';
   $('heatStateNow').textContent = `${STATE_NAME[f.state]} · fault —`;
   highlightState(f.state);
   setHvButton(fil, f.dcHv);
@@ -1056,6 +1061,23 @@ async function hwDownload() {
   } catch (e) { hwMsg('Download failed: ' + e); }
 }
 
+// Read the schedule back out of firmware (ShvGetTableInfo 0x74 + ShvHeatGetInfo
+// 0x7E per controller) and compare entry counts to the loaded plan — this is the
+// answer to "did the download actually land in firmware?".
+async function hwVerify() {
+  if (!schedule.length) { hwMsg('No plan loaded to verify against — build & download one first.'); return; }
+  hwMsg('Verifying firmware tables…');
+  try {
+    const j = await postJSON('/api/verify-schedule', { plan: buildPlan() });
+    if (!j.ok && j.error) { hwMsg(`Verify failed: ${j.error}`); return; }
+    const parts = Object.entries(j.results || {}).map(([k, r]) =>
+      r.error ? `P${k}: ${r.error}`
+        : `P${k}: ${r.match ? '✓' : '✗'} emit ${r.emit}/${r.emitExpected} · heat ${r.heat}/${r.heatExpected}`
+          + (r.crc != null ? ` · crc 0x${(r.crc >>> 0).toString(16).toUpperCase()}` : ''));
+    hwMsg(`${j.ok ? '✓ Firmware matches plan' : '✗ Mismatch — re-download'} — ${parts.join(' · ')}`);
+  } catch (e) { hwMsg('Verify failed: ' + e); }
+}
+
 async function hwArm() {
   const repeats = Math.max(1, parseInt($('hwRepeats').value, 10) || 1);
   hwMsg('Arming…');
@@ -1148,21 +1170,27 @@ async function pollRunStatus() {
 // ---- I2C self-test / channel mask / diagnosis (ported from wifi_gui) ---------
 const i2cMsg = (m) => { const e = $('i2cResult'); if (e) e.innerHTML = m; };
 
-// channel enable mask — 8 toggle bits (default 0x3F = first 6 channels)
-let i2cMask = 0x3F;
+// channel enable mask — 8 toggle bits (default 0x3F = first 6 channels).
+// Single source of truth lives on window so the Boards-matrix card mirror
+// (power.js) stays in sync with this I²C-section control.
+if (window.ctChannelMask == null) window.ctChannelMask = 0x3F;
 function buildMaskBits() {
   const el = $('i2cMaskBits'); if (!el) return;
   el.innerHTML = '';
   for (let ch = 0; ch < 8; ch++) {
     const b = document.createElement('button');
-    b.className = 'mask-bit' + ((i2cMask >> ch) & 1 ? ' on' : '');
+    b.className = 'mask-bit' + ((window.ctChannelMask >> ch) & 1 ? ' on' : '');
     b.textContent = ch + 1;
-    b.title = `Channel ${ch + 1} ${(i2cMask >> ch) & 1 ? 'enabled' : 'disabled'}`;
-    b.addEventListener('click', () => { i2cMask ^= (1 << ch); buildMaskBits(); });
+    b.title = `Channel ${ch + 1} ${(window.ctChannelMask >> ch) & 1 ? 'enabled' : 'disabled'}`;
+    b.addEventListener('click', () => { window.ctChannelMask ^= (1 << ch); maskChanged(); });
     el.appendChild(b);
   }
 }
-function reflectMask(mask) { if (mask != null) { i2cMask = mask & 0xFF; buildMaskBits(); } }
+// Re-render this control AND the Boards-matrix mirror (+ its grid grey-out) so
+// a toggle in either place is reflected in both.
+function maskChanged() { buildMaskBits(); if (window.ctRenderBoardMask) window.ctRenderBoardMask(); }
+window.ctMaskChanged = maskChanged;
+function reflectMask(mask) { if (mask != null) { window.ctChannelMask = mask & 0xFF; maskChanged(); } }
 
 // Per-controller diagnostic caches, keyed by controller id (string). Holds the
 // raw present masks, the deep-diagnosis map, the TCA9554 register read, and the
@@ -1344,7 +1372,7 @@ async function i2cSelftest() {
 }
 async function i2cSetMask() {
   try {
-    const j = await postJSON('/api/channel-mask', { mask: i2cMask });
+    const j = await postJSON('/api/channel-mask', { mask: window.ctChannelMask });
     const parts = Object.entries(j.controllers || {}).map(([k, r]) =>
       `P${k}: ${r.ok ? '0x' + (r.mask).toString(16).toUpperCase().padStart(2, '0') : (r.error || '✗')}`);
     i2cMsg('Channel mask set — ' + (parts.join(' · ') || 'no controller') + '.');
@@ -1396,7 +1424,12 @@ function init() {
   $('i2cMuxResetBtn').addEventListener('click', i2cMuxReset);
   $('i2cMaskGetBtn').addEventListener('click', i2cPresent);
   $('i2cMaskSetBtn').addEventListener('click', i2cSetMask);
+  // Let the Boards-matrix card (power.js) reuse the same get (present scan,
+  // which reflects channel_mask back) and set handlers.
+  window.ctI2cGetMask = i2cPresent;
+  window.ctI2cSetMask = i2cSetMask;
   $('hwDownloadBtn').addEventListener('click', hwDownload);
+  $('hwVerifyBtn').addEventListener('click', hwVerify);
   $('hwArmBtn').addEventListener('click', hwArm);
   $('hwDisarmBtn').addEventListener('click', hwDisarm);
   $('hwTrigBtn').addEventListener('click', hwTrigger);

@@ -32,6 +32,7 @@ export function initControllers() {
 
   scanBtn.addEventListener('click', async () => {
     scanBtn.disabled = true;
+    userPinnedMaster = false;   // fresh scan → re-detect the master from STM32 presence
     scanHint.textContent = 'Scanning LAN + 192.168.4.0/24 …';
     try {
       const { results } = await api('/api/scan');
@@ -67,6 +68,10 @@ export function initControllers() {
   });
 
   let master = 1;
+  // The master carries the STM32 — auto-detected from which connected bridge sees
+  // an STM32 (c.stm32.ever_seen). Clicking a master badge PINS a manual choice so
+  // auto-detect stops overriding it (until the next scan).
+  let userPinnedMaster = false;
   for (const card of cards) {
     const cid = parseInt(card.dataset.ctrl, 10);
     const btn = card.querySelector('[data-connect]');
@@ -88,16 +93,32 @@ export function initControllers() {
     // master badge — pick which bridge carries the STM32 (all STM32/ADC commands route there)
     const mb = card.querySelector('[data-master]');
     if (mb) mb.addEventListener('click', async () => {
+      userPinnedMaster = true;               // manual override — stop auto-detect
       const res = await post('/api/master', { controller: cid });
       if (res && res.master) master = res.master;
       refresh();
     });
   }
 
+  // Auto-pick the master from STM32 presence: if exactly ONE connected bridge sees
+  // an STM32, make it master. If both or neither do, leave the current choice for
+  // the user. Never overrides a manual pin.
+  async function autoDetectMaster(st) {
+    if (userPinnedMaster) return;
+    const withStm = cards
+      .map((c) => parseInt(c.dataset.ctrl, 10))
+      .filter((cid) => { const c = st.controllers[String(cid)]; return c && c.connected && c.stm32 && c.stm32.ever_seen; });
+    if (withStm.length === 1 && withStm[0] !== master) {
+      const res = await post('/api/master', { controller: withStm[0] });
+      if (res && res.master) master = res.master;
+    }
+  }
+
   async function refresh() {
     let st;
     try { st = await api('/api/status'); } catch { return; }
     if (st.master) master = st.master;
+    await autoDetectMaster(st);
     for (const card of cards) {
       const cid = parseInt(card.dataset.ctrl, 10);
       const c = st.controllers[card.dataset.ctrl];
@@ -123,16 +144,19 @@ export function initControllers() {
 
       const rp = card.querySelector('[data-hb="rp"]');
       const stm = card.querySelector('[data-hb="stm"]');
-      // Only the master has an STM32 — dim the STM32 badge on the non-master.
-      const isMaster = cid === master;
-      stm.classList.toggle('na', !isMaster);
-      stm.title = isMaster ? 'STM32 heartbeat (HTTP /stm32 age)' : 'No STM32 on this controller (not master)';
+      // STM32 badge reflects ACTUAL presence on THIS bridge (c.stm32.ever_seen) —
+      // that's what picks the master. A bridge with no STM32 shows a dim/idle badge.
+      const hasStm = c.connected && c.stm32 && c.stm32.ever_seen;
+      stm.classList.remove('na');
+      stm.title = hasStm
+        ? 'STM32 detected on this bridge (HTTP /stm32 age)' + (cid === master ? ' — master' : '')
+        : 'No STM32 seen on this bridge';
       if (!c.connected) {
         rp.className = 'hb idle';
-        stm.className = 'hb idle' + (isMaster ? '' : ' na');
+        stm.className = 'hb idle';
       } else {
         rp.className = 'hb ' + hbClass(c.rp2350.age_ms, c.rp2350.age_ms != null);
-        stm.className = 'hb ' + (isMaster ? hbClass(c.stm32.age_ms, c.stm32.ever_seen) : 'na');
+        stm.className = 'hb ' + hbClass(c.stm32.age_ms, c.stm32.ever_seen);
       }
     }
     window.ctMaster = master;   // expose for power.js STM32/ADC routing

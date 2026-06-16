@@ -48,8 +48,11 @@ from net_protocol import (  # noqa: E402
     adc_ring_tap_stop,
     adc_ring_window,
     adc_ring_window_data,
+    adc_pulse_arm,
+    adc_pulse_disarm,
     primary_local_ip,
     AdcUdpListener,
+    EspCmdClient,
     pulse_events_get,
     stm32_ds3502_get,
     stm32_ds3502_set,
@@ -254,6 +257,7 @@ SHV_GET_PULSE_LOG = 0x7A
 SHV_CAPABILITY = 0x7B
 SHV_HEAT_CLEAR = 0x7C
 SHV_HEAT_SET_ENTRIES = 0x7D
+SHV_HEAT_GET_INFO = 0x7E      # -> OK + u16 heatCount + u16 maxHeatEntries
 CH_FILAMENT_CURRENTS = 0x39
 CH_SET_POWER_STATE = 0x35        # ch,mux,state,arg16 (Idle/Active→mA, Voltage→mV)
 CH_SET_I2C_ENABLE_MASK = 0x34
@@ -573,6 +577,11 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
         if raw and raw[0] == 0 and len(raw) >= 7:
             return {"ok": True, "entryCount": _le(raw, 1, 2), "crc": _le(raw, 3, 4)}
         return {"ok": False}
+    if op == "heat_info":
+        raw = link.request(SHV_HEAT_GET_INFO, b"").get("raw") or []
+        if raw and raw[0] == 0 and len(raw) >= 5:
+            return {"ok": True, "heatCount": _le(raw, 1, 2), "maxHeatEntries": _le(raw, 3, 2)}
+        return {"ok": False}
     if op == "set_config":
         payload = (_u32(int(body.get("interPulseMs", 3000))) + _u16(int(body.get("maxOnMs", 40)))
                    + _u32(int(body.get("totalMs", 60000))) + bytes([int(body.get("triggerEdge", 0)) & 0xFF]))
@@ -650,6 +659,14 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CALIB_DIR = Path(__file__).resolve().parent / "calibration"   # emission-current calibration records
+
+
+def _hv_lut_path(chan: str) -> Path:
+    """Stable per-master, per-channel HV wiper→voltage LUT file. The HV/DS3502
+    board lives on the MASTER controller, so the LUT is keyed by master id +
+    channel; changing the master selects a different LUT."""
+    ch = "focus" if str(chan).startswith("f") else "emission"
+    return CALIB_DIR / f"hv_lut_p{MASTER}_{ch}.json"
 PING_TYPE = 0x01
 PING_PAYLOAD = (0xCAFEF00D).to_bytes(4, "little")
 
@@ -842,16 +859,17 @@ class MeasurementRecorder:
     def _pulse_loop(self, host: str) -> None:
         try:
             with open(self.pulse_path, "w") as f:
-                f.write("id,t_us,on_us,peak,bg,bg_sigma4,integral,recv_ms\n")
+                f.write("id,t_us,on_us,peak,plateau,bg,bg_sigma4,integral,recv_ms\n")
                 since = 0
                 while not self._pulse_stop.is_set():
                     r = pulse_events_get(host, since)
                     if r.get("ok"):
                         evs = r.get("events") or []
                         for e in evs:
-                            f.write("{id},{t_us},{on_us},{peak},{bg},{bg_sigma4},{integral},{recv_ms}\n".format(
+                            f.write("{id},{t_us},{on_us},{peak},{plateau},{bg},{bg_sigma4},{integral},{recv_ms}\n".format(
                                 id=e.get("id", ""), t_us=e.get("t_us", ""), on_us=e.get("on_us", ""),
-                                peak=e.get("peak", ""), bg=e.get("bg", ""), bg_sigma4=e.get("bg_sigma4", ""),
+                                peak=e.get("peak", ""), plateau=e.get("plateau", ""), bg=e.get("bg", ""),
+                                bg_sigma4=e.get("bg_sigma4", ""),
                                 integral=e.get("integral", ""), recv_ms=e.get("recv_ms", "")))
                             since = e.get("id", since)
                             self.pulse_count += 1
@@ -897,6 +915,10 @@ class MeasurementRecorder:
 
 
 RECORDER = MeasurementRecorder()
+
+# ESP32 framed-protocol client (TCP 3334) for the Mode-2 fire-correlated
+# per-pulse source: RING_PULSE_ARM/DISARM + pushed RING_PULSE_EVENT frames.
+ESPCMD = EspCmdClient()
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1187,9 @@ class CtHandler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": err})
             else:
                 self._json(pulse_events_get(host, int(self._query().get("since", "0"))))
+        elif path == "/api/ringpulse/events":
+            since = int(self._query().get("since", "0"))
+            self._json({"ok": True, "events": ESPCMD.events_since(since), **ESPCMD.status()})
         elif path == "/api/record/status":
             self._json({"ok": True, **RECORDER.status()})
         elif path == "/api/record/download":
@@ -1197,6 +1222,19 @@ class CtHandler(BaseHTTPRequestHandler):
         elif path == "/api/stm32/hv-target":
             host, err = self._master_host()
             self._json({"ok": False, "error": err} if err else stm32_hv_get_target(host, self._query().get("chan", "emission")))
+        elif path == "/api/hv-lut":
+            # Host-side HV setpoint LUT: wiper→measured-V samples from a Calibrate
+            # sweep. Read by the GUI to map a target voltage to a DS3502 wiper
+            # (replaces the unstable firmware closed loop). 404-as-ok={ok:false}.
+            chan = self._query().get("chan", "emission")
+            fp = _hv_lut_path(chan)
+            if fp.is_file():
+                try:
+                    self._json({"ok": True, **json.loads(fp.read_text())})
+                except (ValueError, OSError) as exc:
+                    self._json({"ok": False, "error": f"LUT read failed: {exc}"})
+            else:
+                self._json({"ok": False, "error": "no LUT — calibrate first"})
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
@@ -1309,6 +1347,35 @@ class CtHandler(BaseHTTPRequestHandler):
                 if not results:
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 self._json({"ok": all(r.get("ok") for r in results), "results": results})
+            elif path == "/api/verify-schedule":
+                # Read the emission/heat tables back out of each controller and
+                # compare counts to the loaded plan — confirms the download landed.
+                plan = body.get("plan") or {}
+                emit_expected = len(plan.get("emission") or [])
+                results = {}
+                for cid, link in CONTROLLERS.items():
+                    if not link.client.connected:
+                        continue
+                    try:
+                        controller = cid - 1
+                        ti = link.request(SHV_GET_TABLE_INFO, b"", flags=0).get("raw") or []
+                        hi = link.request(SHV_HEAT_GET_INFO, b"", flags=0).get("raw") or []
+                        emit = _le(ti, 1, 2) if ti and ti[0] == 0 and len(ti) >= 7 else None
+                        crc = _le(ti, 3, 4) if ti and ti[0] == 0 and len(ti) >= 7 else None
+                        heat = _le(hi, 1, 2) if hi and hi[0] == 0 and len(hi) >= 5 else None
+                        heat_expected = sum(1 for h in (plan.get("heating") or [])
+                                            if filament_to_board(int(h["filament"]))[0] == controller)
+                        results[str(cid)] = {
+                            "ok": emit is not None and heat is not None,
+                            "emit": emit, "crc": crc, "heat": heat,
+                            "emitExpected": emit_expected, "heatExpected": heat_expected,
+                            "match": emit == emit_expected and heat == heat_expected,
+                        }
+                    except Exception as exc:
+                        results[str(cid)] = {"ok": False, "error": str(exc)}
+                if not results:
+                    return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
+                self._json({"ok": all(r.get("match") for r in results.values()), "results": results})
             elif path == "/api/arm":
                 repeats = int(body.get("repeats", 1))
                 payload = _u16(max(1, repeats))
@@ -1371,10 +1438,17 @@ class CtHandler(BaseHTTPRequestHandler):
                 ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
                 base = CALIB_DIR / f"{name}_{ts}"
                 base.with_suffix(".json").write_text(json.dumps(data, indent=2))
-                lines = ["filament,heat_a,emission_ma,peak_adc"]
-                for fil, curve in sorted((data.get("curves") or {}).items(), key=lambda kv: int(kv[0])):
+                curves = data.get("curves") or {}
+                cols: list[str] = []        # union of point fields, in first-seen order
+                for curve in curves.values():
                     for pt in curve:
-                        lines.append(f"{fil},{pt.get('heatA')},{pt.get('mA')},{pt.get('peak', '')}")
+                        for k in pt:
+                            if k not in cols:
+                                cols.append(k)
+                lines = ["filament" + ("," + ",".join(cols) if cols else "")]
+                for fil, curve in sorted(curves.items(), key=lambda kv: int(kv[0])):
+                    for pt in curve:
+                        lines.append(str(fil) + "".join("," + str(pt.get(k, "")) for k in cols))
                 base.with_suffix(".csv").write_text("\n".join(lines) + "\n")
                 self._json({"ok": True, "json": str(base.with_suffix(".json")),
                             "csv": str(base.with_suffix(".csv")), "filaments": len(data.get("curves") or {})})
@@ -1504,6 +1578,16 @@ class CtHandler(BaseHTTPRequestHandler):
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(adc_ring_stop(host))
+            elif path == "/api/adc/pulse-arm":
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                self._json(adc_pulse_arm(host, int(body.get("rate", 1000000))))
+            elif path == "/api/adc/pulse-disarm":
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                self._json(adc_pulse_disarm(host))
             elif path == "/api/adc/ring-window":
                 # Continuous → trigger → retrieve: arm a trigger-aligned window
                 # on the running ring (optionally firing SyncOut), download it,
@@ -1513,8 +1597,11 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 pre = max(0, int(body.get("pre", 256)))
                 post = max(1, int(body.get("post", 2048)))
-                fire = bool(body.get("fire", True))
-                w = adc_ring_window(host, pre, post, fire, int(body.get("timeout_ms", 1000)))
+                src = str(body.get("src", "fire"))   # fire (ESP32 GP37) | gp40 (external) | now
+                # gp40 blocks for an external edge, so give it (and the HTTP call) longer.
+                tmo_ms = int(body.get("timeout_ms", 5000 if src == "gp40" else 1000))
+                w = adc_ring_window(host, pre, post, src, tmo_ms,
+                                    timeout=max(6.0, tmo_ms / 1000 + 3.0))
                 if not w.get("ok"):
                     return self._json({"ok": False, "error": w.get("error", "window failed")}, HTTPStatus.OK)
                 data = adc_ring_window_data(host)
@@ -1526,7 +1613,24 @@ class CtHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "samples": samples, "n": len(samples),
                             "pre": int(hdr.get("x-win-pre", w.get("pre", 0)) or 0),
                             "rate_hz": int(hdr.get("x-win-rate-hz", w.get("rate_hz", 0)) or 0),
+                            "seq": int(hdr.get("x-win-seq", 0) or 0),
                             "trigger_us": int(w.get("trigger_us", 0) or 0)})
+            elif path == "/api/ringpulse/arm":
+                # Mode-2 fire-correlated per-pulse: ensure the ring runs, connect
+                # the framed esp_cmd client (3334), then RING_PULSE_ARM.
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                rs = adc_ring_start(host, max(1, int(body.get("rate", 1000000))))
+                if not rs.get("ok"):
+                    return self._json({"ok": False, "error": f"ring: {rs.get('error') or rs.get('message')}"}, HTTPStatus.OK)
+                if not ESPCMD.connect(host):
+                    return self._json({"ok": False, "error": f"esp_cmd 3334: {ESPCMD.status().get('error')}"}, HTTPStatus.OK)
+                r = ESPCMD.arm(int(body.get("pre", 256)), int(body.get("post", 2048)),
+                               int(body.get("thresh", 100)), int(body.get("report", 1)))
+                self._json(r if r.get("ok") else {"ok": False, "error": f"arm status {r.get('status')}"})
+            elif path == "/api/ringpulse/disarm":
+                self._json(ESPCMD.disarm())
             elif path == "/api/record/start":
                 host, err = self._master_host()
                 if err:
@@ -1558,6 +1662,25 @@ class CtHandler(BaseHTTPRequestHandler):
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(stm32_hv_clear_target(host, str(body.get("chan", "emission"))))
+            elif path == "/api/hv-lut/save":
+                # Persist a HV setpoint LUT (wiper→measured-V) from a Calibrate
+                # sweep. body: {chan, points:[{wiper,v}], max_mag}. Writes a stable
+                # file (load reads this) plus a dated archive copy.
+                chan = "focus" if str(body.get("chan", "")).startswith("f") else "emission"
+                pts = body.get("points") or []
+                points = [{"wiper": int(p.get("wiper", 0)), "v": float(p.get("v", 0))}
+                          for p in pts if isinstance(p, dict)]
+                if len(points) < 2:
+                    return self._json({"ok": False, "error": "need >=2 LUT points"}, HTTPStatus.OK)
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                rec = {"chan": chan, "master": MASTER, "ts": ts, "points": points,
+                       "max_mag": float(body.get("max_mag", 0)) or round(max(abs(p["v"]) for p in points), 1)}
+                CALIB_DIR.mkdir(exist_ok=True)
+                fp = _hv_lut_path(chan)
+                fp.write_text(json.dumps(rec, indent=2))
+                stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                (CALIB_DIR / f"hv_lut_p{MASTER}_{chan}_{stamp}.json").write_text(json.dumps(rec, indent=2))
+                self._json({"ok": True, "path": str(fp), **rec})
             elif path in ("/api/sync/config", "/api/sync/fire", "/api/sync/abort"):
                 link = CONTROLLERS.get(int(body.get("controller", 0)))
                 if not link or not link.host:

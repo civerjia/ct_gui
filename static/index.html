@@ -265,7 +265,7 @@
                 <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)"></span>
                 <span class="pc-badges">
                   <span class="hb idle" data-hb="rp" title="RP2350B controller heartbeat (PING on :3333)">RP2350&nbsp;♥</span>
-                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age) — only the master has an STM32">STM32&nbsp;♥</span>
+                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age) — the bridge that sees an STM32 becomes master">STM32&nbsp;♥</span>
                 </span>
               </div>
               <div class="pc-row">
@@ -282,7 +282,7 @@
                 <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)"></span>
                 <span class="pc-badges">
                   <span class="hb idle" data-hb="rp" title="RP2350B controller heartbeat (PING on :3333)">RP2350&nbsp;♥</span>
-                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age) — only the master has an STM32">STM32&nbsp;♥</span>
+                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age) — the bridge that sees an STM32 becomes master">STM32&nbsp;♥</span>
                 </span>
               </div>
               <div class="pc-row">
@@ -291,7 +291,7 @@
               </div>
             </div>
 
-            <p class="hint compact-hint">The <b>master</b> badge picks which bridge owns the STM32 (HV/ADC). Filament→power mapping is set in the Mapping card.</p>
+            <p class="hint compact-hint">The bridge that sees an <b>STM32</b> is auto-selected <b>master</b> (owns HV/ADC). Click a <b>master</b> badge to override. Filament→power mapping is in the Mapping card.</p>
           </section>
 
           <!-- Hardware run — own card: download · arm · trigger · scan prep -->
@@ -299,35 +299,87 @@
             <div class="section-head">
               <h2>Hardware Run <span class="hint">— download · arm · trigger · prep</span></h2>
             </div>
-            <p class="hint compact-hint">Runs the bound schedule on the connected controllers. Order: Download → prep ladder → Arm → trigger.</p>
+            <p class="hint compact-hint">Runs the bound schedule on the connected controllers — work top to bottom.</p>
 
-            <div class="row compact hw-actions">
-              <button id="hwDownloadBtn" class="sm quick" title="Translate the logical 0–95 schedule into per-controller frames and download the emission table, heating deltas, and per-filament idle/active currents to every connected controller.">Download</button>
-              <label class="numlabel" title="Loop the one-rotation schedule this many times when armed (1 = a single rotation).">repeats <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
-              <button id="hwArmBtn" class="sm" title="Arm both controllers (ShvArm). Participants drop to IDLE and the controllers wait for the SyncIn trigger to start firing.">Arm</button>
-              <button id="hwDisarmBtn" class="sm" title="Disarm / stop the run (ShvDisarm). Aborts firing and returns participating filaments to IDLE.">Disarm</button>
+            <div class="hw-step">
+              <div class="hw-step-label"><span class="hw-step-n">1</span> Download &amp; verify</div>
+              <div class="hw-step-body">
+                <button id="hwDownloadBtn" class="sm quick" title="Translate the logical 0–95 schedule into per-controller frames and download the emission table, heating deltas, and per-filament idle/active currents to every connected controller.">Download</button>
+                <button id="hwVerifyBtn" class="sm" title="Read the entry counts + table CRC back from each controller (ShvGetTableInfo 0x74 / ShvHeatGetInfo 0x7E) and compare to the loaded plan. This is how you confirm the schedule actually reached firmware.">Verify in firmware</button>
+              </div>
             </div>
-            <div class="row compact hw-actions">
-              <label class="numlabel" title="Bench test: how many SyncIn pulses to emit from the ESP32 (/sync/fire). Use only when the ESP32 drives SyncIn; for an external trigger source leave SyncIn hi-Z.">test trig <input id="hwTrigCount" type="number" min="1" max="100000" value="1" /></label>
-              <button id="hwTrigBtn" class="sm" title="Fire N SyncIn pulses now from the ESP32 (bench trigger). Each pulse advances the armed schedule by one step.">Fire SyncIn</button>
+
+            <div class="hw-step">
+              <div class="hw-step-label"><span class="hw-step-n">2</span> Pre-heat
+                <span class="hint" title="CT-scan prep ladder — applied to ALL filaments on BOTH connected controllers. Click left→right to warm up before arming. Refused while a schedule is running.">(prep ladder)</span></div>
+              <div class="hw-step-body">
+                <button id="hwPrepStop" class="sm" title="All filaments → STOP. TPS output disabled (off). The fully cold rest state.">Stop all</button>
+                <button id="hwPrepSleep" class="sm" title="All filaments → SLEEP. Low-power rest state, output off.">Sleep all</button>
+                <button id="hwPrepStandby" class="sm" title="All filaments → STANDBY. Output held at the 0.8 V minimum for presence/short detection — not yet heating to current.">Standby all</button>
+                <button id="hwPrepIdle" class="sm" title="All filaments → IDLE. Closed-loop heating at each filament's configured idle current (the schedule's warm-pool resting state).">Idle all</button>
+                <button id="hwPrepActive" class="sm" title="Pre-heat the first batch → ACTIVE at each filament's active current. The batch = the heating plan's cold-start band (collimator window + pre-heat lead + hold, ≈ # active) that must already be hot when the first trigger fires. Build a schedule first.">Active first batch</button>
+              </div>
             </div>
-            <div class="row compact hw-actions hw-prep">
-              <span class="hint" title="CT-scan prep ladder — applied to ALL filaments on BOTH connected controllers. Click left→right to warm up before arming. Refused while a schedule is running.">prep ↓</span>
-              <button id="hwPrepStop" class="sm" title="All filaments → STOP. TPS output disabled (off). The fully cold rest state.">Stop all</button>
-              <button id="hwPrepSleep" class="sm" title="All filaments → SLEEP. Low-power rest state, output off.">Sleep all</button>
-              <button id="hwPrepStandby" class="sm" title="All filaments → STANDBY. Output held at the 0.8 V minimum for presence/short detection — not yet heating to current.">Standby all</button>
-              <button id="hwPrepIdle" class="sm" title="All filaments → IDLE. Closed-loop heating at each filament's configured idle current (the schedule's warm-pool resting state).">Idle all</button>
-              <button id="hwPrepActive" class="sm quick" title="Pre-heat the first batch → ACTIVE at each filament's active current. The batch = the heating plan's cold-start band (collimator window + pre-heat lead + hold, ≈ # active) that must already be hot when the first trigger fires. Build a schedule first.">Active first batch</button>
+
+            <div class="hw-step">
+              <div class="hw-step-label"><span class="hw-step-n">3</span> Arm</div>
+              <div class="hw-step-body">
+                <label class="numlabel" title="Loop the one-rotation schedule this many times when armed (1 = a single rotation).">repeats <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
+                <button id="hwArmBtn" class="sm quick" title="Arm both controllers (ShvArm). Participants drop to IDLE and the controllers wait for the SyncIn trigger to start firing.">Arm</button>
+                <button id="hwDisarmBtn" class="sm" title="Disarm / stop the run (ShvDisarm). Aborts firing and returns participating filaments to IDLE.">Disarm</button>
+              </div>
             </div>
+
+            <div class="hw-step">
+              <div class="hw-step-label"><span class="hw-step-n">4</span> Start scan
+                <span class="hint" title="Once armed, the scan begins on the SyncIn trigger. Use Fire SyncIn for a bench trigger, or leave SyncIn hi-Z for an external trigger source.">(trigger)</span></div>
+              <div class="hw-step-body">
+                <label class="numlabel" title="Bench test: how many SyncIn pulses to emit from the ESP32 (/sync/fire). Use only when the ESP32 drives SyncIn; for an external trigger source leave SyncIn hi-Z.">pulses <input id="hwTrigCount" type="number" min="1" max="100000" value="1" /></label>
+                <button id="hwTrigBtn" class="sm quick" title="Fire N SyncIn pulses now from the ESP32 (bench trigger). Each pulse advances the armed schedule by one step.">Fire SyncIn</button>
+              </div>
+            </div>
+
             <div id="hwRunStatus" class="hw-status hint"></div>
           </section>
 
+          <!-- HV control + monitor (mirror of the Direct Power Control HV card —
+               same master STM32; handy during a hardware run without scrolling) -->
+          <details class="card module hv-mirror-card foldable" data-module="hvmirror" open>
+            <summary class="section-head foldable-summary">
+              <h2>HV Control &amp; Monitor <span class="hint">— master STM32 · LUT −V</span></h2>
+            </summary>
+            <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper (no closed loop). Cal sweeps the wiper to (re)build the LUT — enable Emission HV first.">
+              <label class="numlabel"><span class="cap">Emission −V</span><input id="emVset2" type="number" min="0" max="350" value="0" /></label>
+              <span id="emVmeas2" class="pot-est">—</span>
+              <button id="emVsetBtn2" class="xs">Set V</button>
+              <button id="emVcalBtn2" class="xs">Cal</button>
+            </div>
+            <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper (no closed loop). Cal sweeps the wiper to (re)build the LUT — enable Focus HV first.">
+              <label class="numlabel"><span class="cap">Focus −V</span><input id="focVset2" type="number" min="0" max="495" value="0" /></label>
+              <span id="focVmeas2" class="pot-est">—</span>
+              <button id="focVsetBtn2" class="xs">Set V</button>
+              <button id="focVcalBtn2" class="xs">Cal</button>
+            </div>
+            <div class="hv-row">
+              <button id="hvEnEm2" class="xs hv-en off">Emission ?</button>
+              <button id="hvEnFoc2" class="xs hv-en off">Focus ?</button>
+            </div>
+            <div class="detail-top">
+              <div class="metric"><span class="metric-label">Emission V</span><span id="adsEmV2" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Focus V</span><span id="adsFocus2" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Emission I</span><span id="adsEmI2" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Emission HV</span><span id="hvEmStatus2" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Focus HV</span><span id="hvFocStatus2" class="metric-value">—</span></div>
+            </div>
+            <div id="dsStatus2" class="summary"></div>
+          </details>
+
           <!-- Filament → power mapping (host active-list, editable) -->
-          <section class="card module map-card" data-module="mapping">
-            <div class="section-head">
+          <details class="card module map-card foldable" data-module="mapping" open>
+            <summary class="section-head foldable-summary">
               <h2>Filament → Power <span class="hint">— active-list mapping</span></h2>
               <span id="mapCounts" class="summary"></span>
-            </div>
+            </summary>
             <p class="hint compact-hint">Each filament is driven by one controller (a power slot = channel·position; downloaded as the 64-byte active list). Default = alternating groups. Click a cell to reassign: P1 → P2 → unassigned.</p>
             <div class="row compact map-actions">
               <label class="numlabel" title="Alternating-group size: filaments 0..g-1 → P1, g..2g-1 → P2, repeating across all 96.">group <input id="mapGroup" type="number" min="1" max="96" value="12" /></label>
@@ -341,7 +393,7 @@
             </div>
             <div id="mapGrid" class="map-grid"></div>
             <div id="mapStatus" class="summary"></div>
-          </section>
+          </details>
 
         </aside>
       </section>
@@ -421,7 +473,7 @@
       </div>
 
       <div class="heat-sec">Power state <span class="hint" id="heatStateNow">— · fault —</span></div>
-      <div class="seg6" id="heatStateSeg" title="Idle/Active drive the closed-loop heating current (mA). Voltage drives a manual mV. Stop/Sleep/Standby idle the channel.">
+      <div class="seg6" id="heatStateSeg" title="Idle/Active drive the closed-loop heating current (A). Voltage drives a manual V. Stop/Sleep/Standby idle the channel.">
         <button data-state="1">Stop</button>
         <button data-state="2">Sleep</button>
         <button data-state="3">Standby</button>
@@ -432,22 +484,22 @@
 
       <div class="heat-field" id="heatIField" title="Closed-loop CC heating-current target — applied in Idle / Active states.">
         <label>Heating I</label>
-        <span class="u"><input id="heatI" type="number" min="0" max="6000" step="50" value="1000" />mA</span>
+        <span class="u"><input id="heatI" type="number" min="0" max="6" step="0.05" value="1" />A</span>
         <button id="heatSetI" class="sm">Set</button>
       </div>
       <div class="heat-field" id="heatVField" title="Manual filament voltage — switches the channel to Voltage state.">
         <label>Heating V</label>
-        <span class="u"><input id="heatV" type="number" min="800" max="15000" step="50" value="800" />mV</span>
+        <span class="u"><input id="heatV" type="number" min="0.8" max="15" step="0.05" value="0.8" />V</span>
         <button id="heatSetV" class="sm">Set</button>
       </div>
       <div class="heat-field" title="Over-current protection threshold (TPS55289 OCP).">
         <label>OCP</label>
-        <span class="u"><input id="heatOcp" type="number" min="0" max="6000" step="50" value="4000" />mA</span>
+        <span class="u"><input id="heatOcp" type="number" min="0" max="6" step="0.05" value="4" />A</span>
         <button id="heatSetOcp" class="sm">Set</button>
       </div>
 
       <div class="heat-sec">Measured (INA219) <span class="hint">live</span></div>
-      <div class="heat-meas"><b id="heatImeas">— mA</b> · <b id="heatVmeas">— mV</b></div>
+      <div class="heat-meas"><b id="heatImeas">— A</b> · <b id="heatVmeas">— V</b></div>
 
       <div class="heat-sec">HV emission</div>
       <div class="heat-field">
