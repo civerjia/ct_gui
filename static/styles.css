@@ -218,6 +218,12 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 /* channel masked off in the enable mask — dimmed + non-interactive */
 .status-tile.masked { opacity: 0.3; cursor: not-allowed; filter: grayscale(0.85); }
 .status-tile.selected { outline: 2px solid var(--accent); }
+/* HV switch-verify test result marker (Sel test) */
+.status-tile.test-fail { outline: 2px solid #c0392b; }
+.hv-test { font-family: var(--mono); font-weight: 700; }
+.status-tile .hv-test { position: absolute; bottom: 1px; right: 2px; font-size: 9px; }
+.hv-test.pass { color: #2c7a6b; }
+.hv-test.fail { color: #c0392b; }
 .status-tile.active { box-shadow: 0 0 0 2px #ff9a3d; }
 .tile-title { font-family: var(--mono); font-size: 8px; color: var(--muted); align-self: flex-start; padding-right: 16px; }
 .tile-dots { display: flex; gap: 1px; }
@@ -310,6 +316,7 @@ button.off { background: #efece5; color: var(--muted); }
 
 .i2c-mask { gap: 6px; align-items: center; margin-top: 6px; }
 .i2c-mask-bits { display: inline-flex; gap: 3px; }
+.mask-btn { min-width: 38px; text-align: center; }
 .mask-bit { font-family: var(--mono); font-size: 10px; width: 20px; height: 20px; padding: 0; border-radius: 4px; border: 1px solid var(--line); background: #f3f0ea; color: var(--muted); cursor: pointer; }
 .mask-bit.on { background: rgba(63,182,160,0.2); border-color: rgba(63,182,160,0.6); color: #2c7a6b; font-weight: 700; }
 
@@ -330,6 +337,8 @@ button.off { background: #efece5; color: var(--muted); }
 .chip-row { display: inline-flex; gap: 3px; font-family: var(--mono); font-weight: 700; }
 .tca-bits { border-collapse: collapse; font-family: var(--mono); font-size: 10px; line-height: 1.15; }
 .tca-bits td { width: 13px; min-width: 13px; text-align: center; padding: 0; }
+/* per-chip pin-toggle (polarity round-trip) self-test result, above the bit rows */
+.tca-pol { font-family: var(--mono); font-size: 9px; font-weight: 700; line-height: 1.1; margin-bottom: 1px; }
 .plot-btn {
   position: absolute; bottom: 12px; left: 12px;
   padding: 6px 11px; font-size: 12px; font-weight: 700; border-radius: 9px;

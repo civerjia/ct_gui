@@ -73,6 +73,17 @@ function reflectStateArg() {
   const z = document.getElementById('bmZSection');
   if (z) z.style.display = bmState === STATE_VOLTAGE ? '' : 'none';
 }
+// Batch power-state selector (applies to every selected board), independent of
+// the single-board one above.
+let bmBatchState = STATE_IDLE;
+function reflectBatchStateArg() {
+  document.querySelectorAll('#bmBatchStateSeg button').forEach((b) => b.classList.toggle('active', +b.dataset.bstate === bmBatchState));
+  const row = document.getElementById('bmBatchStateArgRow'), unit = document.getElementById('bmBatchArgUnit'), arg = document.getElementById('bmBatchStateArg');
+  if (!row) return;
+  if (bmBatchState === STATE_VOLTAGE) { row.style.display = ''; unit.textContent = 'Voltage (mV)'; if (arg) arg.max = V_MAX_MV; }
+  else if (bmBatchState === STATE_IDLE || bmBatchState === STATE_ACTIVE) { row.style.display = ''; unit.textContent = 'Current (mA)'; if (arg) arg.max = I_MAX_MA; }
+  else { row.style.display = 'none'; }
+}
 const boardSel = new Set(['0.0']);      // multi-select "ch.mux" keys
 const bKey = (b) => `${b.channel}.${b.mux_port}`;
 const keyTo = (k) => { const [c, m] = k.split('.').map(Number); return { channel: c, mux_port: m }; };
@@ -99,9 +110,10 @@ function pruneMaskedSelection() {
   }
 }
 
-// 8-bit enable toggles inside the Boards card (mirror of the I²C-section row).
-function renderBoardMaskBits() {
-  const el = $p('bmMaskBits'); if (!el) return;
+// 8-bit channel-enable toggles. Rendered into both the Boards card (#bmMaskBits)
+// and the HV grid (#hvMaskBits) — both mirror the shared window.ctChannelMask.
+function renderMaskBits(containerId) {
+  const el = $p(containerId); if (!el) return;
   el.innerHTML = '';
   for (let ch = 0; ch < 8; ch++) {
     const b = document.createElement('button');
@@ -110,18 +122,22 @@ function renderBoardMaskBits() {
     b.title = `Channel ${ch + 1} ${chEnabled(ch) ? 'enabled' : 'disabled'}`;
     b.addEventListener('click', () => {
       window.ctChannelMask ^= (1 << ch);
-      // ctMaskChanged (app.js) re-renders both this mirror and the I²C control;
+      // ctMaskChanged (app.js) re-renders every mirror and the I²C control;
       // fall back to a local refresh if app.js hasn't wired it yet.
       if (window.ctMaskChanged) window.ctMaskChanged();
-      else { renderBoardMaskBits(); renderBoardGrid(); }
+      else { renderMaskBits(containerId); }
     });
     el.appendChild(b);
   }
 }
+function renderBoardMaskBits() { renderMaskBits('bmMaskBits'); }
 
-// app.js calls this after any mask change (from either control) to keep the
-// Boards card mirror + grid grey-out in sync.
-window.ctRenderBoardMask = () => { pruneMaskedSelection(); renderBoardMaskBits(); renderBoardGrid(); };
+// app.js calls this after any mask change (from any control) to keep the Boards
+// card + HV grid mirrors and their grid grey-outs in sync.
+window.ctRenderBoardMask = () => {
+  pruneMaskedSelection(); renderBoardMaskBits(); renderBoardGrid();
+  pruneHvMaskedSelection(); renderMaskBits('hvMaskBits'); renderHvGrid();
+};
 
 const BOARDS_HTML = `
   <div class="legend bm-legend">
@@ -136,8 +152,8 @@ const BOARDS_HTML = `
   <div class="row compact i2c-mask bm-mask" title="Channel enable mask — masked-off channels are dimmed, non-selectable, and skip all I²C polling. Shared with the I²C section below.">
     <span class="hint">channels enabled</span>
     <span id="bmMaskBits" class="i2c-mask-bits"></span>
-    <button id="bmMaskGetBtn" class="xs">Get</button>
-    <button id="bmMaskSetBtn" class="xs">Set mask</button>
+    <button id="bmMaskGetBtn" class="xs mask-btn">Get</button>
+    <button id="bmMaskSetBtn" class="xs mask-btn">Set</button>
   </div>
   <div class="row compact selection-toolbar">
     <span id="bmSelSummary" class="summary">1 selected</span>
@@ -163,6 +179,15 @@ const BOARDS_HTML = `
     <div class="bm-set-row">
       <label class="numlabel">OCP mA <input id="bmOcp" type="number" min="0" max="4233" value="3200" /></label>
       <button id="bmSetOcp" class="xs">Set OCP</button>
+    </div>
+    <div class="block-title" style="margin-top:6px">Power state <span class="hint">Idle/Active → mA · Voltage → mV · applies to all selected</span></div>
+    <div class="seg6" id="bmBatchStateSeg">
+      <button data-bstate="1">Stop</button><button data-bstate="2">Sleep</button><button data-bstate="3">Standby</button>
+      <button data-bstate="4">Idle</button><button data-bstate="5">Active</button><button data-bstate="6">Voltage</button>
+    </div>
+    <div class="bm-set-row">
+      <label class="numlabel" id="bmBatchStateArgRow"><span id="bmBatchArgUnit">Current (mA)</span> <input id="bmBatchStateArg" type="number" min="0" value="1000" /></label>
+      <button id="bmBatchApplyState" class="xs quick">Apply state (sel)</button>
     </div>
   </div>
 
@@ -518,6 +543,42 @@ function wireBoards() {
     refreshBoards();
   };
   reflectStateArg();
+  // Batch power state — applies the chosen state to every selected board (loops
+  // CH_SET_POWER_STATE per board; 0x35 has no board-mask form).
+  document.querySelectorAll('#bmBatchStateSeg button').forEach((b) =>
+    b.addEventListener('click', () => {
+      bmBatchState = +b.dataset.bstate;
+      const arg = $p('bmBatchStateArg');
+      if (arg) {
+        if (bmBatchState === STATE_IDLE) arg.value = 1000;
+        else if (bmBatchState === STATE_ACTIVE) arg.value = 3000;
+        else if (bmBatchState === STATE_VOLTAGE) arg.value = 800;
+      }
+      reflectBatchStateArg();
+    }));
+  $p('bmBatchApplyState').onclick = async () => {
+    const keys = [...boardSel];
+    if (!keys.length) { bmMsg('no boards selected'); return; }
+    const energising = bmBatchState === STATE_IDLE || bmBatchState === STATE_ACTIVE || bmBatchState === STATE_VOLTAGE;
+    const cap = bmBatchState === STATE_VOLTAGE ? V_MAX_MV : I_MAX_MA;
+    const arg = energising ? Math.min(cap, Math.max(0, +$p('bmBatchStateArg').value)) : 0;
+    // Energising many boards at once can draw a lot of current — confirm.
+    if (energising && keys.length > 1 &&
+        !confirm(`Apply state ${bmBatchState}${arg ? ' @ ' + arg + (bmBatchState === STATE_VOLTAGE ? ' mV' : ' mA') : ''} to ${keys.length} boards on P${pwTarget}?`)) return;
+    const btn = $p('bmBatchApplyState'); if (btn) btn.disabled = true;
+    let okN = 0; const fails = [];
+    for (const k of keys) {
+      const { channel, mux_port } = keyTo(k);
+      const j = await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', channel, mux_port, state: bmBatchState, arg });
+      if (j.ok) okN++; else fails.push(`CH${channel + 1}.${mux_port + 1}`);
+      bmMsg(`applying state ${bmBatchState}… ${okN}/${keys.length}`);
+    }
+    if (btn) btn.disabled = false;
+    bmMsg(fails.length ? `state ${bmBatchState}: ${okN}/${keys.length} ok · failed ${fails.join(' ')}`
+      : `state ${bmBatchState}${arg ? ' @ ' + arg : ''} → ${okN} board(s)`);
+    refreshBoards();
+  };
+  reflectBatchStateArg();
   $p('bmOneVoutSr').onclick = async () => {
     const ocp = (+$p('bmOneOcpDelay').value) & 0x03, sr = (+$p('bmOneSlew').value) & 0x03;
     const okv = await voutSrOne({ channel: boardPrimary.channel, mux_port: boardPrimary.mux_port }, ocp, sr);
@@ -539,7 +600,18 @@ function wireBoards() {
 let hvDesired = [0, 0, 0, 0, 0, 0, 0, 0];
 let hvFeedback = [0, 0, 0, 0, 0, 0, 0, 0];
 const hvSel = new Set(['0.0']);
+let hvPrimary = { channel: 0, bit: 0 };   // shift-block anchor (like boardPrimary)
+let hvTest = null;   // Map "ch.b" → bool pass, from the last Toggle test switch-verify run
+let hvTestAbort = false;   // set by the Quit button to stop a running Toggle test
 const hvBit = (m, ch, b) => (m[ch] >> b) & 1;
+// Drop selected HV bits (and move the anchor off) channels the mask just disabled.
+function pruneHvMaskedSelection() {
+  for (const k of [...hvSel]) if (!chEnabled(keyTo(k).channel)) hvSel.delete(k);
+  if (!chEnabled(hvPrimary.channel)) {
+    let ch = 0; while (ch < 8 && !chEnabled(ch)) ch++;
+    hvPrimary = { channel: ch < 8 ? ch : 0, bit: 0 };
+  }
+}
 
 const HV_HTML = `
   <div class="batch-box">
@@ -548,6 +620,19 @@ const HV_HTML = `
       <span class="legend-item"><span class="dot on">1</span> on+verified</span>
       <span class="legend-item"><span class="dot off">0</span> off</span>
       <span class="legend-item"><span class="dot fault">!</span> mismatch</span>
+      <span class="legend-item"><span class="hv-test pass">✓</span>/<span class="hv-test fail">✗</span> switch test</span>
+      <span class="hint">click=toggle · shift=block · ctrl=multi</span>
+    </div>
+    <div class="row compact i2c-mask bm-mask" title="Channel enable mask — masked channels are dimmed, non-selectable, and skipped by Toggle test. Shared with the Boards matrix + I²C section.">
+      <span class="hint">channels enabled</span>
+      <span id="hvMaskBits" class="i2c-mask-bits"></span>
+      <button id="hvMaskGetBtn" class="xs mask-btn">Get</button>
+      <button id="hvMaskSetBtn" class="xs mask-btn">Set</button>
+    </div>
+    <div class="hv-row">
+      <button id="hvSelTest" class="xs" title="HV switch toggle test — auto-tests EVERY bit on all ENABLED channels: toggle each switch ON with HV_SET_BIT verify → firmware reads the switch feedback back → ✓ pass / ✗ FAIL (dead/non-actuating switch), then back OFF. Masked channels are skipped. Run with HV voltage at 0 (this exercises the switch, not emission). (Tests the SWITCH; use I²C diagnostics 'Chip test' for the expander chip.)">Toggle test</button>
+      <button id="hvSelTestStop" class="xs danger" title="Abort the running Toggle test (finishes the current switch, then stops)." disabled>Quit</button>
+      <button id="hvTestClear" class="xs" title="Clear the Toggle test ✓/✗ marks from the grid.">Clear</button>
     </div>
     <div id="hvGrid" class="board-grid"></div>
     <div class="hv-row">
@@ -685,12 +770,31 @@ function renderHvGrid() {
     if (d) on++; if (mis) mm++;
     const k = `${ch}.${b}`;
     const tile = document.createElement('div');
-    tile.className = 'status-tile ' + (mis ? 'fault' : d ? 'present' : 'absent') + (hvSel.has(k) ? ' selected' : '');
-    tile.innerHTML = `<span class="tile-title">C${ch + 1}.${b + 1}</span><span class="hv-state">${mis ? '!' : d}</span>`;
-    tile.title = `CH${ch + 1} bit ${b + 1} — desired ${d}, feedback ${f}`;
+    const tested = hvTest && hvTest.has(k), testPass = tested && hvTest.get(k);
+    tile.className = 'status-tile ' + (mis ? 'fault' : d ? 'present' : 'absent') + (hvSel.has(k) ? ' selected' : '')
+      + (chEnabled(ch) ? '' : ' masked')
+      + (tested && !testPass ? ' test-fail' : '');
+    tile.innerHTML = `<span class="tile-title">C${ch + 1}.${b + 1}</span><span class="hv-state">${mis ? '!' : d}</span>`
+      + (tested ? `<span class="hv-test ${testPass ? 'pass' : 'fail'}" title="switch verify ${testPass ? 'OK' : 'FAILED'}">${testPass ? '✓' : '✗'}</span>` : '');
+    tile.title = `CH${ch + 1} bit ${b + 1} — desired ${d}, feedback ${f}`
+      + (tested ? ` · switch test ${testPass ? 'PASS' : 'FAIL'}` : '');
     tile.addEventListener('click', (e) => {
-      if (e.shiftKey || e.ctrlKey || e.metaKey) { hvSel.has(k) ? hvSel.delete(k) : hvSel.add(k); renderHvGrid(); }
-      else { hvSetBit(ch, b, !d); }
+      if (!chEnabled(ch)) return;                        // masked channel: non-interactive
+      if (e.shiftKey) {
+        // rectangular block from the anchor to this cell (enabled channels only)
+        const r0 = Math.min(hvPrimary.channel, ch), r1 = Math.max(hvPrimary.channel, ch);
+        const c0 = Math.min(hvPrimary.bit, b), c1 = Math.max(hvPrimary.bit, b);
+        hvSel.clear();
+        for (let c = r0; c <= r1; c++) { if (!chEnabled(c)) continue; for (let m = c0; m <= c1; m++) hvSel.add(`${c}.${m}`); }
+        renderHvGrid();
+      } else if (e.ctrlKey || e.metaKey) {
+        hvSel.has(k) ? hvSel.delete(k) : hvSel.add(k);
+        hvPrimary = { channel: ch, bit: b };
+        renderHvGrid();
+      } else {
+        hvPrimary = { channel: ch, bit: b };
+        hvSetBit(ch, b, !d);                             // plain click still actuates the switch
+      }
     });
     grid.appendChild(tile);
   }
@@ -714,12 +818,63 @@ async function hvSelSet(val) {
   for (const k of hvSel) { const [c, b] = k.split('.').map(Number); await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: val, verify: true }); }
   refreshHv();
 }
+// Switch-verify test: auto-test EVERY bit on all ENABLED channels. Toggle each
+// switch ON with verify, record the firmware's pass/fail (HV_SET_BIT returns
+// VerifyFail → r.ok=false when the switch doesn't actuate — e.g. a dead CH1/CH5
+// chip), then toggle it back OFF. Marks ✓/✗ per tile. Masked channels skipped.
+// No firmware change — uses the verify the firmware already does on HV_SET_BIT.
+async function hvSwitchTest() {
+  if (!boardTargetConnected()) { $p('hvStatus').textContent = 'connect the target controller first'; return; }
+  const keys = [];
+  for (let c = 0; c < 8; c++) { if (!chEnabled(c)) continue; for (let b = 0; b < 8; b++) keys.push(`${c}.${b}`); }
+  if (!keys.length) { $p('hvStatus').textContent = 'all channels masked off — enable a channel first'; return; }
+  const nch = keys.length / 8;
+  if (!confirm(`Toggle test exercises every HV switch on ${nch} enabled channel(s) of P${pwTarget} (${keys.length} switches, ON→OFF with read-back verify). Best run with HV voltage at 0. Continue?`)) return;
+  hvTest = new Map();
+  hvTestAbort = false;
+  const btn = $p('hvSelTest'); if (btn) btn.disabled = true;
+  const stop = $p('hvSelTestStop'); if (stop) stop.disabled = false;
+  const fails = [];
+  let aborted = false;
+  for (const k of keys) {
+    if (hvTestAbort) { aborted = true; break; }
+    const [c, b] = k.split('.').map(Number);
+    $p('hvStatus').textContent = `toggle test CH${c + 1}.${b + 1}… (${hvTest.size + 1}/${keys.length})`;
+    const r = await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: true, verify: true });
+    const pass = !!r.ok;
+    hvTest.set(k, pass);
+    if (!pass) fails.push(`CH${c + 1}.${b + 1}`);
+    await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: false, verify: true });   // restore off
+    renderHvGrid();
+  }
+  if (btn) btn.disabled = false;
+  if (stop) stop.disabled = true;
+  await refreshHv(true);
+  const done = hvTest.size;
+  $p('hvStatus').textContent = aborted
+    ? `toggle test ABORTED at ${done}/${keys.length}${fails.length ? ' · FAILED ' + fails.join(' ') : ''}`
+    : fails.length
+      ? `toggle test: ${keys.length - fails.length}/${keys.length} ok · FAILED ${fails.join(' ')}`
+      : `toggle test: all ${keys.length} switch(es) verified ✓`;
+}
 
 function wireHv() {
   $p('hvCard').innerHTML = HV_HTML;
   renderHvGrid();
+  // channel-enable mask mirror (shared window.ctChannelMask) — same control as
+  // the Boards matrix; masked channels are greyed out + skipped by Toggle test.
+  renderMaskBits('hvMaskBits');
+  $p('hvMaskGetBtn').onclick = () => { if (window.ctI2cGetMask) window.ctI2cGetMask(); else refreshHv(true); };
+  $p('hvMaskSetBtn').onclick = async () => {
+    if (window.ctI2cSetMask) { window.ctI2cSetMask(); return; }
+    const j = await postJ('/api/channel-mask', { mask: window.ctChannelMask });
+    $p('hvStatus').textContent = j.ok === false ? (j.error || 'set mask failed') : 'channel mask set';
+  };
   $p('hvSelOn').onclick = () => hvSelSet(true);
   $p('hvSelOff').onclick = () => hvSelSet(false);
+  $p('hvSelTest').onclick = () => hvSwitchTest();
+  $p('hvSelTestStop').onclick = () => { hvTestAbort = true; $p('hvStatus').textContent = 'aborting toggle test…'; };
+  $p('hvTestClear').onclick = () => { hvTest = null; renderHvGrid(); $p('hvStatus').textContent = 'toggle test marks cleared'; };
   $p('hvAllOff').onclick = async () => { for (let c = 0; c < 8; c++) for (let b = 0; b < 8; b++) if (hvBit(hvDesired, c, b)) await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: false, verify: true }); refreshHv(); };
   $p('hvRefresh').onclick = () => refreshHv(true);
   $p('hvMonitor').onclick = () => {
@@ -1218,6 +1373,8 @@ const EMI_HTML = `
       </div>
       <div class="bm-set-row">
         <label class="numlabel">total ms <input id="shvTotal" type="number" value="60000" /></label>
+        <label class="numlabel" title="Edge of the SyncIn trigger the schedule fires on. Match this to the Sync I/O 'Ext edge'.">trig edge
+          <select id="shvTrigEdge"><option value="rising">rising</option><option value="falling">falling</option></select></label>
         <button id="shvSetCfg" class="xs">Set cfg</button>
       </div>
     </div>
@@ -1469,7 +1626,9 @@ const SHV_STOP = ['None', 'Complete', 'Mismatch', 'InterPulseTimeout', 'TotalTim
 const SHV_REJECT = ['None (armed)', 'IndexOutOfWindow', 'WidthTooLarge', 'EmptyTable', 'TpsDisabled', 'TpsFault', 'IsoOff', 'NotReady', 'StateConflict'];
 const nm = (arr, i) => (i == null ? '?' : (arr[i] || i));
 
-function shvShow(j) {
+const shvMsg = (t) => { const e = $p('shvResult'); if (e) e.textContent = t; };
+function shvShow(j, label) {
+  const lab = label || 'op';
   let t;
   if (j && j.status) {
     const s = j.status;
@@ -1479,22 +1638,26 @@ function shvShow(j) {
   } else if (j && j.reject != null && j.results) {            // capability test (0xFFFF = 165 verify mismatch)
     t = `reject: ${nm(SHV_REJECT, j.reject)}\n` + j.results.map((r) => `  bit ${r.bit}: ${r.measuredUs === 0xFFFF ? 'verify MISMATCH' : 'measured ' + r.measuredUs + ' µs'}`).join('\n');
   } else if (j && j.reject != null) {                          // arm
-    t = `${j.ok ? '✓ armed' : '✗'} — reject: ${nm(SHV_REJECT, j.reject)}`;
+    t = `${j.ok ? '✓ armed' : '✗ arm rejected'} — ${nm(SHV_REJECT, j.reject)}`;
   } else if (j && j.records) {                                 // pulse log
     t = `${j.records.length}/${j.total} records\n` + j.records.map((r) => `  fil ${r.filament} seq ${r.seq} t ${r.tOnUs}µs dur ${r.durationUs}µs${r.flags ? ' flags 0x' + r.flags.toString(16) : ''}`).join('\n');
   } else if (j && j.entryCount != null) {                      // table info
-    t = `entries ${j.entryCount} · crc 0x${(j.crc >>> 0).toString(16).toUpperCase()}`;
+    t = `✓ table: ${j.entryCount} entries · crc 0x${(j.crc >>> 0).toString(16).toUpperCase()}`;
   } else if (j && j.heatCount != null) {                       // heat-table info
-    t = `heat entries ${j.heatCount}/${j.maxHeatEntries}`;
+    t = `✓ heat entries ${j.heatCount}/${j.maxHeatEntries}`;
   } else if (j && j.interPulseMs != null) {                    // get config
     t = `inter ${j.interPulseMs} ms · maxOn ${j.maxOnMs} ms · total ${j.totalMs} ms · edge ${j.triggerEdge ? 'falling' : 'rising'}`;
   } else if (j && j.mapped != null) {                          // active-list read
-    t = `active list: ${j.mapped}/64 power slots mapped`;
+    t = `✓ active list: ${j.mapped}/64 power slots mapped`;
+  } else if (j && j.count != null) {                           // set_entries (upload)
+    t = `${j.ok ? '✓' : '✗'} ${lab} — ${j.count} entr${j.count === 1 ? 'y' : 'ies'}`;
   } else {
-    t = j && j.ok ? 'ok' : (j && j.error) ? j.error : JSON.stringify(j);
+    t = (j && j.ok) ? `✓ ${lab}` : `✗ ${lab} failed${j && j.error ? ': ' + j.error : ''}`;
   }
   $p('shvResult').textContent = t;
 }
+// In-progress + labelled result wrapper so every ShV button gives feedback.
+async function shvDo(label, op, extra) { shvMsg(label + '…'); shvShow(await shv(op, extra), label); }
 function parseShvEntries() {
   return $p('shvEntries').value.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
     const [filament, numPulses, width] = l.split(',').map(Number);
@@ -1542,23 +1705,25 @@ function wireEmission() {
   });
   wireRecord();
   wireRingPulse();
-  $p('shvPushList').onclick = async () => shvShow(await shv('push_active_list'));
-  $p('shvGetList').onclick = async () => shvShow(await shv('get_active_list'));
-  $p('shvSetCfg').onclick = async () => shvShow(await shv('set_config', { interPulseMs: +$p('shvInter').value, maxOnMs: +$p('shvMaxOn').value, totalMs: +$p('shvTotal').value, triggerEdge: 0 }));
-  $p('shvUpload').onclick = async () => shvShow(await shv('set_entries', { entries: parseShvEntries() }));
-  $p('shvClear').onclick = async () => shvShow(await shv('clear_table'));
-  $p('shvInfo').onclick = async () => shvShow(await shv('table_info'));
-  $p('shvHeatInfo').onclick = async () => shvShow(await shv('heat_info'));
-  $p('shvArm').onclick = async () => shvShow(await shv('arm', { repeats: 1 }));
-  $p('shvDisarm').onclick = async () => shvShow(await shv('disarm'));
-  $p('shvStatus').onclick = async () => shvShow(await shv('status'));
-  $p('shvLog').onclick = async () => shvShow(await shv('pulse_log', { start: 0 }));
+  $p('shvPushList').onclick = () => shvDo('mapping pushed', 'push_active_list');
+  $p('shvGetList').onclick = () => shvDo('read active list', 'get_active_list');
+  $p('shvSetCfg').onclick = () => shvDo('config set', 'set_config', {
+    interPulseMs: +$p('shvInter').value, maxOnMs: +$p('shvMaxOn').value, totalMs: +$p('shvTotal').value,
+    triggerEdge: $p('shvTrigEdge').value === 'falling' ? 1 : 0 });
+  $p('shvUpload').onclick = () => shvDo('uploaded', 'set_entries', { entries: parseShvEntries() });
+  $p('shvClear').onclick = () => shvDo('table cleared', 'clear_table');
+  $p('shvInfo').onclick = () => shvDo('table info', 'table_info');
+  $p('shvHeatInfo').onclick = () => shvDo('heat info', 'heat_info');
+  $p('shvArm').onclick = () => shvDo('armed', 'arm', { repeats: 1 });
+  $p('shvDisarm').onclick = () => shvDo('disarmed', 'disarm');
+  $p('shvStatus').onclick = () => shvDo('status', 'status');
+  $p('shvLog').onclick = () => shvDo('pulse log', 'pulse_log', { start: 0 });
   // capability test (ShvCapabilityTest 0x7B) — FIRES HV
-  $p('shvCapRun').onclick = async () => {
+  $p('shvCapRun').onclick = () => {
     const pairs = $p('shvCapPairs').value.trim().split(/\s+/).filter(Boolean).map((s) => {
       const [bit, width] = s.split(',').map(Number); return { bit, width };
     });
-    shvShow(await shv('capability', { channel: +$p('shvCapCh').value, pairs }));
+    shvDo('capability test', 'capability', { channel: +$p('shvCapCh').value, pairs });
   };
 
   // ESP32 Sync I/O

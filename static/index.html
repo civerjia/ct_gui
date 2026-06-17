@@ -439,7 +439,7 @@
           <button id="i2cPresentBtn" class="sm quick" title="Scan the I²C bus: which mux / TPS / INA219 / IO-expander chips respond (read-only).">I²C scan</button>
           <button id="i2cDiagnoseBtn" class="sm" title="Deep diagnosis (CH_GET_DIAGNOSIS): classify every board+chip as operational / register-only / address-only / missing.">Run diagnosis</button>
           <button id="i2cTcaReadBtn" class="sm" title="Read raw TCA9554 registers via CH_READ_TCA9554 (0x61), per channel: config (dir) / input (live GPIO) / output / polarity + per-read ACK. Read-only.">Read TCA9554</button>
-          <button id="i2cSelftestBtn" class="sm" title="TCA9554 per-pin toggle self-test. Drives output pins — refused while a schedule is running.">Pin toggle</button>
+          <button id="i2cSelftestBtn" class="sm" title="Per-channel TCA9554 chip-liveness test: checks each expander (Enable/Fault/Iso/HV) responds on I²C → pol ✓/✗ per chip in the matrix (✗ = dead/unresponsive chip). Uses the 0x60 polarity round-trip when the firmware supports it, else falls back to the 0x61 register-read ACK. Non-destructive — drives no output pins. (This tests the CHIP; use the HV grid 'Toggle test' to verify the HV SWITCH actuates.)">Chip test</button>
           <button id="i2cMuxResetBtn" class="sm" title="Pulse the TCA9548A reset line and re-detect. Power-cutting: all outputs drop low.">Mux reset</button>
         </div>
       </div>
@@ -448,8 +448,8 @@
         <div class="row compact i2c-mask" title="Channel enable mask — which of the 8 I²C channels each controller uses (default first 6 = 0x3F). Disabled channels skip all I²C polling.">
           <span class="hint">channels enabled</span>
           <span id="i2cMaskBits" class="i2c-mask-bits"></span>
-          <button id="i2cMaskGetBtn" class="xs">Get</button>
-          <button id="i2cMaskSetBtn" class="xs">Set mask</button>
+          <button id="i2cMaskGetBtn" class="xs mask-btn">Get</button>
+          <button id="i2cMaskSetBtn" class="xs mask-btn">Set</button>
         </div>
         <div class="chip-legend">
           <span class="legend-item"><span class="chip-cell op">●</span> op (read+write)</span>

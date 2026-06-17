@@ -1253,6 +1253,21 @@ function tcaBitCell(ctx, channel, chipKey, maskByte) {
   const map = TCA_READ_MAP[chipKey];
   const rch = map && ctx.read && ctx.read[channel] && ctx.read[channel].chips && ctx.read[channel].chips[map.readKey];
   const COL = { ok: '#2c7a6b', fail: '#c0392b', warn: '#b8860b', dim: '#9aa0a6', mute: '#bdbdbd' };
+  // Pin-toggle self-test (CH_TCA9554_SELF_TEST 0x60): per-chip polarity round-trip
+  // = expander alive on I²C. map.readKey ('enable'/'fault'/'iso'/'hv') indexes the
+  // per-channel result. Shown as a "pol ✓/✗" header above the per-pin rows so a
+  // dead expander (e.g. a non-responding HV chip) is obvious.
+  let polRow = '';
+  if (ctx.test && map) {
+    const t = ctx.test.get(channel);
+    const pass = t ? t[map.readKey] : undefined;
+    const g = pass === true ? 'pol ✓' : pass === false ? 'pol ✗' : 'pol ·';
+    const pc = pass === true ? COL.ok : pass === false ? COL.fail : COL.mute;
+    const tip = pass === true ? 'polarity round-trip OK — expander alive on I²C'
+      : pass === false ? 'polarity round-trip FAILED — dead/unresponsive expander chip'
+      : 'self-test not run (Pin toggle)';
+    polRow = `<div class="tca-pol" style="color:${pc}" title="${tip}">${g}</div>`;
+  }
   const sRow = [], dRow = [], lRow = [];
   for (let b = 0; b < 8; b++) {
     const tip = [`CH${channel + 1} board ${b + 1} · ${map ? map.readKey : chipKey}`];
@@ -1279,7 +1294,7 @@ function tcaBitCell(ctx, channel, chipKey, maskByte) {
     dRow.push(`<td style="color:${dc}" title="${t}">${dir}</td>`);
     lRow.push(`<td style="color:${lc};font-weight:bold" title="${t}">${lvl}</td>`);
   }
-  return `<table class="tca-bits"><tbody><tr>${sRow.join('')}</tr><tr>${dRow.join('')}</tr><tr>${lRow.join('')}</tr></tbody></table>`;
+  return polRow + `<table class="tca-bits"><tbody><tr>${sRow.join('')}</tr><tr>${dRow.join('')}</tr><tr>${lRow.join('')}</tr></tbody></table>`;
 }
 function chipHealthTable(cid, ctx) {
   const pm = ctx.masks || {};
@@ -1343,7 +1358,8 @@ function mergeI2C(data) {
     if (c.diagnosis_bits) ctx.diag = new Map(c.diagnosis_bits.map((e) => [`${e.channel}.${e.mux_port}`, e]));
     if (c.tca9554_channels) { ctx.read = c.tca9554_channels; ctx.tca_error = null; }
     if (c.tca9554_error) ctx.tca_error = c.tca9554_error;
-    if (c.selftest_boards) ctx.test = { byKey: new Map(c.selftest_boards.map((b) => [`${b.channel}.${b.mux_port}`, b])), channels_tested: c.channels_tested || [] };
+    if (c.selftest_chips) ctx.test = new Map(c.selftest_chips.map((r) => [r.channel, r]));   // channel → {enable,fault,iso,hv} chip-alive pass/fail
+    if (c.selftest_method) ctx.test_method = c.selftest_method;   // 'polarity' (0x60) | 'read_ack' (0x61 fallback)
     if (c.selftest_error) ctx.selftest_error = c.selftest_error;
   }
   renderI2C();
@@ -1366,9 +1382,15 @@ async function i2cTcaRead() {
   catch (e) { i2cMsg('TCA9554 read failed: ' + e); }
 }
 async function i2cSelftest() {
-  i2cMsg('Running TCA9554 pin-toggle self-test…');
-  try { if (mergeI2C(await postJSON('/api/selftest', {}))) i2cMsg('Self-test complete — pass/fail in the matrix.'); }
-  catch (e) { i2cMsg('Self-test failed: ' + e); }
+  i2cMsg('Running TCA9554 self-test…');
+  try {
+    const j = await postJSON('/api/selftest', {});
+    if (mergeI2C(j)) {
+      const fellBack = Object.values(j.controllers || {}).some((c) => c && c.selftest_method === 'read_ack');
+      const via = fellBack ? ' <span class="hint">(via 0x61 read-ACK — firmware lacks the 0x60 polarity test; reflash the RP2350b for the stronger write+read test)</span>' : '';
+      i2cMsg('Self-test complete — per-chip <b>pol ✓/✗</b> in the matrix (✗ = dead/unresponsive expander).' + via);
+    }
+  } catch (e) { i2cMsg('Self-test failed: ' + e); }
 }
 async function i2cSetMask() {
   try {

@@ -420,40 +420,64 @@ def run_diagnosis(link: "ControllerLink") -> dict:
 
 
 def run_self_test(link: "ControllerLink") -> dict:
-    """TCA9554 toggle self-test (CH_TCA9554_SELF_TEST 0x60; drives output pins —
-    bench/idle only). Surfaces a non-Ok firmware status instead of zeros."""
+    """Non-destructive TCA9554 self-test (CH_TCA9554_SELF_TEST 0x60). The firmware
+    handler is PER-CHANNEL: request = [channel]; reply = status, channel, pass[4]
+    in chip order Enable / Fault / Iso12V / HvCurrent, where 1 = the chip's
+    polarity register (0x02) round-trips OK (= expander alive + addressable on I2C;
+    no output load is driven). We loop the 8 channels and report per-chip pass/fail
+    so a dead/unresponsive expander shows up in the chip-health matrix.
+
+    NOTE: this is a CHIP-liveness test, not a pin-drive/HV-actuation test. A chip
+    that passes here can still have a dead output pin or HV switch — that level is
+    covered by the capability test (ShvCapabilityTest 0x7B verify)."""
+    names = ["enable", "fault", "iso", "hv"]   # firmware chip order on the wire
+    # Probe 0x60 on channel 0. Older RP2350b firmware lacks the handler and replies
+    # Unsupported (the dispatch default); in that case fall back to deriving chip
+    # liveness from the 0x61 register read, whose per-read ACK flags already say
+    # whether each expander responds. Same per-chip pass/fail shape either way.
     try:
-        resp = link.client.send_request(CH_TCA9554_SELF_TEST, bytes(ALL_BOARDS_MASK), timeout=5.0)
+        probe = link.client.send_request(CH_TCA9554_SELF_TEST, bytes([0]), timeout=2.0)
     except Exception as exc:
         return {"selftest_error": str(exc)}
-    err = _status_err(resp, "CH_TCA9554_SELF_TEST")
-    if err:
-        return {"selftest_error": err}
-    st = resp.get("decoded") or {}
-    enable = st.get("enable_toggle_mask") or [0] * 8
-    iso = st.get("iso_toggle_mask") or [0] * 8
-    fault = st.get("fault_live_mask") or [0] * 8
-    hv = st.get("hv_live_mask") or [0] * 8
-    outputs_tested = int(st.get("outputs_tested_mask") or 0)
-    boards = []   # per-board toggle results for the chip-health matrix
-    for ch in range(8):
-        ch_tested = bool(outputs_tested & (1 << ch))
-        for port in range(8):
-            b = 1 << port
-            boards.append({
-                "channel": ch, "mux_port": port,
-                "enable_toggle": bool(enable[ch] & b), "iso_toggle": bool(iso[ch] & b),
-                "fault_live": bool(fault[ch] & b), "hv_live": bool(hv[ch] & b),
-                "outputs_tested": ch_tested,
-            })
+    praw = probe.get("raw") or []
+    polarity_ok = probe.get("status_code") == 0x00 and len(praw) >= 6
+
+    chips = []
+    passed = 0
+    if polarity_ok:
+        for ch in range(8):
+            resp = probe if ch == 0 else link.client.send_request(
+                CH_TCA9554_SELF_TEST, bytes([ch]), timeout=2.0)
+            raw = resp.get("raw") or []
+            if resp.get("status_code") != 0x00 or len(raw) < 6:
+                chips.append({"channel": ch})   # no result (mux likely dead)
+                continue
+            row = {"channel": ch}
+            for i, name in enumerate(names):
+                ok = bool(raw[2 + i])
+                row[name] = ok
+                passed += int(ok)
+            chips.append(row)
+        method = "polarity"   # 0x60 write+read+restore round-trip
+    else:
+        # 0x61 fallback: a chip is "alive" if ANY of its 4 register reads ACKed.
+        rd = run_tca9554_read(link)
+        if rd.get("tca9554_error"):
+            return {"selftest_error": "0x60 unsupported; 0x61 fallback failed: " + rd["tca9554_error"]}
+        for c in rd.get("tca9554_channels", []):
+            row = {"channel": c.get("channel")}
+            for name in names:
+                chip = (c.get("chips") or {}).get(name)
+                ok = bool(chip and (chip.get("ok", 0) & 0x0F))
+                row[name] = ok
+                passed += int(ok)
+            chips.append(row)
+        method = "read_ack"   # derived from 0x61 register-read ACKs
+
     return {
-        "selftest_counts": {
-            "enable_toggle": _popcount(st.get("enable_toggle_mask")),
-            "iso_toggle": _popcount(st.get("iso_toggle_mask")),
-            "outputs_tested_channels": bin(outputs_tested & 0xFF).count("1"),
-        },
-        "selftest_boards": boards,
-        "channels_tested": [bool(outputs_tested & (1 << c)) for c in range(8)],
+        "selftest_chips": chips,
+        "selftest_method": method,
+        "selftest_counts": {"chips_passed": passed, "chips_total": 8 * len(names)},
     }
 
 
@@ -1012,17 +1036,24 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     else:
         fils = [int(f) for f in filaments
                 if filament_to_board(int(f))[0] == controller]
-    applied, ok = 0, True
+    # Per-filament outcome: a bad power channel makes CH_SET_POWER_STATE fail for
+    # THAT filament only. Track which failed (global indices) so callers can skip
+    # + report them instead of aborting the whole batch.
+    applied, failed = 0, []
     for f in fils:
         _, ch, pos, _ = filament_to_board(f)
         arg = int(currents.get(str(f), currents.get(f, default_arg)))
         payload = bytes([ch, pos, int(state) & 0xFF]) + _u16(arg)
         try:
-            ok = _status_ok(link.request(CH_SET_POWER_STATE, payload, flags=FLAG_SINGLE, timeout=2.0)) and ok
+            ok1 = _status_ok(link.request(CH_SET_POWER_STATE, payload, flags=FLAG_SINGLE, timeout=2.0))
         except Exception:
-            ok = False
-        applied += 1
-    return {"controller": controller, "ok": ok, "applied": applied, "state": int(state)}
+            ok1 = False
+        if ok1:
+            applied += 1
+        else:
+            failed.append(int(f))
+    return {"controller": controller, "ok": not failed, "applied": applied,
+            "failed": failed, "state": int(state)}
 
 
 def do_scan() -> list[dict[str, Any]]:
@@ -1428,7 +1459,10 @@ class CtHandler(BaseHTTPRequestHandler):
                         results[str(cid)] = {"ok": False, "error": str(exc)}
                 if not results:
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
-                self._json({"ok": all(r.get("ok") for r in results.values()), "results": results})
+                failed = [int(f) for r in results.values() for f in (r.get("failed") or [])]
+                applied = sum(int(r.get("applied") or 0) for r in results.values())
+                self._json({"ok": all(r.get("ok") for r in results.values()), "results": results,
+                            "failed": failed, "applied": applied})
             elif path == "/api/calibration/save":
                 # Persist an emission-current calibration to the host disk (JSON +
                 # flat CSV). body: {name, params, curves:{filament:[{heatA,mA,peak}]}}.

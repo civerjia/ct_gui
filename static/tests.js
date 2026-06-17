@@ -46,6 +46,11 @@ async function anyRunning() {
   const j = await tGetJ('/api/run-status');
   return Object.values((j && j.controllers) || {}).some((c) => c && c.status && c.status.state === 2);
 }
+// Resolve a filament's mapped power slot to a human label "P1·CH2.7" so scan
+// results show which channel/board a flagged filament drives (the F# alone is
+// the global 0-95 index — opaque without the active-list mapping). ch/pos are
+// 0-based from /api/mapping; the UI is 1-based (CH1.1 = ch0/pos0).
+const filBoard = (m) => (m ? `P${m.ctrl}·CH${m.ch + 1}.${m.pos + 1}` : '?');
 const setState = (ctrl, ch, pos, state, arg) =>
   tPostJ('/api/cmd', { controller: ctrl, command: 'CH_SET_POWER_STATE', channel: ch, mux_port: pos, state, arg: arg || 0 });
 const firePulse = (ctrl, ch, pos, widthUs) =>
@@ -56,6 +61,13 @@ const firePulse = (ctrl, ch, pos, widthUs) =>
 const pulseArm = () => tPostJ('/api/adc/pulse-arm', { rate: 1000000 });
 const pulseDisarm = () => tPostJ('/api/adc/pulse-disarm', {});
 const hvEnable = (chan, on) => tPostJ('/api/stm32/hv-enable', { ch: chan, on });
+// Is the channel's HV output currently energised? (hv_status pin level, same
+// source the Power-view On/Off tiles use.) Lets a test respect a pre-existing
+// HV state instead of unconditionally toggling it.
+const hvIsOn = async (chan) => {
+  const st = await tGetJ('/api/stm32/hv-status');
+  return !!(st && st.ok && (chan === 'focus' ? st.focus_on : st.emission_on));
+};
 const setEmiLimit = (mA) => tPostJ('/api/stm32/ds3502-set', { ch: 'ei', wiper: emiLimitWiper(mA) });
 const readAds = () => tGetJ('/api/stm32/ads1115');
 
@@ -219,7 +231,7 @@ async function runTest(fn, needHv) {
 }
 
 // ---- plots ------------------------------------------------------------------
-const BAR_COLOR = { ok: '#3fb6a0', short: '#ff5d5d', open: '#f2c14e', leak: '#b07ce8', none: '#2a343c' };
+const BAR_COLOR = { ok: '#3fb6a0', short: '#ff5d5d', open: '#f2c14e', leak: '#b07ce8', skip: '#5a6470', none: '#2a343c' };
 function drawBars(canvasId, items, opt) {
   const c = $t(canvasId); if (!c) return;
   const W = c.width = c.clientWidth || 680, H = c.height = 132, ctx = c.getContext('2d');
@@ -288,16 +300,27 @@ async function test1() {
   const shortR = parseFloat($t('t1Short').value) || 0.05, openMa = parseFloat($t('t1OpenMa').value) || 10;
   tMsg('Setting all filaments to STANDBY (0.8 V)…');
   const p = await tPostJ('/api/filament-prep', { state: 3 });
-  if (!p.ok) { tMsg('Standby failed: ' + (p.error || ''), 'bad'); return; }
+  // STANDBY can fail per-filament when a power channel is bad. Don't abort the
+  // whole test — skip the failed filaments, flag them in the report, and measure
+  // the rest. Only bail if NOTHING could be put to standby (no link / all bad).
+  const prepFailed = new Set((p.failed || []).map(Number));
+  const applied = p.applied != null ? p.applied
+    : (p.results ? Object.values(p.results).reduce((a, r) => a + (r.applied || 0), 0) : 0);
+  if (applied === 0) {
+    const why = p.error || (p.results ? Object.values(p.results).map((r) => r.error).filter(Boolean).join('; ') : '') || 'check power';
+    tMsg(`Standby failed on all filaments — ${why}.`, 'bad'); return;
+  }
+  if (prepFailed.size) tMsg(`⚠ Standby failed on ${prepFailed.size} filament(s) — skipping, will report. Settling…`, 'bad');
   for (let s = settle; s > 0 && !abortFlag; s -= 500) { tMsg(`Settling at standby… ${(s / 1000).toFixed(1)} s`); await tSleep(Math.min(500, s)); }
   if (abortFlag) { tMsg('Aborted.'); return; }
   tMsg('Reading INA219 V/I…');
-  const fmap = await loadFilMap(); const items = []; const bad = []; let okN = 0;
+  const fmap = await loadFilMap(); const items = []; const bad = []; const skipped = []; let okN = 0;
   for (const cid of [1, 2]) {
     const j = await tGetJ(`/api/board-snapshot?controller=${cid}`); if (!j.ok) continue;
     const byBoard = {}; (j.boards || []).forEach((b) => { byBoard[`${b.channel}.${b.mux_port}`] = b; });
     for (let f = 0; f < 96; f++) {
       const m = fmap[f]; if (!m || m.ctrl !== cid) continue;
+      if (prepFailed.has(f)) { items.push({ f, value: 0, cls: 'skip' }); skipped.push(`F${f}`); continue; }
       const b = byBoard[`${m.ch}.${m.pos}`]; if (!b || !b.present) continue;
       const mA = b.current_mA || 0, V = (b.bus_mV || 0) / 1000, R = mA > 0 ? V / (mA / 1000) : Infinity;
       let cls;
@@ -308,9 +331,10 @@ async function test1() {
     }
   }
   drawBars('t1Plot', items, { yLabel: 'R (Ω)', yMax: 1.0, fmt: (v) => v.toFixed(2) });
-  $t('t1Result').innerHTML = `<b>${okN} ok</b> · ${bad.filter((s) => s.includes('SHORT')).length} short · ${bad.filter((s) => s.includes('OPEN')).length} open`
-    + (bad.length ? '<br>' + bad.slice(0, 30).join(' · ') : '');
-  tMsg(`Resistance done — ${okN} ok, ${bad.length} flagged.`, bad.length ? 'bad' : '');
+  const skipLine = skipped.length ? `<br><span class="bad">${skipped.length} standby-fail (skipped):</span> ${skipped.slice(0, 30).join(' · ')}` : '';
+  $t('t1Result').innerHTML = `<b>${okN} ok</b> · ${bad.filter((s) => s.includes('SHORT')).length} short · ${bad.filter((s) => s.includes('OPEN')).length} open · ${skipped.length} standby-fail`
+    + (bad.length ? '<br>' + bad.slice(0, 30).join(' · ') : '') + skipLine;
+  tMsg(`Resistance done — ${okN} ok, ${bad.length} flagged, ${skipped.length} standby-fail (skipped).`, (bad.length || skipped.length) ? 'bad' : '');
 }
 
 // =========================================================================
@@ -321,26 +345,43 @@ async function test2() {
   const widthUs = parseInt($t('t2Width').value, 10) || 100000, thr = parseFloat($t('t2Thr').value) || 5;
   const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
   const items = [], shorts = [], cur = { id: await pulseCursor() };
+  // Respect a pre-existing emission state. If HV is already energised, capture
+  // its setpoint, leave it ON, and restore that setpoint at the end; if it was
+  // off, enable it for the sweep and return it to off after. Either way the
+  // sweep itself drives −${magV} V while it runs.
+  const emWasOn = await hvIsOn('emission');
+  let priorV = 0;
+  if (emWasOn) { const a = await readAds(); priorV = (a && a.ok && a.emiss_v != null) ? Math.abs(a.emiss_v) : 0; }
   try {
     tMsg('All filaments → SLEEP (no heating)…');
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
-    tMsg(`Emission → −${magV} V @ ${limMa} mA…`);
-    await setHvAndWait('emission', magV); await setEmiLimit(limMa); await hvEnable('emission', true);
+    tMsg(`Emission → −${magV} V @ ${limMa} mA${emWasOn ? ' (was ON — staying on)' : ''}…`);
+    await setHvAndWait('emission', magV); await setEmiLimit(limMa);
+    if (!emWasOn) await hvEnable('emission', true);
     await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
       const f = fils[i], m = fmap[f];
-      tMsg(`Emission short scan: ${i + 1}/${fils.length} (F${f})…`);
+      tMsg(`Emission short scan: ${i + 1}/${fils.length} (F${f} · ${filBoard(m)})…`);
       const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs), mA = r ? r.mA : 0, isShort = mA > thr;
       items.push({ f, value: Math.max(0, mA), cls: isShort ? 'short' : 'ok' });
-      if (isShort) shorts.push(`F${f}: ${mA.toFixed(1)} mA`);
+      if (isShort) shorts.push(`F${f} (${filBoard(m)}): ${mA.toFixed(1)} mA`);
       drawBars('t2Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(limMa, thr * 2), fmt: (v) => v.toFixed(0) });
     }
     $t('t2Result').innerHTML = shorts.length ? `<b class="bad">${shorts.length} short</b> · ` + shorts.slice(0, 30).join(' · ')
       : `<b class="good">✓ all green</b> — no short on ${fils.length} filaments`;
     tMsg(`Emission short scan done — ${shorts.length ? shorts.length + ' short' : 'all green'}.`, shorts.length ? 'bad' : '');
-  } finally { await hvEnable('emission', false); await lutZeroV('emission'); await pulseDisarm(); }
+  } finally {
+    if (emWasOn) {
+      // Leave emission energised (the caller owns it); restore its prior
+      // setpoint so the scan's −30 V doesn't silently linger.
+      if (priorV > 1) await setHvAndWait('emission', priorV);
+    } else {
+      await hvEnable('emission', false); await lutZeroV('emission');
+    }
+    await pulseDisarm();
+  }
 }
 
 // =========================================================================
