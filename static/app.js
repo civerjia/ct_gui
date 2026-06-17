@@ -1045,10 +1045,22 @@ function buildPlan() {
     if (f.dead) return;
     currents[i] = { idle_mA: Math.round(f.idleA * 1000), active_mA: Math.round(f.activeA * 1000) };
   });
-  return {
-    emission, heating, currents,
-    config: { interPulseMs: 3000, maxOnMs: 40, totalMs: 60000, triggerEdge: 0 },
+  // Derive the firmware config from the actual schedule instead of hardcoding:
+  //  - maxOnMs MUST exceed the widest pulse or arm() rejects WidthTooLarge.
+  //  - interPulseMs / totalMs scale with the rotation so a long/slow scan doesn't
+  //    trip InterPulseTimeout / TotalTimeout mid-run.
+  //  - triggerEdge 0 = rising; match this to the target's Sync I/O 'Ext edge'.
+  const maxWidthUs = emission.reduce((m, e) => Math.max(m, e.widthUs), 0);
+  const rotationMs = heatingSchedule.rotationMs || 0;
+  const pulses = totalTriggers || emission.reduce((s, e) => s + e.numPulses, 0) || 1;
+  const pulseMs = rotationMs ? rotationMs / pulses : 0;
+  const config = {
+    interPulseMs: Math.max(3000, Math.ceil(pulseMs * 4)),
+    maxOnMs: Math.max(40, Math.ceil(maxWidthUs / 1000) + 1),
+    totalMs: Math.max(60000, Math.ceil(rotationMs * 2)),
+    triggerEdge: 0,
   };
+  return { emission, heating, currents, config };
 }
 
 async function hwDownload() {
