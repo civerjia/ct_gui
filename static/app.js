@@ -646,7 +646,10 @@ async function pollTelemetry() {
   // the firmware-reported firing filament(s) are authoritative ACTIVE
   const firing = data.firing || [];
   for (const fi of firing) { const r = rows.find((x) => x.index === fi); if (r) r.state = STATE.ACTIVE; }
-  if (firing.length) state.activeFilament = firing[0];
+  // NOTE: do not assign state.activeFilament — it's a derived getter (no setter),
+  // and writing it throws in strict mode (ES module), aborting the poll. The
+  // firing rows are already marked ACTIVE above; the live active pointer is
+  // driven through geometry by gotoSeq()/pollRunStatus().
   ingestTelemetry(rows);   // calls sync()
   setStatus(present === 0 && !running
     ? `Live — connected, but 0/${tele.length} boards present (no filament daughter-boards detected). Run I2C Self-Test to check the controller chips.`
@@ -1430,12 +1433,9 @@ function init() {
     b.addEventListener('click', () => setScheduleView(b.dataset.view)));
   $('filSaveBtn').addEventListener('click', saveFilSettings);
   $('filLoadBtn').addEventListener('click', () => loadFilSettings(false));
-  $('schPulses').addEventListener('input', (e) => {
-    scheduleDefaults.pulses = Math.max(1, parseInt(e.target.value, 10) || 1); rebuildSchedule();
-  });
-  $('schDuration').addEventListener('input', (e) => {
-    scheduleDefaults.duration = Math.max(1, parseInt(e.target.value, 10) || 1); rebuildSchedule();
-  });
+  // schPulses / schDuration are committed to every filament by the Apply button
+  // below (no live `input` handler — the old one referenced an undefined
+  // `scheduleDefaults` and threw on every keystroke).
   $('schSyncBtn').addEventListener('click', () => rebuildSchedule());
   $('schUploadBtn').addEventListener('click', uploadSchedule);
   buildMaskBits();

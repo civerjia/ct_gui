@@ -494,9 +494,17 @@ async function voutSrOne({ channel, mux_port }, ocp, sr) {
 
 function wireBoards() {
   $p('boardsCard').innerHTML = BOARDS_HTML;
-  $p('bmSelPresent').onclick = () => { boardSel.clear(); boardCache.forEach((b) => b.present && chEnabled(b.channel) && boardSel.add(bKey(b))); renderBoardGrid(); };
-  $p('bmSelAll').onclick = () => { boardSel.clear(); for (let c = 0; c < 8; c++) { if (!chEnabled(c)) continue; for (let m = 0; m < 8; m++) boardSel.add(`${c}.${m}`); } renderBoardGrid(); };
-  $p('bmSelClear').onclick = () => { boardSel.clear(); renderBoardGrid(); };
+  // anchorFromSel: park the shift-block anchor on the lowest selected cell (or the
+  // first enabled board) so a later shift-click starts from a real, visible origin.
+  const anchorFromSel = () => {
+    const ks = [...boardSel].sort();
+    if (ks.length) { boardPrimary = keyTo(ks[0]); return; }
+    let c = 0; while (c < 8 && !chEnabled(c)) c++;
+    boardPrimary = { channel: c < 8 ? c : 0, mux_port: 0 };
+  };
+  $p('bmSelPresent').onclick = () => { boardSel.clear(); boardCache.forEach((b) => b.present && chEnabled(b.channel) && boardSel.add(bKey(b))); anchorFromSel(); renderBoardGrid(); };
+  $p('bmSelAll').onclick = () => { boardSel.clear(); for (let c = 0; c < 8; c++) { if (!chEnabled(c)) continue; for (let m = 0; m < 8; m++) boardSel.add(`${c}.${m}`); } anchorFromSel(); renderBoardGrid(); };
+  $p('bmSelClear').onclick = () => { boardSel.clear(); anchorFromSel(); renderBoardGrid(); };
   // Channel-enable mask (mirror of the I²C-section control). Get = present scan
   // (its response reflects channel_mask back via app.js); Set = push the mask.
   renderBoardMaskBits();
@@ -875,7 +883,10 @@ function wireHv() {
   $p('hvSelTest').onclick = () => hvSwitchTest();
   $p('hvSelTestStop').onclick = () => { hvTestAbort = true; $p('hvStatus').textContent = 'aborting toggle test…'; };
   $p('hvTestClear').onclick = () => { hvTest = null; renderHvGrid(); $p('hvStatus').textContent = 'toggle test marks cleared'; };
-  $p('hvAllOff').onclick = async () => { for (let c = 0; c < 8; c++) for (let b = 0; b < 8; b++) if (hvBit(hvDesired, c, b)) await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: false, verify: true }); refreshHv(); };
+  // All OFF: drive every bit OFF unconditionally — do NOT trust the (possibly
+  // stale, monitor-off) hvDesired cache, or a switch that's actually ON could be
+  // skipped and left energized.
+  $p('hvAllOff').onclick = async () => { for (let c = 0; c < 8; c++) for (let b = 0; b < 8; b++) await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: false, verify: true }); refreshHv(true); };
   $p('hvRefresh').onclick = () => refreshHv(true);
   $p('hvMonitor').onclick = () => {
     hvMonitorOn = !hvMonitorOn;
@@ -1769,7 +1780,8 @@ export function initPower() {
     b.addEventListener('click', () => {
       pwTarget = +b.dataset.ctrl;
       document.querySelectorAll('#pwTargetSeg .seg-btn').forEach((x) => x.classList.toggle('active', x === b));
-      updateTargetStatus(); refreshBoards(); refreshHv(); readHvStatus(true); readTpsRegs(); readStartupOcp();
+      hvTest = null;   // clear stale switch-test marks from the previous controller
+      updateTargetStatus(); refreshBoards(); refreshHv(true); readHvStatus(true); readTpsRegs(); readStartupOcp();
     }));
 
   // poll connection state + board snapshot

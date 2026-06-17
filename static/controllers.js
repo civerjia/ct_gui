@@ -46,11 +46,14 @@ export function initControllers() {
         o.label = (r.name ? r.name + ' · ' : '') + (r.controller_responsive ? 'RP2350 ✓' : 'port open');
         datalist.appendChild(o);
       }
-      // Assign discovered IPs to the cards (OVERWRITE — the defaults are only
-      // valid on the AP and were masking real LAN IPs). Distinct host per card.
+      // Assign DISTINCT discovered IPs to the cards (OVERWRITE — the defaults are
+      // only valid on the AP and were masking real LAN IPs). De-dupe by host so two
+      // cards can never be pointed at the same bridge; cards beyond the number of
+      // distinct hosts keep their current value.
+      const hosts = [...new Set(found.map((r) => r.host))];   // distinct, best-first
       cards.forEach((card, i) => {
         const h = card.querySelector('[data-host]');
-        if (h && found[i]) h.value = found[i].host;
+        if (h && hosts[i]) h.value = hosts[i];
       });
       if (!found.length) {
         scanHint.textContent = 'No bridge found. Join the CTPower-XXXXXX AP or check the ESP32 is powered, then scan again.';

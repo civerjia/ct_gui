@@ -34,7 +34,10 @@ export class ScheduleGantt {
   }
 
   update(state) {
-    if (this.vSpan == null || this._len !== state.len) { this.v0 = 0; this.vSpan = state.len; } // reset on length change
+    // Frame-fit only on first paint (or when the schedule emptied). On a mere
+    // length change, keep the user's pan/zoom — _clampView() below re-clamps it
+    // to the new length — so a live-growing schedule doesn't snap back each tick.
+    if (this.vSpan == null || !state.len) { this.v0 = 0; this.vSpan = state.len; }
     this._len = state.len;
     this.state = state;
     this._clampView();

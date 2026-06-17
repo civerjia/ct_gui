@@ -968,14 +968,19 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     step("mask", link.request(CH_SET_I2C_ENABLE_MASK, bytes([MAPPING.channel_mask(controller) & 0xFF]), flags=0))
 
     # 2. per-filament IDLE/ACTIVE current calibration (this controller's boards)
+    cur_ok = True
+    cur_n = cur_fail = 0
     for fil, cur in (plan.get("currents") or {}).items():
         f = int(fil)
         ctrl, ch, pos, _ = filament_to_board(f)
         if ctrl != controller:
             continue
+        cur_n += 1
         payload = bytes([ch, pos]) + _u16(int(cur.get("idle_mA", 0))) + _u16(int(cur.get("active_mA", 0)))
-        link.request(CH_FILAMENT_CURRENTS, payload, flags=FLAG_SINGLE)
-    steps.append({"step": "currents", "ok": True})
+        if not _status_ok(link.request(CH_FILAMENT_CURRENTS, payload, flags=FLAG_SINGLE)):
+            cur_ok = False
+            cur_fail += 1
+    steps.append({"step": "currents", "ok": cur_ok, "wrote": cur_n, "failed": cur_fail})
 
     # 3. config
     cfg = plan.get("config") or {}

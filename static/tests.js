@@ -70,6 +70,9 @@ const hvIsOn = async (chan) => {
 };
 const setEmiLimit = (mA) => tPostJ('/api/stm32/ds3502-set', { ch: 'ei', wiper: emiLimitWiper(mA) });
 const readAds = () => tGetJ('/api/stm32/ads1115');
+// Read a DS3502 wiper (0-127) — used to capture/restore a pre-existing HV setpoint
+// exactly (the measured voltage is too coarse/unreliable to round-trip).
+const readWiper = async (ds) => { const j = await tGetJ(`/api/stm32/ds3502?ch=${ds}`); return (j && j.ok && j.wiper != null) ? j.wiper : null; };
 
 // ---- HV setpoint LUT --------------------------------------------------------
 // The firmware closed loop (hv_set_target) walks the DS3502 toward an ADS target
@@ -116,14 +119,24 @@ function lutWiperForV(chan, magV) {
   }
   return { wiper: last.w, expectV: sign * last.m, clamped: true };
 }
-// Set a channel to a target magnitude via the LUT (loop bypassed). Loads the LUT
-// on demand. Returns {ok, wiper, expectV, clamped} or {ok:false, error}.
+// Linear wiper estimate, used as a fallback when there is no usable LUT point
+// (no calibration, or the request is outside the LUT's calibrated range):
+// wiper ≈ |V| / full-scale × 127. Approximate — gets HV into the right ballpark.
+const hardcodedWiper = (chan, magV) => Math.max(0, Math.min(127, Math.round(Math.abs(magV) / HV_FULL_V[chan] * 127)));
+// Set a channel to a target magnitude. Prefers the calibrated LUT; falls back to
+// the hardcoded linear formula when the LUT is missing or the request is out of
+// its range, so a missing/partial calibration never blocks a test. Returns
+// {ok, wiper, expectV, method} — method 'lut' | 'formula(no-LUT)' | 'formula(out-of-LUT)'.
 async function lutSetV(chan, magV) {
   if (!lutCache[chan]) await lutLoad(chan);
   const hit = lutWiperForV(chan, magV);
-  if (!hit) return { ok: false, error: `no ${chan} LUT — Calibrate first` };
-  const j = await dsWrite(HV_V_CH[chan].ds, hit.wiper);
-  return { ...j, ok: j.ok, wiper: hit.wiper, expectV: hit.expectV, clamped: hit.clamped };
+  if (hit && !hit.clamped) {
+    const j = await dsWrite(HV_V_CH[chan].ds, hit.wiper);
+    return { ...j, ok: j.ok, wiper: hit.wiper, expectV: hit.expectV, method: 'lut' };
+  }
+  const w = hardcodedWiper(chan, magV);
+  const j = await dsWrite(HV_V_CH[chan].ds, w);
+  return { ...j, ok: j.ok, wiper: w, expectV: -Math.abs(magV), method: hit ? 'formula(out-of-LUT)' : 'formula(no-LUT)' };
 }
 // Safe teardown: zero the voltage wiper (replaces the old hv-clear-target).
 const lutZeroV = (chan) => dsWrite(HV_V_CH[chan].ds, 0);
@@ -166,43 +179,54 @@ async function lutCalibrate(chan, opts = {}) {
   } finally {
     await lutZeroV(chan);                                    // leave it safe
   }
-  const maxMag = Math.max(...points.map((p) => Math.abs(p.v)));
+  const maxMag = points.length ? Math.max(...points.map((p) => Math.abs(p.v))) : 0;
+  if (maxMag < 1) return { ok: false, error: 'calibration captured no voltage (all readings ~0) — check HV enable / ADS wiring', points };
   const save = await lutSave(chan, points, +maxMag.toFixed(1));
   if (save.ok) { lutCache[chan] = { points, max_mag: +maxMag.toFixed(1), ts: save.ts }; }
   return { ok: save.ok, error: save.error, points, max_mag: +maxMag.toFixed(1) };
 }
 
 // Set a channel via the LUT and let it settle (replaces the closed-loop wait).
+// Set HV (LUT or formula fallback) and let it settle. Returns true if the wiper
+// write succeeded (via either path) — callers MUST check this before enabling HV
+// or firing, so a failed DS3502 write never leaves HV at an unknown setpoint.
 async function setHvAndWait(chan, magV, timeoutMs = 8000) {
   const r = await lutSetV(chan, magV);
-  if (!r.ok) { tMsg(`HV ${chan} not set: ${r.error || 'no LUT'} — calibrate the ${chan} LUT first.`, 'bad'); return false; }
-  if (r.clamped) tMsg(`⚠ ${chan} −${Math.abs(magV)} V is outside the LUT range — clamped to wiper ${r.wiper}.`, 'bad');
+  if (!r.ok) { tMsg(`HV ${chan} not set — DS3502 wiper write failed (${r.error || r.status || '?'}).`, 'bad'); return false; }
+  if (r.method !== 'lut') {
+    tMsg(`⚠ ${chan} −${Math.abs(magV)} V set via formula (wiper ${r.wiper}) — ${r.method.includes('no-LUT') ? 'no LUT; Calibrate for accuracy' : 'outside LUT range'}.`, 'bad');
+  }
   await tSleep(Math.min(timeoutMs, 600));                    // direct wiper settles fast
-  return !r.clamped;
+  return true;
 }
 async function pulseCursor() { const j = await tGetJ('/api/pulse-events?since=0'); return (j && j.last_id) || 0; }
 async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
   await firePulse(ctrl, ch, pos, widthUs);
-  await tSleep(Math.max(60, widthUs / 1000 + 120));
-  const j = await tGetJ(`/api/pulse-events?since=${cur.id}`);
-  const evs = (j && j.events) || [];
-  if (evs.length) {
-    cur.id = (j.last_id != null) ? j.last_id : evs[evs.length - 1].id;
-    const e = evs[evs.length - 1];
-    // Per-pulse summary carries raw ADC counts: peak (highest), plateau (steady
-    // "high"), bg (background/baseline). Convert each to mA on the same scale.
-    // peakToMa is affine, so the offset cancels in (peak − bg) → net = real
-    // emission current with the dark/background level subtracted out.
-    const peakMa = peakToMa(e.peak);
-    const bgMa = (e.bg != null) ? peakToMa(e.bg) : 0;
-    const plateauMa = (e.plateau != null) ? peakToMa(e.plateau) : peakMa;
-    return {
-      peak: e.peak, plateau: e.plateau, bg: e.bg,
-      mA: peakMa, peakMa, plateauMa, bgMa,
-      netMa: peakMa - bgMa,
-    };
-  }
-  return null;
+  // Poll until a NEW event (id > cursor) lands rather than a single fixed wait —
+  // a slow EVT_PULSE would otherwise read 0 mA and look like "no emission".
+  const settle = Math.max(60, widthUs / 1000 + 120);
+  const deadline = Date.now() + settle + 400;
+  let evs = [];
+  do {
+    await tSleep(60);
+    const j = await tGetJ(`/api/pulse-events?since=${cur.id}`);
+    evs = (j && j.events) || [];
+    if (evs.length) { cur.id = (j.last_id != null) ? j.last_id : evs[evs.length - 1].id; break; }
+  } while (Date.now() < deadline);
+  if (!evs.length) return null;
+  const e = evs[evs.length - 1];
+  // Per-pulse summary carries raw ADC counts: peak (highest), plateau (steady
+  // "high"), bg (background/baseline). peakToMa is affine, so (peak − bg) → net =
+  // real emission current with the dark/background level subtracted out. mA is the
+  // background-subtracted net (what every verdict should use), clamped ≥ 0.
+  const peakMa = peakToMa(e.peak);
+  const bgMa = (e.bg != null) ? peakToMa(e.bg) : 0;
+  const plateauMa = (e.plateau != null) ? peakToMa(e.plateau) : peakMa;
+  return {
+    peak: e.peak, plateau: e.plateau, bg: e.bg,
+    mA: Math.max(0, peakMa - bgMa),
+    peakMa, plateauMa, bgMa, netMa: peakMa - bgMa,
+  };
 }
 
 // ---- run lifecycle ----------------------------------------------------------
@@ -350,14 +374,15 @@ async function test2() {
   // off, enable it for the sweep and return it to off after. Either way the
   // sweep itself drives −${magV} V while it runs.
   const emWasOn = await hvIsOn('emission');
-  let priorV = 0;
-  if (emWasOn) { const a = await readAds(); priorV = (a && a.ok && a.emiss_v != null) ? Math.abs(a.emiss_v) : 0; }
+  let priorWiper = null;
+  if (emWasOn) priorWiper = await readWiper('ev');   // capture the exact wiper to restore
   try {
     tMsg('All filaments → SLEEP (no heating)…');
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
     tMsg(`Emission → −${magV} V @ ${limMa} mA${emWasOn ? ' (was ON — staying on)' : ''}…`);
-    await setHvAndWait('emission', magV); await setEmiLimit(limMa);
+    if (!(await setHvAndWait('emission', magV))) return;   // wiper write failed → abort (finally tears down)
+    await setEmiLimit(limMa);
     if (!emWasOn) await hvEnable('emission', true);
     await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
@@ -374,9 +399,9 @@ async function test2() {
     tMsg(`Emission short scan done — ${shorts.length ? shorts.length + ' short' : 'all green'}.`, shorts.length ? 'bad' : '');
   } finally {
     if (emWasOn) {
-      // Leave emission energised (the caller owns it); restore its prior
-      // setpoint so the scan's −30 V doesn't silently linger.
-      if (priorV > 1) await setHvAndWait('emission', priorV);
+      // Leave emission energised (the caller owns it); restore its exact prior
+      // wiper so the scan's −30 V doesn't silently linger.
+      if (priorWiper != null) await dsWrite('ev', priorWiper);
     } else {
       await hvEnable('emission', false); await lutZeroV('emission');
     }
@@ -398,7 +423,8 @@ async function test3() {
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
     tMsg(`Focus → −${magV} V (emission stays OFF)…`);
-    await setHvAndWait('focus', magV); await hvEnable('focus', true);
+    if (!(await setHvAndWait('focus', magV))) return;
+    await hvEnable('focus', true);
     await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
@@ -434,7 +460,8 @@ async function test4() {
   const items = [], bad = [], cur = { id: await pulseCursor() }; let cer = null;
   try {
     tMsg(`Emission → −${emV} V…`);
-    await setHvAndWait('emission', emV); await hvEnable('emission', true);
+    if (!(await setHvAndWait('emission', emV))) return;
+    await hvEnable('emission', true);
     await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
@@ -466,13 +493,15 @@ async function test5() {
   const fromA = parseFloat($t('t5From').value) || 1.0, toA = parseFloat($t('t5To').value) || 2.5;
   const stepA = Math.max(0.001, parseFloat($t('t5Step').value) || 0.25), settle = Math.max(0, parseInt($t('t5Settle').value, 10) || 200);
   const emV = Math.abs(parseFloat($t('t5V').value) || 200), widthUs = parseInt($t('t5Width').value, 10) || 1000;
-  const levels = []; for (let a = fromA; a <= toA + 1e-6; a += stepA) levels.push(+a.toFixed(3));
+  const nLevels = Math.max(1, Math.round((toA - fromA) / stepA) + 1);   // integer index avoids float drift dropping the top level
+  const levels = []; for (let k = 0; k < nLevels; k++) levels.push(+(fromA + k * stepA).toFixed(3));
   const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
   const curves = {}, cur = { id: await pulseCursor() }; let cer = null;
   const params = { fromA, toA, stepA, settleMs: settle, emissionV: -emV, pulseUs: widthUs, levels };
   try {
     tMsg(`Calibration — emission → −${emV} V (${fils.length} filaments × ${levels.length} levels)…`);
-    await setHvAndWait('emission', emV); await hvEnable('emission', true);
+    if (!(await setHvAndWait('emission', emV))) return;
+    await hvEnable('emission', true);
     await pulseArm(); await tSleep(150);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted — saving partial…'); break; }
