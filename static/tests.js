@@ -319,6 +319,25 @@ function fitR0(curve) {
 // =========================================================================
 // 1 — Filament resistance
 // =========================================================================
+// ---- unified test-result renderer -------------------------------------------
+// Every test reports the same way: a verdict badge (PASS/FAIL/DONE) + count
+// chips + an optional note + a flagged-item list. opts = { title, pass:
+// true|false|null (null = neutral DONE), counts:[{n,label,bad?}], note?,
+// flagged?:[str] }.
+function testResult(elId, opts) {
+  const el = $t(elId); if (!el) return;
+  const badge = opts.pass == null ? '<span class="tr-badge done">DONE</span>'
+    : opts.pass ? '<span class="tr-badge ok">PASS</span>' : '<span class="tr-badge fail">FAIL</span>';
+  const counts = (opts.counts || []).map((c) =>
+    `<span class="tr-count${c.bad ? ' bad' : ''}">${c.n} ${c.label}</span>`).join('');
+  const flag = (opts.flagged && opts.flagged.length)
+    ? `<div class="tr-flagged">${opts.flagged.slice(0, 30).join(' · ')}${opts.flagged.length > 30 ? ` · +${opts.flagged.length - 30} more` : ''}</div>`
+    : '';
+  el.className = 'summary tr' + (opts.pass === false ? ' bad' : '');
+  el.innerHTML = `<div class="tr-head">${badge} <b>${opts.title}</b> ${counts}</div>`
+    + (opts.note ? `<div class="tr-note">${opts.note}</div>` : '') + flag;
+}
+
 async function test1() {
   const settle = Math.max(0, parseInt($t('t1Settle').value, 10) || 3) * 1000;
   const shortR = parseFloat($t('t1Short').value) || 0.05, openMa = parseFloat($t('t1OpenMa').value) || 10;
@@ -355,9 +374,15 @@ async function test1() {
     }
   }
   drawBars('t1Plot', items, { yLabel: 'R (Ω)', yMax: 1.0, fmt: (v) => v.toFixed(2) });
-  const skipLine = skipped.length ? `<br><span class="bad">${skipped.length} standby-fail (skipped):</span> ${skipped.slice(0, 30).join(' · ')}` : '';
-  $t('t1Result').innerHTML = `<b>${okN} ok</b> · ${bad.filter((s) => s.includes('SHORT')).length} short · ${bad.filter((s) => s.includes('OPEN')).length} open · ${skipped.length} standby-fail`
-    + (bad.length ? '<br>' + bad.slice(0, 30).join(' · ') : '') + skipLine;
+  const shortN = bad.filter((s) => s.includes('SHORT')).length;
+  const openN = bad.filter((s) => s.includes('OPEN')).length;
+  testResult('t1Result', {
+    title: 'Filament resistance',
+    pass: bad.length === 0 && skipped.length === 0,
+    counts: [{ n: okN, label: 'ok' }, { n: shortN, label: 'short', bad: shortN > 0 },
+      { n: openN, label: 'open', bad: openN > 0 }, { n: skipped.length, label: 'standby-fail', bad: skipped.length > 0 }],
+    flagged: bad.concat(skipped.map((s) => `${s} standby-fail`)),
+  });
   tMsg(`Resistance done — ${okN} ok, ${bad.length} flagged, ${skipped.length} standby-fail (skipped).`, (bad.length || skipped.length) ? 'bad' : '');
 }
 
@@ -394,8 +419,11 @@ async function test2() {
       if (isShort) shorts.push(`F${f} (${filBoard(m)}): ${mA.toFixed(1)} mA`);
       drawBars('t2Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(limMa, thr * 2), fmt: (v) => v.toFixed(0) });
     }
-    $t('t2Result').innerHTML = shorts.length ? `<b class="bad">${shorts.length} short</b> · ` + shorts.slice(0, 30).join(' · ')
-      : `<b class="good">✓ all green</b> — no short on ${fils.length} filaments`;
+    testResult('t2Result', {
+      title: 'Emission short scan', pass: shorts.length === 0,
+      counts: [{ n: fils.length, label: 'tested' }, { n: shorts.length, label: 'short', bad: shorts.length > 0 }],
+      flagged: shorts,
+    });
     tMsg(`Emission short scan done — ${shorts.length ? shorts.length + ' short' : 'all green'}.`, shorts.length ? 'bad' : '');
   } finally {
     if (emWasOn) {
@@ -440,8 +468,11 @@ async function test3() {
       if (leak) leaks.push(`F${f}: Ie ${Math.max(iMa, iAds).toFixed(1)} mA · Vem ${vEm.toFixed(1)} V`);
       drawBars('t3Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(iThr * 4, 10), fmt: (v) => v.toFixed(0) });
     }
-    $t('t3Result').innerHTML = leaks.length ? `<b class="bad">${leaks.length} leak</b> · peak Vem ${maxV.toFixed(1)} V · ` + leaks.slice(0, 20).join(' · ')
-      : `<b class="good">✓ no leak</b> — emission V/I unaffected (peak Vem ${maxV.toFixed(1)} V)`;
+    testResult('t3Result', {
+      title: 'Focus leak scan', pass: leaks.length === 0,
+      counts: [{ n: fils.length, label: 'tested' }, { n: leaks.length, label: 'leak', bad: leaks.length > 0 }],
+      note: `peak Vem ${maxV.toFixed(1)} V`, flagged: leaks,
+    });
     tMsg(`Focus leak scan done — ${leaks.length ? leaks.length + ' leak' : 'no leak'}.`, leaks.length ? 'bad' : '');
   } finally { await hvEnable('focus', false); await lutZeroV('focus'); await pulseDisarm(); }
 }
@@ -477,8 +508,11 @@ async function test4() {
       if (cls !== 'ok') bad.push(`F${f}: ${mA.toFixed(1)} mA`);
       drawBars('t4Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(nMax * 1.5, 60), fmt: (v) => v.toFixed(0) });
     }
-    $t('t4Result').innerHTML = bad.length ? `<b class="bad">${bad.length} out of range</b> (${nMin}–${nMax} mA) · ` + bad.slice(0, 25).join(' · ')
-      : `<b class="good">✓ all in range</b> (${nMin}–${nMax} mA) on ${fils.length} filaments`;
+    testResult('t4Result', {
+      title: 'Emission current', pass: bad.length === 0,
+      counts: [{ n: fils.length, label: 'tested' }, { n: fils.length - bad.length, label: 'in-range' }, { n: bad.length, label: 'out', bad: bad.length > 0 }],
+      note: `range ${nMin}–${nMax} mA`, flagged: bad,
+    });
     tMsg(`Emission current test done — ${bad.length ? bad.length + ' out of range' : 'all in range'}.`, bad.length ? 'bad' : '');
   } finally {
     if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 2, 0);
@@ -525,9 +559,11 @@ async function test5() {
   // persist whatever we collected (full or partial)
   if (Object.keys(curves).length) {
     const save = await tPostJ('/api/calibration/save', { name: 'emission_calibration', data: { params, curves } });
-    $t('t5Result').innerHTML = save.ok
-      ? `<b class="good">✓ saved ${save.filaments} filament curves</b><br>${save.csv}`
-      : `<b class="bad">save failed</b>: ${save.error || ''}`;
+    testResult('t5Result', {
+      title: 'Emission calibration', pass: save.ok ? null : false,
+      counts: [{ n: save.filaments != null ? save.filaments : Object.keys(curves).length, label: 'curves' }],
+      note: save.ok ? `saved · ${save.csv || 'disk'}` : `save failed: ${save.error || ''}`,
+    });
     tMsg(`Calibration done — ${Object.keys(curves).length} filaments ${save.ok ? 'saved to disk' : 'NOT saved'}.`, save.ok ? '' : 'bad');
   } else { tMsg('Calibration produced no data.', 'bad'); }
 }
@@ -572,8 +608,11 @@ async function test6() {
     const save = await tPostJ('/api/calibration/save', { name: 'impedance_sweep', data: { params, curves, r0: r0s } });
     const r0vals = Object.values(r0s).filter((x) => x != null);
     const lo = r0vals.length ? Math.min(...r0vals) : 0, hi = r0vals.length ? Math.max(...r0vals) : 0;
-    $t('t6Result').innerHTML = (save.ok ? `<b class="good">✓ ${done} swept, saved</b>` : `<b class="bad">saved failed</b>`)
-      + ` · R₀ ${lo.toFixed(3)}–${hi.toFixed(3)} Ω` + (save.csv ? `<br>${save.csv}` : '');
+    testResult('t6Result', {
+      title: 'Impedance sweep', pass: save.ok ? null : false,
+      counts: [{ n: done, label: 'swept' }],
+      note: `R₀ ${lo.toFixed(3)}–${hi.toFixed(3)} Ω${save.ok ? (save.csv ? ' · ' + save.csv : ' · saved') : ' · save failed'}`,
+    });
     tMsg(`Impedance sweep done — ${done} filaments ${save.ok ? 'saved to disk' : 'NOT saved'}.`, save.ok ? '' : 'bad');
   } else { tMsg('Impedance sweep produced no data.', 'bad'); }
 }

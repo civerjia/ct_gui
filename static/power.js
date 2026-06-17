@@ -1214,6 +1214,7 @@ let adsBusy = false;
 // never left on screen looking live — a safety monitor must read '—', not lie.
 function blankAds(msg, kind) {
   for (const id of ['adsRef', 'adsFocus', 'adsEmI', 'adsEmV']) for (const e of [$p(id), $p(id + '2')]) if (e) e.textContent = '—';
+  for (const id of ['ctHvEmV', 'ctHvEmI', 'ctHvFocV']) { const e = $p(id); if (e) e.textContent = '—'; }
   // hvEmStatus/hvFocStatus are owned by readHvStatus() (hv_status pin level) — not blanked here.
   const s = $p('adsStatus'); if (s) { s.textContent = msg; s.className = 'summary ' + (kind || ''); }
 }
@@ -1230,6 +1231,9 @@ async function adsRead() {
     setM('adsFocus', f(j.focus_v, ' V'));
     setM('adsEmI', f(j.emiss_i_ma, ' mA'));
     setM('adsEmV', f(j.emiss_v, ' V'));
+    // mirror onto the CT-geometry overlay (top-right of the plot)
+    const co = (id, v) => { const e = $p(id); if (e) e.textContent = v; };
+    co('ctHvEmV', f(j.emiss_v, ' V')); co('ctHvEmI', f(j.emiss_i_ma, ' mA')); co('ctHvFocV', f(j.focus_v, ' V'));
     // NOTE: the Emission/Focus pin On/Off tiles are driven by readHvStatus()
     // (hv_status pin level), NOT the ADS1115 safety flags — those had emission/
     // focus polarity written wrong in firmware.

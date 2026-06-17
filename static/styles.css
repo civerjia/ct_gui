@@ -150,6 +150,14 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .geo-dims { justify-content: center; gap: 18px; margin-top: 10px; }
 .geo-dims input { width: 64px; }
 .geo-stage canvas { display: block; width: 100%; height: 100%; }
+/* live HV monitor overlay, top-right of the CT plot */
+.ct-hv-overlay { position: absolute; top: 8px; right: 8px; display: flex; flex-direction: column; gap: 3px;
+  font-family: var(--mono); font-size: 10px; color: #cdd6dc; background: rgba(7,11,14,0.66);
+  border: 1px solid #243038; border-radius: 8px; padding: 5px 8px; pointer-events: none; text-align: right; }
+.ct-hv-row { display: grid; grid-template-columns: 52px 58px 58px; gap: 6px; align-items: baseline; }
+.ct-hv-row span { color: #8b97a0; text-align: left; }
+.ct-hv-row b { color: #3fb6a0; font-weight: 700; }
+.ct-hv-row b.dim { color: #566069; font-weight: 400; }
 
 /* hardware run panel (schedule card) */
 .hw-actions { gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
@@ -169,6 +177,17 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .hw-step-body { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .hw-step-body .numlabel input { width: 64px; }
 @media (max-width: 520px) { .hw-step { grid-template-columns: 1fr; gap: 4px; } }
+/* prerequisite gates (①②③) — green when satisfied, grey when not */
+.hw-gates { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+.hw-gate { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700;
+           padding: 3px 8px; border-radius: 12px; background: #f2efe9; color: var(--muted);
+           border: 1px solid var(--line); }
+.hw-gate.ok { background: rgba(63,182,160,0.18); border-color: rgba(63,182,160,0.55); color: #2c7a6b; }
+/* a step whose prerequisites aren't met: dimmed + its buttons disabled in JS */
+.hw-step.locked { opacity: 0.45; }
+.hw-step.locked .hw-step-n { background: var(--muted); }
+.hw-status.bad { color: #c0392b; }
+.hw-run-card button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* total heating power strip (under the ring) */
 .geo-power { display: flex; gap: 8px; margin: 10px 2px 2px; }
@@ -498,6 +517,16 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .test-params .numlabel input { width: 72px; }
 .test-params .test-run { margin-left: auto; align-self: flex-end; padding: 6px 16px; }
 .test-plot { width: 100%; height: 132px; display: block; border-radius: 6px; margin: 4px 0 6px; background: #070b0e; }
+/* unified Cal&Test result card (testResult): verdict badge + count chips + flagged list */
+.tr .tr-head { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.tr-badge { font-size: 10px; font-weight: 800; padding: 1px 7px; border-radius: 10px; letter-spacing: 0.04em; }
+.tr-badge.ok { background: rgba(63,182,160,0.2); color: #2c7a6b; }
+.tr-badge.fail { background: rgba(192,57,43,0.15); color: #c0392b; }
+.tr-badge.done { background: #eceae3; color: #566069; }
+.tr-count { font-family: var(--mono); font-size: 11px; font-weight: 400; color: var(--muted); }
+.tr-count.bad { color: #c0392b; font-weight: 700; }
+.tr-note { font-size: 11px; font-weight: 400; color: var(--muted); margin-top: 2px; }
+.tr-flagged { font-family: var(--mono); font-size: 10.5px; font-weight: 400; color: #7a838b; margin-top: 3px; line-height: 1.5; }
 .test-legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
 .test-legend span { display: inline-flex; align-items: center; gap: 5px; }
 .test-legend .sw { width: 12px; height: 10px; border-radius: 2px; display: inline-block; }

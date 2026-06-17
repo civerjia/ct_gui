@@ -1372,14 +1372,25 @@ class CtHandler(BaseHTTPRequestHandler):
                 # Download the bound schedule + config to every connected controller.
                 plan = body.get("plan") or {}
                 channels = body.get("channels") or DEFAULT_CHANNELS
-                results = []
-                for cid, link in CONTROLLERS.items():
-                    if not link.client.connected:
-                        continue
+                # Download to each connected controller IN PARALLEL — the links are
+                # independent TCP sockets, so the two controllers' ~108 sequential
+                # UART round-trips overlap (≈2× faster than serial).
+                links = [(cid, link) for cid, link in CONTROLLERS.items() if link.client.connected]
+                slots = [None] * len(links)
+
+                def _dl(i, cid, link):
                     try:
-                        results.append(download_to_controller(link, cid - 1, plan, channels))
+                        slots[i] = download_to_controller(link, cid - 1, plan, channels)
                     except Exception as exc:
-                        results.append({"controller": cid - 1, "ok": False, "error": str(exc)})
+                        slots[i] = {"controller": cid - 1, "ok": False, "error": str(exc)}
+
+                threads = [threading.Thread(target=_dl, args=(i, cid, link), daemon=True)
+                           for i, (cid, link) in enumerate(links)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                results = [r for r in slots if r]
                 if not results:
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 self._json({"ok": all(r.get("ok") for r in results), "results": results})

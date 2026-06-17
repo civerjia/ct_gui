@@ -163,6 +163,8 @@ export function initControllers() {
       }
     }
     window.ctMaster = master;   // expose for power.js STM32/ADC routing
+    window.ctConnected = { 1: !!connected['1'], 2: !!connected['2'] };   // for the Hardware Run gate
+    if (window.ctRefreshRunGate) window.ctRefreshRunGate();
   }
 
   setInterval(refresh, 1500);

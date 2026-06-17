@@ -57,6 +57,10 @@
           <div class="geo-stage">
             <canvas id="ctCanvas"></canvas>
             <button id="resetGantryBtn" class="plot-btn" title="Reset gantry rotation to 0°">⟲ gantry 0°</button>
+            <div id="ctHvOverlay" class="ct-hv-overlay" title="Live HV monitor (ADS1115 on the master STM32). Focus current is not sensed by the hardware.">
+              <div class="ct-hv-row"><span>Emission</span><b id="ctHvEmV">—</b><b id="ctHvEmI">—</b></div>
+              <div class="ct-hv-row"><span>Focus</span><b id="ctHvFocV">—</b><b class="dim">no I</b></div>
+            </div>
           </div>
 
           <div class="geo-power" title="Total filament heating power. Plan view estimates from the configured per-filament power × state counts; Live view uses measured P = V·I.">
@@ -299,18 +303,25 @@
             <div class="section-head">
               <h2>Hardware Run <span class="hint">— download · arm · trigger · prep</span></h2>
             </div>
-            <p class="hint compact-hint">Runs the bound schedule on the connected controllers — work top to bottom.</p>
+            <p class="hint compact-hint">Guided scan sequence — each step unlocks the next. Work top to bottom.</p>
 
-            <div class="hw-step">
-              <div class="hw-step-label"><span class="hw-step-n">1</span> Download &amp; verify</div>
+            <div class="hw-gates" id="hwGates">
+              <span id="hwGateConn" class="hw-gate">① Connect</span>
+              <span id="hwGateHw" class="hw-gate">② Hardware
+                <button id="hwCheckBtn" class="xs" title="Confirm the pre-scan health checks passed: I²C Chip test (expanders alive), HV grid Toggle test (switches actuate), and the Cal&Test resistance/short scan. Click to mark checked; rebuilding hardware or reconnecting clears it.">mark OK</button></span>
+              <span id="hwGateSched" class="hw-gate">③ Schedule</span>
+            </div>
+
+            <div class="hw-step" id="hwStepDownload">
+              <div class="hw-step-label"><span class="hw-step-n">4</span> Download &amp; verify</div>
               <div class="hw-step-body">
                 <button id="hwDownloadBtn" class="sm quick" title="Translate the logical 0–95 schedule into per-controller frames and download the emission table, heating deltas, and per-filament idle/active currents to every connected controller.">Download</button>
                 <button id="hwVerifyBtn" class="sm" title="Read the entry counts + table CRC back from each controller (ShvGetTableInfo 0x74 / ShvHeatGetInfo 0x7E) and compare to the loaded plan. This is how you confirm the schedule actually reached firmware.">Verify in firmware</button>
               </div>
             </div>
 
-            <div class="hw-step">
-              <div class="hw-step-label"><span class="hw-step-n">2</span> Pre-heat
+            <div class="hw-step" id="hwStepPrep">
+              <div class="hw-step-label"><span class="hw-step-n">5</span> Pre-heat
                 <span class="hint" title="CT-scan prep ladder — applied to ALL filaments on BOTH connected controllers. Click left→right to warm up before arming. Refused while a schedule is running.">(prep ladder)</span></div>
               <div class="hw-step-body">
                 <button id="hwPrepStop" class="sm" title="All filaments → STOP. TPS output disabled (off). The fully cold rest state.">Stop all</button>
@@ -321,8 +332,8 @@
               </div>
             </div>
 
-            <div class="hw-step">
-              <div class="hw-step-label"><span class="hw-step-n">3</span> Arm</div>
+            <div class="hw-step" id="hwStepArm">
+              <div class="hw-step-label"><span class="hw-step-n">6</span> Arm</div>
               <div class="hw-step-body">
                 <label class="numlabel" title="Loop the one-rotation schedule this many times when armed (1 = a single rotation).">repeats <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
                 <button id="hwArmBtn" class="sm quick" title="Arm both controllers (ShvArm). Participants drop to IDLE and the controllers wait for the SyncIn trigger to start firing.">Arm</button>
@@ -330,8 +341,8 @@
               </div>
             </div>
 
-            <div class="hw-step">
-              <div class="hw-step-label"><span class="hw-step-n">4</span> Start scan
+            <div class="hw-step" id="hwStepTrig">
+              <div class="hw-step-label"><span class="hw-step-n">7</span> Start scan
                 <span class="hint" title="Once armed, the scan begins on the SyncIn trigger. Use Fire SyncIn for a bench trigger, or leave SyncIn hi-Z for an external trigger source.">(trigger)</span></div>
               <div class="hw-step-body">
                 <label class="numlabel" title="Bench test: how many SyncIn pulses to emit from the ESP32 (/sync/fire). Use only when the ESP32 drives SyncIn; for an external trigger source leave SyncIn hi-Z.">pulses <input id="hwTrigCount" type="number" min="1" max="100000" value="1" /></label>

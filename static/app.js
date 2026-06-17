@@ -269,6 +269,7 @@ function rebuildSchedule() {
   applyScheduleView();     // (re)populate the active view
   updateScheduleHeader();
   gotoSeq(0, false);
+  if (typeof invalidateRun === 'function') invalidateRun();   // a changed schedule must be re-downloaded
 }
 
 function applyScheduleView() {
@@ -1031,6 +1032,45 @@ const postJSON = async (path, body) => (await fetch(path, {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
 })).json();
 
+// ---- guided run-sequence gating --------------------------------------------
+// Each step unlocks the next; later actions stay disabled until prerequisites
+// pass. Hard gates use only state app.js fully owns — schedule (scanReady),
+// operator ack (hwChecked), and runState (download/verify/prep/arm) — so they
+// can't be wrong. Connection is a live indicator chip fed by controllers.js.
+const runState = { hwChecked: false, downloaded: false, verified: false, prepActive: false, armed: false };
+const scanReady = () => schedule.length > 0;
+const settleOk = () => !!(heatingPlan && heatingPlan.validation && heatingPlan.validation.ok);
+const hwConnected = () => { const c = window.ctConnected || {}; return !!(c[1] || c[2]); };
+function setGate(id, ok, text) {
+  const e = $(id); if (!e) return;
+  e.classList.toggle('ok', !!ok);
+  if (text != null && e.childNodes[0]) e.childNodes[0].nodeValue = text;
+}
+function enableBtn(id, on) { const e = $(id); if (e) e.disabled = !on; }
+function lockStep(id, locked) { const e = $(id); if (e) e.classList.toggle('locked', !!locked); }
+function refreshRunGate() {
+  const conn = hwConnected();
+  setGate('hwGateConn', conn, conn ? '① Connected ' : '① Connect ');
+  setGate('hwGateHw', runState.hwChecked, runState.hwChecked ? '② Hardware OK ' : '② Hardware ');
+  setGate('hwGateSched', scanReady(), scanReady() ? `③ Schedule ${schedule.length}${settleOk() ? '' : ' ⚠'} ` : '③ Schedule ');
+  const canDownload = scanReady();
+  const canPrep = runState.downloaded;
+  const canArm = runState.downloaded && runState.verified && runState.hwChecked && scanReady();
+  enableBtn('hwDownloadBtn', canDownload);
+  enableBtn('hwVerifyBtn', runState.downloaded);
+  ['hwPrepStop', 'hwPrepSleep', 'hwPrepStandby', 'hwPrepIdle', 'hwPrepActive'].forEach((id) => enableBtn(id, canPrep));
+  enableBtn('hwArmBtn', canArm && !runState.armed);
+  enableBtn('hwDisarmBtn', runState.armed);
+  enableBtn('hwTrigBtn', runState.armed);
+  lockStep('hwStepDownload', !canDownload);
+  lockStep('hwStepPrep', !canPrep);
+  lockStep('hwStepArm', !(canArm || runState.armed));
+  lockStep('hwStepTrig', !runState.armed);
+}
+window.ctRefreshRunGate = refreshRunGate;
+// A changed/rebuilt schedule (or lost connection) invalidates a prior download.
+function invalidateRun() { runState.downloaded = runState.verified = runState.prepActive = runState.armed = false; refreshRunGate(); }
+
 // Translate the GUI's bound schedule into the host plan (logical filament 0-95;
 // the backend maps to global 0-127 + per-controller split).
 function buildPlan() {
@@ -1073,6 +1113,7 @@ async function hwDownload() {
     if (!j.ok && j.error) { hwMsg(`Download failed: ${j.error}`); return; }
     const parts = (j.results || []).map((r) => `P${r.controller + 1}: ${r.ok ? '✓' : '✗'} ${r.emit} emit/${r.heat} heat`);
     hwMsg(`${j.ok ? '✓ Downloaded' : '✗ Partial'} — ${parts.join(' · ')}`);
+    runState.downloaded = !!j.ok; runState.verified = false; runState.armed = false; refreshRunGate();
   } catch (e) { hwMsg('Download failed: ' + e); }
 }
 
@@ -1090,16 +1131,19 @@ async function hwVerify() {
         : `P${k}: ${r.match ? '✓' : '✗'} emit ${r.emit}/${r.emitExpected} · heat ${r.heat}/${r.heatExpected}`
           + (r.crc != null ? ` · crc 0x${(r.crc >>> 0).toString(16).toUpperCase()}` : ''));
     hwMsg(`${j.ok ? '✓ Firmware matches plan' : '✗ Mismatch — re-download'} — ${parts.join(' · ')}`);
+    runState.verified = !!j.ok; refreshRunGate();
   } catch (e) { hwMsg('Verify failed: ' + e); }
 }
 
 async function hwArm() {
   const repeats = Math.max(1, parseInt($('hwRepeats').value, 10) || 1);
+  if (!runState.prepActive && !confirm('Pre-heat (Active first batch) has not been run — the lead filaments may fire cold. Arm anyway?')) return;
   hwMsg('Arming…');
   try {
     const j = await postJSON('/api/arm', { repeats });
     const parts = Object.entries(j.results || {}).map(([k, r]) => `P${k}: ${r.ok ? 'armed' : (r.error || 'reject ' + r.reject)}`);
     hwMsg(`${j.ok ? '✓ Armed' : '✗'} (×${repeats}) — ${parts.join(' · ')} — waiting for SyncIn.`);
+    runState.armed = !!j.ok; refreshRunGate();
     if (j.ok) startRunMonitor();
   } catch (e) { hwMsg('Arm failed: ' + e); }
 }
@@ -1107,6 +1151,7 @@ async function hwArm() {
 async function hwDisarm() {
   try { await postJSON('/api/disarm', {}); hwMsg('Disarmed — participants → IDLE.'); }
   catch (e) { hwMsg('Disarm failed: ' + e); }
+  runState.armed = false; refreshRunGate();
   stopRunMonitor();
 }
 
@@ -1130,6 +1175,7 @@ async function hwPrep(state, label, opts) {
     const parts = Object.entries(j.results || {}).map(([k, r]) =>
       `P${k}: ${r.ok ? '✓' : '✗'}${r.applied != null ? ' ' + r.applied : ''}${r.error ? ' ' + r.error : ''}`);
     hwMsg(`${j.ok ? '✓' : '✗'} ${label} — ${parts.join(' · ')}`);
+    if (j.ok && state === STATE.ACTIVE) { runState.prepActive = true; refreshRunGate(); }
   } catch (e) { hwMsg(`${label} failed: ` + e); }
 }
 // per-filament CC current (mA) so Idle/Active land on the right setpoint
@@ -1467,6 +1513,8 @@ function init() {
   $('hwArmBtn').addEventListener('click', hwArm);
   $('hwDisarmBtn').addEventListener('click', hwDisarm);
   $('hwTrigBtn').addEventListener('click', hwTrigger);
+  $('hwCheckBtn').addEventListener('click', () => { runState.hwChecked = !runState.hwChecked; refreshRunGate(); });
+  refreshRunGate();   // initial gate/lock state
   $('hwPrepStop').addEventListener('click', () => hwPrep(STATE.STOP, 'Stop all'));
   $('hwPrepSleep').addEventListener('click', () => hwPrep(STATE.SLEEP, 'Sleep all'));
   $('hwPrepStandby').addEventListener('click', () => hwPrep(STATE.STANDBY, 'Standby all'));
