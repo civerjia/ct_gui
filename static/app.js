@@ -1108,13 +1108,36 @@ async function hwDownload() {
   const v = heatingPlan && heatingPlan.validation;
   if (v && !v.ok && !confirm('Settle time is NOT satisfied. Download anyway?')) { hwMsg('Download cancelled.'); return; }
   hwMsg(`Downloading ${schedule.length} emission + ${heatRows.length} heating…`);
+  // /api/download blocks for the whole transfer, so poll a live progress endpoint
+  // (separate request, runs concurrently) to show phase + frames done while it runs.
+  let progDone = false;   // guards against a late poll overwriting the final result
+  let progTimer = setInterval(async () => {
+    if (progDone) return;
+    try {
+      const p = await (await fetch('/api/download-progress')).json();
+      if (progDone) return;   // re-check: the download may have finished mid-fetch
+      const parts = Object.entries(p.controllers || {})
+        .map(([k, s]) => `P${k} ${s.phase} ${s.done}/${s.total}`);
+      if (parts.length) hwMsg(`Downloading… ${parts.join(' · ')}`);
+    } catch { /* keep the bar alive */ }
+  }, 400);
   try {
     const j = await postJSON('/api/download', { plan: buildPlan() });
+    progDone = true; clearInterval(progTimer); progTimer = null;
     if (!j.ok && j.error) { hwMsg(`Download failed: ${j.error}`); return; }
-    const parts = (j.results || []).map((r) => `P${r.controller + 1}: ${r.ok ? '✓' : '✗'} ${r.emit} emit/${r.heat} heat`);
-    hwMsg(`${j.ok ? '✓ Downloaded' : '✗ Partial'} — ${parts.join(' · ')}`);
+    const s = (ms) => ((ms || 0) / 1000).toFixed(1) + 's';
+    const parts = (j.results || []).map((r) => {
+      const t = r.timing || {};
+      const perf = (t.total && r.frames) ? ` · ${Math.round(t.total / r.frames)} ms/frame` : '';
+      const breakdown = t.total != null
+        ? `<br>&nbsp;&nbsp;<span class="hint">${r.frames} frames in ${s(t.total)}${perf}${r.fails ? ' · ' + r.fails + ' failed' : ''}</span>`
+        : '';
+      return `P${r.controller + 1}: ${r.ok ? '✓' : '✗'} ${r.emit} emit / ${r.heat} heat${breakdown}`;
+    });
+    hwMsg(`${j.ok ? '✓ Downloaded' : '✗ Partial'} — ${parts.join('<br>')}`);
     runState.downloaded = !!j.ok; runState.verified = false; runState.armed = false; refreshRunGate();
   } catch (e) { hwMsg('Download failed: ' + e); }
+  finally { progDone = true; if (progTimer) clearInterval(progTimer); }
 }
 
 // Read the schedule back out of firmware (ShvGetTableInfo 0x74 + ShvHeatGetInfo

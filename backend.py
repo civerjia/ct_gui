@@ -540,7 +540,10 @@ def read_telemetry(link: "ControllerLink", controller: int, channels=None) -> di
         page_start += len(entries)
     return out
 
-SHV_EMIT_CHUNK = 64    # emission entries per frame (64*4+3 = 259 B)
+SHV_EMIT_CHUNK = 64    # emission entries per frame (64*4+3 = 259 B). Bigger chunks
+                       # didn't help — the bottleneck is RP2350 per-frame service
+                       # latency, not frame count (it processes a bigger frame
+                       # proportionally slower while busy with I2C).
 SHV_HEAT_CHUNK = 56    # firmware caps ShvHeatSetEntries at 56
 
 
@@ -955,55 +958,61 @@ ESPCMD = EspCmdClient()
 #   config   : {interPulseMs, maxOnMs, totalMs, triggerEdge}
 #   repeats  : loop count
 # ---------------------------------------------------------------------------
+# Live download progress, polled by the GUI while /api/download blocks. Keyed by
+# controller index → {phase, done, total}. Updated per frame by the worker thread.
+_DL_PROGRESS: dict[int, dict] = {}
+_DL_LOCK = threading.Lock()
+
+
 def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
                            channels=None) -> dict:
-    steps: list[dict] = []
+    # PIPELINED download: build the whole ordered frame list, then fire it with a
+    # sliding window so the ~per-frame round-trip latencies overlap instead of
+    # serializing. Order only matters within emit/heat (CLEAR must precede its
+    # SET_ENTRIES); the firmware processes the UART stream in order, so one ordered
+    # pipeline is safe. A non-OK / timed-out frame is counted as a failure and the
+    # overall ok is False — the GUI's Verify (CRC) is the backstop.
+    t_all = time.monotonic()
+    reqs: list = []      # (frame_type, payload, flags) in send order
+    labels: list = []
 
-    def step(name, resp):
-        steps.append({"step": name, "ok": _status_ok(resp)})
-        return _status_ok(resp)
+    reqs.append((SHV_SET_ACTIVE_LIST, MAPPING.active_list(controller), 0)); labels.append("active_list")
+    reqs.append((CH_SET_I2C_ENABLE_MASK, bytes([MAPPING.channel_mask(controller) & 0xFF]), 0)); labels.append("mask")
 
-    # 1. active-filament list (64-byte power-slot -> global filament) + channel mask
-    step("active_list", link.request(SHV_SET_ACTIVE_LIST, MAPPING.active_list(controller), flags=0))
-    step("mask", link.request(CH_SET_I2C_ENABLE_MASK, bytes([MAPPING.channel_mask(controller) & 0xFF]), flags=0))
-
-    # 2. per-filament IDLE/ACTIVE current calibration (this controller's boards)
-    cur_ok = True
-    cur_n = cur_fail = 0
+    cur_n = 0
     for fil, cur in (plan.get("currents") or {}).items():
         f = int(fil)
         ctrl, ch, pos, _ = filament_to_board(f)
         if ctrl != controller:
             continue
         cur_n += 1
-        payload = bytes([ch, pos]) + _u16(int(cur.get("idle_mA", 0))) + _u16(int(cur.get("active_mA", 0)))
-        if not _status_ok(link.request(CH_FILAMENT_CURRENTS, payload, flags=FLAG_SINGLE)):
-            cur_ok = False
-            cur_fail += 1
-    steps.append({"step": "currents", "ok": cur_ok, "wrote": cur_n, "failed": cur_fail})
+        reqs.append((CH_FILAMENT_CURRENTS,
+                     bytes([ch, pos]) + _u16(int(cur.get("idle_mA", 0))) + _u16(int(cur.get("active_mA", 0))),
+                     FLAG_SINGLE))
+        labels.append("currents")
 
-    # 3. config
     cfg = plan.get("config") or {}
-    cfg_payload = (_u32(int(cfg.get("interPulseMs", 3000))) + _u16(int(cfg.get("maxOnMs", 40)))
-                   + _u32(int(cfg.get("totalMs", 60000))) + bytes([int(cfg.get("triggerEdge", 0)) & 0xFF]))
-    step("config", link.request(SHV_SET_CONFIG, cfg_payload, flags=0))
+    reqs.append((SHV_SET_CONFIG,
+                 _u32(int(cfg.get("interPulseMs", 3000))) + _u16(int(cfg.get("maxOnMs", 40)))
+                 + _u32(int(cfg.get("totalMs", 60000))) + bytes([int(cfg.get("triggerEdge", 0)) & 0xFF]), 0))
+    labels.append("config")
 
-    # 4. emission table — the SAME full global list to BOTH controllers; the entry
-    # carries the GLOBAL filament 0-95 (firmware decode_ reverse-maps via the
-    # active list; a not-mine filament is counted but not fired).
-    step("emit_clear", link.request(SHV_CLEAR_TABLE, b"", flags=0))
+    # emission table — full global list (entry carries global filament 0-95)
+    reqs.append((SHV_CLEAR_TABLE, b"", 0)); labels.append("emit_clear")
     emit = plan.get("emission") or []
     ent = bytearray()
     for e in emit:
         ent += bytes([int(e["filament"]) & 0xFF, int(e["numPulses"]) & 0xFF]) + _u16(int(e["widthUs"]))
     n = len(emit)
+    emit_frames = 0
     for start in range(0, n, SHV_EMIT_CHUNK):
         count = min(SHV_EMIT_CHUNK, n - start)
-        body = _u16(start) + bytes([count]) + bytes(ent[start * 4:(start + count) * 4])
-        step(f"emit[{start}]", link.request(SHV_SET_ENTRIES, body, flags=0))
+        emit_frames += 1
+        reqs.append((SHV_SET_ENTRIES, _u16(start) + bytes([count]) + bytes(ent[start * 4:(start + count) * 4]), 0))
+        labels.append("emit")
 
-    # 5. heating deltas — only THIS controller's filaments, local (ch, pos)
-    step("heat_clear", link.request(SHV_HEAT_CLEAR, b"", flags=0))
+    # heating deltas — only THIS controller's filaments (local ch, pos)
+    reqs.append((SHV_HEAT_CLEAR, b"", 0)); labels.append("heat_clear")
     heat = [h for h in (plan.get("heating") or [])
             if filament_to_board(int(h["filament"]))[0] == controller]
     heat.sort(key=lambda h: int(h["triggerIndex"]))
@@ -1015,11 +1024,32 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     hn = len(heat)
     for start in range(0, hn, SHV_HEAT_CHUNK):
         count = min(SHV_HEAT_CHUNK, hn - start)
-        body = _u16(start) + bytes([count]) + bytes(hent[start * 8:(start + count) * 8])
-        step(f"heat[{start}]", link.request(SHV_HEAT_SET_ENTRIES, body, flags=0))
+        reqs.append((SHV_HEAT_SET_ENTRIES, _u16(start) + bytes([count]) + bytes(hent[start * 8:(start + count) * 8]), 0))
+        labels.append("heat")
 
-    ok = all(s["ok"] for s in steps)
-    return {"controller": controller, "ok": ok, "emit": n, "heat": hn, "steps": steps}
+    total = len(reqs)
+
+    def _on_prog(d):
+        with _DL_LOCK:
+            _DL_PROGRESS[controller] = {"phase": "pipelined", "done": d, "total": total}
+
+    _on_prog(0)
+    results = link.client.send_pipeline(reqs, window=8, timeout=2.5, on_progress=_on_prog)
+    oks = [_status_ok(r) if isinstance(r, dict) else False for r in results]
+    fails = [labels[i] for i, x in enumerate(oks) if not x]
+    ok = not fails
+
+    total_ms = round((time.monotonic() - t_all) * 1000)
+    with _DL_LOCK:
+        _DL_PROGRESS[controller] = {"phase": "done", "done": total, "total": total}
+    per_frame = total_ms / max(1, total)
+    print(f"[download] P{controller + 1} (pipelined, w=8): {total_ms} ms, {total} frames "
+          f"({per_frame:.0f} ms/frame) | currents {cur_n}f · emit {emit_frames}f · heat {hn // SHV_HEAT_CHUNK + 1}f"
+          + (f" · {len(fails)} FAILED: {fails[:6]}" if fails else ""), flush=True)
+
+    return {"controller": controller, "ok": ok, "emit": n, "heat": hn,
+            "frames": total, "fails": len(fails),
+            "timing": {"total": total_ms}}
 
 
 # ---------------------------------------------------------------------------
@@ -1271,6 +1301,11 @@ class CtHandler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": f"LUT read failed: {exc}"})
             else:
                 self._json({"ok": False, "error": "no LUT — calibrate first"})
+        elif path == "/api/download-progress":
+            # Live download progress (the GUI polls this while /api/download blocks).
+            with _DL_LOCK:
+                prog = {str(c + 1): dict(v) for c, v in _DL_PROGRESS.items()}
+            self._json({"ok": True, "controllers": prog})
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
@@ -1377,6 +1412,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 # UART round-trips overlap (≈2× faster than serial).
                 links = [(cid, link) for cid, link in CONTROLLERS.items() if link.client.connected]
                 slots = [None] * len(links)
+                with _DL_LOCK:
+                    _DL_PROGRESS.clear()   # fresh progress for the GUI poller
 
                 def _dl(i, cid, link):
                     try:
