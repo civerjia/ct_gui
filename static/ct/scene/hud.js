@@ -20,8 +20,12 @@ export function drawHud(r) {
   const neutral = 'rgba(195,208,214,0.95)';
   const sc = (s.stateColor && s.stateColor[f.state]) || '#888';
 
+  // filament id -> board id: P(ower) 1-2 · CH(annel) 1-8 · B(oard) 1-8
+  const hw = s.hwMap ? s.hwMap(idx) : null;
+  const board = hw ? `P${hw.controller} · CH${hw.channel + 1} · B${hw.mux + 1}` : '—';
+
   const x = 10, y = 10, w = 150, pad = 8, lh = 14;
-  const h = pad * 2 + lh * 4;
+  const h = pad * 2 + lh * 5;
   ctx.fillStyle = 'rgba(8,13,18,0.74)';
   r._rrect(x, y, w, h, 7); ctx.fill();
   ctx.strokeStyle = 'rgba(120,150,162,0.28)'; ctx.lineWidth = 1; ctx.stroke();
@@ -44,6 +48,9 @@ export function drawHud(r) {
   ctx.textAlign = 'left'; ctx.fillStyle = sc;
   ctx.fillText(`FIL ${idx}`, colL, yy);
   kv(colR, 'θ', ang.toFixed(1) + '°', neutral); yy += lh;
+  ctx.font = '700 10.5px var(--mono, monospace)';
+  ctx.textAlign = 'left'; ctx.fillStyle = neutral;
+  ctx.fillText(board, colL, yy); yy += lh;
   kv(colL, 'V', V.toFixed(2) + ' V', '#5fd0bb');
   kv(colR, 'I', I.toFixed(0) + ' mA', '#f2c14e'); yy += lh;
   kv(colL, 'R', R == null ? '—' : R.toFixed(1) + ' Ω', neutral);

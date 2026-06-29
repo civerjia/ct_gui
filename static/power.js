@@ -25,7 +25,7 @@ let pwTarget = 1;                       // selected controller (1 or 2) — boar
 // controller; those calls route there regardless of the selected target.
 const masterId = () => window.ctMaster || 1;
 const masterConnected = () => !!connectedSet[masterId()];
-const POLL_MS = 2000;                    // board snapshot + HV grid refresh period
+const POLL_MS = 1000;                    // board snapshot + HV grid refresh period
 const REFRESH_S = (POLL_MS / 1000).toFixed(0) + ' s';
 const powerCmd = (command, extra) => postJ('/api/power-cmd', { controller: pwTarget, command, ...extra });
 
@@ -775,17 +775,21 @@ function renderHvGrid() {
   let on = 0, mm = 0;
   for (let ch = 0; ch < 8; ch++) for (let b = 0; b < 8; b++) {
     const d = hvBit(hvDesired, ch, b), f = hvBit(hvFeedback, ch, b), mis = d !== f;
-    if (d) on++; if (mis) mm++;
+    if (d) on++; if (mis && chEnabled(ch)) mm++;
     const k = `${ch}.${b}`;
     const tile = document.createElement('div');
-    const tested = hvTest && hvTest.has(k), testPass = tested && hvTest.get(k);
+    const tested = hvTest && hvTest.has(k);
+    const mark = tested ? hvTest.get(k) : undefined;     // true=pass · false=real fail · 'err'=inconclusive
+    const testPass = mark === true, testErr = mark === 'err';
+    const glyph = testPass ? '✓' : testErr ? '⚠' : '✗';
+    const word = testPass ? 'OK' : testErr ? 'INCONCLUSIVE (link busy/timeout — re-run)' : 'FAILED';
     tile.className = 'status-tile ' + (mis ? 'fault' : d ? 'present' : 'absent') + (hvSel.has(k) ? ' selected' : '')
       + (chEnabled(ch) ? '' : ' masked')
-      + (tested && !testPass ? ' test-fail' : '');
+      + (mark === false ? ' test-fail' : testErr ? ' test-err' : '');
     tile.innerHTML = `<span class="tile-title">C${ch + 1}.${b + 1}</span><span class="hv-state">${mis ? '!' : d}</span>`
-      + (tested ? `<span class="hv-test ${testPass ? 'pass' : 'fail'}" title="switch verify ${testPass ? 'OK' : 'FAILED'}">${testPass ? '✓' : '✗'}</span>` : '');
+      + (tested ? `<span class="hv-test ${testPass ? 'pass' : testErr ? 'err' : 'fail'}" title="switch verify ${word}">${glyph}</span>` : '');
     tile.title = `CH${ch + 1} bit ${b + 1} — desired ${d}, feedback ${f}`
-      + (tested ? ` · switch test ${testPass ? 'PASS' : 'FAIL'}` : '');
+      + (tested ? ` · switch test ${testPass ? 'PASS' : testErr ? 'INCONCLUSIVE' : 'FAIL'}` : '');
     tile.addEventListener('click', (e) => {
       if (!chEnabled(ch)) return;                        // masked channel: non-interactive
       if (e.shiftKey) {
@@ -826,10 +830,41 @@ async function hvSelSet(val) {
   for (const k of hvSel) { const [c, b] = k.split('.').map(Number); await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: val, verify: true }); }
   refreshHv();
 }
+// Pause/resume the target controller's background PING. The toggle test fires
+// ~2 round-trips per switch on the shared bridge socket; without this they'd
+// queue behind the 1 Hz PING (and its slow replies), so per-bit latency jitters.
+const pollPause = (paused) => postJ('/api/poll-pause', { controller: pwTarget, paused });
+
+// A transient (retryable) failure is a transport timeout or the device-busy
+// mailbox status — NOT a real VERIFY_FAIL. VERIFY_FAIL means the switch didn't
+// actuate (a genuine dead chip), which must be marked ✗ immediately, never
+// retried away. No decoded status ⇒ the request timed out at the transport.
+function hvCmdTransient(r) {
+  if (r.ok) return false;
+  const st = r.response && r.response.status;
+  if (!st) return true;            // no status frame ⇒ transport timeout/error
+  return st === 'BUSY';            // device mailbox momentarily busy
+}
+
+// Set one HV bit with verify, retrying ONLY the transient busy/timeout (up to 4×,
+// 200 ms apart). A real VERIFY_FAIL returns on the first try.
+async function hvSetBitVerified(c, b, value) {
+  let r;
+  for (let i = 0; i < 4; i++) {
+    r = await powerCmd('HV_SET_BIT', { channel: c, bit: b, value, verify: true });
+    if (!hvCmdTransient(r)) break;
+    $p('hvStatus').textContent = `CH${c + 1}.${b + 1}: link busy, retry ${i + 1}/4…`;
+    await sleep(200);
+  }
+  return r;
+}
+
 // Switch-verify test: auto-test EVERY bit on all ENABLED channels. Toggle each
 // switch ON with verify, record the firmware's pass/fail (HV_SET_BIT returns
 // VerifyFail → r.ok=false when the switch doesn't actuate — e.g. a dead CH1/CH5
-// chip), then toggle it back OFF. Marks ✓/✗ per tile. Masked channels skipped.
+// chip), then toggle it back OFF. Marks ✓ pass / ✗ fail / ⚠ inconclusive per tile.
+// The PING is paused for the run and transient link errors are retried, so a ✗ is
+// a real dead switch and a ⚠ is "couldn't reach the device — re-run", never mixed.
 // No firmware change — uses the verify the firmware already does on HV_SET_BIT.
 async function hvSwitchTest() {
   if (!boardTargetConnected()) { $p('hvStatus').textContent = 'connect the target controller first'; return; }
@@ -842,27 +877,40 @@ async function hvSwitchTest() {
   hvTestAbort = false;
   const btn = $p('hvSelTest'); if (btn) btn.disabled = true;
   const stop = $p('hvSelTestStop'); if (stop) stop.disabled = false;
-  const fails = [];
+  const fails = [], inconc = [];
   let aborted = false;
-  for (const k of keys) {
-    if (hvTestAbort) { aborted = true; break; }
-    const [c, b] = k.split('.').map(Number);
-    $p('hvStatus').textContent = `toggle test CH${c + 1}.${b + 1}… (${hvTest.size + 1}/${keys.length})`;
-    const r = await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: true, verify: true });
-    const pass = !!r.ok;
-    hvTest.set(k, pass);
-    if (!pass) fails.push(`CH${c + 1}.${b + 1}`);
-    await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: false, verify: true });   // restore off
-    renderHvGrid();
+  await pollPause(true);
+  try {
+    let i = 0;
+    for (const k of keys) {
+      if (hvTestAbort) { aborted = true; break; }
+      if (i++ % 8 === 0) pollPause(true);                  // re-arm the auto-expiring pause on long runs
+      const [c, b] = k.split('.').map(Number);
+      $p('hvStatus').textContent = `toggle test CH${c + 1}.${b + 1}… (${hvTest.size + 1}/${keys.length})`;
+      const r = await hvSetBitVerified(c, b, true);
+      let mark;                                          // true=pass · false=real fail · 'err'=inconclusive
+      if (r.ok) mark = true;
+      else if (hvCmdTransient(r)) { mark = 'err'; inconc.push(`CH${c + 1}.${b + 1}`); }
+      else { mark = false; fails.push(`CH${c + 1}.${b + 1}`); }
+      hvTest.set(k, mark);
+      await hvSetBitVerified(c, b, false);               // restore off (also retries transient)
+      renderHvGrid();
+    }
+  } finally {
+    await pollPause(false);                              // always resume the PING
   }
   if (btn) btn.disabled = false;
   if (stop) stop.disabled = true;
   await refreshHv(true);
   const done = hvTest.size;
+  const ok = done - fails.length - inconc.length;
+  const parts = [];
+  if (fails.length) parts.push(`FAILED ${fails.join(' ')}`);
+  if (inconc.length) parts.push(`INCONCLUSIVE ${inconc.join(' ')} (link busy — re-run)`);
   $p('hvStatus').textContent = aborted
-    ? `toggle test ABORTED at ${done}/${keys.length}${fails.length ? ' · FAILED ' + fails.join(' ') : ''}`
-    : fails.length
-      ? `toggle test: ${keys.length - fails.length}/${keys.length} ok · FAILED ${fails.join(' ')}`
+    ? `toggle test ABORTED at ${done}/${keys.length}${parts.length ? ' · ' + parts.join(' · ') : ''}`
+    : parts.length
+      ? `toggle test: ${ok}/${done} ok · ${parts.join(' · ')}`
       : `toggle test: all ${keys.length} switch(es) verified ✓`;
 }
 
@@ -953,8 +1001,18 @@ function wireHv() {
     const next = $p(id).dataset.on !== '1';
     setHvEnBtn(id, label, next);               // flip immediately — no waiting for the round-trip
     hvFb(`${label}: turning ${next ? 'ON' : 'OFF'} …`);
-    const j = await postJ('/api/stm32/hv-enable', { controller: masterId(), ch: chan, on: next });
-    if (!j.ok) setHvEnBtn(id, label, !next);   // command failed → undo the flip
+    // The hv_enable command shares the single STM32 UART with the 2 Hz ads/hv_status
+    // poll; a click that lands while the STM32 is mid-transaction misses the firmware's
+    // 250 ms ACK window and the device returns HTTP 502 (UART busy). Retry the transient
+    // busy-502 (same pattern as ds3502SetRetry) instead of surfacing it to the user.
+    let j;
+    for (let i = 0; i < 4; i++) {
+      j = await postJ('/api/stm32/hv-enable', { controller: masterId(), ch: chan, on: next });
+      if (j.ok || j.status !== 502) break;     // only retry the busy-bus 502
+      hvFb(`${label}: STM32 link busy, retrying ${i + 1}/4…`);
+      await sleep(250);
+    }
+    if (!j.ok) setHvEnBtn(id, label, !next);   // command still failed → undo the flip
     hvFb(j.ok ? `${label} ${next ? 'ON' : 'OFF'}` : `${label} ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
   };
   $p('hvEnEm').onclick = () => hvEnClick('emission', 'hvEnEm', 'Emission');

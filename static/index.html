@@ -225,6 +225,7 @@
             <div class="row compact fil-save">
               <button id="filSaveBtn" class="xs">Save to host</button>
               <button id="filLoadBtn" class="xs">Load</button>
+              <button id="schDetectPresent" class="xs" title="Scan the controller(s) for physically-present boards (enables isolated-12V so the INA219s power up, then reads them) and apply the result to the plan: present → live, absent → dead (✕). Rebuilds the schedule so it fires only real boards (no IsoOff at arm). Leaves boards at Sleep.">Detect present</button>
               <span class="hint">currents download with the schedule.</span>
             </div>
             <div class="fil-list-head"><span>Fil</span><span>#Pul</span><span>Dur µs</span><span>Idle A</span><span>Act A</span></div>
@@ -302,8 +303,9 @@
           <section class="card module hw-run-card" data-module="hwrun">
             <div class="section-head">
               <h2>Hardware Run <span class="hint">— download · arm · trigger · prep</span></h2>
+              <label id="hwOverrideLbl" class="hw-override" title="Override the guided gate: enable every step button regardless of order (download / verify / prep / arm / trigger) for testing &amp; bring-up. The firmware still enforces its own safety (e.g. ISO/TPS arm rejects) — this only unlocks the UI."><input type="checkbox" id="hwOverride" /> Override</label>
             </div>
-            <p class="hint compact-hint">Guided scan sequence — each step unlocks the next. Work top to bottom.</p>
+            <p class="hint compact-hint">Guided scan sequence — each step unlocks the next. Work top to bottom. <span id="hwOverrideNote" class="hw-override-note" hidden>⚠ Override on — all steps unlocked; firmware safety still applies.</span></p>
 
             <div class="hw-gates" id="hwGates">
               <span id="hwGateConn" class="hw-gate">① Connect</span>
@@ -338,6 +340,7 @@
                 <label class="numlabel" title="Loop the one-rotation schedule this many times when armed (1 = a single rotation).">repeats <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
                 <button id="hwArmBtn" class="sm quick" title="Arm both controllers (ShvArm). Participants drop to IDLE and the controllers wait for the SyncIn trigger to start firing.">Arm</button>
                 <button id="hwDisarmBtn" class="sm" title="Disarm / stop the run (ShvDisarm). Aborts firing and returns participating filaments to IDLE.">Disarm</button>
+                <span id="hwArmState" class="hw-armstate idle" title="Live schedule state (ShvGetStatus): Idle → Armed (waiting for SyncIn) → Running → Complete / Fault.">idle</span>
               </div>
             </div>
 

@@ -60,6 +60,23 @@ function filamentToHw(i) {
   return { controller, channel, mux, label: `P${controller} · CH${channel + 1}.${mux + 1}` };
 }
 
+// Filament -> board id via the live ACTIVE-LIST mapping (mapping.js), not the
+// fixed wiring above. Each controller packs its assigned filaments into slots
+// 0-63 in ascending filament order; slot k -> channel k>>3 (0-7), position k&7
+// (0-7). Derived from the per-filament controller assignment so it stays correct
+// mid-edit (before Apply repopulates the server slot detail). Returns null when
+// unassigned or overflowing the 64 slots (can't fire). Shape matches filamentToHw.
+function filamentToBoard(i) {
+  const get = window.ctFilamentController;
+  if (!get) return null;
+  const c = get(i);
+  if (c !== 0 && c !== 1) return null;        // unassigned
+  let slot = 0;
+  for (let g = 0; g < i; g++) if (get(g) === c) slot++;
+  if (slot > 63) return null;                 // beyond the 64 power slots
+  return { controller: c + 1, channel: slot >> 3, mux: slot & 7 };
+}
+
 // ---- per-filament telemetry + per-filament pulse/heating plan ---------------
 const DEFAULT_PULSES = 1;
 const DEFAULT_DUR_US = 1000; // 1 ms, shown in µs
@@ -513,6 +530,7 @@ function sync() {
     filaments, vMax: V_MAX, iMax: I_MAX, mAsMax: maxMAs(),
     stateColor: STATE_COLOR,
     hover: hoverFil,
+    hwMap: filamentToBoard,   // filament idx -> active-list {controller, channel, mux} for the HUD board-id readout
   });
 
   $('collimatorSlider').value = state.collimatorCenter;
@@ -932,6 +950,28 @@ function setCoverage(n) {
 
 // Plan mode: disable/enable a filament. Dead filaments are omitted from the
 // emission schedule (and so from the heating plan) — a known projection gap.
+async function detectPresent() {
+  setStatus('Enabling isolation power & scanning board presence (boards → Sleep)…');
+  try {
+    const j = await (await fetch('/api/present-filaments')).json();
+    const present = new Set(j.present || []);
+    if (!present.size) { setStatus('No present boards detected — check the controller connection / I²C (nothing changed).'); return; }
+    // Full sync: the scan is authoritative — present → live, absent → dead. This
+    // links the detected hardware to the plan (✕ marks) and the schedule.
+    let alive = 0, dead = 0;
+    for (let i = 0; i < N; i++) {
+      const shouldDie = !present.has(i);
+      if (filaments[i].dead !== shouldDie) {
+        filaments[i].dead = shouldDie;
+        if (shouldDie) { filaments[i].state = STATE.STOP; filaments[i].mAs = 0; }
+      }
+      filaments[i].dead ? dead++ : alive++;
+    }
+    rebuildSchedule();   // → gotoSeq → sync redraws the plan (✕); schedule excludes dead
+    setStatus(`Detected ${present.size} present board(s) → ${alive} live / ${dead} dead. Plan + schedule updated. (Manually disable any present-but-bad board.)`);
+  } catch (e) { setStatus('Detect present failed: ' + e); }
+}
+
 function toggleDead(i) {
   filaments[i].dead = !filaments[i].dead;
   if (filaments[i].dead) { filaments[i].state = STATE.STOP; filaments[i].mAs = 0; }
@@ -1037,7 +1077,7 @@ const postJSON = async (path, body) => (await fetch(path, {
 // pass. Hard gates use only state app.js fully owns — schedule (scanReady),
 // operator ack (hwChecked), and runState (download/verify/prep/arm) — so they
 // can't be wrong. Connection is a live indicator chip fed by controllers.js.
-const runState = { hwChecked: false, downloaded: false, verified: false, prepActive: false, armed: false };
+const runState = { hwChecked: false, downloaded: false, verified: false, prepActive: false, armed: false, override: false };
 const scanReady = () => schedule.length > 0;
 const settleOk = () => !!(heatingPlan && heatingPlan.validation && heatingPlan.validation.ok);
 const hwConnected = () => { const c = window.ctConnected || {}; return !!(c[1] || c[2]); };
@@ -1053,19 +1093,37 @@ function refreshRunGate() {
   setGate('hwGateConn', conn, conn ? '① Connected ' : '① Connect ');
   setGate('hwGateHw', runState.hwChecked, runState.hwChecked ? '② Hardware OK ' : '② Hardware ');
   setGate('hwGateSched', scanReady(), scanReady() ? `③ Schedule ${schedule.length}${settleOk() ? '' : ' ⚠'} ` : '③ Schedule ');
-  const canDownload = scanReady();
-  const canPrep = runState.downloaded;
-  const canArm = runState.downloaded && runState.verified && runState.hwChecked && scanReady();
+  // Verify is the gate for Arm, NOT Download. The schedule may already be in the
+  // firmware from a prior session — verify it matches the plan, then arm. Download
+  // is only needed when Verify fails (or you changed the plan, which clears
+  // `verified` via invalidateRun). Prep is power-states only — independent of both.
+  // Override unlocks every step regardless of order (testing / bring-up). It only
+  // relaxes the GUI gate — the firmware still enforces its own arm safety.
+  const ovr = !!runState.override;
+  const canDownload = ovr || scanReady();
+  const canVerify = ovr || scanReady();
+  const canPrep = ovr || scanReady();
+  const canArm = ovr || (runState.verified && runState.hwChecked && scanReady());
   enableBtn('hwDownloadBtn', canDownload);
-  enableBtn('hwVerifyBtn', runState.downloaded);
+  enableBtn('hwVerifyBtn', canVerify);
   ['hwPrepStop', 'hwPrepSleep', 'hwPrepStandby', 'hwPrepIdle', 'hwPrepActive'].forEach((id) => enableBtn(id, canPrep));
   enableBtn('hwArmBtn', canArm && !runState.armed);
-  enableBtn('hwDisarmBtn', runState.armed);
-  enableBtn('hwTrigBtn', runState.armed);
+  // Disarm is an abort/quit — always available when connected, even after a
+  // rejected arm or an out-of-band armed state, so there's always a way out.
+  enableBtn('hwDisarmBtn', hwConnected());
+  enableBtn('hwTrigBtn', ovr || runState.armed);
   lockStep('hwStepDownload', !canDownload);
   lockStep('hwStepPrep', !canPrep);
   lockStep('hwStepArm', !(canArm || runState.armed));
-  lockStep('hwStepTrig', !runState.armed);
+  lockStep('hwStepTrig', !(ovr || runState.armed));
+  // baseline arm-state badge (pollRunStatus refines it to Running/Complete/Fault)
+  if (!runState.armed) setArmState('idle', 'idle');
+  else if ($('hwArmState') && /idle/.test($('hwArmState').className)) setArmState('● armed', 'armed');
+}
+function setArmState(label, cls) {
+  const e = $('hwArmState'); if (!e) return;
+  e.textContent = label;
+  e.className = 'hw-armstate ' + cls;
 }
 window.ctRefreshRunGate = refreshRunGate;
 // A changed/rebuilt schedule (or lost connection) invalidates a prior download.
@@ -1160,14 +1218,39 @@ async function hwVerify() {
 
 async function hwArm() {
   const repeats = Math.max(1, parseInt($('hwRepeats').value, 10) || 1);
-  if (!runState.prepActive && !confirm('Pre-heat (Active first batch) has not been run — the lead filaments may fire cold. Arm anyway?')) return;
+  if (!runState.override && !runState.prepActive && !confirm('Pre-heat (Active first batch) has not been run — the lead filaments may fire cold. Arm anyway?')) return;
+  // The firmware arm gate requires every participating filament at PowerState
+  // >= Sleep (isolated-12V on); a board left in Stop => IsoOff. For emission-only
+  // runs the firmware won't auto-idle (it only does so when a heating stream is
+  // loaded), so bring the schedule's filaments to Idle here first. Idempotent —
+  // Idle on an already-warm board is a no-op.
+  const parts0 = [...new Set(schedule.map((r) => r.filament).filter((f) => f != null && f !== 255))];
+  if (parts0.length) {
+    hwMsg(`Idling ${parts0.length} participating filament(s) (arm prerequisite)…`);
+    try {
+      const jp = await postJSON('/api/filament-prep', { state: STATE.IDLE, filaments: parts0 });
+      if (!jp.ok) hwMsg(`⚠ Idle prep partial (applied ${jp.applied || 0}/${parts0.length}) — arming anyway…`);
+    } catch (e) { hwMsg('Idle prep failed: ' + e + ' — aborting arm.'); return; }
+  }
   hwMsg('Arming…');
   try {
     const j = await postJSON('/api/arm', { repeats });
-    const parts = Object.entries(j.results || {}).map(([k, r]) => `P${k}: ${r.ok ? 'armed' : (r.error || 'reject ' + r.reject)}`);
-    hwMsg(`${j.ok ? '✓ Armed' : '✗'} (×${repeats}) — ${parts.join(' · ')} — waiting for SyncIn.`);
+    const parts = Object.entries(j.results || {}).map(([k, r]) => `P${k}: ${r.ok ? 'armed' : (r.error || 'reject ' + (SHV_REJECT[r.reject] || r.reject))}`);
     runState.armed = !!j.ok; refreshRunGate();
-    if (j.ok) startRunMonitor();
+    if (j.ok) {
+      hwMsg(`✓ Armed (×${repeats}) — ${parts.join(' · ')} — waiting for SyncIn.`);
+      setViewMode('live'); startRunMonitor();   // watch the run: plot tracks the firing filament
+    } else {
+      // it's NOT armed/waiting — surface why, with a fix hint for the common rejects
+      const reasons = Object.values(j.results || {}).map((r) => r.reject);
+      const hint = reasons.includes(6) ? ' — a participating filament is still in Stop (its isolated-12V is off). Run Prep → Idle first.'
+        : reasons.includes(4) ? ' — TPS/HV supply is disabled; enable it.'
+        : reasons.includes(3) ? ' — schedule table is empty; download first.'
+        : reasons.includes(5) ? ' — TPS fault; clear it then retry.'
+        : reasons.includes(7) ? ' — controller not ready.'
+        : reasons.includes(8) ? ' — state conflict; Disarm then retry.' : '';
+      hwMsg(`✗ Arm rejected — ${parts.join(' · ')}${hint}`);
+    }
   } catch (e) { hwMsg('Arm failed: ' + e); }
 }
 
@@ -1191,15 +1274,18 @@ async function hwTrigger() {
 // state; "Active first batch" then pre-heats the cold-start band so the lead
 // filaments are already hot when the first trigger fires.
 async function hwPrep(state, label, opts) {
-  hwMsg(`${label}…`);
+  hwMsg(`⏳ ${label} — applying…`);   // explicit in-progress (present continuous)
   try {
     const j = await postJSON('/api/filament-prep', { state, ...(opts || {}) });
-    if (!j.ok && j.error) { hwMsg(`${label} failed: ${j.error}`); return; }
-    const parts = Object.entries(j.results || {}).map(([k, r]) =>
-      `P${k}: ${r.ok ? '✓' : '✗'}${r.applied != null ? ' ' + r.applied : ''}${r.error ? ' ' + r.error : ''}`);
-    hwMsg(`${j.ok ? '✓' : '✗'} ${label} — ${parts.join(' · ')}`);
+    if (!j.ok && j.error) { hwMsg(`✗ ${label} failed — ${j.error}`); return; }
+    const parts = Object.entries(j.results || {}).map(([k, r]) => {
+      const total = r.total != null ? r.total : (r.applied || 0) + (r.failed ? r.failed.length : 0);
+      const nf = r.failed ? r.failed.length : 0;
+      return `P${k}: ${r.applied || 0}/${total}` + (nf ? ` · ${nf} failed (${r.failed.slice(0, 6).join(',')})` : '');
+    });
+    hwMsg(`${j.ok ? '✓ done' : '⚠ partial'} — ${label}: ${parts.join(' · ')}`);
     if (j.ok && state === STATE.ACTIVE) { runState.prepActive = true; refreshRunGate(); }
-  } catch (e) { hwMsg(`${label} failed: ` + e); }
+  } catch (e) { hwMsg(`✗ ${label} failed — ` + e); }
 }
 // per-filament CC current (mA) so Idle/Active land on the right setpoint
 function prepCurrents(field) {
@@ -1218,6 +1304,7 @@ function firstBatchFilaments() {
 // Poll ShvGetStatus: totalPulsesDone → schedule playhead, firmware filament/state.
 let runMonitorTimer = null;
 const SHV_STATE_NAME = { 0: 'Idle', 1: 'Armed', 2: 'Running', 3: 'Complete', 4: 'Fault' };
+const SHV_REJECT = ['None (armed)', 'IndexOutOfWindow', 'WidthTooLarge', 'EmptyTable', 'TpsDisabled', 'TpsFault', 'IsoOff', 'NotReady', 'StateConflict'];
 function startRunMonitor() {
   if (runMonitorTimer) return;
   runMonitorTimer = setInterval(pollRunStatus, 500);
@@ -1229,21 +1316,39 @@ async function pollRunStatus() {
   let data;
   try { data = await (await fetch('/api/run-status')).json(); } catch { return; }
   const ctrls = data.controllers || {};
-  let cursor = null, anyRunning = false, fault = null, statePieces = [];
+  let cursor = null, anyRunning = false, fault = null, statePieces = [], firingFil = null;
+  let anyArmed = false, anyComplete = false;
   for (const [k, c] of Object.entries(ctrls)) {
     if (!c.connected || !c.status) continue;
     const s = c.status;
     if (cursor == null) cursor = s.totalPulsesDone;
+    if (s.state === 1) anyArmed = true;
     if (s.state === 2) anyRunning = true;
+    if (s.state === 3) anyComplete = true;
     if (s.state === 4) fault = { ctrl: k, fil: s.faultFilament };
-    statePieces.push(`P${k}:${SHV_STATE_NAME[s.state] || s.state}@${s.totalPulsesDone}/${s.totalPulsesTarget || '?'}`);
+    // firmware-reported live firing filament (255 = none/idle)
+    if (s.filamentIndex != null && s.filamentIndex !== 255) firingFil = s.filamentIndex;
+    const fil = (s.filamentIndex == null || s.filamentIndex === 255) ? '—' : s.filamentIndex;
+    statePieces.push(`P${k}: ${SHV_STATE_NAME[s.state] || s.state} · firing fil ${fil} · pulse ${s.totalPulsesDone}/${s.totalPulsesTarget || '?'}`);
   }
-  if (cursor != null && schedule.length) {
-    // map global pulse cursor → the schedule row whose burst contains it
-    let idx = 0;
-    for (let i = 0; i < schedule.length; i++) { if (schedule[i].trigger <= cursor) idx = i; else break; }
-    if (viewMode === 'live') { gotoSeq(idx, false); updateTableActive(); }
+  // ---- link the live firing filament to the CT plot (live view) ----
+  // Position the geometry to the firmware-reported firing filament so the ring
+  // highlights exactly what's firing; fall back to the pulse cursor's row.
+  if (viewMode === 'live' && schedule.length) {
+    let idx = -1;
+    if (cursor != null) { for (let i = 0; i < schedule.length; i++) { if (schedule[i].trigger <= cursor) idx = i; else break; } }
+    if (firingFil != null && (idx < 0 || schedule[idx].filament !== firingFil)) {
+      const j = schedule.findIndex((r) => r.filament === firingFil);
+      if (j >= 0) idx = j;
+    }
+    if (idx >= 0) { gotoSeq(idx, false); updateTableActive(); }
   }
+  // arm-state badge (firmware-authoritative)
+  if (fault) setArmState(`✗ fault (fil ${fault.fil})`, 'fault');
+  else if (anyRunning) setArmState('● running', 'running');
+  else if (anyArmed) setArmState('● armed', 'armed');
+  else if (anyComplete) setArmState('✓ complete', 'complete');
+  else setArmState('idle', 'idle');
   const f = fault ? ` — ⚠ FAULT P${fault.ctrl} fil ${fault.fil}` : '';
   hwMsg(`${statePieces.join(' · ') || 'no controller'}${f}`);
   if (!anyRunning && !fault && runMonitorTimer && cursor != null) {
@@ -1514,6 +1619,7 @@ function init() {
     b.addEventListener('click', () => setScheduleView(b.dataset.view)));
   $('filSaveBtn').addEventListener('click', saveFilSettings);
   $('filLoadBtn').addEventListener('click', () => loadFilSettings(false));
+  $('schDetectPresent').addEventListener('click', detectPresent);
   // schPulses / schDuration are committed to every filament by the Apply button
   // below (no live `input` handler — the old one referenced an undefined
   // `scheduleDefaults` and threw on every keystroke).
@@ -1537,6 +1643,12 @@ function init() {
   $('hwDisarmBtn').addEventListener('click', hwDisarm);
   $('hwTrigBtn').addEventListener('click', hwTrigger);
   $('hwCheckBtn').addEventListener('click', () => { runState.hwChecked = !runState.hwChecked; refreshRunGate(); });
+  $('hwOverride').addEventListener('change', (e) => {
+    runState.override = e.target.checked;
+    const note = $('hwOverrideNote'); if (note) note.hidden = !runState.override;
+    $('hwOverrideLbl').classList.toggle('active', runState.override);
+    refreshRunGate();
+  });
   refreshRunGate();   // initial gate/lock state
   $('hwPrepStop').addEventListener('click', () => hwPrep(STATE.STOP, 'Stop all'));
   $('hwPrepSleep').addEventListener('click', () => hwPrep(STATE.SLEEP, 'Sleep all'));

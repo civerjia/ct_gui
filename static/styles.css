@@ -188,6 +188,18 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .hw-step.locked .hw-step-n { background: var(--muted); }
 .hw-status.bad { color: #c0392b; }
 .hw-run-card button:disabled { opacity: 0.4; cursor: not-allowed; }
+/* live schedule-state badge on the Arm step */
+.hw-armstate { font-size: 11px; font-weight: 800; padding: 2px 9px; border-radius: 12px; letter-spacing: 0.03em; }
+.hw-armstate.idle { background: #eceae3; color: #566069; }
+.hw-armstate.armed { background: rgba(184,134,11,0.18); color: #8a6d0b; }
+.hw-armstate.running { background: rgba(192,57,43,0.15); color: #c0392b; }
+.hw-armstate.complete { background: rgba(63,182,160,0.2); color: #2c7a6b; }
+.hw-armstate.fault { background: rgba(192,57,43,0.22); color: #c0392b; }
+/* override toggle */
+.hw-override { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 700; color: var(--muted); cursor: pointer; margin-left: auto; user-select: none; }
+.hw-override input { margin: 0; cursor: pointer; }
+.hw-override.active { color: #c0392b; }
+.hw-override-note { color: #c0392b; font-weight: 700; }
 
 /* total heating power strip (under the ring) */
 .geo-power { display: flex; gap: 8px; margin: 10px 2px 2px; }
@@ -239,10 +251,12 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .status-tile.selected { outline: 2px solid var(--accent); }
 /* HV switch-verify test result marker (Sel test) */
 .status-tile.test-fail { outline: 2px solid #c0392b; }
+.status-tile.test-err { outline: 2px solid #d39e00; }   /* inconclusive — link busy/timeout, re-run */
 .hv-test { font-family: var(--mono); font-weight: 700; }
 .status-tile .hv-test { position: absolute; bottom: 1px; right: 2px; font-size: 9px; }
 .hv-test.pass { color: #2c7a6b; }
 .hv-test.fail { color: #c0392b; }
+.hv-test.err { color: #d39e00; }
 .status-tile.active { box-shadow: 0 0 0 2px #ff9a3d; }
 .tile-title { font-family: var(--mono); font-size: 8px; color: var(--muted); align-self: flex-start; padding-right: 16px; }
 .tile-dots { display: flex; gap: 1px; }

@@ -552,6 +552,26 @@ def _status_ok(resp) -> bool:
     return bool(raw) and raw[0] == 0x00
 
 
+def _pipeline_reliable(link, reqs, window=8, timeout=2.5, retries=2, on_progress=None):
+    """Pipeline `reqs` (fast when the link is fast), then SERIALLY retry any frame
+    that failed/timed out. On a slow or variable link send_pipeline silently drops
+    frames (per-frame deadlines expire while the ESP32 serializes the burst); the
+    single-request path is reliable, so failed slots are re-sent one at a time with
+    a longer timeout. Returns decoded responses in request order."""
+    results = link.client.send_pipeline(reqs, window=window, timeout=timeout, on_progress=on_progress)
+    for _ in range(max(0, retries)):
+        bad = [i for i, r in enumerate(results) if not (isinstance(r, dict) and _status_ok(r))]
+        if not bad:
+            break
+        for i in bad:
+            ft, payload, flags = reqs[i]
+            try:
+                results[i] = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
+            except Exception as exc:
+                results[i] = {"ok": False, "error": str(exc)}
+    return results
+
+
 def _le(raw, off, n):
     return sum(raw[off + i] << (8 * i) for i in range(n))
 
@@ -696,6 +716,7 @@ def _hv_lut_path(chan: str) -> Path:
     return CALIB_DIR / f"hv_lut_p{MASTER}_{ch}.json"
 PING_TYPE = 0x01
 PING_PAYLOAD = (0xCAFEF00D).to_bytes(4, "little")
+POLL_PAUSE_MAX_S = 15.0   # max time a background-PING pause survives without a re-arm
 
 GEOMETRY = {
     "n_filaments": 96,
@@ -720,6 +741,11 @@ class ControllerLink:
         self.client = TcpProtocolClient()
         self.host: str | None = None
         self._running = False
+        # Suppress the PING during exclusive bench ops. A DEADLINE (monotonic),
+        # not a sticky bool: if the GUI never sends "resume" (page reload /
+        # navigation mid-test), the pause auto-expires so the heartbeat can never
+        # be killed permanently. The GUI re-arms it while a test is actually running.
+        self._poll_pause_until = 0.0
         self._poll_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self.rp_last = 0.0                       # unix time of last good PING
@@ -732,6 +758,7 @@ class ControllerLink:
             self._stop_poll()
             self.client.connect(host, BRIDGE_PORT)
             self.host = host
+            self._poll_pause_until = 0.0             # a fresh connection always polls
             self.rp_last = 0.0
             self.rp_rtt_ms = None
             self.stm = {}
@@ -769,15 +796,24 @@ class ControllerLink:
         if t and t.is_alive() and t is not threading.current_thread():
             t.join(timeout=0.4)
 
+    def set_poll_paused(self, paused: bool) -> None:
+        """Pause/resume the background PING. Held by exclusive bench ops (e.g. the
+        HV switch toggle test) so their per-command round-trips don't queue behind
+        the 1 Hz PING on the shared bridge socket / request lock. Pausing arms a
+        short deadline (POLL_PAUSE_MAX_S) that the caller re-arms while its op runs;
+        if the caller dies the pause auto-expires, so the heartbeat always returns."""
+        self._poll_pause_until = (time.monotonic() + POLL_PAUSE_MAX_S) if paused else 0.0
+
     def _poll(self) -> None:
         while self._running and self.client.connected:
             t0 = time.monotonic()
-            try:
-                self.client.send_request(PING_TYPE, PING_PAYLOAD, timeout=0.6)
-                self.rp_last = time.time()
-                self.rp_rtt_ms = (time.monotonic() - t0) * 1000.0
-            except Exception:
-                pass
+            if t0 >= self._poll_pause_until:
+                try:
+                    self.client.send_request(PING_TYPE, PING_PAYLOAD, timeout=0.6)
+                    self.rp_last = time.time()
+                    self.rp_rtt_ms = (time.monotonic() - t0) * 1000.0
+                except Exception:
+                    pass
             host = self.host
             if host:
                 try:
@@ -1034,7 +1070,7 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
             _DL_PROGRESS[controller] = {"phase": "pipelined", "done": d, "total": total}
 
     _on_prog(0)
-    results = link.client.send_pipeline(reqs, window=8, timeout=2.5, on_progress=_on_prog)
+    results = _pipeline_reliable(link, reqs, window=8, timeout=2.5, on_progress=_on_prog)
     oks = [_status_ok(r) if isinstance(r, dict) else False for r in results]
     fails = [labels[i] for i, x in enumerate(oks) if not x]
     ok = not fails
@@ -1073,22 +1109,24 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
                 if filament_to_board(int(f))[0] == controller]
     # Per-filament outcome: a bad power channel makes CH_SET_POWER_STATE fail for
     # THAT filament only. Track which failed (global indices) so callers can skip
-    # + report them instead of aborting the whole batch.
-    applied, failed = 0, []
+    # + report them instead of aborting the whole batch. Pipelined (window of
+    # frames in flight) so a 48-filament prep is ~1 s, not ~40 s.
+    reqs = []
     for f in fils:
         _, ch, pos, _ = filament_to_board(f)
         arg = int(currents.get(str(f), currents.get(f, default_arg)))
-        payload = bytes([ch, pos, int(state) & 0xFF]) + _u16(arg)
-        try:
-            ok1 = _status_ok(link.request(CH_SET_POWER_STATE, payload, flags=FLAG_SINGLE, timeout=2.0))
-        except Exception:
-            ok1 = False
-        if ok1:
+        reqs.append((CH_SET_POWER_STATE, bytes([ch, pos, int(state) & 0xFF]) + _u16(arg), FLAG_SINGLE))
+    if not reqs:
+        return {"controller": controller, "ok": True, "applied": 0, "failed": [], "state": int(state)}
+    results = _pipeline_reliable(link, reqs, window=8, timeout=2.5)
+    applied, failed = 0, []
+    for f, r in zip(fils, results):
+        if isinstance(r, dict) and _status_ok(r):
             applied += 1
         else:
             failed.append(int(f))
     return {"controller": controller, "ok": not failed, "applied": applied,
-            "failed": failed, "state": int(state)}
+            "total": len(fils), "failed": failed, "state": int(state)}
 
 
 def do_scan() -> list[dict[str, Any]]:
@@ -1170,6 +1208,44 @@ class CtHandler(BaseHTTPRequestHandler):
                     self._json({"ok": True, "boards": board_snapshot(link, cid - 1)})
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc), "boards": []})
+        elif path == "/api/present-filaments":
+            # Which GLOBAL filament indices have a physically-present board, across
+            # all connected controllers. The GUI uses this to one-click disable the
+            # absent ones so the schedule fits the bench (arm rejects absent boards).
+            present = []
+            for cid, link in CONTROLLERS.items():
+                if not link.client.connected:
+                    continue
+                # INA219 is powered by the isolated-12V rail, so a board reads
+                # ABSENT unless iso is on first. The firmware's real presence scan
+                # (runPresenceScan_ = forceEnableAllIso then scan) is serial-only,
+                # so replicate it over the bridge: Sleep every board position
+                # (setPowerState bundles iso on, no output current) → wait for INA
+                # power-up → then read. Leaves boards at Sleep (iso on, low power).
+                try:
+                    prep_filaments(link, cid - 1, 2, None)   # state 2 = Sleep → iso on
+                except Exception:
+                    pass
+                time.sleep(0.4)
+                # presence (CH_GET_PRESENT) still flakes on a slow link → union a
+                # few reads; stop early once two passes agree on a non-empty set.
+                pres, prev = set(), None
+                for _ in range(5):
+                    try:
+                        now = {(b["channel"], b["mux_port"]) for b in board_snapshot(link, cid - 1) if b.get("present")}
+                    except Exception:
+                        now = set()
+                    pres |= now
+                    if pres and now == prev:
+                        break
+                    prev = now
+                for fil in range(96):
+                    c, ch, pos, *_ = filament_to_board(fil)
+                    if c == cid - 1 and (ch, pos) in pres:
+                        present.append(fil)
+            present = sorted(set(present))
+            self._json({"ok": True, "present": present, "count": len(present),
+                        "note": "boards left at Sleep (iso on) after the scan"})
         elif path == "/api/hv-snapshot":
             link = self._target_link()
             if not link or not link.client.connected:
@@ -1639,6 +1715,15 @@ class CtHandler(BaseHTTPRequestHandler):
                         break
                     fired += 1
                 self._json({"ok": fired == count, "fired": fired, "last": last})
+            elif path == "/api/poll-pause":
+                # Pause/resume a controller's background PING for the duration of an
+                # exclusive bench op (HV toggle test). body: {controller, paused}.
+                cid = int(body.get("controller", 0))
+                link = CONTROLLERS.get(cid)
+                if not link:
+                    return self._json({"ok": False, "error": "bad controller"}, HTTPStatus.OK)
+                link.set_poll_paused(bool(body.get("paused")))
+                self._json({"ok": True, "paused": bool(body.get("paused"))})
             elif path == "/api/power-cmd":
                 # Direct power-plane command to ONE controller, built via the
                 # WiFi GUI's build_command_payload (board/HV/TPS/INA opcodes,
