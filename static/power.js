@@ -846,33 +846,53 @@ function hvCmdTransient(r) {
   return st === 'BUSY';            // device mailbox momentarily busy
 }
 
-// Set one HV bit with verify, retrying ONLY the transient busy/timeout (up to 4×,
-// 200 ms apart). A real VERIFY_FAIL returns on the first try.
-async function hvSetBitVerified(c, b, value) {
+// Retry a power command ONLY on the transient busy/timeout (up to 4×, 200 ms
+// apart). A real device status (VERIFY_FAIL, etc.) returns on the first try.
+async function powerCmdRetry(command, extra) {
   let r;
   for (let i = 0; i < 4; i++) {
-    r = await powerCmd('HV_SET_BIT', { channel: c, bit: b, value, verify: true });
+    r = await powerCmd(command, extra);
     if (!hvCmdTransient(r)) break;
-    $p('hvStatus').textContent = `CH${c + 1}.${b + 1}: link busy, retry ${i + 1}/4…`;
     await sleep(200);
   }
   return r;
 }
 
-// Switch-verify test: auto-test EVERY bit on all ENABLED channels. Toggle each
-// switch ON with verify, record the firmware's pass/fail (HV_SET_BIT returns
-// VerifyFail → r.ok=false when the switch doesn't actuate — e.g. a dead CH1/CH5
-// chip), then toggle it back OFF. Marks ✓ pass / ✗ fail / ⚠ inconclusive per tile.
-// The PING is paused for the run and transient link errors are retried, so a ✗ is
-// a real dead switch and a ⚠ is "couldn't reach the device — re-run", never mixed.
-// No firmware change — uses the verify the firmware already does on HV_SET_BIT.
+// Deterministic switch read. The firmware's own HV_SET_BIT verify reads the 165
+// switch-SENSE line the instant after latching the 595, racing the switch's
+// physical settling — so a marginal switch verifies differently run-to-run. We
+// can't add the settle in firmware (it lives in the core-1 verify chain on a
+// tight stack), so we do it on the HOST: force-write the bit (write-mode 2 — no
+// firmware verify, no fault/clear), wait HV_SETTLE_MS, then force a FRESH 165
+// read and fetch the byte. Returns the read-back bit (0/1), or null on a
+// transport error (→ inconclusive).
+const HV_SETTLE_MS = 12;
+async function hvForceReadBit(c, b, value) {
+  const w = await powerCmdRetry('HV_SET_BIT', { channel: c, bit: b, value, force: true });
+  if (!w.ok) return null;
+  await sleep(HV_SETTLE_MS);                              // host-side settle the firmware lacks
+  const rf = await powerCmdRetry('HV_REFRESH_FEEDBACK', { channel: c });  // fresh 165 read
+  if (!rf.ok) return null;
+  const g = await powerCmdRetry('HV_GET_ALL_BYTES', {});
+  const fb = g.ok && g.response && g.response.decoded && g.response.decoded.feedback;
+  if (!fb) return null;
+  return (fb[c] >> b) & 1;
+}
+
+// Switch-verify test: auto-test EVERY bit on all ENABLED channels. For each
+// switch we force it ON and read the 165 sense back TWICE after a host settle
+// (hvForceReadBit), then restore it OFF. A switch is ✓ only if both settled
+// reads say "actuated", ✗ if both say "not actuated" (a real dead switch), and
+// ⚠ inconclusive if the two reads disagree (genuinely flaky/marginal) or a
+// transport error prevented a read. The PING is paused for the run. No firmware
+// change — the settle that the firmware verify lacks is applied host-side.
 async function hvSwitchTest() {
   if (!boardTargetConnected()) { $p('hvStatus').textContent = 'connect the target controller first'; return; }
   const keys = [];
   for (let c = 0; c < 8; c++) { if (!chEnabled(c)) continue; for (let b = 0; b < 8; b++) keys.push(`${c}.${b}`); }
   if (!keys.length) { $p('hvStatus').textContent = 'all channels masked off — enable a channel first'; return; }
   const nch = keys.length / 8;
-  if (!confirm(`Toggle test exercises every HV switch on ${nch} enabled channel(s) of P${pwTarget} (${keys.length} switches, ON→OFF with read-back verify). Best run with HV voltage at 0. Continue?`)) return;
+  if (!confirm(`Toggle test exercises every HV switch on ${nch} enabled channel(s) of P${pwTarget} (${keys.length} switches, ON→settled read-back→OFF). Best run with HV voltage at 0. Continue?`)) return;
   hvTest = new Map();
   hvTestAbort = false;
   const btn = $p('hvSelTest'); if (btn) btn.disabled = true;
@@ -887,13 +907,15 @@ async function hvSwitchTest() {
       if (i++ % 8 === 0) pollPause(true);                  // re-arm the auto-expiring pause on long runs
       const [c, b] = k.split('.').map(Number);
       $p('hvStatus').textContent = `toggle test CH${c + 1}.${b + 1}… (${hvTest.size + 1}/${keys.length})`;
-      const r = await hvSetBitVerified(c, b, true);
-      let mark;                                          // true=pass · false=real fail · 'err'=inconclusive
-      if (r.ok) mark = true;
-      else if (hvCmdTransient(r)) { mark = 'err'; inconc.push(`CH${c + 1}.${b + 1}`); }
-      else { mark = false; fails.push(`CH${c + 1}.${b + 1}`); }
+      const s1 = await hvForceReadBit(c, b, true);       // settled read #1
+      const s2 = await hvForceReadBit(c, b, true);       // settled read #2 (must agree)
+      await hvForceReadBit(c, b, false);                 // restore off
+      let mark;                                          // true=pass · false=real dead · 'err'=inconclusive
+      if (s1 === null || s2 === null) { mark = 'err'; inconc.push(`CH${c + 1}.${b + 1}`); }
+      else if (s1 === 1 && s2 === 1) mark = true;        // consistently actuated
+      else if (s1 === 0 && s2 === 0) { mark = false; fails.push(`CH${c + 1}.${b + 1}`); }  // consistently dead
+      else { mark = 'err'; inconc.push(`CH${c + 1}.${b + 1}`); }   // reads disagree → flaky/marginal
       hvTest.set(k, mark);
-      await hvSetBitVerified(c, b, false);               // restore off (also retries transient)
       renderHvGrid();
     }
   } finally {
@@ -906,7 +928,7 @@ async function hvSwitchTest() {
   const ok = done - fails.length - inconc.length;
   const parts = [];
   if (fails.length) parts.push(`FAILED ${fails.join(' ')}`);
-  if (inconc.length) parts.push(`INCONCLUSIVE ${inconc.join(' ')} (link busy — re-run)`);
+  if (inconc.length) parts.push(`INCONCLUSIVE ${inconc.join(' ')} (link busy or flaky switch — re-run)`);
   $p('hvStatus').textContent = aborted
     ? `toggle test ABORTED at ${done}/${keys.length}${parts.length ? ' · ' + parts.join(' · ') : ''}`
     : parts.length
