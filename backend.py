@@ -141,7 +141,18 @@ class FilamentMapping:
     `group_size`. Downloaded to each controller as the 64-byte ShvSetActiveList."""
 
     def __init__(self, group_size: int = DEFAULT_GROUP_SIZE) -> None:
+        # Per-controller set of BROKEN channels (0-indexed) to skip when packing
+        # filaments into power slots. A skipped channel's 8 slots are left empty
+        # so filaments flow into the next good channel — e.g. skip ch5 (index 4)
+        # and 48 filaments land on channels 0-3,5,6 (= CH1-4,6,7) instead of 0-5.
+        self.skip_channels: dict[int, set] = {0: set(), 1: set()}
         self.set_default(group_size)
+
+    def set_skip_channels(self, controller: int, channels) -> None:
+        """channels = iterable of 0-indexed channel numbers to leave empty (broken)."""
+        if controller in (0, 1):
+            self.skip_channels[controller] = {int(c) for c in channels if 0 <= int(c) < 8}
+            self._recompute()
 
     def set_default(self, group_size: int) -> None:
         gs = max(1, int(group_size))
@@ -167,10 +178,14 @@ class FilamentMapping:
         self._board_to_fil: dict[tuple, int] = {}  # (controller, slot) -> filament
         self.overflow = {0: [], 1: []}             # filaments past slot 63 (can't fire)
         for c in (0, 1):
-            for slot, f in enumerate(sorted(self._ctrl_fils[c])):
-                if slot >= POWER_SLOTS:
-                    self.overflow[c].append(f)
+            skip = self.skip_channels.get(c, set())
+            # Usable slots = those whose channel (slot>>3) isn't skipped, in order.
+            valid_slots = [s for s in range(POWER_SLOTS) if (s >> 3) not in skip]
+            for i, f in enumerate(sorted(self._ctrl_fils[c])):
+                if i >= len(valid_slots):
+                    self.overflow[c].append(f)          # past the good slots -> can't fire
                     continue
+                slot = valid_slots[i]
                 self.slot_of[f] = slot
                 self._board_to_fil[(c, slot)] = f
 
@@ -225,11 +240,23 @@ class FilamentMapping:
             "counts": {"1": len(self._ctrl_fils[0]), "2": len(self._ctrl_fils[1])},
             "overflow": {"1": self.overflow[0], "2": self.overflow[1]},
             "channel_mask": {"1": self.channel_mask(0), "2": self.channel_mask(1)},
+            "skip_channels": {"1": sorted(self.skip_channels[0]), "2": sorted(self.skip_channels[1])},
             "filaments": rows,
         }
 
 
 MAPPING = FilamentMapping()
+
+# Host-side I²C POLL set: which of the 8 channels the boards matrix actually reads
+# INA219 V/I from. The firmware ignores its own enable mask (it always scans all 8
+# and only stores/echoes the value), so THIS host mask — set by the GUI's "channels
+# enabled" control — is the real lever for what gets polled. Bit c = channel c.
+# Default 0x3F = CH1-6 (matches the historical channels_used default).
+SCAN_MASK = 0x3F
+
+
+def _scan_channels() -> list:
+    return [c for c in range(8) if SCAN_MASK & (1 << c)]
 
 
 def filament_to_board(filament: int, channels=None):
@@ -301,7 +328,10 @@ def read_channel_mask(link: "ControllerLink"):
 def run_chip_health(link: "ControllerLink") -> dict:
     """Presence scan (CH_GET_PRESENT 0x25) + channel mask. Counts read from the
     RAW response (robust), and a non-Ok status surfaces as present_error."""
-    out: dict[str, Any] = {"channel_mask": read_channel_mask(link)}
+    # Report the HOST poll set (SCAN_MASK) — that's what board_snapshot actually
+    # reads, so it's what the "channels enabled" checkboxes should reflect. The
+    # firmware's own mask (read_channel_mask) is inert and kept only for diagnostics.
+    out: dict[str, Any] = {"channel_mask": SCAN_MASK, "fw_channel_mask": read_channel_mask(link)}
     try:
         resp = link.client.send_request(CH_GET_PRESENT, bytes(ALL_BOARDS_MASK), timeout=3.0)
     except Exception as exc:
@@ -333,9 +363,16 @@ def run_chip_health(link: "ControllerLink") -> dict:
 CH_GET_BOARD_BITMAPS = 0x26     # iso/tps enable + tps fault + hv overcurrent masks
 
 
-def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHANNELS) -> list:
+def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHANNELS,
+                   vi_only: bool = False) -> list:
     """64-board snapshot for the boards matrix: present/tps/ina presence (0x25),
-    iso/tps enable + fault (0x26), and INA219 V/I (0x24). Returns 64 board dicts."""
+    iso/tps enable + fault (0x26), and INA219 V/I (0x24). Returns 64 board dicts.
+
+    vi_only=True does ONLY the INA219 read (V/I + presence) and SKIPS the two heavy
+    bitmap round-trips — the values that actually change frame-to-frame. The GUI
+    merges these into its cache and does a full snapshot only occasionally, so the
+    matrix numbers stay live at ~1 Hz even while the single-client link is busy
+    with user commands. (The enable/fault/mux bitmaps change rarely.)"""
     boards = {}
     for ch in range(8):
         for mux in range(8):
@@ -354,38 +391,40 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
                 if raw[start + ch] & (1 << mux):
                     boards[(ch, mux)][field] = True
 
+    if not vi_only:
+        try:
+            resp = link.client.send_request(CH_GET_PRESENT, bytes(ALL_BOARDS_MASK), timeout=3.0)
+            if resp.get("status_code") == 0x00:
+                raw = resp.get("raw") or []     # status, mask[8], mux, tps, ina, ...
+                # A board is "present" iff its per-board INA219 responds. muxPresent
+                # is the per-CHANNEL TCA9548 (probeDevice(kAddrMux)) — it reads true
+                # for all 8 ports when the channel's mux chip exists, so it does NOT
+                # indicate a plugged-in daughter-board. (Matches the WiFi GUI.)
+                apply_slice(raw, 9, "mux_present")
+                apply_slice(raw, 17, "tps_present")
+                apply_slice(raw, 25, "ina_present")
+                apply_slice(raw, 25, "present")
+        except Exception:
+            pass
+        try:
+            resp = link.client.send_request(CH_GET_BOARD_BITMAPS, bytes(ALL_BOARDS_MASK), timeout=3.0)
+            if resp.get("status_code") == 0x00:
+                raw = resp.get("raw") or []     # status, targeted[8], iso_en, tps_en, tps_fault, hv_oc
+                apply_slice(raw, 9, "iso_enabled")
+                apply_slice(raw, 17, "tps_enabled")
+                apply_slice(raw, 25, "tps_fault")
+                apply_slice(raw, 33, "hv_overcurrent")
+        except Exception:
+            pass
+    # INA219 V/I, keyed directly by (channel, mux) over the host SCAN_MASK — NOT
+    # the filament map. So enabling a channel in the "channels enabled" control
+    # surfaces that channel's boards (e.g. CH7) immediately, independent of which
+    # filaments are mapped there.
     try:
-        resp = link.client.send_request(CH_GET_PRESENT, bytes(ALL_BOARDS_MASK), timeout=3.0)
-        if resp.get("status_code") == 0x00:
-            raw = resp.get("raw") or []     # status, mask[8], mux, tps, ina, ...
-            # A board is "present" iff its per-board INA219 responds. muxPresent
-            # is the per-CHANNEL TCA9548 (probeDevice(kAddrMux)) — it reads true
-            # for all 8 ports when the channel's mux chip exists, so it does NOT
-            # indicate a plugged-in daughter-board. (Matches the WiFi GUI.)
-            apply_slice(raw, 9, "mux_present")
-            apply_slice(raw, 17, "tps_present")
-            apply_slice(raw, 25, "ina_present")
-            apply_slice(raw, 25, "present")
-    except Exception:
-        pass
-    try:
-        resp = link.client.send_request(CH_GET_BOARD_BITMAPS, bytes(ALL_BOARDS_MASK), timeout=3.0)
-        if resp.get("status_code") == 0x00:
-            raw = resp.get("raw") or []     # status, targeted[8], iso_en, tps_en, tps_fault, hv_oc
-            apply_slice(raw, 9, "iso_enabled")
-            apply_slice(raw, 17, "tps_enabled")
-            apply_slice(raw, 25, "tps_fault")
-            apply_slice(raw, 33, "hv_overcurrent")
-    except Exception:
-        pass
-    try:
-        for fil, t in read_telemetry(link, controller).items():
-            b = MAPPING.board(fil)
-            if not b:
-                continue
-            ch, mux = b[1], b[2]
-            boards[(ch, mux)].update(bus_mV=t["bus_mV"], current_mA=t["current_mA"],
-                                     ina_present=t["present"], present=t["present"])
+        for (ch, mux), v in read_ina_by_board(link, _scan_channels()).items():
+            if (ch, mux) in boards:
+                boards[(ch, mux)].update(bus_mV=v["bus_mV"], current_mA=v["current_mA"],
+                                         ina_present=v["present"], present=v["present"])
     except Exception:
         pass
     return [boards[(ch, mux)] for ch in range(8) for mux in range(8)]
@@ -510,14 +549,17 @@ def run_tca9554_read(link: "ControllerLink") -> dict:
     return {"tca9554_channels": channels}
 
 
-def read_telemetry(link: "ControllerLink", controller: int, channels=None) -> dict:
-    """Batch-read every populated board's INA219 (multi-board paged 0x24) and map
-    local (channel, mux) → global filament 0-95 via the active-list MAPPING."""
-    used = MAPPING.channels_used(controller)
+def read_ina_by_board(link: "ControllerLink", channels) -> dict:
+    """Multi-board paged INA219 (0x24, flags=0 = NOT single-board) over `channels`,
+    keyed by (channel, mux_port). This is the host POLL primitive — independent of
+    the filament map, so enabling a channel in the scan mask surfaces its boards'
+    V/I directly. (The firmware's own enable mask is inert; the host decides what
+    to read.) `channels` = iterable of 0-indexed channel numbers."""
     mask = bytearray(8)
-    for c in used:
-        mask[c] = 0xFF
-    out: dict[int, dict] = {}
+    for c in channels:
+        if 0 <= int(c) < 8:
+            mask[int(c)] = 0xFF
+    out: dict[tuple, dict] = {}
     page_start, max_entries, guard = 0, 16, 0
     while guard < 16:
         guard += 1
@@ -527,17 +569,26 @@ def read_telemetry(link: "ControllerLink", controller: int, channels=None) -> di
         entries = (dec or {}).get("entries", [])
         total = (dec or {}).get("total_matching_entries", 0)
         for e in entries:
-            ch, mux = e.get("channel"), e.get("mux_port")
-            fil = MAPPING.filament_for_board(controller, ch, mux)
-            if fil is None:
-                continue
-            out[fil] = {
-                "index": fil, "present": bool(e.get("present")),
+            out[(e.get("channel"), e.get("mux_port"))] = {
+                "present": bool(e.get("present")),
                 "bus_mV": e.get("bus_mV", 0), "current_mA": e.get("current_mA", 0),
             }
         if not entries or len(out) >= total or len(entries) < max_entries:
             break
         page_start += len(entries)
+    return out
+
+
+def read_telemetry(link: "ControllerLink", controller: int, channels=None) -> dict:
+    """Per-FILAMENT telemetry for the ring view: read every populated board's INA219
+    and map local (channel, mux) → global filament 0-95 via the active-list MAPPING.
+    Filament-bound by design (the ring is indexed by filament)."""
+    out: dict[int, dict] = {}
+    for (ch, mux), v in read_ina_by_board(link, MAPPING.channels_used(controller)).items():
+        fil = MAPPING.filament_for_board(controller, ch, mux)
+        if fil is None:
+            continue
+        out[fil] = {"index": fil, **v}
     return out
 
 SHV_EMIT_CHUNK = 64    # emission entries per frame (64*4+3 = 259 B). Bigger chunks
@@ -1194,18 +1245,24 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json({"telemetry": list(rows.values()), "firing": firing, "run": run_state})
         elif path == "/api/board-snapshot":
             # 64-board matrix for the selected controller (?controller=N).
+            # ?vi=1 → lightweight V/I-only refresh (skips the two bitmap reads); the
+            # GUI merges it into its cache for a live ~1 Hz numbers update.
             q = self.path.split("?", 1)
             cid = 1
+            vi_only = False
             if len(q) > 1:
                 for kv in q[1].split("&"):
                     if kv.startswith("controller="):
                         cid = int(kv.split("=", 1)[1] or 1)
+                    elif kv.startswith("vi="):
+                        vi_only = kv.split("=", 1)[1] in ("1", "true", "yes")
             link = CONTROLLERS.get(cid)
             if not link or not link.client.connected:
                 self._json({"ok": False, "error": "controller not connected", "boards": []})
             else:
                 try:
-                    self._json({"ok": True, "boards": board_snapshot(link, cid - 1)})
+                    self._json({"ok": True, "vi_only": vi_only,
+                                "boards": board_snapshot(link, cid - 1, vi_only=vi_only)})
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc), "boards": []})
         elif path == "/api/present-filaments":
@@ -1401,6 +1458,7 @@ class CtHandler(BaseHTTPRequestHandler):
 
     # --- POST ---------------------------------------------------------------
     def do_POST(self) -> None:
+        global SCAN_MASK   # read (diagnosis branch) + written (channel-mask branch)
         path = self.path.split("?", 1)[0]
         body = self._read_json()
         try:
@@ -1451,6 +1509,16 @@ class CtHandler(BaseHTTPRequestHandler):
                     MAPPING.set_assignment(body["assignment"], body.get("group_size"))
                 elif "group_size" in body:
                     MAPPING.set_default(int(body["group_size"]))
+                # Skip broken channel(s): {"skip_channels": {"1":[4], "2":[]}} or a flat
+                # list applied to both controllers. 0-indexed channels (ch5 -> 4).
+                if "skip_channels" in body:
+                    sk = body["skip_channels"]
+                    if isinstance(sk, dict):
+                        for cid_s, chans in sk.items():
+                            MAPPING.set_skip_channels(int(cid_s) - 1, chans or [])
+                    else:
+                        for c in (0, 1):
+                            MAPPING.set_skip_channels(c, sk or [])
                 uploaded = {}
                 if body.get("upload"):
                     for cid, link in CONTROLLERS.items():
@@ -1651,7 +1719,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     if not link.client.connected:
                         continue
                     try:
-                        res = {"channel_mask": read_channel_mask(link)}
+                        res = {"channel_mask": SCAN_MASK, "fw_channel_mask": read_channel_mask(link)}
                         res.update(run_diagnosis(link))
                         out[str(cid)] = res
                     except Exception as exc:
@@ -1669,8 +1737,14 @@ class CtHandler(BaseHTTPRequestHandler):
                         out[str(cid)] = {"tca9554_error": str(exc)}
                 self._json({"ok": bool(out), "controllers": out})
             elif path == "/api/channel-mask":
-                # Set the channel enable mask on connected controllers (0x34).
+                # Set the channel enable mask. The HOST poll set (SCAN_MASK) is the
+                # real lever — board_snapshot reads INA219 V/I only for these
+                # channels, so this is what makes the matrix poll (or stop polling) a
+                # channel. We ALSO push it to the firmware (0x34) for completeness,
+                # but the firmware ignores its own mask (always scans all 8), so that
+                # part is cosmetic.
                 mask = int(body.get("mask", 0x3F)) & 0xFF
+                SCAN_MASK = mask
                 only = body.get("controller")
                 out = {}
                 for cid, link in CONTROLLERS.items():

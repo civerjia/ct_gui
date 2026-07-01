@@ -459,7 +459,7 @@
       </div>
 
       <section class="card module" data-module="i2c">
-        <div class="row compact i2c-mask" title="Channel enable mask — which of the 8 I²C channels each controller uses (default first 6 = 0x3F). Disabled channels skip all I²C polling.">
+        <div class="row compact i2c-mask" title="Host poll set — which of the 8 I²C channels the Boards matrix reads INA219 V/I from (default first 6 = 0x3F). Enable a channel (e.g. CH7) to start polling it, or disable a broken one. Note: the firmware ignores its own mask and always scans all 8; this is a host-side filter, applied on Set.">
           <span class="hint">channels enabled</span>
           <span id="i2cMaskBits" class="i2c-mask-bits"></span>
           <button id="i2cMaskGetBtn" class="xs mask-btn">Get</button>

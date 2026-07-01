@@ -149,7 +149,7 @@ const BOARDS_HTML = `
     <span class="legend-item"><span class="dot absent">·</span> absent</span>
     <span class="hint">Shift-click = block · Ctrl/Cmd-click = toggle</span>
   </div>
-  <div class="row compact i2c-mask bm-mask" title="Channel enable mask — masked-off channels are dimmed, non-selectable, and skip all I²C polling. Shared with the I²C section below.">
+  <div class="row compact i2c-mask bm-mask" title="Host poll set — only enabled channels are read for INA219 V/I (and selectable). Set applies it host-side; enable CH7 to start polling it. The firmware always scans all 8 regardless. Shared with the I²C section below.">
     <span class="hint">channels enabled</span>
     <span id="bmMaskBits" class="i2c-mask-bits"></span>
     <button id="bmMaskGetBtn" class="xs mask-btn">Get</button>
@@ -282,7 +282,9 @@ function renderBoardGrid() {
     tile.innerHTML = hv
       + `<span class="tile-title">${b.label}</span>`
       + `<span class="tile-dots">${dot(b.present, 'P')}${dot(b.iso_enabled, 'I')}${dot(b.tps_enabled, 'T', b.tps_fault)}${dot(b.tps_fault, 'F', b.tps_fault)}</span>`
-      + `<span class="tile-measure">${b.present ? (b.bus_mV / 1000).toFixed(2) + 'V ' + b.current_mA + 'mA' : '—'}</span>`;
+      + `<span class="tile-measure">${b.present
+          ? `<span>${(b.bus_mV / 1000).toFixed(2)} V</span><span>${b.current_mA} mA</span>`
+          : '<span>—</span>'}</span>`;
     tile.addEventListener('click', (e) => {
       if (!chEnabled(b.channel)) return;                 // masked-off channel: non-selectable
       if (e.shiftKey) {
@@ -465,16 +467,36 @@ async function readStartupOcp() {
   } else { $p('bmStartOcpRead').textContent = '—'; $p('bmStartOcpMetric').textContent = '—'; }
 }
 
-async function refreshBoards() {
+// fast=true → lightweight V/I-only read (?vi=1): MERGE the live bus_mV/current_mA/
+// present into the existing cache instead of replacing it, so the numbers update
+// at ~1 Hz without paying for the two bitmap round-trips (enable/fault/mux presence
+// change rarely and come from the periodic full refresh). fast=false → full snapshot.
+let boardGen = 0;   // bumped on every refresh + controller switch; stale responses drop
+async function refreshBoards(fast) {
   const conn = boardTargetConnected();
   if (!conn) { boardCache = emptyBoards(); renderBoardGrid(); renderOneBoard(); bmMsg(`Power ${pwTarget} not connected.`); return; }
+  const gen = ++boardGen, target = pwTarget;   // this call supersedes any in-flight one
   let j;
-  try { j = await (await fetch(`/api/board-snapshot?controller=${pwTarget}`)).json(); } catch { return; }
-  if (!j.ok) { boardCache = emptyBoards(); renderBoardGrid(); bmMsg(j.error || 'snapshot failed'); return; }
-  boardCache = (j.boards && j.boards.length) ? j.boards : emptyBoards();
+  try { j = await (await fetch(`/api/board-snapshot?controller=${target}${fast ? '&vi=1' : ''}`)).json(); } catch { return; }
+  // Drop the response if a newer refresh started or the user switched controllers
+  // mid-flight — otherwise stale (e.g. Power 1) data lands after the switch to Power 2.
+  if (gen !== boardGen || target !== pwTarget) return;
+  if (!j.ok) { if (!fast) { boardCache = emptyBoards(); renderBoardGrid(); bmMsg(j.error || 'snapshot failed'); } return; }
+  const rows = (j.boards && j.boards.length) ? j.boards : emptyBoards();
+  if (fast && boardCache && boardCache.length === rows.length) {
+    // merge only the volatile fields; keep bitmap-derived flags from the last full read
+    const by = new Map(rows.map((b) => [`${b.channel}.${b.mux_port}`, b]));
+    for (const b of boardCache) {
+      const n = by.get(`${b.channel}.${b.mux_port}`);
+      if (n) { b.bus_mV = n.bus_mV; b.current_mA = n.current_mA; b.present = n.present; b.ina_present = n.ina_present; }
+    }
+  } else {
+    boardCache = rows;
+  }
   renderBoardGrid(); renderOneBoard();
   bmMsg(`Power ${pwTarget} — ${boardCache.filter((b) => b.present).length}/64 present · INA219 refresh ${REFRESH_S}.`);
 }
+window.ctRefreshBoards = refreshBoards;
 
 let connectedSet = {};
 function boardTargetConnected() { return !!connectedSet[pwTarget]; }
@@ -514,7 +536,7 @@ function wireBoards() {
     const j = await postJ('/api/channel-mask', { mask: window.ctChannelMask });
     bmMsg(j.ok === false ? (j.error || 'set mask failed') : 'channel mask set');
   };
-  const run = async (p) => { const j = await p; bmMsg(j.ok ? 'ok' : (j.error || 'failed')); refreshBoards(); };
+  const run = async (p) => { const j = await p; bmMsg(j.ok ? 'ok' : (j.error || 'failed')); refreshBoards(true); };
   $p('bmIsoOn').onclick = () => run(powerCmd('CH_SET_ISO_ENABLE', { ...batchExtra(), enable: true }));
   $p('bmIsoOff').onclick = () => run(powerCmd('CH_SET_ISO_ENABLE', { ...batchExtra(), enable: false }));
   $p('bmTpsOn').onclick = () => run(powerCmd('CH_SET_TPS_ENABLE', { ...batchExtra(), enable: true }));
@@ -548,7 +570,7 @@ function wireBoards() {
       ? Math.min(cap, Math.max(0, +$p('bmStateArg').value)) : 0;
     const j = await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', channel: boardPrimary.channel, mux_port: boardPrimary.mux_port, state: bmState, arg });
     bmMsg(j.ok ? `state ${bmState}${arg ? ' @ ' + arg : ''} set` : (j.error || 'state failed'));
-    refreshBoards();
+    refreshBoards(true);
   };
   reflectStateArg();
   // Batch power state — applies the chosen state to every selected board (loops
@@ -584,7 +606,7 @@ function wireBoards() {
     if (btn) btn.disabled = false;
     bmMsg(fails.length ? `state ${bmBatchState}: ${okN}/${keys.length} ok · failed ${fails.join(' ')}`
       : `state ${bmBatchState}${arg ? ' @ ' + arg : ''} → ${okN} board(s)`);
-    refreshBoards();
+    refreshBoards(true);
   };
   reflectBatchStateArg();
   $p('bmOneVoutSr').onclick = async () => {
@@ -631,7 +653,7 @@ const HV_HTML = `
       <span class="legend-item"><span class="hv-test pass">✓</span>/<span class="hv-test fail">✗</span> switch test</span>
       <span class="hint">click=toggle · shift=block · ctrl=multi</span>
     </div>
-    <div class="row compact i2c-mask bm-mask" title="Channel enable mask — masked channels are dimmed, non-selectable, and skipped by Toggle test. Shared with the Boards matrix + I²C section.">
+    <div class="row compact i2c-mask bm-mask" title="Host poll set — disabled channels are dimmed, non-selectable, and skipped by the Toggle test. Shared with the Boards matrix + I²C section. (Firmware always scans all 8; this is a host-side filter.)">
       <span class="hint">channels enabled</span>
       <span id="hvMaskBits" class="i2c-mask-bits"></span>
       <button id="hvMaskGetBtn" class="xs mask-btn">Get</button>
@@ -1861,37 +1883,77 @@ export function initPower() {
 
   // target-controller selector
   document.querySelectorAll('#pwTargetSeg .seg-btn').forEach((b) =>
-    b.addEventListener('click', () => {
-      pwTarget = +b.dataset.ctrl;
-      document.querySelectorAll('#pwTargetSeg .seg-btn').forEach((x) => x.classList.toggle('active', x === b));
-      hvTest = null;   // clear stale switch-test marks from the previous controller
-      updateTargetStatus(); refreshBoards(); refreshHv(true); readHvStatus(true); readTpsRegs(); readStartupOcp();
-    }));
+    b.addEventListener('click', () => selectController(+b.dataset.ctrl, b)));
 
   // poll connection state + board snapshot
   setInterval(pollPower, POLL_MS);
   pollPower();
 }
 
-let pollBusy = false;
-let prevConn = false;
-async function pollPower() {
-  if (pollBusy) return;          // never overlap — the board sweep is slow
-  if (window.ctTestRunning) { updateTargetStatus(); return; }   // pause heavy snapshot during a Cal & Test
+// Controller switch: clear the matrix immediately (so the click visibly registers),
+// bump boardGen to drop any in-flight Power-1 response, force the next periodic poll
+// to be a full snapshot, then refresh the boards FIRST (awaited) so the matrix fills
+// fast, before the heavier HV/TPS reads queue behind it on the single-client link.
+async function selectController(n, btn) {
+  if (n === pwTarget && btn && btn.classList.contains('active')) return;
+  pwTarget = n;
+  document.querySelectorAll('#pwTargetSeg .seg-btn').forEach((x) => x.classList.toggle('active', x === btn));
+  hvTest = null;               // stale switch-test marks belong to the previous controller
+  boardGen++;                  // supersede any in-flight refresh for the old controller
+  boardCache = emptyBoards(); renderBoardGrid(); renderOneBoard();
+  pollTick = 0;                // next periodic poll does a full snapshot
+  updateTargetStatus();
+  if (pollBusy) return;        // a sweep is running; it'll target the new controller on its next tick
   pollBusy = true;
   try {
-    const st = await (await fetch('/api/status')).json();
+    await refreshBoards(false);   // full snapshot first → matrix fills immediately
+    await refreshHv(true);
+    await readHvStatus(true);
+    await readTpsRegs(true);
+    await readStartupOcp();
+  } catch { /* keep last */ } finally { pollBusy = false; }
+}
+
+let pollBusy = false;
+let prevConn = false;
+let pollTick = 0;
+const POLL_PHASES = 5;
+// True only when the matrix is actually on screen. When it's not (different tab /
+// backgrounded), skip its reads so the single-client link stays free for the CT
+// geometry live view. Robust check: checkVisibility() where available, else box size.
+function powerPanelVisible() {
+  if (document.hidden) return false;
+  const el = document.getElementById('bmGrid');
+  if (!el) return true;
+  if (el.checkVisibility) return el.checkVisibility({ visibilityProperty: true, contentVisibilityAuto: true });
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+// One poll per second. INA219 V/I is the live operational signal, so EVERY tick
+// does the cheap V/I refresh and the matrix numbers stay current. The only other
+// periodic reads are the presence/enable/fault snapshot (phase 0) and the HV grid
+// (phase 2) — both change rarely and are spread onto their own ticks so no tick
+// holds the link long enough to stall the V/I refresh. TPS OCP/delay/slew are
+// debug config that don't change during a run, so they are NOT polled — they're
+// read on demand only (selecting a board / switching controllers).
+async function pollPower() {
+  if (pollBusy) return;          // never overlap — reads serialize on the single link
+  if (window.ctTestRunning) { updateTargetStatus(); return; }   // pause during a Cal & Test
+  if (document.hidden) return;   // tab backgrounded → nothing to draw
+  pollBusy = true;
+  try {
+    const st = await (await fetch('/api/status')).json();   // cheap: local connection flags, no bridge round-trip
     connectedSet = {};
     for (const [k, c] of Object.entries(st.controllers || {})) connectedSet[+k] = c.connected;
     updateTargetStatus();
-    await refreshBoards();
-    await refreshHv();
-    await readTpsRegs(true);   // live-monitor the selected board's TPS OCP/delay/slew registers
-    // Sync the enable buttons to the real pin state ONCE on (re)connect — NOT
-    // every poll, which would fight the user's click and need a second press.
     const conn = boardTargetConnected();
-    if (conn && !prevConn) await readHvStatus(true);
+    if (!conn) { prevConn = false; return; }
+    if (!prevConn) await readHvStatus(true);   // sync enable buttons ONCE on (re)connect
     prevConn = conn;
+    if (!powerPanelVisible()) return;          // matrix off-screen → yield the link to geometry
+    const phase = pollTick++ % POLL_PHASES;
+    await refreshBoards(phase !== 0);          // phase 0 = full snapshot; every other tick = fast V/I merge
+    if (phase === 2) await refreshHv();        // HV grid on its own tick (bits change on action, not continuously)
   } catch { /* keep last */ } finally { pollBusy = false; }
 }
 

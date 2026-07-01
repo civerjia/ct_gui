@@ -1584,9 +1584,11 @@ async function i2cSelftest() {
 async function i2cSetMask() {
   try {
     const j = await postJSON('/api/channel-mask', { mask: window.ctChannelMask });
-    const parts = Object.entries(j.controllers || {}).map(([k, r]) =>
-      `P${k}: ${r.ok ? '0x' + (r.mask).toString(16).toUpperCase().padStart(2, '0') : (r.error || '✗')}`);
-    i2cMsg('Channel mask set — ' + (parts.join(' · ') || 'no controller') + '.');
+    const en = [];
+    for (let c = 0; c < 8; c++) if ((window.ctChannelMask >> c) & 1) en.push('CH' + (c + 1));
+    i2cMsg('Polling ' + (en.join(', ') || 'no channels') + ' (host scan set, 0x'
+      + (window.ctChannelMask & 0xFF).toString(16).toUpperCase().padStart(2, '0') + '). Refreshing boards…');
+    if (window.ctRefreshBoards) window.ctRefreshBoards();
   } catch (e) { i2cMsg('Set mask failed: ' + e); }
 }
 async function i2cMuxReset() {
