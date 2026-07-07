@@ -1317,9 +1317,19 @@ async function pollRunStatus() {
   try { data = await (await fetch('/api/run-status')).json(); } catch { return; }
   const ctrls = data.controllers || {};
   let cursor = null, anyRunning = false, fault = null, statePieces = [], firingFil = null;
-  let anyArmed = false, anyComplete = false;
+  let anyArmed = false, anyComplete = false, anyDead = false;
+  const HEARTBEAT_STALE_MS = 6000;   // no RP2350 heartbeat this long => dead/hung
   for (const [k, c] of Object.entries(ctrls)) {
-    if (!c.connected || !c.status) continue;
+    if (!c.connected) { anyDead = true; statePieces.push(`P${k}: ⚠ DISCONNECTED (bridge down)`); continue; }
+    // Connected bridge but the RP2350 behind it is unresponsive: the status poll
+    // errored, or the heartbeat has gone stale. Surface it — never skip silently.
+    const stale = (c.rp_age_ms != null && c.rp_age_ms > HEARTBEAT_STALE_MS);
+    if (!c.status || stale) {
+      anyDead = true;
+      const age = c.rp_age_ms != null ? ` — heartbeat ${(c.rp_age_ms / 1000).toFixed(0)}s ago` : '';
+      statePieces.push(`P${k}: ⚠ RP2350 UNRESPONSIVE${age}`);
+      continue;
+    }
     const s = c.status;
     if (cursor == null) cursor = s.totalPulsesDone;
     if (s.state === 1) anyArmed = true;
@@ -1343,8 +1353,10 @@ async function pollRunStatus() {
     }
     if (idx >= 0) { gotoSeq(idx, false); updateTableActive(); }
   }
-  // arm-state badge (firmware-authoritative)
-  if (fault) setArmState(`✗ fault (fil ${fault.fil})`, 'fault');
+  // arm-state badge (firmware-authoritative). A dead/unresponsive RP2350 is the
+  // most critical state — surface it above run state so it can't be missed.
+  if (anyDead) setArmState('✗ RP2350 unresponsive', 'fault');
+  else if (fault) setArmState(`✗ fault (fil ${fault.fil})`, 'fault');
   else if (anyRunning) setArmState('● running', 'running');
   else if (anyArmed) setArmState('● armed', 'armed');
   else if (anyComplete) setArmState('✓ complete', 'complete');

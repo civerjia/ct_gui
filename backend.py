@@ -1447,11 +1447,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 if not c.client.connected:
                     out[str(k)] = {"connected": False}
                     continue
+                # RP2350 heartbeat age — a periodic message from the RP2350; if it
+                # stops the RP2350 is dead/hung even though the ESP32 TCP link is up.
+                rp_age = None if c.rp_last == 0 else (time.time() - c.rp_last) * 1000.0
                 try:
                     st = decode_shv_status(c.request(SHV_GET_STATUS, b"", timeout=1.0))
-                    out[str(k)] = {"connected": True, "status": st}
+                    out[str(k)] = {"connected": True, "status": st, "rp_age_ms": rp_age}
                 except Exception as exc:
-                    out[str(k)] = {"connected": True, "error": str(exc)}
+                    out[str(k)] = {"connected": True, "error": str(exc), "rp_age_ms": rp_age}
             self._json({"controllers": out})
         else:
             self._serve_static(path)
