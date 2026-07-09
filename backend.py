@@ -80,8 +80,17 @@ def build_payload(command: str, b: dict):
     """Return (frame_type, flags, payload) for a single-board command."""
     ch = int(b.get("channel", 0)) & 0xFF
     mux = int(b.get("mux_port", 0)) & 0xFF
-    if command == "CH_SET_POWER_STATE":      # 0x35: ch,mux,state,arg16 (IDLE/ACTIVE→mA, VOLTAGE→mV)
-        return 0x35, FLAG_SINGLE, bytes([ch, mux, int(b["state"]) & 0xFF]) + _u16(int(b.get("arg", 0)))
+    if command == "CH_SET_POWER_STATE":      # 0x35
+        st = int(b["state"]) & 0xFF
+        arg = _u16(int(b.get("arg", 0)))
+        # Multi-board form [mask0..7, state, arg16] (flags=0) — the firmware loops
+        # the mask internally, so a whole batch is ONE command / one round-trip
+        # instead of one per board. Single-board [ch,mux,state,arg16] otherwise.
+        if b.get("board_mask") is not None:
+            mask = bytes((int(x) & 0xFF) for x in list(b["board_mask"])[:8])
+            mask = mask + bytes(8 - len(mask))          # pad to 8
+            return 0x35, 0, mask + bytes([st]) + arg
+        return 0x35, FLAG_SINGLE, bytes([ch, mux, st]) + arg
     if command == "CH_GET_POWER_STATE":      # 0x36: ch,mux -> status,ch,mux,state,faultKind
         return 0x36, FLAG_SINGLE, bytes([ch, mux])
     if command == "CH_STARTUP_OCP":          # 0x37: get(empty) / set(mA16) startup OCP floor
@@ -1050,6 +1059,39 @@ ESPCMD = EspCmdClient()
 _DL_PROGRESS: dict[int, dict] = {}
 _DL_LOCK = threading.Lock()
 
+# ---- Scan simulation --------------------------------------------------------
+# Auto-generate the whole sync-pulse train, PACED over the scan duration, in a
+# background thread (so the HTTP handler never blocks for ~30 s). Fire the HEAD
+# of the sync chain (P1); the RP2350 chain (P1 SyncOut -> P2 SyncIn) propagates
+# it, so both controllers advance per pulse. The GUI reads schedule progress via
+# /api/run-status and fire progress via /api/sync/simulate-status.
+_SIM_STATE: dict = {"running": False, "fired": 0, "count": 0, "stop": False, "controller": None}
+_SIM_LOCK = threading.Lock()
+
+
+def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) -> None:
+    # running/count/stop already claimed by the caller under _SIM_LOCK (atomic start).
+    interval_s = interval_ms / 1000.0
+    start = time.monotonic()
+    try:
+        for i in range(count):
+            with _SIM_LOCK:
+                if _SIM_STATE["stop"]:
+                    break
+            sync_post_fire(host)   # a dropped fire is tolerated (schedule has interPulseMs slack)
+            with _SIM_LOCK:
+                _SIM_STATE["fired"] = i + 1
+            if interval_s > 0:
+                # Pace against a WALL-CLOCK deadline so the whole train spans ~duration
+                # even though each fire itself costs bridge round-trip time (a fixed
+                # per-iteration sleep would add the fire time on top and overrun).
+                delay = (start + (i + 1) * interval_s) - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+    finally:
+        with _SIM_LOCK:
+            _SIM_STATE["running"] = False
+
 
 def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
                            channels=None) -> dict:
@@ -1158,24 +1200,55 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     else:
         fils = [int(f) for f in filaments
                 if filament_to_board(int(f))[0] == controller]
-    # Per-filament outcome: a bad power channel makes CH_SET_POWER_STATE fail for
-    # THAT filament only. Track which failed (global indices) so callers can skip
-    # + report them instead of aborting the whole batch. Pipelined (window of
-    # frames in flight) so a 48-filament prep is ~1 s, not ~40 s.
-    reqs = []
+    # BATCHED, not per-filament. A per-filament flood (~48 CH_SET_POWER_STATE frames
+    # back-to-back) overwhelmed the RP2350's UART+I2C and tripped its 2 s watchdog
+    # ("Stop all" -> RP2350 reset). Instead send ONE MASKED frame per (channel,
+    # current) group: an 8-bit TCA9554 mask for that channel. STOP/SLEEP write the
+    # channel's iso/EN registers once for the whole mask (setPowerStateMasked), and
+    # each frame touches <=8 boards so no single command blocks the loop long enough
+    # to reset. Grouped by current so Idle/Active with per-filament targets still
+    # batch per channel where the target matches. Response layout (per handler):
+    # [status, mask[8], applied[8], failed[8], state, ...] -> applied[] at raw[9:17].
+    if not fils:
+        return {"controller": controller, "ok": True, "applied": 0, "failed": [], "state": int(state)}
+    groups: dict = {}   # (channel, arg) -> OR'd mask byte for that channel
+    members: dict = {}  # (channel, arg) -> [filament]
     for f in fils:
         _, ch, pos, _ = filament_to_board(f)
-        arg = int(currents.get(str(f), currents.get(f, default_arg)))
-        reqs.append((CH_SET_POWER_STATE, bytes([ch, pos, int(state) & 0xFF]) + _u16(arg), FLAG_SINGLE))
-    if not reqs:
-        return {"controller": controller, "ok": True, "applied": 0, "failed": [], "state": int(state)}
-    results = _pipeline_reliable(link, reqs, window=8, timeout=2.5)
+        if ch is None:            # unslotted/overflow filament (past slot 63, or a
+            continue              # skipped channel) -> has no power slot to address
+        v = currents.get(str(f), currents.get(f, default_arg))
+        arg = int(v if v is not None else default_arg)   # tolerate an explicit null
+        groups[(ch, arg)] = groups.get((ch, arg), 0) | (1 << pos)
+        members.setdefault((ch, arg), []).append(f)
+    reqs, keys = [], []
+    for (ch, arg), chmask in groups.items():
+        m = bytearray(8)
+        m[ch] = chmask & 0xFF
+        reqs.append((CH_SET_POWER_STATE, bytes(m) + bytes([int(state) & 0xFF]) + _u16(arg), 0))
+        keys.append((ch, arg))
+    # Few frames (<=8, one per channel) and each is ~instant on the RP2350, so send
+    # them serially via the reliable single-request path. _pipeline_reliable's
+    # pipeline phase was spending ~5 s PER frame here (a 0.2 s op became 30 s) --
+    # its per-frame deadlines mistime against the RP2350's interleaved heartbeat/
+    # telemetry stream. The single-request path drains those cleanly.
+    results = []
+    for ft, payload, flags in reqs:
+        try:
+            results.append(link.client.send_request(ft, payload, flags=flags, timeout=3.0))
+        except Exception as exc:
+            results.append({"ok": False, "error": str(exc)})
     applied, failed = 0, []
-    for f, r in zip(fils, results):
-        if isinstance(r, dict) and _status_ok(r):
-            applied += 1
-        else:
-            failed.append(int(f))
+    for key, r in zip(keys, results):
+        ch, _arg = key
+        raw = r.get("raw") if isinstance(r, dict) else None
+        appl = raw[9 + ch] if (raw and len(raw) >= 9 + ch + 1) else 0
+        for f in members[key]:
+            _, _fch, fpos, _ = filament_to_board(f)
+            if appl & (1 << fpos):
+                applied += 1
+            else:
+                failed.append(int(f))
     return {"controller": controller, "ok": not failed, "applied": applied,
             "total": len(fils), "failed": failed, "state": int(state)}
 
@@ -1439,6 +1512,10 @@ class CtHandler(BaseHTTPRequestHandler):
             with _DL_LOCK:
                 prog = {str(c + 1): dict(v) for c, v in _DL_PROGRESS.items()}
             self._json({"ok": True, "controllers": prog})
+        elif path == "/api/sync/simulate-status":
+            # Scan-simulation fire progress (the GUI polls this while it runs).
+            with _SIM_LOCK:
+                self._json({"ok": True, **_SIM_STATE})
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
@@ -1554,27 +1631,20 @@ class CtHandler(BaseHTTPRequestHandler):
                 # Download the bound schedule + config to every connected controller.
                 plan = body.get("plan") or {}
                 channels = body.get("channels") or DEFAULT_CHANNELS
-                # Download to each connected controller IN PARALLEL — the links are
-                # independent TCP sockets, so the two controllers' ~108 sequential
-                # UART round-trips overlap (≈2× faster than serial).
+                # Download to each connected controller SEQUENTIALLY. Parallel transfers
+                # to both bridges contend on the host's single WiFi uplink and drop each
+                # other's frames (one loads, the other gets wiped to 0 — observed flapping).
+                # Serializing costs ~2× wall-clock but each controller's ~108 UART
+                # round-trips complete cleanly, which is what actually matters here.
                 links = [(cid, link) for cid, link in CONTROLLERS.items() if link.client.connected]
-                slots = [None] * len(links)
                 with _DL_LOCK:
                     _DL_PROGRESS.clear()   # fresh progress for the GUI poller
-
-                def _dl(i, cid, link):
+                results = []
+                for cid, link in links:
                     try:
-                        slots[i] = download_to_controller(link, cid - 1, plan, channels)
+                        results.append(download_to_controller(link, cid - 1, plan, channels))
                     except Exception as exc:
-                        slots[i] = {"controller": cid - 1, "ok": False, "error": str(exc)}
-
-                threads = [threading.Thread(target=_dl, args=(i, cid, link), daemon=True)
-                           for i, (cid, link) in enumerate(links)]
-                for t in threads:
-                    t.start()
-                for t in threads:
-                    t.join()
-                results = [r for r in slots if r]
+                        results.append({"controller": cid - 1, "ok": False, "error": str(exc)})
                 if not results:
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 self._json({"ok": all(r.get("ok") for r in results), "results": results})
@@ -1941,6 +2011,35 @@ class CtHandler(BaseHTTPRequestHandler):
                 else:
                     fields = {k: str(body[k]) for k in ("sync_out_edge", "sync_out_width_us", "ready_active", "ext_trig_edge") if k in body}
                     self._json(sync_post_config(link.host, fields))
+            elif path == "/api/sync/simulate":
+                # SIMULATE SCAN: paced, background sync-pulse train over the whole
+                # scan. count = the schedule's total triggers; duration_s spreads
+                # them over the real scan time (interval_ms = duration_s/count).
+                # Fire the head-of-chain controller (default MASTER); the RP2350
+                # chain propagates it to the other power.
+                cid = int(body.get("controller", MASTER))
+                link = CONTROLLERS.get(cid)
+                if not link or not link.host:
+                    return self._json({"ok": False, "error": "controller not connected"}, HTTPStatus.OK)
+                count = max(1, int(body.get("count", 1)))
+                if "interval_ms" in body:
+                    interval_ms = max(0.0, float(body["interval_ms"]))
+                else:
+                    dur = max(0.0, float(body.get("duration_s", 0)))
+                    interval_ms = (dur * 1000.0 / count) if (dur > 0 and count > 0) else 0.0
+                with _SIM_LOCK:
+                    if _SIM_STATE["running"]:
+                        return self._json({"ok": False, "error": "simulation already running"}, HTTPStatus.OK)
+                    # Claim it ATOMICALLY here (not inside the thread) so two near-
+                    # simultaneous starts can't both pass the guard and double-fire.
+                    _SIM_STATE.update(running=True, fired=0, count=count, stop=False, controller=cid)
+                threading.Thread(target=_run_scan_sim, args=(link.host, count, interval_ms, cid),
+                                 daemon=True).start()
+                self._json({"ok": True, "count": count, "interval_ms": interval_ms, "controller": cid})
+            elif path == "/api/sync/simulate-stop":
+                with _SIM_LOCK:
+                    _SIM_STATE["stop"] = True
+                self._json({"ok": True})
             elif path == "/api/shv":
                 link = CONTROLLERS.get(int(body.get("controller", 0)))
                 if not link or not link.client.connected:

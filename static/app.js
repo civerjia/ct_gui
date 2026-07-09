@@ -83,7 +83,7 @@ const DEFAULT_DUR_US = 1000; // 1 ms, shown in µs
 const filaments = Array.from({ length: N }, () => ({
   state: STATE.STOP, voltage_mV: 0, current_mA: 0, mAs: 0,
   pulses: DEFAULT_PULSES, durationUs: DEFAULT_DUR_US,
-  idleA: 1, activeA: 3,      // cathode heating currents (A)
+  idleA: 1.5, activeA: 3,    // cathode heating currents (A)
   ocp: 4000, dcHv: false, // debug: per-board OCP (mA, firmware default 4 A), DC HV bit
   dead: false,            // disabled filament — omitted from the schedule (§8.4)
 }));
@@ -146,8 +146,13 @@ function applyGantryFromIndex() {
 // Idle. Everything outside the window sleeps. Real telemetry replaces this in
 // ingestTelemetry().
 function refreshStates() {
-  // Only the Plan view simulates. Live/Debug reflect actual per-filament data.
-  if (viewMode !== 'plan') return;
+  // Plan view always simulates. During a live hardware run/sim the firmware executes
+  // the EXACT downloaded plan, so we color the ring by that plan at the live trigger
+  // too — that IS the real scanning status (the ACTIVE heating band the firmware
+  // promotes, with the geometry positioned by pollRunStatus → gotoSeq to the firing
+  // filament). Debug view still reflects actual per-filament telemetry only.
+  const liveRun = (viewMode === 'live' && runMonitorTimer);
+  if (viewMode !== 'plan' && !liveRun) return;
   // Bound-schedule heating: every filament rests at IDLE (warm pool); the
   // derived plan promotes the hot band (collimator window + T_settle lead) to
   // ACTIVE at the current pulse trigger. The firing filament emits.
@@ -271,6 +276,7 @@ function buildSchedule() {
 }
 
 function updateScheduleHeader() {
+  if (typeof updateScanSummary === 'function') updateScanSummary();   // step-7 derived scan line
   const lbl = $('schGanttLabel'); if (lbl) lbl.textContent = `${schedule.length} emit · ${heatRows.length} heat`;
   if (scheduleView === 'heating') { $('schCount').textContent = `${heatRows.length} state changes`; return; }
   $('schCount').textContent = scheduleTruncated
@@ -558,7 +564,10 @@ function sync() {
   $('modeBadge').textContent = 'Mode: ' + (state.mode === 'precision' ? 'Precision' : 'Stationary');
   const pct = Math.round((state.ringStep / N) * 100);
   const pb = $('progressBadge');
-  if (playTimer) { pb.textContent = `Scanning… ring ${pct}%`; pb.className = 'badge heartbeat-alive'; }
+  if (dryRunActive) {
+    const dp = schedule.length > 1 ? Math.round((liveSeq / (schedule.length - 1)) * 100) : 0;
+    pb.textContent = `Dry run… ${dp}%`; pb.className = 'badge heartbeat-alive';
+  } else if (playTimer) { pb.textContent = `Scanning… ring ${pct}%`; pb.className = 'badge heartbeat-alive'; }
   else { pb.textContent = `ring ${pct}%`; pb.className = 'badge heartbeat-idle'; }
 }
 
@@ -567,17 +576,25 @@ function sync() {
 //            × the number of filaments in each state.
 //  · Live  — MEASURED: real P = V·I (voltage_mV × current_mA / 1e6), present only.
 function renderPower() {
-  let active = 0, idle = 0;
+  let active = 0, idle = 0, p1 = 0, p2 = 0;
   const live = viewMode === 'live';
-  for (const f of filaments) {
+  const getCtrl = window.ctFilamentController;   // filament idx -> 0 (P1) / 1 (P2) / other
+  for (let i = 0; i < filaments.length; i++) {
+    const f = filaments[i];
     if (!f || f.dead) continue;
-    if (f.state === STATE.ACTIVE) active += live ? (f.voltage_mV * f.current_mA) / 1e6 : powerEst.activeW;
-    else if (f.state === STATE.IDLE) idle += live ? (f.voltage_mV * f.current_mA) / 1e6 : powerEst.idleW;
+    let w = 0;
+    if (f.state === STATE.ACTIVE) { w = live ? (f.voltage_mV * f.current_mA) / 1e6 : powerEst.activeW; active += w; }
+    else if (f.state === STATE.IDLE) { w = live ? (f.voltage_mV * f.current_mA) / 1e6 : powerEst.idleW; idle += w; }
+    else continue;
+    const c = getCtrl ? getCtrl(i) : -1;   // split heating power by the controller that drives it
+    if (c === 0) p1 += w; else if (c === 1) p2 += w;
   }
   const fmt = (w) => (w >= 1000 ? (w / 1000).toFixed(2) + ' kW' : w.toFixed(1) + ' W');
   $('pwTotal').textContent = fmt(active + idle);
   $('pwActive').textContent = fmt(active);
   $('pwIdle').textContent = fmt(idle);
+  if ($('pwP1')) $('pwP1').textContent = fmt(p1);
+  if ($('pwP2')) $('pwP2').textContent = fmt(p2);
 }
 
 // ---- play loop --------------------------------------------------------------
@@ -598,6 +615,36 @@ function stopPlay() {
 }
 function togglePlay() { playTimer ? stopPlay() : startPlay(); }
 
+// ---- dry run: play the built schedule ONCE, locally, at the plan's real pace ---
+// No hardware — a pure visualization to verify the plan (heating band sweep + ring +
+// progress) before arming. Complements Hardware Run → Simulate Scan (which needs the
+// real controllers). Runs in Plan view so refreshStates() colors the ACTIVE band.
+let dryRunTimer = null, dryRunActive = false;
+function startDryRun() {
+  stopPlay(); stopDryRun();
+  setViewMode('plan');
+  if (!schedule.length) rebuildSchedule();
+  if (!schedule.length) { setStatus('No schedule to dry-run — build one first.'); return; }
+  gotoSeq(0, false);
+  dryRunActive = true;
+  // spread the plan's rotation time across the schedule rows, clamped so it's watchable
+  const stepMs = Math.min(600, Math.max(40, heatingSchedule.rotationMs / Math.max(1, schedule.length)));
+  const btn = $('dryRunBtn'); if (btn) { btn.textContent = '⏹ Stop'; btn.classList.add('playing'); }
+  dryRunTimer = setInterval(() => {
+    if (liveSeq + 1 >= schedule.length) { stopDryRun(); return; }   // one rotation → done
+    gotoSeq(liveSeq + 1, false);
+  }, stepMs);
+  sync();
+}
+function stopDryRun() {
+  if (dryRunTimer) { clearInterval(dryRunTimer); dryRunTimer = null; }
+  if (!dryRunActive) return;
+  dryRunActive = false;
+  const btn = $('dryRunBtn'); if (btn) { btn.textContent = '⤳ Dry run'; btn.classList.remove('playing'); }
+  sync();
+}
+function toggleDryRun() { dryRunActive ? stopDryRun() : startDryRun(); }
+
 // ---- view mode (live / plan / debug) ---------------------------------------
 function setViewMode(mode) {
   viewMode = mode;
@@ -608,7 +655,8 @@ function setViewMode(mode) {
     b.classList.toggle('active', b.dataset.view === mode));
   // only Plan can simulate-and-play and edit the motion/schedule
   const plan = mode === 'plan';
-  for (const id of ['playBtn', 'stepBtn', 'resetBtn']) $(id).disabled = !plan;
+  if (!plan) stopDryRun();   // a dry run only makes sense in Plan view
+  for (const id of ['playBtn', 'stepBtn', 'resetBtn', 'dryRunBtn']) { const el = $(id); if (el) el.disabled = !plan; }
   for (const id of ['schApplyBtn', 'schSyncBtn']) $(id).disabled = !plan;
   setStatus(mode === 'live'
     ? 'Live — reflects the actual gantry position and INA219 sensor data from the controllers.'
@@ -1100,10 +1148,12 @@ function refreshRunGate() {
   // Override unlocks every step regardless of order (testing / bring-up). It only
   // relaxes the GUI gate — the firmware still enforces its own arm safety.
   const ovr = !!runState.override;
-  const canDownload = ovr || scanReady();
-  const canVerify = ovr || scanReady();
-  const canPrep = ovr || scanReady();
-  const canArm = ovr || (runState.verified && runState.hwChecked && scanReady());
+  // `conn` (hwConnected) already computed above for the gate chips — reuse it:
+  // no bridge => nothing to download/verify/prep/arm.
+  const canDownload = ovr || (conn && scanReady());
+  const canVerify = ovr || (conn && scanReady());
+  const canPrep = ovr || (conn && scanReady());
+  const canArm = ovr || (conn && runState.verified && runState.hwChecked && scanReady());
   enableBtn('hwDownloadBtn', canDownload);
   enableBtn('hwVerifyBtn', canVerify);
   ['hwPrepStop', 'hwPrepSleep', 'hwPrepStandby', 'hwPrepIdle', 'hwPrepActive'].forEach((id) => enableBtn(id, canPrep));
@@ -1112,6 +1162,7 @@ function refreshRunGate() {
   // rejected arm or an out-of-band armed state, so there's always a way out.
   enableBtn('hwDisarmBtn', hwConnected());
   enableBtn('hwTrigBtn', ovr || runState.armed);
+  enableBtn('hwSimBtn', ovr || runState.armed);   // Simulate Scan: same gate as manual trigger
   lockStep('hwStepDownload', !canDownload);
   lockStep('hwStepPrep', !canPrep);
   lockStep('hwStepArm', !(canArm || runState.armed));
@@ -1128,6 +1179,10 @@ function setArmState(label, cls) {
 window.ctRefreshRunGate = refreshRunGate;
 // A changed/rebuilt schedule (or lost connection) invalidates a prior download.
 function invalidateRun() { runState.downloaded = runState.verified = runState.prepActive = runState.armed = false; refreshRunGate(); }
+// Called by controllers.js on a connected->disconnected transition: a reboot can
+// clear the firmware schedule table, so also drop the hardware-check + arm gate so
+// the operator must re-verify (or Override) before arming again.
+window.ctInvalidateRun = () => { runState.hwChecked = false; invalidateRun(); };
 
 // Translate the GUI's bound schedule into the host plan (logical filament 0-95;
 // the backend maps to global 0-127 + per-controller split).
@@ -1228,7 +1283,9 @@ async function hwArm() {
   if (parts0.length) {
     hwMsg(`Idling ${parts0.length} participating filament(s) (arm prerequisite)…`);
     try {
-      const jp = await postJSON('/api/filament-prep', { state: STATE.IDLE, filaments: parts0 });
+      // Pass the per-filament idleA setpoints so arm-prerequisite idling lands on
+      // the plan's currents (the backend applies currents[idx] only to `filaments`).
+      const jp = await postJSON('/api/filament-prep', { state: STATE.IDLE, filaments: parts0, currents: prepCurrents('idleA') });
       if (!jp.ok) hwMsg(`⚠ Idle prep partial (applied ${jp.applied || 0}/${parts0.length}) — arming anyway…`);
     } catch (e) { hwMsg('Idle prep failed: ' + e + ' — aborting arm.'); return; }
   }
@@ -1261,12 +1318,68 @@ async function hwDisarm() {
   stopRunMonitor();
 }
 
+// Manual bench step: fire ONE SyncIn pulse (advance the armed schedule one trigger).
 async function hwTrigger() {
-  const count = Math.max(1, parseInt($('hwTrigCount').value, 10) || 1);
   try {
-    const j = await postJSON('/api/trigger', { count });
-    hwMsg(`Fired ${j.fired}/${count} SyncIn pulse(s)${j.ok ? '.' : ' — ' + ((j.last && j.last.message) || j.error || 'stalled')}`);
-  } catch (e) { hwMsg('Trigger failed: ' + e); }
+    const j = await postJSON('/api/trigger', { count: 1 });
+    hwMsg(`Fired ${j.fired}/1 SyncIn pulse${j.ok ? ' (stepped one trigger).' : ' — ' + ((j.last && j.last.message) || j.error || 'stalled')}`);
+  } catch (e) { hwMsg('Step failed: ' + e); }
+}
+
+// The scan the simulation runs is fully DERIVED from the plan — nothing to enter:
+//   triggers = the schedule's total pulse count (totalTriggers) × repeats
+//   duration = the heating-plan rotation time (heatingSchedule.rotationMs) × repeats
+// (rotationMs is the same "rotation … ms" field that drives the heating layer, so
+// the sim paces exactly like the real gantry.) Keeps step 7 in sync with the plan.
+function scanSimParams() {
+  const repeats = Math.max(1, parseInt($('hwRepeats').value, 10) || 1);
+  const triggers = Math.max(0, totalTriggers) * repeats;
+  const durationS = (heatingSchedule.rotationMs / 1000) * repeats;
+  return { repeats, triggers, durationS };
+}
+function updateScanSummary() {
+  const el = $('hwScanSummary'); if (!el) return;
+  const { repeats, triggers, durationS } = scanSimParams();
+  el.textContent = triggers
+    ? `Full scan: ${triggers} triggers · ${durationS.toFixed(1)} s${repeats > 1 ? ` · ×${repeats}` : ''}`
+    : 'Build a schedule first';
+}
+
+// Simulate the ENTIRE scan: auto-generate the full sync-pulse train, paced over the
+// plan's real duration, in the backend (non-blocking). Fires P1 (the sync-chain
+// head) — the RP2350 chain (P1 SyncOut -> P2 SyncIn) drives the other power. The CT
+// geometry plot + run-status line track the schedule advancing (viewMode=live).
+async function hwSimulateScan() {
+  // A sim train fired at an un-armed schedule just clocks past an empty window —
+  // require Arm (or Override) so the simulation actually exercises the run.
+  if (!runState.armed && !runState.override) {
+    hwMsg('Arm the schedule before simulating a scan (or enable Override).');
+    return;
+  }
+  const { triggers, durationS } = scanSimParams();
+  // Prefer the firmware's armed target (authoritative post-arm), fall back to the
+  // plan-derived trigger count if the status read fails.
+  let count = 0;
+  try {
+    const rs = await (await fetch('/api/run-status')).json();
+    for (const c of Object.values(rs.controllers || {})) {
+      const t = c.status && c.status.totalPulsesTarget;
+      if (t) count = Math.max(count, t);
+    }
+  } catch { /* fall through to the plan-derived count */ }
+  if (!count) count = triggers;
+  if (!count) { hwMsg('No schedule to simulate — build & download one first.'); return; }
+  try {
+    const j = await postJSON('/api/sync/simulate', { controller: 1, count, duration_s: durationS });
+    if (!j.ok) { hwMsg('Simulate Scan failed: ' + (j.error || '?')); return; }
+    hwMsg(`Simulating scan: ${count} triggers over ${durationS.toFixed(1)}s (fired at chain head P1) — watch the CT plot & run status.`);
+    setViewMode('live'); startRunMonitor();   // track the schedule advancing
+  } catch (e) { hwMsg('Simulate Scan failed: ' + e); }
+}
+
+async function hwSimStopScan() {
+  try { await postJSON('/api/sync/simulate-stop', {}); hwMsg('Scan simulation stopped.'); }
+  catch (e) { hwMsg('Stop failed: ' + e); }
 }
 
 // ---- CT-scan prep ladder: batch PowerState across BOTH controllers ----------
@@ -1318,19 +1431,26 @@ async function pollRunStatus() {
   const ctrls = data.controllers || {};
   let cursor = null, anyRunning = false, fault = null, statePieces = [], firingFil = null;
   let anyArmed = false, anyComplete = false, anyDead = false;
+  let doneMax = 0, targetMax = 0;   // for the scan progress bar
   const HEARTBEAT_STALE_MS = 6000;   // no RP2350 heartbeat this long => dead/hung
   for (const [k, c] of Object.entries(ctrls)) {
     if (!c.connected) { anyDead = true; statePieces.push(`P${k}: ⚠ DISCONNECTED (bridge down)`); continue; }
     // Connected bridge but the RP2350 behind it is unresponsive: the status poll
     // errored, or the heartbeat has gone stale. Surface it — never skip silently.
     const stale = (c.rp_age_ms != null && c.rp_age_ms > HEARTBEAT_STALE_MS);
-    if (!c.status || stale) {
+    if (!c.status) {
+      // The status poll itself FAILED -> genuinely unresponsive (bridge up, RP2350
+      // not answering). A stale heartbeat ALONE does NOT mean dead: under heavy scan
+      // load the 1 Hz heartbeat can lag while the poll still succeeds, so it must not
+      // override a working poll (that would false-flag a running power mid-scan).
       anyDead = true;
       const age = c.rp_age_ms != null ? ` — heartbeat ${(c.rp_age_ms / 1000).toFixed(0)}s ago` : '';
       statePieces.push(`P${k}: ⚠ RP2350 UNRESPONSIVE${age}`);
       continue;
     }
     const s = c.status;
+    doneMax = Math.max(doneMax, s.totalPulsesDone || 0);
+    targetMax = Math.max(targetMax, s.totalPulsesTarget || 0);
     if (cursor == null) cursor = s.totalPulsesDone;
     if (s.state === 1) anyArmed = true;
     if (s.state === 2) anyRunning = true;
@@ -1339,7 +1459,9 @@ async function pollRunStatus() {
     // firmware-reported live firing filament (255 = none/idle)
     if (s.filamentIndex != null && s.filamentIndex !== 255) firingFil = s.filamentIndex;
     const fil = (s.filamentIndex == null || s.filamentIndex === 255) ? '—' : s.filamentIndex;
-    statePieces.push(`P${k}: ${SHV_STATE_NAME[s.state] || s.state} · firing fil ${fil} · pulse ${s.totalPulsesDone}/${s.totalPulsesTarget || '?'}`);
+    // Poll succeeded => responsive. A stale heartbeat here is just a soft note.
+    const hb = stale ? ' · ⚠hb-stale' : '';
+    statePieces.push(`P${k}: ${SHV_STATE_NAME[s.state] || s.state} · firing fil ${fil} · pulse ${s.totalPulsesDone}/${s.totalPulsesTarget || '?'}${hb}`);
   }
   // ---- link the live firing filament to the CT plot (live view) ----
   // Position the geometry to the firmware-reported firing filament so the ring
@@ -1363,8 +1485,26 @@ async function pollRunStatus() {
   else setArmState('idle', 'idle');
   const f = fault ? ` — ⚠ FAULT P${fault.ctrl} fil ${fault.fil}` : '';
   hwMsg(`${statePieces.join(' · ') || 'no controller'}${f}`);
-  if (!anyRunning && !fault && runMonitorTimer && cursor != null) {
-    // schedule complete / idle — keep polling slowly only while armed
+  // live scan progress bar — firmware pulses done / target (0 while merely armed)
+  const prog = $('hwProgress');
+  if (prog) {
+    const active = anyRunning || anyArmed || (anyComplete && !anyDead);
+    prog.hidden = !active;
+    if (active) {
+      const pct = targetMax > 0 ? Math.min(100, Math.round((doneMax / targetMax) * 100)) : 0;
+      const fill = $('hwProgressFill');
+      fill.style.width = pct + '%';
+      fill.className = 'hw-progress-fill' + (fault ? ' fault' : (anyComplete && !anyRunning) ? ' done' : '');
+      $('hwProgressLabel').textContent = (anyComplete && !anyRunning)
+        ? `✓ complete · ${doneMax}/${targetMax} pulses`
+        : `${pct}% · ${doneMax}/${targetMax || '?'} pulses`;
+    }
+  }
+  // Once the run is definitively finished (every controller Complete, none still
+  // running/armed, no fault, all connected), stop hammering the single RP2350 link
+  // at 2 Hz — the '✓ complete' badge persists. Re-arm / Simulate restarts the poll.
+  if (anyComplete && !anyRunning && !anyArmed && !fault && !anyDead) {
+    stopRunMonitor();
   }
 }
 
@@ -1656,6 +1796,10 @@ function init() {
   $('hwArmBtn').addEventListener('click', hwArm);
   $('hwDisarmBtn').addEventListener('click', hwDisarm);
   $('hwTrigBtn').addEventListener('click', hwTrigger);
+  $('hwSimBtn').addEventListener('click', hwSimulateScan);
+  $('hwSimStop').addEventListener('click', hwSimStopScan);
+  $('hwRepeats').addEventListener('input', updateScanSummary);   // ×repeats reshapes the derived scan
+  updateScanSummary();
   $('hwCheckBtn').addEventListener('click', () => { runState.hwChecked = !runState.hwChecked; refreshRunGate(); });
   $('hwOverride').addEventListener('change', (e) => {
     runState.override = e.target.checked;
@@ -1751,6 +1895,7 @@ function init() {
 
   $('playBtn').addEventListener('click', togglePlay);
   $('stepBtn').addEventListener('click', () => { stopPlay(); advance(); });
+  $('dryRunBtn').addEventListener('click', toggleDryRun);
   $('resetBtn').addEventListener('click', reset);
   $('speedInput').addEventListener('input', (e) => {
     $('speedVal').textContent = `${e.target.value} fil/s`;

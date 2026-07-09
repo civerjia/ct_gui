@@ -46,11 +46,20 @@ export function initControllers() {
         o.label = (r.name ? r.name + ' · ' : '') + (r.controller_responsive ? 'RP2350 ✓' : 'port open');
         datalist.appendChild(o);
       }
-      // Assign DISTINCT discovered IPs to the cards (OVERWRITE — the defaults are
-      // only valid on the AP and were masking real LAN IPs). De-dupe by host so two
-      // cards can never be pointed at the same bridge; cards beyond the number of
-      // distinct hosts keep their current value.
-      const hosts = [...new Set(found.map((r) => r.host))];   // distinct, best-first
+      // Assign DISTINCT bridges to the cards (OVERWRITE — the defaults are only
+      // valid on the AP and were masking real LAN IPs). De-dupe by bridge IDENTITY
+      // (name = AP SSID / MAC), not just host: the SAME physical bridge answers at
+      // two addresses (its LAN IP AND its own 192.168.4.1 AP), which would otherwise
+      // fill both Power 1 and Power 2 with the same board. Fall back to host when a
+      // scan record has no name. Cards beyond the # of distinct bridges keep theirs.
+      const seenId = new Set();
+      const hosts = [];
+      for (const r of found) {
+        const id = r.name || r.host;          // identity, best-first order preserved
+        if (seenId.has(id)) continue;
+        seenId.add(id);
+        hosts.push(r.host);
+      }
       cards.forEach((card, i) => {
         const h = card.querySelector('[data-host]');
         if (h && hosts[i]) h.value = hosts[i];
@@ -126,7 +135,12 @@ export function initControllers() {
       const cid = parseInt(card.dataset.ctrl, 10);
       const c = st.controllers[card.dataset.ctrl];
       if (!c) continue;
+      const wasConn = connected[card.dataset.ctrl];
       connected[card.dataset.ctrl] = c.connected;
+      // A controller that just dropped (reboot / link loss) may have cleared its
+      // firmware schedule table — invalidate the download/verify/arm gate so the
+      // operator must re-verify (or Override) before arming again.
+      if (wasConn && !c.connected && window.ctInvalidateRun) window.ctInvalidateRun();
       // Restore the host field from the backend's live state — the connection
       // outlives a page refresh, so the IP must reappear when still connected.
       if (c.connected && c.host) {
@@ -135,7 +149,9 @@ export function initControllers() {
       }
       card.querySelector('[data-dot]').className = 'dot ' + (c.connected ? 'online' : 'offline');
       const btn = card.querySelector('[data-connect]');
-      btn.textContent = c.connected ? 'Disconnect' : 'Connect';
+      // short labels keep the 2-up controller cells narrow enough to show the IP
+      btn.textContent = c.connected ? 'Disc' : 'Conn';
+      btn.title = c.connected ? 'Disconnect this bridge' : 'Connect to this bridge';
       btn.classList.toggle('quick', !c.connected);
 
       const ident = card.querySelector('[data-ident]');
@@ -145,8 +161,12 @@ export function initControllers() {
       const mb = card.querySelector('[data-master]');
       if (mb) mb.classList.toggle('active', cid === master);
 
-      const rp = card.querySelector('[data-hb="rp"]');
-      const stm = card.querySelector('[data-hb="stm"]');
+      // Heartbeat badges live on the card's TITLE bar now (grouped per controller),
+      // not inside each .pc row — look them up by controller id.
+      const hbGroup = document.querySelector(`.pc-hb[data-ctrl="${card.dataset.ctrl}"]`);
+      const rp = hbGroup && hbGroup.querySelector('[data-hb="rp"]');
+      const stm = hbGroup && hbGroup.querySelector('[data-hb="stm"]');
+      if (!rp || !stm) continue;
       // STM32 badge reflects ACTUAL presence on THIS bridge (c.stm32.ever_seen) —
       // that's what picks the master. A bridge with no STM32 shows a dim/idle badge.
       const hasStm = c.connected && c.stm32 && c.stm32.ever_seen;

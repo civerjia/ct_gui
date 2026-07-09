@@ -596,16 +596,12 @@ function wireBoards() {
     if (energising && keys.length > 1 &&
         !confirm(`Apply state ${bmBatchState}${arg ? ' @ ' + arg + (bmBatchState === STATE_VOLTAGE ? ' mV' : ' mA') : ''} to ${keys.length} boards on P${pwTarget}?`)) return;
     const btn = $p('bmBatchApplyState'); if (btn) btn.disabled = true;
-    let okN = 0; const fails = [];
-    for (const k of keys) {
-      const { channel, mux_port } = keyTo(k);
-      const j = await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', channel, mux_port, state: bmBatchState, arg });
-      if (j.ok) okN++; else fails.push(`CH${channel + 1}.${mux_port + 1}`);
-      bmMsg(`applying state ${bmBatchState}… ${okN}/${keys.length}`);
-    }
+    // One masked CH_SET_POWER_STATE for the whole selection (firmware loops the
+    // mask internally) — one round-trip instead of one command per board.
+    const j = await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', board_mask: boardMask(), state: bmBatchState, arg });
     if (btn) btn.disabled = false;
-    bmMsg(fails.length ? `state ${bmBatchState}: ${okN}/${keys.length} ok · failed ${fails.join(' ')}`
-      : `state ${bmBatchState}${arg ? ' @ ' + arg : ''} → ${okN} board(s)`);
+    bmMsg(j.ok ? `state ${bmBatchState}${arg ? ' @ ' + arg : ''} → ${keys.length} board(s)`
+              : (j.error || `state ${bmBatchState} failed`));
     refreshBoards(true);
   };
   reflectBatchStateArg();
@@ -1070,6 +1066,27 @@ function wireHv() {
   if ($p('focVcalBtn2')) $p('focVcalBtn2').onclick = () => hvLutCalibrate('focus');
   if ($p('hvEnEm2')) $p('hvEnEm2').onclick = () => hvEnClick('emission', 'hvEnEm', 'Emission');
   if ($p('hvEnFoc2')) $p('hvEnFoc2').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus');
+  // Mirror Emission-I (DS3502 wiper) — same 'ei' channel + retry path as the main card.
+  if ($p('dsEi2')) {
+    $p('dsEi2').addEventListener('input', updatePotEsts);
+    $p('dsSet2').onclick = async () => {
+      if (!hvConnGuard()) return;
+      const w = +$p('dsEi2').value;
+      hvFb('Em-I: setting …');
+      const j = await ds3502SetRetry('ei', w, 'Em-I');
+      if (j.ok && $p('dsEi')) { $p('dsEi').value = w; updatePotEsts(); }   // keep both cards in step
+      hvFb(j.ok ? `Em-I wiper ${w} set` : `Em-I ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
+    };
+    $p('dsRead2').onclick = async () => {
+      if (!hvConnGuard()) return;
+      hvFb('reading …');
+      let j;
+      try { j = await (await fetch(`/api/stm32/ds3502?controller=${masterId()}&ch=ei`)).json(); }
+      catch (e) { hvFb(`Em-I read error — ${String((e && e.message) || e)}`, 'bad'); return; }
+      if (j.ok && j.wiper != null) { $p('dsEi2').value = j.wiper; if ($p('dsEi')) $p('dsEi').value = j.wiper; updatePotEsts(); }
+      hvFb(j.ok ? `Em-I wiper = ${j.wiper}` : `read ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
+    };
+  }
   setHvEnBtn('hvEnEm', 'Emission', false);   // start OFF (boot-safe) — updates primary + mirror
   setHvEnBtn('hvEnFoc', 'Focus', false);
   // ADS1115 monitor + DS3502 wiper readout — same 2 Hz auto-poll, on by default
@@ -1255,7 +1272,12 @@ function potEstText(ch, wiper) {
   const w = Number.isFinite(wiper) ? Math.min(127, Math.max(0, wiper)) : 0;
   return `~${((w / 127) * s.full).toFixed(s.unit === 'mA' ? 1 : 0)} ${s.unit}`;
 }
-function updatePotEsts() { $p('dsEiEst').textContent = potEstText('ei', +$p('dsEi').value); }
+function updatePotEsts() {
+  const t = potEstText('ei', +$p('dsEi').value);
+  if ($p('dsEiEst')) $p('dsEiEst').textContent = t;
+  // keep the HV Control & Monitor mirror card's Emission-I estimate in step
+  if ($p('dsEiEst2') && $p('dsEi2')) $p('dsEiEst2').textContent = potEstText('ei', +$p('dsEi2').value);
+}
 
 // prominent, immediate feedback for every HV-setpoint action
 function hvFb(msg, kind) { for (const e of [$p('dsStatus'), $p('dsStatus2')]) if (e) { e.textContent = msg; e.className = 'summary hv-fb ' + (kind || ''); } }

@@ -63,10 +63,12 @@
             </div>
           </div>
 
-          <div class="geo-power" title="Total filament heating power. Plan view estimates from the configured per-filament power × state counts; Live view uses measured P = V·I.">
+          <div class="geo-power" title="Filament heating power. Plan view estimates from the configured per-filament power × state counts; Live view uses measured P = V·I. P1 / P2 split the total by which controller drives each filament (the active-list mapping).">
             <div class="pw-item total"><span class="pw-cap">total</span><b id="pwTotal">0 W</b></div>
             <div class="pw-item act"><span class="pw-cap">active</span><b id="pwActive">0 W</b></div>
             <div class="pw-item idle"><span class="pw-cap">idle</span><b id="pwIdle">0 W</b></div>
+            <div class="pw-item p1"><span class="pw-cap">Power 1</span><b id="pwP1">0 W</b></div>
+            <div class="pw-item p2"><span class="pw-cap">Power 2</span><b id="pwP2">0 W</b></div>
           </div>
           <div class="row compact pw-config" title="Per-filament power used for the Plan total-power estimate.">
             <label class="numlabel">active <input id="pwActiveW" type="number" min="0" max="500" step="0.1" value="32" /><span class="u">W</span></label>
@@ -106,6 +108,7 @@
             <div class="spacer"></div>
             <button id="playBtn" class="quick">▶ Play</button>
             <button id="stepBtn">Step ▸</button>
+            <button id="dryRunBtn" title="Dry-run the built schedule locally — NO hardware. Plays the whole plan once at its real pace (heating-plan rotation time), sweeping the heating band + ring + progress, so you can verify the plan before connecting hardware.">⤳ Dry run</button>
             <button id="resetBtn">⟲ Reset</button>
           </div>
 
@@ -113,7 +116,7 @@
           <details class="motion-setup">
             <summary>
               <span>Motion &amp; scan setup</span>
-              <span class="hint">— drives the animation only</span>
+              <span class="hint">— geometry &amp; sweep for Play / Dry run</span>
             </summary>
 
             <p id="modeHelp" class="hint mode-help">
@@ -170,14 +173,16 @@
 
               <div class="ctrl-block readouts">
                 <div class="block-title">State</div>
-                <div class="kv"><span>Active filament</span><b id="roActive">0</b></div>
-                <div class="kv"><span>Filament angle</span><b id="roAngle">90.00°</b></div>
-                <div class="kv"><span>Collimator center</span><b id="roColl">0</b></div>
-                <div class="kv"><span>Detector center</span><b id="roDet">−90.00°</b></div>
-                <div class="kv"><span>Gantry angle</span><b id="roGantry">0.00°</b></div>
-                <div class="kv"><span>Window scan</span><b id="roScan">1 / 35</b></div>
-                <div class="kv"><span>Ring step</span><b id="roRing">1 / 96</b></div>
-                <div class="kv"><span>Source ⟶ detector</span><b id="roSdd">— mm</b></div>
+                <div class="kv-grid">
+                  <div class="kv"><span>Active filament</span><b id="roActive">0</b></div>
+                  <div class="kv"><span>Filament angle</span><b id="roAngle">90.00°</b></div>
+                  <div class="kv"><span>Collimator center</span><b id="roColl">0</b></div>
+                  <div class="kv"><span>Detector center</span><b id="roDet">−90.00°</b></div>
+                  <div class="kv"><span>Gantry angle</span><b id="roGantry">0.00°</b></div>
+                  <div class="kv"><span>Window scan</span><b id="roScan">1 / 35</b></div>
+                  <div class="kv"><span>Ring step</span><b id="roRing">1 / 96</b></div>
+                  <div class="kv"><span>Source ⟶ detector</span><b id="roSdd">— mm</b></div>
+                </div>
               </div>
             </div>
 
@@ -218,16 +223,16 @@
             <div class="fil-bulk">
               <label># pulses<input id="schPulses" type="number" min="1" max="65535" value="1" /></label>
               <label>dur µs<input id="schDuration" type="number" min="1" max="1000000" value="1000" /></label>
-              <label>idle A<input id="hsIdleA" type="number" min="0" max="10" step="0.1" value="1" /></label>
+              <label>idle A<input id="hsIdleA" type="number" min="0" max="10" step="0.1" value="1.5" /></label>
               <label>active A<input id="hsActiveA" type="number" min="0" max="10" step="0.1" value="3" /></label>
-              <button id="schApplyBtn" class="xs">Apply all</button>
+              <button id="schApplyBtn" class="xs quick">Apply all</button>
             </div>
-            <div class="row compact fil-save">
+            <div class="fil-save">
               <button id="filSaveBtn" class="xs">Save to host</button>
               <button id="filLoadBtn" class="xs">Load</button>
               <button id="schDetectPresent" class="xs" title="Scan the controller(s) for physically-present boards (enables isolated-12V so the INA219s power up, then reads them) and apply the result to the plan: present → live, absent → dead (✕). Rebuilds the schedule so it fires only real boards (no IsoOff at arm). Leaves boards at Sleep.">Detect present</button>
-              <span class="hint">currents download with the schedule.</span>
             </div>
+            <p class="fil-note hint">Currents download with the schedule.</p>
             <div class="fil-list-head"><span>Fil</span><span>#Pul</span><span>Dur µs</span><span>Idle A</span><span>Act A</span></div>
             <div id="filList" class="fil-list"></div>
           </details>
@@ -243,6 +248,28 @@
           </div>
         </details>
 
+        <!-- Filament → power mapping (host active-list, editable) — sits between the
+             schedule and the tests so mapping is set right after building the plan -->
+        <details class="card module map-card foldable" data-module="mapping" open>
+          <summary class="section-head foldable-summary">
+            <h2>Filament → Power <span class="hint">— active-list mapping</span></h2>
+            <span id="mapCounts" class="summary"></span>
+          </summary>
+          <p class="hint compact-hint">Each filament is driven by one controller (a power slot = channel·position; downloaded as the 64-byte active list). Default = alternating groups. Click a cell to reassign: P1 → P2 → unassigned.</p>
+          <div class="row compact map-actions">
+            <label class="numlabel" title="Alternating-group size: filaments 0..g-1 → P1, g..2g-1 → P2, repeating across all 96.">group <input id="mapGroup" type="number" min="1" max="96" value="12" /></label>
+            <button id="mapAltBtn" class="xs" title="Reset the whole map to alternating groups of the chosen size.">Alt groups</button>
+            <button id="mapApplyBtn" class="xs quick" title="Save the mapping on the host and upload the 64-byte active list + channel mask to every connected controller.">Apply &amp; upload</button>
+          </div>
+          <div class="legend map-legend">
+            <span class="legend-item"><span class="g-sw p1"></span> Power 1</span>
+            <span class="legend-item"><span class="g-sw p2"></span> Power 2</span>
+            <span class="legend-item"><span class="g-sw none"></span> unassigned</span>
+          </div>
+          <div id="mapGrid" class="map-grid"></div>
+          <div id="mapStatus" class="summary"></div>
+        </details>
+
         <!-- Calibration & test — below the schedule, foldable to free space -->
         <details class="card module cal-card foldable" data-module="tests">
           <summary class="section-head foldable-summary">
@@ -255,57 +282,48 @@
         <!-- RIGHT: control modules (hardware control — scaffolded) -->
         <aside class="ctrl-column">
           <section class="card module" data-module="power">
-            <div class="section-head">
-              <h2>Power Controllers</h2>
-              <button id="scanBtn" class="sm">Scan :3333</button>
+            <div class="section-head pc-head-bar">
+              <h2 title="Two ESP32 bridges. The one that sees an STM32 is auto-selected master (owns HV/ADC) — click a master badge to override. Filament→power mapping is in the Mapping card.">Power Controllers</h2>
+              <div class="pc-hbs">
+                <span class="pc-hb" data-ctrl="1"><span class="pc-hb-lbl">P1</span>
+                  <span class="hb idle" data-hb="rp" title="Power 1 — RP2350B controller heartbeat (PING on :3333)">RP&nbsp;♥</span>
+                  <span class="hb idle" data-hb="stm" title="Power 1 — STM32 heartbeat (HTTP /stm32 age); the bridge that sees an STM32 becomes master">STM&nbsp;♥</span>
+                </span>
+                <span class="pc-hb" data-ctrl="2"><span class="pc-hb-lbl">P2</span>
+                  <span class="hb idle" data-hb="rp" title="Power 2 — RP2350B controller heartbeat (PING on :3333)">RP&nbsp;♥</span>
+                  <span class="hb idle" data-hb="stm" title="Power 2 — STM32 heartbeat (HTTP /stm32 age); the bridge that sees an STM32 becomes master">STM&nbsp;♥</span>
+                </span>
+              </div>
+              <button id="scanBtn" class="sm" title="Scan finds ESP32 bridges on TCP :3333 (LAN + 192.168.4.0/24 AP) and fills the IP fields with distinct bridges.">Scan</button>
             </div>
-            <div id="scanHint" class="hint compact-hint">Scan finds ESP32 bridges on TCP :3333.</div>
             <datalist id="bridgeHosts"></datalist>
 
-            <div class="pc" data-ctrl="1">
-              <div class="pc-head">
-                <span class="dot offline" data-dot></span>
-                <b>Power 1</b>
-                <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">master</button>
-                <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)"></span>
-                <span class="pc-badges">
-                  <span class="hb idle" data-hb="rp" title="RP2350B controller heartbeat (PING on :3333)">RP2350&nbsp;♥</span>
-                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age) — the bridge that sees an STM32 becomes master">STM32&nbsp;♥</span>
-                </span>
+            <div class="pc-2up">
+              <div class="pc" data-ctrl="1">
+                <span class="dot offline" data-dot title="Power 1"></span>
+                <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">M</button>
+                <input data-host list="bridgeHosts" type="text" value="" placeholder="Power 1 IP — Scan" />
+                <button data-connect class="quick">Conn</button>
+                <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)" hidden></span>
               </div>
-              <div class="pc-row">
-                <input data-host list="bridgeHosts" type="text" value="" placeholder="ESP32 #1 IP — Scan to fill" />
-                <button data-connect class="quick">Connect</button>
-              </div>
-            </div>
-
-            <div class="pc" data-ctrl="2">
-              <div class="pc-head">
-                <span class="dot offline" data-dot></span>
-                <b>Power 2</b>
-                <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">master</button>
-                <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)"></span>
-                <span class="pc-badges">
-                  <span class="hb idle" data-hb="rp" title="RP2350B controller heartbeat (PING on :3333)">RP2350&nbsp;♥</span>
-                  <span class="hb idle" data-hb="stm" title="STM32 heartbeat (HTTP /stm32 age) — the bridge that sees an STM32 becomes master">STM32&nbsp;♥</span>
-                </span>
-              </div>
-              <div class="pc-row">
-                <input data-host list="bridgeHosts" type="text" value="" placeholder="ESP32 #2 IP — Scan to fill" />
-                <button data-connect class="quick">Connect</button>
+              <div class="pc" data-ctrl="2">
+                <span class="dot offline" data-dot title="Power 2"></span>
+                <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">M</button>
+                <input data-host list="bridgeHosts" type="text" value="" placeholder="Power 2 IP — Scan" />
+                <button data-connect class="quick">Conn</button>
+                <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)" hidden></span>
               </div>
             </div>
-
-            <p class="hint compact-hint">The bridge that sees an <b>STM32</b> is auto-selected <b>master</b> (owns HV/ADC). Click a <b>master</b> badge to override. Filament→power mapping is in the Mapping card.</p>
+            <div id="scanHint" class="hint compact-hint"></div>
           </section>
 
           <!-- Hardware run — own card: download · arm · trigger · scan prep -->
           <section class="card module hw-run-card" data-module="hwrun">
             <div class="section-head">
-              <h2>Hardware Run <span class="hint">— download · arm · trigger · prep</span></h2>
+              <h2>Hardware Run</h2>
               <label id="hwOverrideLbl" class="hw-override" title="Override the guided gate: enable every step button regardless of order (download / verify / prep / arm / trigger) for testing &amp; bring-up. The firmware still enforces its own safety (e.g. ISO/TPS arm rejects) — this only unlocks the UI."><input type="checkbox" id="hwOverride" /> Override</label>
             </div>
-            <p class="hint compact-hint">Guided scan sequence — each step unlocks the next. Work top to bottom. <span id="hwOverrideNote" class="hw-override-note" hidden>⚠ Override on — all steps unlocked; firmware safety still applies.</span></p>
+            <div id="hwOverrideNote" class="hw-override-note" hidden>⚠ Override on — all steps unlocked; firmware safety still applies.</div>
 
             <div class="hw-gates" id="hwGates">
               <span id="hwGateConn" class="hw-gate">① Connect</span>
@@ -315,7 +333,7 @@
             </div>
 
             <div class="hw-step" id="hwStepDownload">
-              <div class="hw-step-label"><span class="hw-step-n">4</span> Download &amp; verify</div>
+              <div class="hw-step-label"><span class="hw-step-n">4</span> Download</div>
               <div class="hw-step-body">
                 <button id="hwDownloadBtn" class="sm quick" title="Translate the logical 0–95 schedule into per-controller frames and download the emission table, heating deltas, and per-filament idle/active currents to every connected controller.">Download</button>
                 <button id="hwVerifyBtn" class="sm" title="Read the entry counts + table CRC back from each controller (ShvGetTableInfo 0x74 / ShvHeatGetInfo 0x7E) and compare to the loaded plan. This is how you confirm the schedule actually reached firmware.">Verify in firmware</button>
@@ -323,8 +341,7 @@
             </div>
 
             <div class="hw-step" id="hwStepPrep">
-              <div class="hw-step-label"><span class="hw-step-n">5</span> Pre-heat
-                <span class="hint" title="CT-scan prep ladder — applied to ALL filaments on BOTH connected controllers. Click left→right to warm up before arming. Refused while a schedule is running.">(prep ladder)</span></div>
+              <div class="hw-step-label" title="CT-scan prep ladder — applied to ALL filaments on BOTH connected controllers. Click left→right to warm up before arming. Refused while a schedule is running."><span class="hw-step-n">5</span> Pre-heat</div>
               <div class="hw-step-body">
                 <button id="hwPrepStop" class="sm" title="All filaments → STOP. TPS output disabled (off). The fully cold rest state.">Stop all</button>
                 <button id="hwPrepSleep" class="sm" title="All filaments → SLEEP. Low-power rest state, output off.">Sleep all</button>
@@ -335,24 +352,29 @@
             </div>
 
             <div class="hw-step" id="hwStepArm">
-              <div class="hw-step-label"><span class="hw-step-n">6</span> Arm</div>
+              <div class="hw-step-label"><span class="hw-step-n">6</span> Arm
+                <span id="hwArmState" class="hw-armstate idle" title="Live schedule state (ShvGetStatus): Idle → Armed (waiting for SyncIn) → Running → Complete / Fault.">idle</span></div>
               <div class="hw-step-body">
-                <label class="numlabel" title="Loop the one-rotation schedule this many times when armed (1 = a single rotation).">repeats <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
+                <label class="numlabel" title="How many full gantry rotations (scans) to run. The schedule is ONE rotation; the firmware loops it this many times once armed. 1 = a single scan.">rotations <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
                 <button id="hwArmBtn" class="sm quick" title="Arm both controllers (ShvArm). Participants drop to IDLE and the controllers wait for the SyncIn trigger to start firing.">Arm</button>
                 <button id="hwDisarmBtn" class="sm" title="Disarm / stop the run (ShvDisarm). Aborts firing and returns participating filaments to IDLE.">Disarm</button>
-                <span id="hwArmState" class="hw-armstate idle" title="Live schedule state (ShvGetStatus): Idle → Armed (waiting for SyncIn) → Running → Complete / Fault.">idle</span>
               </div>
             </div>
 
             <div class="hw-step" id="hwStepTrig">
-              <div class="hw-step-label"><span class="hw-step-n">7</span> Start scan
-                <span class="hint" title="Once armed, the scan begins on the SyncIn trigger. Use Fire SyncIn for a bench trigger, or leave SyncIn hi-Z for an external trigger source.">(trigger)</span></div>
+              <div class="hw-step-label" title="Once armed, the scan begins on the SyncIn trigger. Simulate Scan auto-generates the whole trigger train (derived from the heating plan). Step fires one bench pulse; or leave SyncIn hi-Z for an external trigger source."><span class="hw-step-n">7</span> Start scan</div>
               <div class="hw-step-body">
-                <label class="numlabel" title="Bench test: how many SyncIn pulses to emit from the ESP32 (/sync/fire). Use only when the ESP32 drives SyncIn; for an external trigger source leave SyncIn hi-Z.">pulses <input id="hwTrigCount" type="number" min="1" max="100000" value="1" /></label>
-                <button id="hwTrigBtn" class="sm quick" title="Fire N SyncIn pulses now from the ESP32 (bench trigger). Each pulse advances the armed schedule by one step.">Fire SyncIn</button>
+                <span id="hwScanSummary" class="hw-scan-summary" title="The full scan the simulation will run — total triggers = the schedule's pulse count, duration = the heating-plan rotation time, both × repeats. Derived from the plan; nothing to enter here.">—</span>
+                <button id="hwSimBtn" class="sm quick" title="Simulate the entire scan: auto-generate the full sync-pulse train (total triggers × repeats), paced over the heating-plan rotation time × repeats — the real scan duration — so ACTIVE heating is exercised exactly like a real scan. Fires the head-of-chain controller; the RP2350 chain drives the other power. The CT geometry plot and run status track it live.">Simulate Scan</button>
+                <button id="hwSimStop" class="sm" title="Abort the running scan simulation.">Stop Sim</button>
+                <button id="hwTrigBtn" class="sm" title="Manual bench step: fire ONE SyncIn pulse now from the ESP32 (/sync/fire). Advances the armed schedule by one trigger — handy for stepping through the schedule by hand.">Step ▸</button>
               </div>
             </div>
 
+            <div id="hwProgress" class="hw-progress" hidden title="Live scan progress — firmware pulses done / target (totalPulsesDone / totalPulsesTarget), across rotations.">
+              <div id="hwProgressFill" class="hw-progress-fill"></div>
+              <span id="hwProgressLabel" class="hw-progress-label"></span>
+            </div>
             <div id="hwRunStatus" class="hw-status hint"></div>
           </section>
 
@@ -374,6 +396,12 @@
               <button id="focVsetBtn2" class="xs">Set V</button>
               <button id="focVcalBtn2" class="xs">Cal</button>
             </div>
+            <div class="bm-set-row hv-set" title="Emission current limit — DS3502 wiper (0–127), written directly (no closed loop). The mA estimate is approximate (~85 mA at full scale). Enable Emission HV first.">
+              <label class="numlabel"><span class="cap">Emission I</span><input id="dsEi2" type="number" min="0" max="127" value="0" /></label>
+              <span id="dsEiEst2" class="pot-est">~0 mA</span>
+              <button id="dsSet2" class="xs">Set I</button>
+              <button id="dsRead2" class="xs">Read</button>
+            </div>
             <div class="hv-row">
               <button id="hvEnEm2" class="xs hv-en off">Emission ?</button>
               <button id="hvEnFoc2" class="xs hv-en off">Focus ?</button>
@@ -386,27 +414,6 @@
               <div class="metric"><span class="metric-label">Focus HV</span><span id="hvFocStatus2" class="metric-value">—</span></div>
             </div>
             <div id="dsStatus2" class="summary"></div>
-          </details>
-
-          <!-- Filament → power mapping (host active-list, editable) -->
-          <details class="card module map-card foldable" data-module="mapping" open>
-            <summary class="section-head foldable-summary">
-              <h2>Filament → Power <span class="hint">— active-list mapping</span></h2>
-              <span id="mapCounts" class="summary"></span>
-            </summary>
-            <p class="hint compact-hint">Each filament is driven by one controller (a power slot = channel·position; downloaded as the 64-byte active list). Default = alternating groups. Click a cell to reassign: P1 → P2 → unassigned.</p>
-            <div class="row compact map-actions">
-              <label class="numlabel" title="Alternating-group size: filaments 0..g-1 → P1, g..2g-1 → P2, repeating across all 96.">group <input id="mapGroup" type="number" min="1" max="96" value="12" /></label>
-              <button id="mapAltBtn" class="xs" title="Reset the whole map to alternating groups of the chosen size.">Alt groups</button>
-              <button id="mapApplyBtn" class="xs quick" title="Save the mapping on the host and upload the 64-byte active list + channel mask to every connected controller.">Apply &amp; upload</button>
-            </div>
-            <div class="legend map-legend">
-              <span class="legend-item"><span class="g-sw p1"></span> Power 1</span>
-              <span class="legend-item"><span class="g-sw p2"></span> Power 2</span>
-              <span class="legend-item"><span class="g-sw none"></span> unassigned</span>
-            </div>
-            <div id="mapGrid" class="map-grid"></div>
-            <div id="mapStatus" class="summary"></div>
           </details>
 
         </aside>

@@ -57,7 +57,8 @@ body {
 .gantt-top { margin-bottom: 18px; }
 .gantt-top .section-head { margin-bottom: 6px; }
 
-.layout-ct { grid-template-columns: minmax(0, 480px) minmax(320px, 380px) 1fr; align-items: start; }
+/* three balanced columns: geometry · schedule/mapping/tests · controls */
+.layout-ct { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start; }
 /* middle column = scan schedule + calibration, stacked & individually foldable */
 .mid-stack { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 .foldable > summary.foldable-summary { cursor: pointer; list-style: none; }
@@ -135,6 +136,15 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .section-head h2 { margin: 0 0 12px; font-size: 18px; }
 .summary { color: var(--muted); font-size: 13px; font-weight: 700; }
+/* Hierarchy: the many right-/middle-column control modules get a smaller header
+   than the primary sections (CT Geometry, section dividers), so the page reads
+   top-down and the secondary cards carry less visual weight. */
+.module .section-head h2,
+.module .foldable-summary h2 { font-size: 15.5px; }
+.module .section-head h2 { margin-bottom: 10px; }
+/* card-header hint: the "— …" subtitle beside a title, kept quiet + on one line */
+.section-head h2 .hint,
+.foldable-summary h2 .hint { font-size: 11px; font-weight: 600; }
 
 /* ---- geometry panel ---- */
 .geo-stage {
@@ -163,20 +173,43 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .hw-actions { gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 .hw-actions .numlabel input { width: 64px; }
 .hw-prep { border-top: 1px dashed var(--line); padding-top: 8px; }
-.hw-status { margin-top: 10px; font-family: var(--mono); font-size: 11px; line-height: 1.5; word-break: break-word; }
+/* live scan progress bar (firmware pulse count) */
+.hw-progress { position: relative; height: 16px; margin-top: 8px; background: #efece5;
+               border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.hw-progress[hidden] { display: none; }
+.hw-progress-fill { height: 100%; width: 0; border-radius: 8px 0 0 8px;
+                    background: linear-gradient(90deg, var(--accent), #3fb6a0); transition: width 0.3s ease; }
+.hw-progress-fill.done { background: #3fb6a0; }
+.hw-progress-fill.fault { background: linear-gradient(90deg, #c0392b, #e07a5f); }
+.hw-progress-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                     font-family: var(--mono); font-size: 10px; font-weight: 800; color: var(--ink); }
+.hw-status { margin-top: 8px; font-family: var(--mono); font-size: 11px; line-height: 1.45; word-break: break-word; }
+.hw-override-note { font-size: 10px; font-weight: 700; margin: 2px 0 6px; }
 /* stepped run flow: numbered phase label on the left, controls on the right */
-.hw-step { display: grid; grid-template-columns: 128px 1fr; gap: 12px; align-items: start;
-           padding: 9px 0; border-top: 1px dashed var(--line); }
+.hw-step { display: grid; grid-template-columns: 104px 1fr; gap: 10px; align-items: start;
+           padding: 6px 0; border-top: 1px dashed var(--line); }
 .hw-step:first-of-type { border-top: none; }
 .hw-step-label { font-size: 11.5px; font-weight: 700; color: var(--ink); display: flex;
-                 align-items: center; gap: 6px; padding-top: 6px; line-height: 1.3; }
+                 flex-wrap: wrap; align-items: center; gap: 5px; padding-top: 5px; line-height: 1.25; cursor: help; }
 .hw-step-label .hint { font-weight: 400; cursor: help; }
 .hw-step-n { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
              width: 19px; height: 19px; border-radius: 50%; background: var(--accent); color: #fff;
              font-size: 11px; font-weight: 800; }
 .hw-step-body { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.hw-step-body .numlabel input { width: 64px; }
-@media (max-width: 520px) { .hw-step { grid-template-columns: 1fr; gap: 4px; } }
+/* buttons stretch to fill each row (content-aware) so every step's controls line
+   up flush to the row edges instead of trailing off ragged */
+.hw-step-body button { flex: 1 1 auto; min-width: 76px; padding: 7px 10px; font-size: 12px; text-align: center;
+                       line-height: 1.2; white-space: nowrap; }
+.hw-step-body .numlabel { font-size: 11px; font-weight: 700; color: var(--muted); gap: 5px; white-space: nowrap; }
+.hw-step-body .numlabel input { width: 60px; }
+/* the prep ladder (Stop→Sleep→Standby→Idle→Active) reads best as equal columns */
+#hwStepPrep .hw-step-body button { flex: 1 1 0; min-width: 84px; }
+/* step-7 derived scan line: its own full-width row above the Simulate/Stop/Step buttons */
+.hw-scan-summary { flex: 1 1 100%; font-size: 11px; font-weight: 700; color: var(--muted); font-family: var(--mono);
+                   background: #f2efe9; border: 1px solid var(--line); border-radius: 8px;
+                   padding: 5px 9px; text-align: center; }
+@media (max-width: 520px) { .hw-step { grid-template-columns: 1fr; gap: 4px; }
+                            #hwStepPrep .hw-step-body button { flex: 1 1 40%; } }
 /* prerequisite gates (①②③) — green when satisfied, grey when not */
 .hw-gates { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
 .hw-gate { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700;
@@ -202,7 +235,12 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .hw-override-note { color: #c0392b; font-weight: 700; }
 
 /* total heating power strip (under the ring) */
-.geo-power { display: flex; gap: 8px; margin: 10px 2px 2px; }
+.geo-power { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 2px 2px; }
+.geo-power .pw-item { min-width: 64px; }
+.geo-power .pw-item.p1 { border-color: rgba(95,186,136,0.5); }
+.geo-power .pw-item.p1 b { color: #7fd0a8; }
+.geo-power .pw-item.p2 { border-color: rgba(224,164,74,0.55); }
+.geo-power .pw-item.p2 b { color: #e6b866; }
 .geo-power .pw-item {
   flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
   padding: 7px 6px; border-radius: 10px;
@@ -390,9 +428,9 @@ button.off { background: #efece5; color: var(--muted); }
 .chk input { width: auto; }
 
 /* ---- controls panel ---- */
-.ctrl-block { padding: 14px 0; border-top: 1px solid var(--line); }
-.ctrl-block:first-of-type { border-top: none; padding-top: 4px; }
-.block-title { font-weight: 800; font-size: 13px; margin-bottom: 10px; letter-spacing: 0.01em; }
+/* motion-setup blocks read as tidy panels (not border-top dividers) */
+.ctrl-block { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #fbf9f4; }
+.block-title { font-weight: 800; font-size: 12px; margin-bottom: 8px; letter-spacing: 0.01em; }
 .block-title .hint { font-weight: 600; }
 .hint { color: var(--muted); font-size: 12px; line-height: 1.45; }
 .mono-val { font-family: var(--mono); font-weight: 800; color: var(--accent); min-width: 3ch; text-align: right; }
@@ -430,11 +468,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .mode-precision { background: #f6f9f7; border-radius: 12px; }
 
 /* ---- motion bar + collapsed setup ---- */
+/* row 1 = mode toggle; the spacer forces a line break so the transport buttons
+   drop to row 2 and split it evenly — nothing overflows the narrow geometry card */
 .motion-bar {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
   margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line);
 }
-.motion-bar .spacer { flex: 1; }
+.motion-bar .spacer { flex-basis: 100%; height: 0; margin: 0; }
+.motion-bar > button { flex: 1 1 auto; padding: 8px 10px; font-size: 12px; white-space: nowrap; text-align: center; }
+.motion-bar #modeSeg { flex: 0 0 auto; }
 
 .motion-setup { margin-top: 12px; }
 .motion-setup > summary {
@@ -448,8 +490,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .motion-setup[open] > summary::before { transform: rotate(90deg); }
 .motion-setup[open] > summary { margin-bottom: 12px; }
 .mode-help { margin: 0 2px 12px; }
-.setup-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 22px; }
+.setup-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }
 @media (max-width: 760px) { .setup-grid { grid-template-columns: 1fr; } }
+/* State readouts span the full width, in two compact columns */
+.ctrl-block.readouts { grid-column: 1 / -1; }
+.readouts .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px 18px; }
 .geo-toggles { margin-top: 12px; gap: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
 
 /* legend extras */
@@ -465,18 +510,31 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .state-pill { font-size: 12px; padding: 5px 11px; background: #efece5; color: var(--muted); }
 
 .module[data-module="power"] { padding-bottom: 12px; }
-.compact-hint { font-size: 11px; margin: 4px 0; }
-.pc { border: 1px solid var(--line); border-radius: 10px; padding: 7px 9px; margin: 7px 0; background: #fbf9f4; }
-.pc-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
-.pc-head b { font-size: 13px; }
-.pc-head .hint { font-size: 11px; }
-.pc-badges { margin-left: auto; display: flex; gap: 5px; }
-.pc-row { display: flex; align-items: center; gap: 6px; }
-.pc-row input[data-host] { flex: 1; min-width: 0; padding: 6px 9px; }
-.pc-row .numlabel { font-size: 11px; gap: 4px; }
-.pc-row .numlabel input { width: 44px; padding: 6px 6px; }
-.pc-row button { padding: 7px 12px; }
-.pc-row .numlabel input[data-offset] { width: 52px; }
+/* explanatory / secondary text: smaller + dimmer so the controls read first */
+.compact-hint { font-size: 10px; margin: 3px 0 5px; opacity: 0.85; line-height: 1.45; }
+/* card title bar: title · both controllers' heartbeats · Scan — all on ONE line */
+.pc-head-bar { align-items: center; gap: 8px; flex-wrap: nowrap; }
+.pc-head-bar h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pc-hbs { display: flex; gap: 8px; align-items: center; margin-left: auto; flex: 0 0 auto; }
+.pc-hb { display: inline-flex; align-items: center; gap: 3px; }
+.pc-hb-lbl { font-size: 10px; font-weight: 800; color: var(--muted); }
+.pc-head-bar .hb { font-size: 9px; padding: 1px 4px; }
+.pc-head-bar #scanBtn { flex: 0 0 auto; padding: 5px 9px; font-size: 11px; }
+
+/* both controllers share ONE row — compact IP+Connect cells side by side.
+   minmax(0,1fr) lets the tracks shrink so the input never pushes off-screen. */
+.pc-2up { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+@media (max-width: 720px) { .pc-2up { grid-template-columns: 1fr; } }
+.pc { display: flex; flex-wrap: nowrap; align-items: center; gap: 5px; min-width: 0;
+      border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; background: #fbf9f4; }
+.pc > b { font-size: 12px; font-weight: 800; flex: 0 0 auto; }
+.pc .master-badge { flex: 0 0 auto; padding: 2px 6px; }
+.pc input[data-host] { flex: 1 1 auto; min-width: 0; width: 0; padding: 6px 7px; font-size: 12px; }
+.pc button[data-connect] { padding: 6px 8px; font-size: 11px; flex: 0 0 auto; }
+.pc-ident { display: none; }
+/* scan-result feedback: no vertical footprint until it has text */
+#scanHint { margin-top: 6px; }
+#scanHint:empty { display: none; }
 .pc-ident { font-family: var(--mono); font-size: 10px; color: var(--accent); font-weight: 700; }
 .pc-devoff { font-family: var(--mono); font-size: 10px; color: var(--muted); white-space: nowrap; }
 .pc-devoff.bad { color: #c0392b; }
@@ -599,13 +657,15 @@ button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 .heat-params .numlabel .u { color: var(--muted); flex: 0 0 auto; }
 .plan-verdict { font-size: 11.5px; line-height: 1.55; padding: 8px 10px; border-radius: 9px; }
 
-/* aligned per-filament bulk row */
-.fil-bulk { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-bottom: 8px; }
-.fil-bulk label { display: flex; flex-direction: column; gap: 3px; font-size: 10px; font-weight: 700; color: var(--muted); }
-.fil-bulk input { width: 58px; padding: 5px 6px; font-size: 12px; }
-.fil-bulk button { align-self: flex-end; }
-.fil-save { gap: 8px; align-items: center; margin-bottom: 8px; }
-.fil-save .hint { font-size: 10.5px; }
+/* bulk-apply: 4 evenly-sized labeled inputs + Apply all, all bottom-aligned */
+.fil-bulk { display: grid; grid-template-columns: repeat(4, 1fr) auto; gap: 5px 8px; align-items: end; margin-bottom: 8px; }
+.fil-bulk label { display: flex; flex-direction: column; gap: 3px; font-size: 10px; font-weight: 700; color: var(--muted); min-width: 0; }
+.fil-bulk input { width: 100%; min-width: 0; padding: 5px 6px; font-size: 12px; }
+.fil-bulk button { align-self: end; white-space: nowrap; }
+/* save / load / detect: three equal-width buttons on one row */
+.fil-save { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 4px; }
+.fil-save button { width: 100%; white-space: nowrap; }
+.fil-note { font-size: 10px; margin: 0 0 8px; opacity: 0.85; }
 
 /* emission / heating / gantt view toggle */
 .sch-viewbar { display: flex; justify-content: flex-start; margin: 4px 0 6px; }
