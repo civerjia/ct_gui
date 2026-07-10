@@ -1059,6 +1059,22 @@ ESPCMD = EspCmdClient()
 _DL_PROGRESS: dict[int, dict] = {}
 _DL_LOCK = threading.Lock()
 
+# Per-controller cache of the per-filament currents (idle_mA, active_mA) that we
+# LAST successfully downloaded, keyed by controller index -> {filament: (idle,act)}.
+# The ~48 currents frames/controller dominate the download and rarely change, so a
+# re-download skips any filament whose value matches. Invalidated whenever the
+# firmware might have lost them: (re)connect (reflash clears the table) and mapping
+# change (a filament's board/slot moves). Only updated on a FULLY successful
+# download; a partial failure clears it so the next download re-sends everything.
+_DL_CURRENTS_CACHE: dict[int, dict[int, tuple]] = {}
+
+def invalidate_currents_cache(controller: int | None = None) -> None:
+    with _DL_LOCK:
+        if controller is None:
+            _DL_CURRENTS_CACHE.clear()
+        else:
+            _DL_CURRENTS_CACHE.pop(controller, None)
+
 # ---- Scan simulation --------------------------------------------------------
 # Auto-generate the whole sync-pulse train, PACED over the scan duration, in a
 # background thread (so the HTTP handler never blocks for ~30 s). Fire the HEAD
@@ -1108,15 +1124,28 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     reqs.append((SHV_SET_ACTIVE_LIST, MAPPING.active_list(controller), 0)); labels.append("active_list")
     reqs.append((CH_SET_I2C_ENABLE_MASK, bytes([MAPPING.channel_mask(controller) & 0xFF]), 0)); labels.append("mask")
 
+    # Per-filament currents — the ~48 frames/controller that DOMINATE the download.
+    # Skip any whose (idle, active) matches what we last downloaded to this controller
+    # (cache invalidated on connect / mapping change). `want` is the full intended set
+    # so the cache can be refreshed to firmware truth on a successful download.
+    with _DL_LOCK:
+        cached = dict(_DL_CURRENTS_CACHE.get(controller, {}))
+    want: dict[int, tuple] = {}
     cur_n = 0
+    cur_skipped = 0
     for fil, cur in (plan.get("currents") or {}).items():
         f = int(fil)
         ctrl, ch, pos, _ = filament_to_board(f)
         if ctrl != controller:
             continue
+        val = (int(cur.get("idle_mA", 0)), int(cur.get("active_mA", 0)))
+        want[f] = val
+        if cached.get(f) == val:      # firmware already has this value → skip the frame
+            cur_skipped += 1
+            continue
         cur_n += 1
         reqs.append((CH_FILAMENT_CURRENTS,
-                     bytes([ch, pos]) + _u16(int(cur.get("idle_mA", 0))) + _u16(int(cur.get("active_mA", 0))),
+                     bytes([ch, pos]) + _u16(val[0]) + _u16(val[1]),
                      FLAG_SINGLE))
         labels.append("currents")
 
@@ -1163,17 +1192,52 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
             _DL_PROGRESS[controller] = {"phase": "pipelined", "done": d, "total": total}
 
     _on_prog(0)
-    results = _pipeline_reliable(link, reqs, window=8, timeout=2.5, on_progress=_on_prog)
+    # Pipeline depth: a deep window (8) overwhelms the ESP32 bridge's buffering on a
+    # slow/variable link — frames execute on the RP2350 but their ACKs come back after
+    # the per-frame deadline, so the pipeline false-fails them and serial-retries at 3 s
+    # each (minutes). A shallower window lets the bridge return ACKs in time; a longer
+    # per-frame timeout tolerates a late-but-valid ACK. Env-tunable to measure.
+    _win = max(1, int(os.environ.get("CT_DL_WINDOW", "8")))
+    _tmo = max(0.5, float(os.environ.get("CT_DL_TIMEOUT", "2.5")))
+    if os.environ.get("CT_DL_PIPELINE"):
+        # Legacy 8-in-flight pipeline. Measured ~50x SLOWER than serial on this bridge
+        # (responses stall to ~1.2 s/frame vs ~20 ms serial). Kept behind an env flag only.
+        results = _pipeline_reliable(link, reqs, window=_win, timeout=_tmo, on_progress=_on_prog)
+    else:
+        # Serial send: each frame round-trips in ~20 ms (with the interrupt RX ring the
+        # RP2350 answers immediately), so a full ~14 KB schedule downloads in ~2 s and is
+        # reliable (Verify/CRC confirms). One retry per frame covers a rare transient.
+        results = []
+        for i, (ft, payload, flags) in enumerate(reqs):
+            r = None
+            for _try in range(2):
+                try:
+                    r = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
+                    if _status_ok(r):
+                        break
+                except Exception as exc:
+                    r = {"ok": False, "error": str(exc)}
+            results.append(r)
+            _on_prog(i + 1)
     oks = [_status_ok(r) if isinstance(r, dict) else False for r in results]
     fails = [labels[i] for i, x in enumerate(oks) if not x]
     ok = not fails
+
+    # Refresh the currents cache to firmware truth. On full success the firmware now
+    # holds `want` (sent + skipped). On ANY failure clear it so the next download
+    # re-sends every current (correctness over speed).
+    with _DL_LOCK:
+        if ok:
+            _DL_CURRENTS_CACHE[controller] = want
+        else:
+            _DL_CURRENTS_CACHE.pop(controller, None)
 
     total_ms = round((time.monotonic() - t_all) * 1000)
     with _DL_LOCK:
         _DL_PROGRESS[controller] = {"phase": "done", "done": total, "total": total}
     per_frame = total_ms / max(1, total)
     print(f"[download] P{controller + 1} (pipelined, w=8): {total_ms} ms, {total} frames "
-          f"({per_frame:.0f} ms/frame) | currents {cur_n}f · emit {emit_frames}f · heat {hn // SHV_HEAT_CHUNK + 1}f"
+          f"({per_frame:.0f} ms/frame) | currents {cur_n}f (+{cur_skipped} cached) · emit {emit_frames}f · heat {hn // SHV_HEAT_CHUNK + 1}f"
           + (f" · {len(fails)} FAILED: {fails[:6]}" if fails else ""), flush=True)
 
     return {"controller": controller, "ok": ok, "emit": n, "heat": hn,
@@ -1550,6 +1614,9 @@ class CtHandler(BaseHTTPRequestHandler):
                 host = str(body.get("host", "")).strip()
                 if not host:
                     return self._json({"ok": False, "error": "no host"}, HTTPStatus.BAD_REQUEST)
+                # A (re)connect may be a freshly reflashed controller with an empty
+                # table — drop its currents cache so the next download re-sends them.
+                invalidate_currents_cache(cid - 1)
                 link.connect(host)
                 if not link.client.connected:
                     # Port opened but the session dropped — the bridge is single-
@@ -1585,6 +1652,9 @@ class CtHandler(BaseHTTPRequestHandler):
                 # set the alternating-group size, or a full per-filament assignment
                 # (list[96] of 0/1/null). Optionally upload to connected controllers.
                 global MAPPING
+                # Remapping moves filaments between controllers/slots (ch,pos), so the
+                # currents cache (keyed by filament) is no longer firmware truth — clear it.
+                invalidate_currents_cache()
                 if "assignment" in body:
                     MAPPING.set_assignment(body["assignment"], body.get("group_size"))
                 elif "group_size" in body:

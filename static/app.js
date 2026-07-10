@@ -657,7 +657,11 @@ function setViewMode(mode) {
   const plan = mode === 'plan';
   if (!plan) stopDryRun();   // a dry run only makes sense in Plan view
   for (const id of ['playBtn', 'stepBtn', 'resetBtn', 'dryRunBtn']) { const el = $(id); if (el) el.disabled = !plan; }
-  for (const id of ['schApplyBtn', 'schSyncBtn']) $(id).disabled = !plan;
+  // schSync rebuilds the schedule from the live geometry (Plan-only). Apply-all only
+  // edits the plan's per-filament currents/pulses (they download with the schedule),
+  // so it must work in ANY view — that's how you set idle/active currents for a run.
+  { const s = $('schSyncBtn'); if (s) s.disabled = !plan; }
+  { const a = $('schApplyBtn'); if (a) a.disabled = false; }
   setStatus(mode === 'live'
     ? 'Live — reflects the actual gantry position and INA219 sensor data from the controllers.'
     : mode === 'debug'

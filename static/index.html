@@ -203,8 +203,8 @@
             <span id="schCount" class="summary">0 rows</span>
           </summary>
           <div class="row compact sch-actions">
-            <button id="schSyncBtn" class="sm">Sync</button>
-            <button id="schUploadBtn" class="sm quick">Upload</button>
+            <button id="schSyncBtn" class="sm" title="Rebuild the schedule table LOCALLY from the current geometry + per-filament settings (pulses, duration, currents). No hardware — regenerates the emission rows and the bound heating layer. Use it after changing geometry, coverage, or per-filament values. (Plan view only.)">Sync</button>
+            <button id="schUploadBtn" class="sm quick" title="Stage the built schedule (emission rows + heating deltas) on the HOST backend (/api/schedule). Host-side staging only — this does NOT push to the RP2350 controllers. To send the schedule to firmware for a run, use Hardware Run → ④ Download instead.">Upload</button>
             <span id="schStatus" class="hint"></span>
           </div>
 
