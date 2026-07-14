@@ -598,9 +598,9 @@ async function test3() {
     }
 
     const items = Object.entries(filResult)
-      .map(([fs, r]) => ({ f: +fs, value: Math.max(r.iMa, 0), cls: r.cls }))
+      .map(([fs, r]) => ({ f: +fs, value: Math.max(r.vEm, 0), cls: r.cls }))
       .sort((a, b) => a.f - b.f);
-    drawBars('t3Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(iThr * 4, 10), fmt: (v) => v.toFixed(0) });
+    drawBars('t3Plot', items, { yLabel: 'Vem (V)', yMax: Math.max(vThr * 4, 10), fmt: (v) => v.toFixed(1) });
     const suspectLabels = suspectChans.map((c) => `P${c.ctrl}·CH${c.ch + 1}`);
     testResult('t3Result', {
       title: 'Focus leak scan', pass: leaks.length === 0,
