@@ -482,6 +482,7 @@ async function test2() {
       .map(([fs, r]) => ({ f: +fs, value: r.mA, cls: r.cls }))
       .sort((a, b) => a.f - b.f);
     drawBars('t2Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(limMa, thr * 2), fmt: (v) => v.toFixed(0) });
+    const suspectLabels = suspectChans.map((c) => `P${c.ctrl}·CH${c.ch + 1}`);
     testResult('t2Result', {
       title: 'Emission short scan',
       pass: shorts.length === 0,
@@ -490,6 +491,7 @@ async function test2() {
         { n: suspectChans.length, label: 'suspect', bad: suspectChans.length > 0 },
         { n: shorts.length, label: 'short', bad: shorts.length > 0 },
       ],
+      note: suspectLabels.length ? 'suspects: ' + suspectLabels.join(', ') : undefined,
       flagged: shorts,
     });
     tMsg(`Scan done — ${shorts.length ? shorts.length + ' short' : 'all green'}.`, shorts.length ? 'bad' : '');
@@ -599,6 +601,7 @@ async function test3() {
       .map(([fs, r]) => ({ f: +fs, value: Math.max(r.iMa, 0), cls: r.cls }))
       .sort((a, b) => a.f - b.f);
     drawBars('t3Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(iThr * 4, 10), fmt: (v) => v.toFixed(0) });
+    const suspectLabels = suspectChans.map((c) => `P${c.ctrl}·CH${c.ch + 1}`);
     testResult('t3Result', {
       title: 'Focus leak scan', pass: leaks.length === 0,
       counts: [
@@ -606,7 +609,8 @@ async function test3() {
         { n: suspectChans.length, label: 'suspect', bad: suspectChans.length > 0 },
         { n: leaks.length, label: 'leak', bad: leaks.length > 0 },
       ],
-      note: `peak Vem ${maxV.toFixed(1)} V`, flagged: leaks,
+      note: `peak Vem ${maxV.toFixed(1)} V${suspectLabels.length ? ' · suspects: ' + suspectLabels.join(', ') : ''}`,
+      flagged: leaks,
     });
     tMsg(`Focus leak scan done — ${leaks.length ? leaks.length + ' leak' : 'no leak'}.`, leaks.length ? 'bad' : '');
 
