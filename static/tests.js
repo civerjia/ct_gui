@@ -519,7 +519,7 @@ async function test2() {
 // emission V, turn off. Plot what was measured. Leak if emiss_v > vThr.
 async function test3() {
   const magV = Math.abs(parseFloat($t('t3V').value) || 30);
-  const settleMs = Math.max(30, parseInt($t('t3Width').value, 10) || 60);
+  const settleMs = Math.max(30, parseInt($t('t3Width').value, 10) || 200);
   const vThr = parseFloat($t('t3VThr').value) || 10;
 
   const fmap = await loadFilMap();
@@ -558,7 +558,14 @@ async function test3() {
       await hvBit(m.ctrl, m.ch, m.pos, 0);
       lastBit = null;
 
-      const vEm = (ads && ads.ok) ? Math.abs(ads.emiss_v) : 0;
+      if (!ads || !ads.ok) {
+        tMsg(`F${f}: ADS1115 read failed (${(ads && ads.error) || 'no response'}) — skipping`, 'bad');
+        items.push({ f, value: 0, cls: 'skip' });
+        drawBars('t3Plot', items, { yLabel: 'Vem (V)', yMax: Math.max(magV * 1.1, vThr * 2), fmt: (v) => v.toFixed(1) });
+        continue;
+      }
+      const vEm = Math.abs(ads.emiss_v);
+      tMsg(`F${f} (${filBoard(m)}): emiss_v=${ads.emiss_v?.toFixed(1)} V (|${vEm.toFixed(1)}| V) codes=[${(ads.codes||[]).join(',')}]`);
       const leak = vEm > vThr;
       items.push({ f, value: vEm, cls: leak ? 'leak' : 'ok' });
       if (leak) leaks.push(`F${f} (${filBoard(m)}): Vem ${vEm.toFixed(1)} V`);
@@ -759,7 +766,7 @@ const TESTS_HTML = `
     <div class="block-title" title="Focus ON (−V), emission OFF, wiper=0. Per filament: close switch, read ADS1115 emission voltage, open. Normal baseline ≈ −2.4 V. If focus leaks through the filament to the emission rail, emission V rises toward the focus setpoint.">3 · Focus leak scan <span class="hint">ⓘ</span></div>
     <div class="test-params">
       <label class="numlabel">focus −V<input id="t3V" type="number" min="0" max="1000" value="30" /></label>
-      <label class="numlabel">settle ms<input id="t3Width" type="number" min="30" max="500" value="60" /></label>
+      <label class="numlabel">settle ms<input id="t3Width" type="number" min="30" max="1000" value="200" /></label>
       <label class="numlabel">leak V<input id="t3VThr" type="number" min="0" value="10" /></label>
       <button class="xs quick test-run" id="t3Run">Run</button>
     </div>
