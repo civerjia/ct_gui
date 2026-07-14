@@ -391,51 +391,122 @@ async function test1() {
 // =========================================================================
 // 2 — Emission short scan (no heating)
 // =========================================================================
+// Two-phase ADS1115 scan. Phase 1: turn on all bits in a channel at once,
+// read ADS1115 — 12 scans total. Phase 2: per-bit scan on any suspect channel.
+// HV-on window per measurement ≈ settleMs + one ADS1115 read (~100 ms total).
 async function test2() {
-  const magV = Math.abs(parseFloat($t('t2V').value) || 30), limMa = parseFloat($t('t2Lim').value) || 30;
-  const widthUs = parseInt($t('t2Width').value, 10) || 100000, thr = parseFloat($t('t2Thr').value) || 5;
-  const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
-  const items = [], shorts = [], cur = { id: await pulseCursor() };
-  // Respect a pre-existing emission state. If HV is already energised, capture
-  // its setpoint, leave it ON, and restore that setpoint at the end; if it was
-  // off, enable it for the sweep and return it to off after. Either way the
-  // sweep itself drives −${magV} V while it runs.
+  const magV = Math.abs(parseFloat($t('t2V').value) || 30);
+  const limMa = parseFloat($t('t2Lim').value) || 30;
+  const settleMs = Math.max(30, parseInt($t('t2Width').value, 10) || 60);
+  const thr = parseFloat($t('t2Thr').value) || 5;
+
+  const fmap = await loadFilMap();
+
+  // Group filaments by controller + channel
+  const chanMap = {};
+  for (const [fs, m] of Object.entries(fmap)) {
+    const key = `${m.ctrl}-${m.ch}`;
+    if (!chanMap[key]) chanMap[key] = { ctrl: m.ctrl, ch: m.ch, bits: [] };
+    chanMap[key].bits.push({ f: +fs, pos: m.pos });
+  }
+  const chanList = Object.values(chanMap).sort((a, b) => a.ctrl - b.ctrl || a.ch - b.ch);
+
+  const hvBit = (ctrl, ch, bit, val) =>
+    tPostJ('/api/cmd', { controller: ctrl, command: 'HV_SET_BIT', channel: ch, bit, value: val, force: true });
+
+  // Track every bit we turn on so finally() can clean up even if we abort mid-channel.
+  const bitsOn = new Set();
+  const bitOn  = async (ctrl, ch, pos) => { await hvBit(ctrl, ch, pos, 1); bitsOn.add(`${ctrl}-${ch}-${pos}`); };
+  const bitOff = async (ctrl, ch, pos) => { await hvBit(ctrl, ch, pos, 0); bitsOn.delete(`${ctrl}-${ch}-${pos}`); };
+
   const emWasOn = await hvIsOn('emission');
   let priorWiper = null;
-  if (emWasOn) priorWiper = await readWiper('ev');   // capture the exact wiper to restore
+  if (emWasOn) priorWiper = await readWiper('ev');
+
+  const filResult = {};   // filament → {mA, cls}
+  const shorts = [];
+
   try {
-    tMsg('All filaments → SLEEP (no heating)…');
+    tMsg('All filaments → SLEEP…');
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
-    tMsg(`Emission → −${magV} V @ ${limMa} mA${emWasOn ? ' (was ON — staying on)' : ''}…`);
-    if (!(await setHvAndWait('emission', magV))) return;   // wiper write failed → abort (finally tears down)
+
+    tMsg(`Emission → −${magV} V @ ${limMa} mA…`);
+    if (!(await setHvAndWait('emission', magV))) return;
     await setEmiLimit(limMa);
     if (!emWasOn) await hvEnable('emission', true);
-    await pulseArm(); await tSleep(150);
-    for (let i = 0; i < fils.length; i++) {
-      if (abortFlag) { tMsg('Aborted.'); break; }
-      const f = fils[i], m = fmap[f];
-      tMsg(`Emission short scan: ${i + 1}/${fils.length} (F${f} · ${filBoard(m)})…`);
-      const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs), mA = r ? r.mA : 0, isShort = mA > thr;
-      items.push({ f, value: Math.max(0, mA), cls: isShort ? 'short' : 'ok' });
-      if (isShort) shorts.push(`F${f} (${filBoard(m)}): ${mA.toFixed(1)} mA`);
-      drawBars('t2Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(limMa, thr * 2), fmt: (v) => v.toFixed(0) });
+    await tSleep(200);
+
+    // ── Phase 1: channel scan (all bits on simultaneously) ──────────────────
+    tMsg(`Phase 1 — ${chanList.length} channel scans…`);
+    const suspectChans = [];
+    for (let ci = 0; ci < chanList.length; ci++) {
+      if (abortFlag) { tMsg('Aborted.'); return; }
+      const chan = chanList[ci];
+      tMsg(`Channel ${ci + 1}/${chanList.length}: P${chan.ctrl}·CH${chan.ch + 1} (${chan.bits.length} bits)…`);
+
+      await Promise.all(chan.bits.map(({ pos }) => bitOn(chan.ctrl, chan.ch, pos)));
+      await tSleep(settleMs);
+      const ads = await readAds();
+      await Promise.all(chan.bits.map(({ pos }) => bitOff(chan.ctrl, chan.ch, pos)));
+
+      const iMa = (ads && ads.ok) ? Math.abs(ads.emiss_i_ma) : 0;
+      if (iMa > thr) {
+        suspectChans.push(chan);
+        tMsg(`  ↑ P${chan.ctrl}·CH${chan.ch + 1}: ${iMa.toFixed(1)} mA — suspect, queued for bit scan`);
+      } else {
+        // Whole channel clean — mark all its filaments ok at 0 mA
+        for (const { f } of chan.bits) filResult[f] = { mA: 0, cls: 'ok' };
+      }
     }
+
+    // ── Phase 2: per-bit scan on suspect channels ────────────────────────────
+    for (const chan of suspectChans) {
+      if (abortFlag) { tMsg('Aborted.'); return; }
+      tMsg(`Phase 2 — P${chan.ctrl}·CH${chan.ch + 1}: scanning ${chan.bits.length} bits…`);
+      for (const { f, pos } of chan.bits) {
+        if (abortFlag) { tMsg('Aborted.'); return; }
+        await bitOn(chan.ctrl, chan.ch, pos);
+        await tSleep(settleMs);
+        const ads = await readAds();
+        await bitOff(chan.ctrl, chan.ch, pos);
+
+        const iMa = (ads && ads.ok) ? Math.abs(ads.emiss_i_ma) : 0;
+        const isShort = iMa > thr;
+        filResult[f] = { mA: iMa, cls: isShort ? 'short' : 'ok' };
+        if (isShort) shorts.push(`F${f} (P${chan.ctrl}·CH${chan.ch + 1}.${pos + 1}): ${iMa.toFixed(1)} mA`);
+      }
+    }
+
+    const items = Object.entries(filResult)
+      .map(([fs, r]) => ({ f: +fs, value: r.mA, cls: r.cls }))
+      .sort((a, b) => a.f - b.f);
+    drawBars('t2Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(limMa, thr * 2), fmt: (v) => v.toFixed(0) });
     testResult('t2Result', {
-      title: 'Emission short scan', pass: shorts.length === 0,
-      counts: [{ n: fils.length, label: 'tested' }, { n: shorts.length, label: 'short', bad: shorts.length > 0 }],
+      title: 'Emission short scan',
+      pass: shorts.length === 0,
+      counts: [
+        { n: chanList.length, label: 'channels' },
+        { n: suspectChans.length, label: 'suspect', bad: suspectChans.length > 0 },
+        { n: shorts.length, label: 'short', bad: shorts.length > 0 },
+      ],
       flagged: shorts,
     });
-    tMsg(`Emission short scan done — ${shorts.length ? shorts.length + ' short' : 'all green'}.`, shorts.length ? 'bad' : '');
+    tMsg(`Scan done — ${shorts.length ? shorts.length + ' short' : 'all green'}.`, shorts.length ? 'bad' : '');
+
   } finally {
+    // Turn off any bits still on (abort or exception mid-channel)
+    if (bitsOn.size) {
+      await Promise.all([...bitsOn].map((k) => {
+        const [ctrl, ch, pos] = k.split('-').map(Number);
+        return hvBit(ctrl, ch, pos, 0);
+      }));
+    }
     if (emWasOn) {
-      // Leave emission energised (the caller owns it); restore its exact prior
-      // wiper so the scan's −30 V doesn't silently linger.
       if (priorWiper != null) await dsWrite('ev', priorWiper);
     } else {
       await hvEnable('emission', false); await lutZeroV('emission');
     }
-    await pulseDisarm();
   }
 }
 
@@ -643,11 +714,11 @@ const TESTS_HTML = `
   </div>
 
   <div class="test-block" id="testBlock2">
-    <div class="block-title" title="With every filament cold (SLEEP), sets a low emission voltage at a tight current limit and pulses each filament. A cold filament draws almost nothing — real emission current = short.">2 · Emission short scan <span class="hint">— no heating · ⓘ</span></div>
+    <div class="block-title" title="Phase 1: all bits on per channel (12 scans), read ADS1115. Phase 2: per-bit on suspect channels. ADS1115 measures total emission current — a shorted filament draws mA, a cold one draws nothing.">2 · Emission short scan <span class="hint">— no heating · ⓘ</span></div>
     <div class="test-params">
       <label class="numlabel">emis −V<input id="t2V" type="number" min="0" max="350" value="30" /></label>
       <label class="numlabel">limit mA<input id="t2Lim" type="number" min="0" max="85" value="30" /></label>
-      <label class="numlabel">pulse µs<input id="t2Width" type="number" min="1" max="1000000" value="100000" /></label>
+      <label class="numlabel">settle ms<input id="t2Width" type="number" min="30" max="500" value="60" /></label>
       <label class="numlabel">short mA<input id="t2Thr" type="number" min="0" value="5" /></label>
       <button class="xs quick test-run" id="t2Run">Run</button>
     </div>
