@@ -515,10 +515,12 @@ async function test2() {
 // =========================================================================
 // 3 — Focus leak scan (monitor emission V per filament)
 // =========================================================================
-// Focus ON, emission OFF, emission wiper=0. Per filament: close the switch,
-// read ADS1115 emission voltage, open switch. Normal = ~−2.4 V (no leak).
-// If focus leaks to emission through the filament, emission V rises toward
-// the focus setpoint. Threshold vThr (default 10 V) flags the filament.
+// Step 0: baseline — emission V with focus OFF (expect ~2.4 V magnitude).
+// Step 1: enable focus, measure emission V with ALL switches open.
+//         If already > vThr → board-level leak; report and stop.
+// Step 2: only if board is clean, scan each filament one by one:
+//         close switch → read emission V → open switch.
+//         A specific filament leaking raises emission V above vThr.
 async function test3() {
   const magV = Math.abs(parseFloat($t('t3V').value) || 30);
   const settleMs = Math.max(30, parseInt($t('t3Width').value, 10) || 60);
@@ -530,8 +532,8 @@ async function test3() {
   const hvBit = (ctrl, ch, bit, val) =>
     tPostJ('/api/cmd', { controller: ctrl, command: 'HV_SET_BIT', channel: ch, bit, value: val, force: true });
 
-  let lastBit = null;   // {ctrl,ch,pos} — ensure cleanup even on abort
-  const items = [], leaks = []; let maxV = 0;
+  let lastBit = null;
+  const items = [], leaks = [];
 
   try {
     tMsg('Emission OFF (wiper=0), all → SLEEP…');
@@ -539,16 +541,35 @@ async function test3() {
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
 
+    // ── Step 0: baseline with focus OFF ─────────────────────────────────────
+    const baseAds = await readAds();
+    const baseV = (baseAds && baseAds.ok) ? Math.abs(baseAds.emiss_v) : 0;
+    tMsg(`Baseline (focus OFF): Vem = ${baseV.toFixed(1)} V`);
+
+    // ── Step 1: enable focus, check board-level leak (no switches) ───────────
     tMsg(`Focus → −${magV} V…`);
     if (!(await setHvAndWait('focus', magV))) return;
     await hvEnable('focus', true);
     await tSleep(300);
 
-    // Measure baseline emission voltage with all switches open
-    const base = await readAds();
-    const baseV = (base && base.ok) ? Math.abs(base.emiss_v) : 0;
-    tMsg(`Baseline emission V = ${baseV.toFixed(1)} V — scanning ${fils.length} filaments…`);
+    const boardAds = await readAds();
+    const boardV = (boardAds && boardAds.ok) ? Math.abs(boardAds.emiss_v) : 0;
+    tMsg(`Board check (focus ON, no switches): Vem = ${boardV.toFixed(1)} V`);
 
+    if (boardV > vThr) {
+      testResult('t3Result', {
+        title: 'Focus leak scan', pass: false,
+        counts: [{ n: 0, label: 'tested' }, { n: 1, label: 'BOARD leak', bad: true }],
+        note: `focus −${magV} V · baseline ${baseV.toFixed(1)} V → board ${boardV.toFixed(1)} V (no switches open) — fix board before per-filament scan`,
+        flagged: [`Board-level leak: Vem ${boardV.toFixed(1)} V with all switches open`],
+      });
+      tMsg(`Board-level focus→emission leak: ${boardV.toFixed(1)} V. Fix board before scanning filaments.`, 'bad');
+      return;
+    }
+
+    // ── Step 2: per-filament scan ────────────────────────────────────────────
+    tMsg(`Board clean (${boardV.toFixed(1)} V) — scanning ${fils.length} filaments…`);
+    let maxV = boardV;
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
       const f = fils[i], m = fmap[f];
@@ -571,11 +592,8 @@ async function test3() {
 
     testResult('t3Result', {
       title: 'Focus leak scan', pass: leaks.length === 0,
-      counts: [
-        { n: fils.length, label: 'tested' },
-        { n: leaks.length, label: 'leak', bad: leaks.length > 0 },
-      ],
-      note: `focus −${magV} V · baseline Vem ${baseV.toFixed(1)} V · peak ${maxV.toFixed(1)} V`,
+      counts: [{ n: fils.length, label: 'tested' }, { n: leaks.length, label: 'leak', bad: leaks.length > 0 }],
+      note: `focus −${magV} V · baseline ${baseV.toFixed(1)} V · board ${boardV.toFixed(1)} V · peak ${maxV.toFixed(1)} V`,
       flagged: leaks,
     });
     tMsg(`Focus leak scan done — ${leaks.length ? leaks.length + ' leak' : 'no leak'}.`, leaks.length ? 'bad' : '');
