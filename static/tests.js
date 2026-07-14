@@ -215,17 +215,19 @@ async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
   } while (Date.now() < deadline);
   if (!evs.length) return null;
   const e = evs[evs.length - 1];
-  // Per-pulse summary carries raw ADC counts: peak (highest), plateau (steady
-  // "high"), bg (background/baseline). peakToMa is affine, so (peak − bg) → net =
-  // real emission current with the dark/background level subtracted out. mA is the
-  // background-subtracted net (what every verdict should use), clamped ≥ 0.
+  // Per-pulse summary carries raw ADC counts: peak (highest single sample),
+  // plateau (MEAN over the pulse's steady/hot region — hundreds of samples, edges
+  // excluded, matches the DC steady-state mean), bg (baseline). peakToMa is affine,
+  // so (plateau − bg) → net emission current. Use the plateau-mean (NOT peak) as
+  // the emission current: peak is noise-biased high (~2–3σ above the mean), while
+  // the plateau-mean agrees with the steady-state ADC summary. Clamped ≥ 0.
   const peakMa = peakToMa(e.peak);
   const bgMa = (e.bg != null) ? peakToMa(e.bg) : 0;
   const plateauMa = (e.plateau != null) ? peakToMa(e.plateau) : peakMa;
   return {
     peak: e.peak, plateau: e.plateau, bg: e.bg,
-    mA: Math.max(0, peakMa - bgMa),
-    peakMa, plateauMa, bgMa, netMa: peakMa - bgMa,
+    mA: Math.max(0, plateauMa - bgMa),
+    peakMa, plateauMa, bgMa, netMa: plateauMa - bgMa,
   };
 }
 
