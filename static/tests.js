@@ -513,114 +513,75 @@ async function test2() {
 }
 
 // =========================================================================
-// 3 — Focus leak scan (monitor emission V and I)
+// 3 — Focus leak scan (monitor emission V per filament)
 // =========================================================================
-// Two-phase ADS1115 scan — same structure as test2 but watching emission V/I
-// while the focus rail is energised. A leak shows up as emission current or
-// voltage rising above threshold with a filament's switch closed.
+// Focus ON, emission OFF, emission wiper=0. Per filament: close the switch,
+// read ADS1115 emission voltage, open switch. Normal = ~−2.4 V (no leak).
+// If focus leaks to emission through the filament, emission V rises toward
+// the focus setpoint. Threshold vThr (default 10 V) flags the filament.
 async function test3() {
   const magV = Math.abs(parseFloat($t('t3V').value) || 30);
   const settleMs = Math.max(30, parseInt($t('t3Width').value, 10) || 60);
-  const iThr = parseFloat($t('t3IThr').value) || 2, vThr = parseFloat($t('t3VThr').value) || 5;
+  const vThr = parseFloat($t('t3VThr').value) || 10;
 
   const fmap = await loadFilMap();
-
-  const chanMap = {};
-  for (const [fs, m] of Object.entries(fmap)) {
-    const key = `${m.ctrl}-${m.ch}`;
-    if (!chanMap[key]) chanMap[key] = { ctrl: m.ctrl, ch: m.ch, bits: [] };
-    chanMap[key].bits.push({ f: +fs, pos: m.pos });
-  }
-  const chanList = Object.values(chanMap).sort((a, b) => a.ctrl - b.ctrl || a.ch - b.ch);
+  const fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
 
   const hvBit = (ctrl, ch, bit, val) =>
     tPostJ('/api/cmd', { controller: ctrl, command: 'HV_SET_BIT', channel: ch, bit, value: val, force: true });
 
-  const bitsOn = new Set();
-  const bitOn  = async (ctrl, ch, pos) => { await hvBit(ctrl, ch, pos, 1); bitsOn.add(`${ctrl}-${ch}-${pos}`); };
-  const bitOff = async (ctrl, ch, pos) => { await hvBit(ctrl, ch, pos, 0); bitsOn.delete(`${ctrl}-${ch}-${pos}`); };
-
-  const filResult = {}, leaks = []; let maxV = 0;
+  let lastBit = null;   // {ctrl,ch,pos} — ensure cleanup even on abort
+  const items = [], leaks = []; let maxV = 0;
 
   try {
-    tMsg('Emission OFF, all → SLEEP…');
+    tMsg('Emission OFF (wiper=0), all → SLEEP…');
     await hvEnable('emission', false); await lutZeroV('emission');
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
 
-    tMsg(`Focus → −${magV} V (emission stays OFF)…`);
+    tMsg(`Focus → −${magV} V…`);
     if (!(await setHvAndWait('focus', magV))) return;
     await hvEnable('focus', true);
-    await tSleep(200);
+    await tSleep(300);
 
-    // ── Phase 1: channel scan ────────────────────────────────────────────────
-    tMsg(`Phase 1 — ${chanList.length} channel scans…`);
-    const suspectChans = [];
-    for (let ci = 0; ci < chanList.length; ci++) {
-      if (abortFlag) { tMsg('Aborted.'); return; }
-      const chan = chanList[ci];
-      tMsg(`Channel ${ci + 1}/${chanList.length}: P${chan.ctrl}·CH${chan.ch + 1}…`);
+    // Measure baseline emission voltage with all switches open
+    const base = await readAds();
+    const baseV = (base && base.ok) ? Math.abs(base.emiss_v) : 0;
+    tMsg(`Baseline emission V = ${baseV.toFixed(1)} V — scanning ${fils.length} filaments…`);
 
-      await Promise.all(chan.bits.map(({ pos }) => bitOn(chan.ctrl, chan.ch, pos)));
+    for (let i = 0; i < fils.length; i++) {
+      if (abortFlag) { tMsg('Aborted.'); break; }
+      const f = fils[i], m = fmap[f];
+      tMsg(`Focus leak: ${i + 1}/${fils.length} (F${f} · ${filBoard(m)})…`);
+
+      lastBit = { ctrl: m.ctrl, ch: m.ch, pos: m.pos };
+      await hvBit(m.ctrl, m.ch, m.pos, 1);
       await tSleep(settleMs);
       const ads = await readAds();
-      await Promise.all(chan.bits.map(({ pos }) => bitOff(chan.ctrl, chan.ch, pos)));
+      await hvBit(m.ctrl, m.ch, m.pos, 0);
+      lastBit = null;
 
-      const iMa = (ads && ads.ok) ? Math.abs(ads.emiss_i_ma) : 0;
-      const vEm  = (ads && ads.ok) ? Math.abs(ads.emiss_v)    : 0;
+      const vEm = (ads && ads.ok) ? Math.abs(ads.emiss_v) : 0;
       maxV = Math.max(maxV, vEm);
-      if (iMa > iThr || vEm > vThr) {
-        suspectChans.push(chan);
-        tMsg(`  ↑ P${chan.ctrl}·CH${chan.ch + 1}: Ie ${iMa.toFixed(1)} mA · Vem ${vEm.toFixed(1)} V — suspect`);
-      } else {
-        for (const { f } of chan.bits) filResult[f] = { iMa: 0, vEm: 0, cls: 'ok' };
-      }
+      const leak = vEm > vThr;
+      items.push({ f, value: vEm, cls: leak ? 'leak' : 'ok' });
+      if (leak) leaks.push(`F${f} (${filBoard(m)}): Vem ${vEm.toFixed(1)} V`);
+      drawBars('t3Plot', items, { yLabel: 'Vem (V)', yMax: Math.max(magV * 1.1, vThr * 2), fmt: (v) => v.toFixed(1) });
     }
 
-    // ── Phase 2: per-bit scan on suspect channels ────────────────────────────
-    for (const chan of suspectChans) {
-      if (abortFlag) { tMsg('Aborted.'); return; }
-      tMsg(`Phase 2 — P${chan.ctrl}·CH${chan.ch + 1}: scanning ${chan.bits.length} bits…`);
-      for (const { f, pos } of chan.bits) {
-        if (abortFlag) { tMsg('Aborted.'); return; }
-        await bitOn(chan.ctrl, chan.ch, pos);
-        await tSleep(settleMs);
-        const ads = await readAds();
-        await bitOff(chan.ctrl, chan.ch, pos);
-
-        const iMa = (ads && ads.ok) ? Math.abs(ads.emiss_i_ma) : 0;
-        const vEm  = (ads && ads.ok) ? Math.abs(ads.emiss_v)    : 0;
-        maxV = Math.max(maxV, vEm);
-        const leak = iMa > iThr || vEm > vThr;
-        filResult[f] = { iMa, vEm, cls: leak ? 'leak' : 'ok' };
-        if (leak) leaks.push(`F${f} (P${chan.ctrl}·CH${chan.ch + 1}.${pos + 1}): Ie ${iMa.toFixed(1)} mA · Vem ${vEm.toFixed(1)} V`);
-      }
-    }
-
-    const items = Object.entries(filResult)
-      .map(([fs, r]) => ({ f: +fs, value: Math.max(r.vEm, 0), cls: r.cls }))
-      .sort((a, b) => a.f - b.f);
-    drawBars('t3Plot', items, { yLabel: 'Vem (V)', yMax: Math.max(vThr * 4, 10), fmt: (v) => v.toFixed(1) });
-    const suspectLabels = suspectChans.map((c) => `P${c.ctrl}·CH${c.ch + 1}`);
     testResult('t3Result', {
       title: 'Focus leak scan', pass: leaks.length === 0,
       counts: [
-        { n: chanList.length, label: 'channels' },
-        { n: suspectChans.length, label: 'suspect', bad: suspectChans.length > 0 },
+        { n: fils.length, label: 'tested' },
         { n: leaks.length, label: 'leak', bad: leaks.length > 0 },
       ],
-      note: `peak Vem ${maxV.toFixed(1)} V${suspectLabels.length ? ' · suspects: ' + suspectLabels.join(', ') : ''}`,
+      note: `focus −${magV} V · baseline Vem ${baseV.toFixed(1)} V · peak ${maxV.toFixed(1)} V`,
       flagged: leaks,
     });
     tMsg(`Focus leak scan done — ${leaks.length ? leaks.length + ' leak' : 'no leak'}.`, leaks.length ? 'bad' : '');
 
   } finally {
-    if (bitsOn.size) {
-      await Promise.all([...bitsOn].map((k) => {
-        const [ctrl, ch, pos] = k.split('-').map(Number);
-        return hvBit(ctrl, ch, pos, 0);
-      }));
-    }
+    if (lastBit) await hvBit(lastBit.ctrl, lastBit.ch, lastBit.pos, 0);
     await hvEnable('focus', false); await lutZeroV('focus');
   }
 }
@@ -803,12 +764,11 @@ const TESTS_HTML = `
   </div>
 
   <div class="test-block" id="testBlock3">
-    <div class="block-title" title="Energises the focus rail with emission OFF, all filaments SLEEP. Phase 1: all bits per channel on together, read ADS1115 emission V/I. Phase 2: per-bit on suspect channels. Emission V/I rising = focus leaking across.">3 · Focus leak scan <span class="hint">ⓘ</span></div>
+    <div class="block-title" title="Focus ON (−V), emission OFF, wiper=0. Per filament: close switch, read ADS1115 emission voltage, open. Normal baseline ≈ −2.4 V. If focus leaks through the filament to the emission rail, emission V rises toward the focus setpoint.">3 · Focus leak scan <span class="hint">ⓘ</span></div>
     <div class="test-params">
       <label class="numlabel">focus −V<input id="t3V" type="number" min="0" max="1000" value="30" /></label>
       <label class="numlabel">settle ms<input id="t3Width" type="number" min="30" max="500" value="60" /></label>
-      <label class="numlabel">leak mA<input id="t3IThr" type="number" min="0" value="2" /></label>
-      <label class="numlabel">leak V<input id="t3VThr" type="number" min="0" value="5" /></label>
+      <label class="numlabel">leak V<input id="t3VThr" type="number" min="0" value="10" /></label>
       <button class="xs quick test-run" id="t3Run">Run</button>
     </div>
     <canvas id="t3Plot" class="test-plot"></canvas>
