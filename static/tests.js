@@ -531,6 +531,11 @@ async function test3() {
   let lastBit = null;
   const items = [], leaks = [];
 
+  // Respect pre-existing focus state — if already on, keep the user's wiper
+  const focWasOn = await hvIsOn('focus');
+  let priorFocWiper = null;
+  if (focWasOn) priorFocWiper = await readWiper('fv');
+
   // Clear plot immediately so old data never shows
   drawBars('t3Plot', [], { yLabel: 'Vem (V)', yMax: magV * 1.1, fmt: (v) => v.toFixed(1) });
 
@@ -540,9 +545,13 @@ async function test3() {
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
 
-    tMsg(`Focus → −${magV} V…`);
-    if (!(await setHvAndWait('focus', magV))) return;
-    await hvEnable('focus', true);
+    if (focWasOn) {
+      tMsg(`Focus already ON (keeping current setpoint wiper=${priorFocWiper})…`);
+    } else {
+      tMsg(`Focus → −${magV} V…`);
+      if (!(await setHvAndWait('focus', magV))) return;
+      await hvEnable('focus', true);
+    }
     await tSleep(200);
 
     tMsg(`Scanning ${fils.length} filaments…`);
@@ -581,7 +590,11 @@ async function test3() {
 
   } finally {
     if (lastBit) await hvBit(lastBit.ctrl, lastBit.ch, lastBit.pos, 0);
-    await hvEnable('focus', false); await lutZeroV('focus');
+    if (focWasOn) {
+      if (priorFocWiper != null) await dsWrite('fv', priorFocWiper);
+    } else {
+      await hvEnable('focus', false); await lutZeroV('focus');
+    }
   }
 }
 
