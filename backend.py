@@ -865,7 +865,33 @@ class ControllerLink:
         self._poll_pause_until = (time.monotonic() + POLL_PAUSE_MAX_S) if paused else 0.0
 
     def _poll(self) -> None:
-        while self._running and self.client.connected:
+        # Loop on _running (NOT connected): the ESP32 bridge is single-client with
+        # a ~6s TCP keepalive, so a transient WiFi/CPU stall, an STM32 reboot, or
+        # heavy HTTP polling starving the bridge task makes it stop() the socket.
+        # Without in-place reconnect the link stays down until a manual Scan &
+        # Connect ("master frequently loses connection"). self.host is cleared only
+        # by an explicit disconnect(), so we auto-heal on drops but stay down when
+        # the user really meant to disconnect.
+        reconnecting = False
+        while self._running:
+            if not self.client.connected:
+                host = self.host
+                if not host:
+                    time.sleep(1.0)
+                    continue
+                try:
+                    self.client.connect(host, BRIDGE_PORT)   # connect() cleans up half-open state
+                    if reconnecting:
+                        print(f"[{self.name}] bridge reconnected to {host}", flush=True)
+                    reconnecting = False
+                    self.rp_last = 0.0
+                    self.rp_rtt_ms = None
+                except Exception:
+                    if not reconnecting:
+                        print(f"[{self.name}] bridge down, reconnecting to {host}…", flush=True)
+                    reconnecting = True
+                    time.sleep(1.0)
+                    continue
             t0 = time.monotonic()
             if t0 >= self._poll_pause_until:
                 try:
