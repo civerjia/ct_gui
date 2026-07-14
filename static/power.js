@@ -671,7 +671,12 @@ const HV_HTML = `
       <label class="numlabel">Pulse µs <input id="hvPulseUs" type="number" min="1" value="100" /></label>
       <button id="hvPulse" class="xs">Fire pulse</button>
     </div>
+    <div class="hv-row" title="Pulse-INDEPENDENT ADC ground truth: the STM32 sums N samples on-chip over the window and returns mean/min/max/rms/std over UART (no SPI, no pulse needed). At 1 MSPS, 1 ms = 1000 samples. Arms the ADC if idle.">
+      <label class="numlabel">Window ms <input id="adcWinMs" type="number" min="0.1" max="100" step="0.1" value="1" /></label>
+      <button id="adcWinBtn" class="xs">ADC summary</button>
+    </div>
     <div id="hvStatus" class="summary"></div>
+    <div id="adcWinStatus" class="summary"></div>
   </div>
 
   <div class="batch-box">
@@ -983,6 +988,35 @@ function wireHv() {
     if (hvMonitorOn) refreshHv(true);
   };
   $p('hvPulse').onclick = async () => { const j = await powerCmd('HV_PULSE', { hv_mask: hvSelMask(), width_us: +$p('hvPulseUs').value, verify_mode: 0 }); $p('hvStatus').textContent = j.ok ? 'pulse fired' : (j.error || 'pulse failed'); refreshHv(); };
+  // Non-pulse ADC summary: STM32 sums N samples on-chip over the window and returns
+  // mean/min/max/rms/std over UART (ground truth, no SPI, no pulse). Tries first; if
+  // the ADC isn't streaming it arms the detector (pulse-arm @ 1 MSPS) and retries.
+  // Emission current from raw ADC count — SAME affine formula as the per-pulse
+  // measurement (tests.js peakToMa). Affine, so mean/min/max map directly and
+  // pk-pk/σ scale by the slope (the DC offset cancels in a difference/spread).
+  const emiPeakToMa = (c) => 2 * (c * 3.1 / 4095 - 0.5 * 1.155) / 6.8 / 8.2 * 1000;
+  const EMI_MA_PER_COUNT = emiPeakToMa(1) - emiPeakToMa(0);
+  $p('adcWinBtn').onclick = async () => {
+    const ms = Math.max(0.1, parseFloat($p('adcWinMs').value) || 1);
+    const n = Math.max(1, Math.round(ms * 1000));   // 1 MSPS → samples
+    const st = $p('adcWinStatus');
+    const measure = async () => { try { return await (await fetch(`/api/stm32/adc-window?n=${n}`)).json(); } catch (e) { return { ok: false, error: String(e) }; } };
+    st.textContent = 'measuring…';
+    let j = await measure();
+    if (!j.ok) {                       // ADC likely idle — arm the detector, retry
+      st.textContent = 'arming ADC…';
+      await postJ('/api/adc/pulse-arm', { controller: masterId(), rate: 1000000 });
+      await new Promise((r) => setTimeout(r, 200));
+      j = await measure();
+    }
+    if (!j.ok) { st.textContent = `ADC summary failed: ${j.error || 'is the ADC/STM32 up?'}`; return; }
+    const meanMa = emiPeakToMa(j.mean), minMa = emiPeakToMa(j.min), maxMa = emiPeakToMa(j.max);
+    const ppMa = j.pp * EMI_MA_PER_COUNT, stdMa = j.std * EMI_MA_PER_COUNT;
+    st.textContent =
+      `${ms} ms · ${j.n} samp — Ie mean ${meanMa.toFixed(2)} mA · σ ${stdMa.toFixed(2)} mA · ` +
+      `min ${minMa.toFixed(2)} · max ${maxMa.toFixed(2)} · pk-pk ${ppMa.toFixed(2)} mA ` +
+      `(raw mean ${Number(j.mean).toFixed(0)} cnt)`;
+  };
   // LUT voltage: Emission/Focus target (V) → wiper via the calibrated LUT, then
   // written directly to the DS3502 (no closed loop, no drift). Cal (re)builds it.
   $p('emVsetBtn').onclick = () => hvLutSet('emission', 'emVset');
@@ -1836,7 +1870,17 @@ function wireEmission() {
     pulseTimer = setInterval(pulseTick, 500); $p('pulseStream').classList.add('danger'); pulseTick();
     if (!pulseList.length) $p('pulseSummary').textContent = 'armed — waiting for pulses…';
   };
-  $p('pulseClear').onclick = () => { pulseList = []; pulseSince = 0; pulseFollow = true; renderPulses(); };
+  $p('pulseClear').onclick = async () => {
+    // Empty the display AND advance the cursor to the server's latest id, so the
+    // next poll fetches only NEW pulses. (The old code reset pulseSince=0, which
+    // made pulseTick re-fetch every historical pulse → "Clear cleared nothing".)
+    pulseList = []; pulseFollow = true;
+    try {
+      const j = await (await fetch(`/api/pulse-events?controller=${masterId()}&since=2000000000`)).json();
+      if (j && j.last_id != null) pulseSince = j.last_id;
+    } catch { /* keep current cursor */ }
+    renderPulses();
+  };
   $p('pulseSlider').addEventListener('input', () => {
     const sl = $p('pulseSlider');
     pulseFollow = (+sl.value >= +sl.max);   // dragged to the far right ⇒ resume live-follow
