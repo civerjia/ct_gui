@@ -666,6 +666,7 @@ const HV_HTML = `
       <button id="hvSelOff" class="xs">Sel OFF</button>
       <button id="hvAllOff" class="xs">All OFF</button>
       <button id="hvRefresh" class="xs">Refresh</button>
+      <label class="hw-override" title="Force mode: send force=true instead of verify=true when toggling bits. Use when the switch feedback is unreliable or the filament is shorted."><input type="checkbox" id="hvForce" /> Force</label>
     </div>
     <div class="hv-row">
       <label class="numlabel">Pulse µs <input id="hvPulseUs" type="number" min="1" value="100" /></label>
@@ -844,13 +845,22 @@ async function refreshHv(force) {
   let j; try { j = await (await fetch(`/api/hv-snapshot?controller=${pwTarget}`)).json(); } catch { return; }
   if (j.ok) { hvDesired = j.desired; hvFeedback = j.feedback; renderHvGrid(); }
 }
+function hvForceChecked() { const el = $p('hvForce'); return !!(el && el.checked); }
 async function hvSetBit(ch, b, val) {
-  await powerCmd('HV_SET_BIT', { channel: ch, bit: b, value: val, verify: true });
+  const extra = hvForceChecked() ? { channel: ch, bit: b, value: val, force: true }
+                                 : { channel: ch, bit: b, value: val, verify: true };
+  await powerCmd('HV_SET_BIT', extra);
   refreshHv();
 }
 function hvSelMask() { const m = [0, 0, 0, 0, 0, 0, 0, 0]; for (const k of hvSel) { const [c, b] = k.split('.').map(Number); m[c] |= (1 << b); } return m; }
 async function hvSelSet(val) {
-  for (const k of hvSel) { const [c, b] = k.split('.').map(Number); await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: val, verify: true }); }
+  const force = hvForceChecked();
+  for (const k of hvSel) {
+    const [c, b] = k.split('.').map(Number);
+    const extra = force ? { channel: c, bit: b, value: val, force: true }
+                        : { channel: c, bit: b, value: val, verify: true };
+    await powerCmd('HV_SET_BIT', extra);
+  }
   refreshHv();
 }
 // Pause/resume the target controller's background PING. The toggle test fires
