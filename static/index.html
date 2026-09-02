@@ -7,6 +7,10 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <div id="backendBanner" class="backend-banner" hidden>
+      <span class="backend-banner-dot"></span>
+      Backend offline — retrying…
+    </div>
     <main class="app">
       <header class="hero">
         <div>
@@ -211,11 +215,12 @@
           <details class="sch-section heat-plan" id="heatPlanDetails" open>
             <summary title="The GUI derives the heating layer from the emission schedule and checks settle.">Heating plan <span class="hint">— settle-checked</span></summary>
             <div class="heat-params">
-              <label class="numlabel" title="Thermal settle: how long a filament must sit at stable ACTIVE before its X-ray pulse. Larger = promote earlier.">T settle <input id="hsSettle" type="number" min="0" max="60000" value="1000" /><span class="u">ms</span></label>
+              <label class="numlabel" title="Thermal settle: how long a filament must sit at stable ACTIVE before its X-ray pulse. Larger = promote earlier.">T settle <input id="hsSettle" type="number" min="0" max="60000" value="4000" /><span class="u">ms</span></label>
               <label class="numlabel" title="Hold: stay ACTIVE this long after the last pulse before dropping back to IDLE (avoids re-cycling during a burst).">T hold <input id="hsHold" type="number" min="0" max="60000" value="200" /><span class="u">ms</span></label>
-              <label class="numlabel" title="Filaments ACTIVE at once = the collimator window + this many pre-heated ahead. More = longer pre-heat lead (needs ≥ T settle).">#&nbsp;active <input id="hsActive" type="number" min="1" max="96" value="40" /><span class="u">fil</span></label>
-              <label class="numlabel" title="Gantry rotation period — one full 96-angle turn. Sets the per-trigger time (≈ rotation ÷ total triggers).">rotation <input id="hsRot" type="number" min="100" max="600000" value="30000" /><span class="u">ms</span></label>
+              <label class="numlabel" title="Filaments ACTIVE at once = the collimator window + this many pre-heated ahead. More = longer pre-heat lead (needs ≥ T settle).">#&nbsp;active <input id="hsActive" type="number" min="1" max="96" value="43" /><span class="u">fil</span></label>
+              <label class="numlabel" title="Gantry rotation period — one full 96-angle turn. Sets the per-trigger time (≈ rotation ÷ total triggers). 300 s or more with small # active works well for development runs with low vacuum pump load.">rotation <input id="hsRotS" type="number" min="0.5" max="7200" value="30" step="0.5" /><span class="u">s</span></label>
             </div>
+
             <div id="planVerdict" class="plan-verdict"></div>
           </details>
           <details class="sch-section" id="filListDetails">
@@ -232,9 +237,20 @@
               <button id="filLoadBtn" class="xs">Load</button>
               <button id="schDetectPresent" class="xs" title="Scan the controller(s) for physically-present boards (enables isolated-12V so the INA219s power up, then reads them) and apply the result to the plan: present → live, absent → dead (✕). Rebuilds the schedule so it fires only real boards (no IsoOff at arm). Leaves boards at Sleep.">Detect present</button>
             </div>
-            <p class="fil-note hint">Currents download with the schedule.</p>
-            <div class="fil-list-head"><span>Fil</span><span>#Pul</span><span>Dur µs</span><span>Idle A</span><span>Act A</span></div>
+            <p class="fil-note hint">Currents download with the schedule. ○ No HV = heats only, no emission pulse. ◇ No heat = fires cold, no pre-heating.</p>
+            <div class="fil-list-head"><span>Fil</span><span>#Pul</span><span>Dur µs</span><span>Idle A</span><span>Act A</span><span title="Heat-only — no HV pulse">○ HV</span><span title="Fire cold — no heating deltas">◇ Heat</span></div>
             <div id="filList" class="fil-list"></div>
+          </details>
+          <details class="sch-section" id="filOrderDetails">
+            <summary>Filament order <span class="hint">— custom ring-position → filament mapping</span></summary>
+            <div class="fil-order-wrap">
+              <textarea id="filOrderInput" class="fil-order-input" rows="3" spellcheck="false" placeholder="Paste comma-separated filament indices 0–95 (up to 96 values). Position i in this list fires at ring step i. Leave blank for natural order (0, 1, 2 … 95)."></textarea>
+              <div class="fil-order-btns">
+                <button id="filOrderApply" class="xs quick">Apply</button>
+                <button id="filOrderReset" class="xs">Reset</button>
+                <span id="filOrderStatus" class="hint"></span>
+              </div>
+            </div>
           </details>
           <div class="sch-viewbar">
             <div class="seg sm" id="schViewSeg">
@@ -285,43 +301,47 @@
             <div class="section-head pc-head-bar">
               <h2 title="Two ESP32 bridges. The one that sees an STM32 is auto-selected master (owns HV/ADC) — click a master badge to override. Filament→power mapping is in the Mapping card.">Power Controllers</h2>
               <div class="pc-hbs">
-                <span class="pc-hb" data-ctrl="1"><span class="pc-hb-lbl">P1</span>
+                <span class="pc-hb" data-ctrl="1">
+                  <span class="dot offline" data-dot title="Power 1 connection status"></span>
+                  <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">M</button>
+                  <span class="pc-hb-lbl">P1</span>
                   <span class="hb idle" data-hb="rp" title="Power 1 — RP2350B controller heartbeat (PING on :3333)">RP&nbsp;♥</span>
                   <span class="hb idle" data-hb="stm" title="Power 1 — STM32 heartbeat (HTTP /stm32 age); the bridge that sees an STM32 becomes master">STM&nbsp;♥</span>
                 </span>
-                <span class="pc-hb" data-ctrl="2"><span class="pc-hb-lbl">P2</span>
+                <span class="pc-hb" data-ctrl="2">
+                  <span class="dot offline" data-dot title="Power 2 connection status"></span>
+                  <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">M</button>
+                  <span class="pc-hb-lbl">P2</span>
                   <span class="hb idle" data-hb="rp" title="Power 2 — RP2350B controller heartbeat (PING on :3333)">RP&nbsp;♥</span>
                   <span class="hb idle" data-hb="stm" title="Power 2 — STM32 heartbeat (HTTP /stm32 age); the bridge that sees an STM32 becomes master">STM&nbsp;♥</span>
                 </span>
               </div>
               <button id="scanBtn" class="sm" title="Scan finds ESP32 bridges on TCP :3333 (LAN + 192.168.4.0/24 AP) and fills the IP fields with distinct bridges.">Scan</button>
             </div>
-            <datalist id="bridgeHosts"></datalist>
+            <datalist id="bridgeHosts1"></datalist>
+            <datalist id="bridgeHosts2"></datalist>
 
             <div class="pc-2up">
               <div class="pc" data-ctrl="1">
-                <span class="dot offline" data-dot title="Power 1"></span>
-                <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">M</button>
-                <input data-host list="bridgeHosts" type="text" value="" placeholder="Power 1 IP — Scan" />
+                <input id="pcHost1" data-host list="bridgeHosts1" type="text" value="" placeholder="Power 1 IP" />
                 <button data-connect class="quick">Conn</button>
                 <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)" hidden></span>
               </div>
               <div class="pc" data-ctrl="2">
-                <span class="dot offline" data-dot title="Power 2"></span>
-                <button class="master-badge" data-master title="Master controller — carries the STM32 HV board. All STM32 / HV-monitor / ADC commands route here. Click to make this the master.">M</button>
-                <input data-host list="bridgeHosts" type="text" value="" placeholder="Power 2 IP — Scan" />
+                <input id="pcHost2" data-host list="bridgeHosts2" type="text" value="" placeholder="Power 2 IP" />
                 <button data-connect class="quick">Conn</button>
                 <span class="pc-ident hint" data-ident title="ESP32 AP SSID — derived from the board's factory MAC (unique per board)" hidden></span>
               </div>
             </div>
             <div id="scanHint" class="hint compact-hint"></div>
+            <div id="apiLockBadge" class="api-lock" title="Another program on this shared API holds the write lease. Reads keep working; your writes are refused until it releases (or its lease expires)." hidden></div>
           </section>
 
           <!-- Hardware run — own card: download · arm · trigger · scan prep -->
           <section class="card module hw-run-card" data-module="hwrun">
             <div class="section-head">
               <h2>Hardware Run</h2>
-              <label id="hwOverrideLbl" class="hw-override" title="Override the guided gate: enable every step button regardless of order (download / verify / prep / arm / trigger) for testing &amp; bring-up. The firmware still enforces its own safety (e.g. ISO/TPS arm rejects) — this only unlocks the UI."><input type="checkbox" id="hwOverride" /> Override</label>
+              <label id="hwOverrideLbl" class="hw-override" title="Override the guided gate: enable every step button regardless of order (download / verify / prep / arm / trigger) for testing &amp; bring-up. The firmware still enforces its own safety (e.g. ISO/TPS arm rejects) — this only unlocks the UI."><input type="checkbox" id="hwOverride" data-nostick /> Override</label>
             </div>
             <div id="hwOverrideNote" class="hw-override-note" hidden>⚠ Override on — all steps unlocked; firmware safety still applies.</div>
 
@@ -356,6 +376,8 @@
                 <span id="hwArmState" class="hw-armstate idle" title="Live schedule state (ShvGetStatus): Idle → Armed (waiting for SyncIn) → Running → Complete / Fault.">idle</span></div>
               <div class="hw-step-body">
                 <label class="numlabel" title="How many full gantry rotations (scans) to run. The schedule is ONE rotation; the firmware loops it this many times once armed. 1 = a single scan.">rotations <input id="hwRepeats" type="number" min="1" max="65535" value="1" /></label>
+                <label class="numlabel hw-fault-policy" title="ShvFaultPolicy board: when a board latches a CC open/OCP fault, continue scanning (record faulted slot) instead of stopping."><input type="checkbox" id="hwFaultContBoard" data-nostick /> Continue: board fault</label>
+                <label class="numlabel hw-fault-policy" title="ShvFaultPolicy mismatch: when an HC165 read-back disagrees with the commanded byte, continue scanning instead of stopping."><input type="checkbox" id="hwFaultContMismatch" data-nostick /> Continue: mismatch</label>
                 <button id="hwArmBtn" class="sm quick" title="Arm both controllers (ShvArm). Participants drop to IDLE and the controllers wait for the SyncIn trigger to start firing.">Arm</button>
                 <button id="hwDisarmBtn" class="sm" title="Disarm / stop the run (ShvDisarm). Aborts firing and returns participating filaments to IDLE.">Disarm</button>
               </div>
@@ -484,6 +506,15 @@
         <div id="i2cHealthHost"></div>
       </section>
     </main>
+
+    <!-- Plan mode: filament right-click state menu -->
+    <div id="filMenu" class="fil-menu" hidden>
+      <div class="fil-menu-title">Fil <span id="filMenuIdx">?</span></div>
+      <button id="filMenuEnable" title="Fire HV + heat normally">● Enable</button>
+      <button id="filMenuNoHv"   title="Heat-only: warms the cathode but no HV pulse in the emission schedule">○ No HV <span class="fil-menu-hint">heat only</span></button>
+      <button id="filMenuNoHeat" title="Cold-fire: HV pulse fires but no pre-heating deltas — filament stays at idle current">◇ No heat <span class="fil-menu-hint">fires cold</span></button>
+      <button id="filMenuDead"   title="Fully disabled: no HV pulse and no heating">✕ Disable</button>
+    </div>
 
     <!-- Debug: per-filament power/pulse editor (right-click the rings, or the
          Debug… button in the Selected Filament card) -->

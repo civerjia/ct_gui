@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import threading
 import time
 from http import HTTPStatus
@@ -25,10 +24,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-# reuse the WiFi GUI transport/protocol layer
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "wifi_gui"))
-from net_protocol import (  # noqa: E402
+from net_protocol import (
     BRIDGE_PORT,
+    TYPE_NAMES,
     TcpProtocolClient,
     build_command_payload,
     fetch_bridge_info,
@@ -37,6 +35,9 @@ from net_protocol import (  # noqa: E402
     sync_post_fire,
     sync_post_config,
     sync_post_abort,
+    sync_post_burst,
+    sync_get_burst_status,
+    sync_post_burst_stop,
     sync_get_status,
     adc_get_burst,
     adc_spi_shot_arm,
@@ -59,6 +60,7 @@ from net_protocol import (  # noqa: E402
     stm32_hv_enable_set,
     stm32_hv_status,
     stm32_ads1115,
+    stm32_adc_window,
     stm32_hv_set_target,
     stm32_hv_get_target,
     stm32_hv_clear_target,
@@ -101,6 +103,10 @@ def build_payload(command: str, b: dict):
         return 0x28, FLAG_SINGLE, bytes([ch, mux]) + _u16(int(b["threshold_mA"]))
     if command == "CH_GET_INA219":           # 0x24: ch,mux -> status,ch,mux,present,busMv16,mA16
         return 0x24, FLAG_SINGLE, bytes([ch, mux])
+    # NOTE: no single-board CH_GET_CACHED_CURRENTS here BY DESIGN. Cached currents
+    # are read in bulk via read_cached_currents_by_board / /api/cached-currents
+    # (one paged request for all boards). Never loop single-board reads — it floods
+    # the one shared bridge link and starves the CC loop.
     if command == "HV_GET_ALL_BYTES":        # 0x13: desired[8]+feedback[8]
         return 0x13, 0, b""
     if command == "HV_SET_BIT":              # 0x10: ch,bit,value,verifyMode
@@ -294,10 +300,12 @@ SHV_CAPABILITY = 0x7B
 SHV_HEAT_CLEAR = 0x7C
 SHV_HEAT_SET_ENTRIES = 0x7D
 SHV_HEAT_GET_INFO = 0x7E      # -> OK + u16 heatCount + u16 maxHeatEntries
+SHV_FAULT_POLICY = 0x81       # GET/SET board+mismatch policies; response has faulted-slots bitmask
 CH_FILAMENT_CURRENTS = 0x39
 CH_SET_POWER_STATE = 0x35        # ch,mux,state,arg16 (Idle/Active→mA, Voltage→mV)
 CH_SET_I2C_ENABLE_MASK = 0x34
 CH_GET_INA219 = 0x24
+CH_GET_CACHED_CURRENTS = 0x3A    # CC-loop cached currents, NO I2C (run-safe telemetry)
 CH_GET_PRESENT = 0x25            # I2C presence scan (mux/tps/ina/io per board)
 CH_GET_DIAGNOSIS = 0x2E         # deep diagnosis: addr-ACK / reg-read / operational
 CH_GET_I2C_ENABLE_MASK = 0x2F   # read the channel enable mask
@@ -600,6 +608,119 @@ def read_telemetry(link: "ControllerLink", controller: int, channels=None) -> di
         out[fil] = {"index": fil, **v}
     return out
 
+
+def read_cached_currents_by_board(link: "ControllerLink", channels) -> dict:
+    """Paged bulk read of the CC-loop CACHED currents (0x3A) over `channels`, keyed
+    by (channel, mux_port). NO I2C on the firmware side — it returns the currents the
+    current loop already measured — so this is SAFE to poll while a schedule is
+    firing (the live INA sweep is skipped then because it stalls pulses)."""
+    mask = bytearray(8)
+    for c in channels:
+        if 0 <= int(c) < 8:
+            mask[int(c)] = 0xFF
+    out: dict[tuple, dict] = {}
+    page_start, max_entries, guard = 0, 32, 0
+    while guard < 16:
+        guard += 1
+        payload = bytes(mask) + bytes([page_start & 0xFF, max_entries & 0xFF])
+        resp = link.request(CH_GET_CACHED_CURRENTS, payload, flags=0, timeout=1.5)
+        dec = resp.get("decoded") if isinstance(resp, dict) else None
+        entries = (dec or {}).get("entries", [])
+        total = (dec or {}).get("total_matching_entries", 0)
+        for e in entries:
+            out[(e.get("channel"), e.get("mux_port"))] = {
+                "mode": e.get("mode", 0),
+                "current_mA": e.get("measured_mA", 0),
+                "target_mA": e.get("target_mA", 0),
+            }
+        if not entries or len(out) >= total or len(entries) < max_entries:
+            break
+        page_start += len(entries)
+    return out
+
+
+def read_cached_telemetry(link: "ControllerLink", controller: int) -> dict:
+    """Per-FILAMENT CC-loop cached currents mapped to global filament 0-95. The
+    run-safe sibling of read_telemetry (no I2C). `present` is inferred from the CC
+    mode (a board the loop is regulating is present); bus_mV is unavailable here."""
+    out: dict[int, dict] = {}
+    for (ch, mux), v in read_cached_currents_by_board(link, MAPPING.channels_used(controller)).items():
+        fil = MAPPING.filament_for_board(controller, ch, mux)
+        if fil is None:
+            continue
+        # mode: 0 voltage, 1 current (Idle/Active), 2/3 fault. Regulated => present.
+        present = v.get("mode", 0) != 0
+        out[fil] = {"index": fil, "present": present, "bus_mV": 0,
+                    "current_mA": v.get("current_mA", 0), "target_mA": v.get("target_mA", 0),
+                    "cc_mode": v.get("mode", 0), "cached": True}
+    return out
+
+
+# ---- PUSHED telemetry (firmware -> host, no request) -------------------------
+# During a scan the firmware PUSHES EVENT_TELEMETRY frames (cached currents, no
+# I2C) every ~50 ms. The host just receives them (client._events) and reads the
+# latest — no request round-trip, so the live view can update at ~20 fps.
+SET_EVENT_CONFIG = 0x06
+EVENT_TELEMETRY_ENABLE_BIT = 0x08     # kEventEnableTelemetry (1<<3)
+TELEMETRY_MODE_CACHED = 2             # firmware kTelemetryModeCached
+SCAN_TELEMETRY_PERIOD_MS = 50         # ~20 fps push cadence
+_LIVE_PUSH: set = set()               # controllers (1-based) with the push enabled
+_PUSH_SAW_RUN = False                 # push tore-down only after a run actually started
+
+
+def set_scan_telemetry(link: "ControllerLink", controller: int, enable: bool) -> None:
+    """Enable/disable the firmware's CACHED telemetry PUSH for the high-fps live
+    view. Enable => push every used-channel board's cached current every 50 ms
+    (mode 2, no I2C). Disable => telemetry_mode 0 stops the push."""
+    try:
+        used = set(MAPPING.channels_used(controller))
+    except Exception:
+        used = set(range(6))
+    mask = [0xFF if c in used else 0 for c in range(8)]
+    if enable:
+        body = {"event_enable_bits": EVENT_TELEMETRY_ENABLE_BIT,
+                "telemetry_period_ms": SCAN_TELEMETRY_PERIOD_MS,
+                "telemetry_mode": TELEMETRY_MODE_CACHED, "board_mask": mask}
+    else:
+        body = {"event_enable_bits": 0, "telemetry_period_ms": 0,
+                "telemetry_mode": 0, "board_mask": mask}
+    try:
+        ft, flags, payload = build_command_payload("SET_EVENT_CONFIG", body)
+        link.client.send_request(ft, payload, flags=flags, timeout=1.5)
+    except Exception:
+        pass
+    global _PUSH_SAW_RUN
+    if enable:
+        _LIVE_PUSH.add(controller + 1)
+        _PUSH_SAW_RUN = False
+    else:
+        _LIVE_PUSH.discard(controller + 1)
+
+
+def read_pushed_telemetry(link: "ControllerLink", controller: int) -> dict:
+    """Per-FILAMENT snapshot assembled from the firmware-PUSHED EVENT_TELEMETRY
+    frames already RECEIVED (no request). Pages stream in order, so applying every
+    received page's entries (oldest->newest) leaves the newest value per board."""
+    board: dict[tuple, tuple] = {}
+    try:
+        events = link.client.events()
+    except Exception:
+        events = []
+    for ev in events:
+        if ev.get("type") != "EVENT_TELEMETRY":
+            continue
+        dec = ev.get("decoded") or {}
+        for e in dec.get("entries", []):
+            board[(e.get("channel"), e.get("mux_port"))] = (e.get("current_mA", 0), e.get("bus_mV", 0))
+    out: dict[int, dict] = {}
+    for (ch, mux), (mA, mv) in board.items():
+        fil = MAPPING.filament_for_board(controller, ch, mux)
+        if fil is None:
+            continue
+        out[fil] = {"index": fil, "present": True, "bus_mV": mv,
+                    "current_mA": mA, "pushed": True}
+    return out
+
 SHV_EMIT_CHUNK = 64    # emission entries per frame (64*4+3 = 259 B). Bigger chunks
                        # didn't help — the bottleneck is RP2350 per-frame service
                        # latency, not frame count (it processes a bigger frame
@@ -671,14 +792,23 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
     if op == "set_entries":
         entries = body.get("entries") or []
         ent = bytearray()
+        resolved = []
         for e in entries:
-            ent += bytes([int(e["filament"]) & 0xFF, int(e["numPulses"]) & 0xFF]) + _u16(int(e["width"]))
+            if "filament" in e:
+                fil = int(e["filament"]) & 0xFF
+            else:
+                # Board-coord entry: resolve (controller, channel, position) → global filament
+                ctrl = int(e.get("controller", 1)) - 1
+                slot = int(e.get("channel", 0)) * 8 + int(e.get("position", 0))
+                fil = MAPPING._board_to_fil.get((ctrl, slot), NO_FILAMENT)
+            resolved.append(fil)
+            ent += bytes([fil & 0xFF, int(e["numPulses"]) & 0xFF]) + _u16(int(e["width"]))
         ok = True
         for start in range(0, len(entries), SHV_EMIT_CHUNK):
             cnt = min(SHV_EMIT_CHUNK, len(entries) - start)
             payload = _u16(start) + bytes([cnt]) + bytes(ent[start * 4:(start + cnt) * 4])
             ok = _status_ok(link.request(SHV_SET_ENTRIES, payload)) and ok
-        return {"ok": ok, "count": len(entries)}
+        return {"ok": ok, "count": len(entries), "resolved": resolved}
     if op == "table_info":
         raw = link.request(SHV_GET_TABLE_INFO, b"").get("raw") or []
         if raw and raw[0] == 0 and len(raw) >= 7:
@@ -740,6 +870,24 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                 off += 3
             out["results"] = results
         return out
+    if op == "fault_policy":
+        # GET or SET the per-run fault policy (0=stop, 1=continue).
+        # Two independent policies: board (CC/OCP fault) and mismatch (HC165 read-back).
+        # Request body fields: board (optional int), mismatch (optional int).
+        # Response: {ok, board, mismatch, mismatchCount, faultedSlots (list of slot ints)}
+        payload = b""
+        if "board" in body:
+            payload = bytes([int(body["board"]) & 0x01])
+        if "mismatch" in body:
+            payload = (payload or bytes([0])) + bytes([int(body["mismatch"]) & 0x01])
+        raw = link.request(SHV_FAULT_POLICY, payload).get("raw") or []
+        # response: [status, board, mismatch, mismatch_count(4 LE), slots(8 LE)] = 14 bytes
+        if raw and raw[0] == 0 and len(raw) >= 15:
+            slots64 = _le(raw, 7, 8)
+            faulted = [i for i in range(64) if (slots64 >> i) & 1]
+            return {"ok": True, "board": raw[1], "mismatch": raw[2],
+                    "mismatchCount": _le(raw, 3, 4), "faultedSlots": faulted}
+        return {"ok": False}
     return {"ok": False, "error": "unknown op"}
 
 
@@ -774,6 +922,54 @@ def _hv_lut_path(chan: str) -> Path:
     channel; changing the master selects a different LUT."""
     ch = "focus" if str(chan).startswith("f") else "emission"
     return CALIB_DIR / f"hv_lut_p{MASTER}_{ch}.json"
+
+
+# Hardware full-scale: DS3502 wiper 127 → these output levels.
+_HV_FULL_V: dict[str, float] = {"emission": 350.0, "focus": 495.0}
+_HV_DS_CH:  dict[str, str]   = {"emission": "ev",  "focus": "fv"}
+_EM_I_FULL_MA = 85.7   # mA at wiper 127 on the "ei" DS3502 channel
+
+
+def _lut_wiper_for_v(chan: str, mag_v: float) -> tuple[int, float, str]:
+    """Interpolate target magnitude → (wiper, expect_v_signed, method).
+
+    Reads the calibrated LUT from disk when available; falls back to a linear
+    approximation using the hardware full-scale constant.  Same algorithm as
+    the GUI's lutWiperForV() / lutSetV() in tests.js.
+    """
+    fp = _hv_lut_path(chan)
+    lut = None
+    if fp.is_file():
+        try:
+            lut = json.loads(fp.read_text())
+        except (ValueError, OSError):
+            lut = None
+    if lut and isinstance(lut.get("points"), list) and len(lut["points"]) >= 2:
+        pts_raw = sorted(
+            [{"w": int(p["wiper"]), "m": abs(float(p["v"]))} for p in lut["points"]],
+            key=lambda p: p["w"],
+        )
+        mono: list[dict] = []
+        max_seen = -1.0
+        for p in pts_raw:
+            if p["m"] >= max_seen:
+                mono.append(p)
+                max_seen = p["m"]
+        sign = -1.0 if float(lut["points"][0]["v"]) < 0 else 1.0
+        T = abs(mag_v)
+        if T <= mono[0]["m"]:
+            return mono[0]["w"], sign * mono[0]["m"], "lut"
+        if T >= mono[-1]["m"]:
+            return mono[-1]["w"], sign * mono[-1]["m"], "lut(clamped)"
+        for i in range(len(mono) - 1):
+            a, b = mono[i], mono[i + 1]
+            if a["m"] <= T <= b["m"]:
+                f = 0.0 if b["m"] == a["m"] else (T - a["m"]) / (b["m"] - a["m"])
+                w = round(a["w"] + f * (b["w"] - a["w"]))
+                return w, sign * T, "lut"
+    full = _HV_FULL_V.get(chan, 350.0)
+    w = max(0, min(127, round(abs(mag_v) / full * 127)))
+    return w, -abs(mag_v), "linear(no-lut)"
 PING_TYPE = 0x01
 PING_PAYLOAD = (0xCAFEF00D).to_bytes(4, "little")
 POLL_PAUSE_MAX_S = 15.0   # max time a background-PING pause survives without a re-arm
@@ -941,6 +1137,134 @@ CONTROLLERS: dict[int, ControllerLink] = {
 MASTER = 1
 
 STAGED_SCHEDULE: list = []  # last schedule uploaded from the GUI
+
+# ---------------------------------------------------------------------------
+# Shared access — several programs, one bridge
+# ---------------------------------------------------------------------------
+# The ESP32 bridge is SINGLE-CLIENT: tcp_bridge.cpp accepts one socket on :3333
+# and hard-rejects every other connect, so only one process can ever own a
+# controller. This backend is that process — it owns both sockets, serializes
+# every frame on the link's request lock and routes responses by seq — so any
+# number of programs can share the hardware by speaking HTTP to this API
+# instead of grabbing :3333 for themselves (that is why the server binds all
+# interfaces and answers CORS: see main() and _json()).
+#
+# Reads are always free. Writes interleave frame-by-frame and are free too. A
+# program that needs a stretch of UNINTERRUPTED time (a schedule download, a
+# calibration sweep, an armed run) takes the cooperative LEASE below: while it
+# is held only the holder may write, everyone else gets 409 + who holds it.
+# The lease always expires on its own, so a client that crashes mid-run can
+# never wedge the bench.
+LOCK_TTL_DEFAULT_S = 30.0
+LOCK_TTL_MAX_S = 600.0
+
+_ACCESS_LOCK = threading.Lock()
+_LEASE: dict[str, Any] = {"owner": None, "expires": 0.0, "note": ""}
+_CLIENTS: dict[str, dict[str, Any]] = {}   # client id -> last-seen bookkeeping
+
+# POST paths that never reach the hardware link (pure host-side bookkeeping) or
+# must stay reachable while somebody holds the lease — coordination first.
+_UNGATED_POSTS = {
+    "/api/lock",
+    "/api/master",            # which controller is master: host-side routing only
+    "/api/schedule",          # stages the plan in this process
+    "/api/poll-pause",        # heartbeat hint, self-expiring, no hardware write
+    "/api/calibration/save",  # writes a host file
+    "/api/hv-lut/save",       # writes a host file
+    # Read-only hardware queries that happen to be POSTs. A lease reserves the
+    # right to CHANGE the hardware, not to look at it — so the GUI's background
+    # presence/diagnosis polling keeps working while a script drives the bench.
+    "/api/present",           # CH_GET_PRESENT     — I2C presence scan
+    "/api/diagnosis",         # CH_GET_DIAGNOSIS   — per-chip classification
+    "/api/tca9554-read",      # CH_READ_TCA9554    — expander registers
+    "/api/verify-schedule",   # ShvGetTableInfo / ShvHeatGetInfo readback
+}
+
+
+def _is_read_command(name: str) -> bool:
+    """True for the protocol commands that only READ (CH_GET_*, HV_GET_*,
+    ShvGetStatus, …). Those stay allowed while another client holds the lease —
+    a lease reserves the right to CHANGE the hardware, not to look at it."""
+    n = (name or "").upper()
+    if "SET" in n or "WRITE" in n or "CLEAR" in n:
+        return False
+    return "GET" in n or "READ" in n
+
+
+def _lease_snapshot() -> dict[str, Any]:
+    with _ACCESS_LOCK:
+        owner, left = _LEASE["owner"], _LEASE["expires"] - time.monotonic()
+        if not owner or left <= 0:
+            return {"held": False, "owner": None, "note": "", "expires_in_s": 0.0}
+        return {"held": True, "owner": owner, "note": _LEASE["note"],
+                "expires_in_s": round(left, 2)}
+
+
+def _lease_acquire(owner: str, ttl: float, note: str = "", steal: bool = False) -> bool:
+    """Take (or renew) the lease. The holder renewing always succeeds; another
+    client succeeds only once the current lease has expired — or with steal."""
+    ttl = max(1.0, min(float(ttl or LOCK_TTL_DEFAULT_S), LOCK_TTL_MAX_S))
+    with _ACCESS_LOCK:
+        cur, left = _LEASE["owner"], _LEASE["expires"] - time.monotonic()
+        if cur and cur != owner and left > 0 and not steal:
+            return False
+        _LEASE.update(owner=owner, expires=time.monotonic() + ttl, note=str(note or ""))
+        return True
+
+
+def _lease_release(owner: str, force: bool = False) -> bool:
+    with _ACCESS_LOCK:
+        if _LEASE["owner"] and _LEASE["owner"] != owner and not force:
+            return False
+        _LEASE.update(owner=None, expires=0.0, note="")
+        return True
+
+
+def _lease_blocking(owner: str) -> dict[str, Any] | None:
+    """The lease snapshot when someone ELSE holds it right now, else None."""
+    snap = _lease_snapshot()
+    return snap if snap["held"] and snap["owner"] != owner else None
+
+
+def _note_client(client: str, addr: str, path: str) -> None:
+    with _ACCESS_LOCK:
+        rec = _CLIENTS.setdefault(client, {"id": client, "requests": 0})
+        rec["requests"] += 1
+        rec["address"] = addr
+        rec["last_path"] = path
+        rec["last_seen"] = time.time()
+        if len(_CLIENTS) > 64:   # bench tool — keep the roster from growing forever
+            for k, v in sorted(_CLIENTS.items(), key=lambda kv: kv[1]["last_seen"])[:16]:
+                if k != client:
+                    _CLIENTS.pop(k, None)
+
+
+def _coerce_bytes(value: Any) -> bytes:
+    """Payload for /api/raw: hex string ('0a1b', '0a 1b', '0x0a,0x1b') or a byte list."""
+    if value is None or value == "":
+        return b""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, list):
+        return bytes(int(v) & 0xFF for v in value)
+    if isinstance(value, str):
+        s = value.replace("0x", "").replace(",", " ").strip()
+        if " " in s:
+            return bytes(int(p, 16) & 0xFF for p in s.split() if p)
+        if len(s) % 2:
+            raise ValueError("hex payload must have an even number of digits")
+        return bytes.fromhex(s)
+    raise ValueError("payload must be a hex string or a list of bytes")
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """Accept 0x79 / '0x79' / '121' / 121 — external callers write frame types
+    in whatever base the protocol doc uses."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return int(value, 0)
+    return int(value)
 
 # ---------------------------------------------------------------------------
 # Measurement recorder. A session records BOTH streams to host files while a
@@ -1111,28 +1435,166 @@ _SIM_STATE: dict = {"running": False, "fired": 0, "count": 0, "stop": False, "co
 _SIM_LOCK = threading.Lock()
 
 
+class RunRecorder:
+    """Accumulates per-filament heating feedback during a schedule run so an
+    end-of-run report can confirm each filament that fired actually reached its
+    ACTIVE current. Fed from /api/telemetry (piggybacks the existing poll — no
+    extra bridge traffic); during a run those samples are the CC-loop CACHED
+    currents (no I2C). A filament counts as CONFIRMED if its peak measured current
+    came within CONFIRM_MARGIN_MA of the active setpoint it was commanded to."""
+    CONFIRM_MARGIN_MA = 150       # peak within this of the active target = confirmed
+    ACTIVE_MIN_TARGET_MA = 2000   # a commanded target >= this means "was driven ACTIVE"
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.active = False
+        self.started = 0.0
+        self.peak: dict[int, int] = {}    # filament -> peak measured mA over the run
+        self.last: dict[int, int] = {}
+        self.tgt: dict[int, int] = {}     # filament -> peak commanded target mA (= active setpoint)
+        self.samples = 0
+        self.expect: set[int] = set()
+        self.active_mA = 2900
+        self.report: dict | None = None
+
+    def start(self, expect=None, active_mA: int = 2900) -> None:
+        with self._lock:
+            self.active = True
+            self.started = time.time()
+            self.peak, self.last, self.tgt = {}, {}, {}
+            self.samples = 0
+            self.expect = set(int(x) for x in (expect or []))
+            self.active_mA = int(active_mA or 2900)
+            self.report = None
+
+    def observe(self, rows) -> None:
+        with self._lock:
+            if not self.active:
+                return
+            self.samples += 1
+            for r in rows:
+                fil = r.get("index")
+                if fil is None:
+                    continue
+                mA = int(r.get("current_mA") or 0)
+                self.last[fil] = mA
+                if mA > self.peak.get(fil, -1 << 30):
+                    self.peak[fil] = mA
+                tg = int(r.get("target_mA") or 0)
+                if tg > self.tgt.get(fil, 0):
+                    self.tgt[fil] = tg   # max target seen = the ACTIVE setpoint
+
+    def stop(self) -> dict | None:
+        with self._lock:
+            if not self.active:
+                return self.report
+            self.active = False
+            self.report = self._finalize()
+        _write_run_report(self.report)
+        return self.report
+
+    def _finalize(self) -> dict:
+        rows = []
+        for fil in sorted(set(self.peak) | self.expect):
+            peak = self.peak.get(fil, 0)
+            ptgt = self.tgt.get(fil, 0)
+            was_active = (fil in self.expect) or (ptgt >= self.ACTIVE_MIN_TARGET_MA)
+            aim = ptgt if ptgt >= self.ACTIVE_MIN_TARGET_MA else self.active_mA
+            confirmed = was_active and peak >= (aim - self.CONFIRM_MARGIN_MA)
+            rows.append({"filament": fil, "expected": fil in self.expect,
+                         "was_active": was_active, "peak_mA": peak,
+                         "last_mA": self.last.get(fil, 0), "aim_mA": aim,
+                         "confirmed": bool(confirmed)})
+        active_rows = [r for r in rows if r["was_active"]]
+        confirmed = [r for r in active_rows if r["confirmed"]]
+        missing = [r["filament"] for r in active_rows if not r["confirmed"]]
+        return {
+            "generated": time.time(),
+            "duration_s": round(time.time() - self.started, 1),
+            "samples": self.samples,
+            "n_active": len(active_rows),
+            "n_confirmed": len(confirmed),
+            "missing": missing,
+            "rows": rows,
+        }
+
+    def status(self) -> dict:
+        with self._lock:
+            return {"active": self.active, "samples": self.samples,
+                    "n_tracked": len(self.peak), "report": self.report}
+
+
+RUN_RECORDER = RunRecorder()
+
+
+def _write_run_report(report: dict | None) -> None:
+    """Persist the run report as a human-readable text file next to the backend."""
+    if not report:
+        return
+    try:
+        d = Path(__file__).resolve().parent / "run_reports"
+        d.mkdir(exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(report.get("generated", time.time())))
+        lines = [f"RUN POWER-STATE REPORT  {ts}",
+                 f"duration {report['duration_s']}s · {report['samples']} samples · "
+                 f"{report['n_confirmed']}/{report['n_active']} active filaments confirmed >= target-"
+                 f"{RunRecorder.CONFIRM_MARGIN_MA}mA",
+                 ""]
+        if report["missing"]:
+            lines.append(f"!! NOT CONFIRMED ACTIVE: {report['missing']}")
+            lines.append("")
+        lines.append(" fil  expected  peak mA  last mA  aim mA  verdict")
+        for r in report["rows"]:
+            if not r["was_active"] and not r["expected"]:
+                continue
+            lines.append(f" {r['filament']:>3}  {('yes' if r['expected'] else '  -'):>8}  "
+                         f"{r['peak_mA']:>7}  {r['last_mA']:>7}  {r['aim_mA']:>6}  "
+                         f"{'OK' if r['confirmed'] else 'MISS !!'}")
+        (d / f"run_{ts}.txt").write_text("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) -> None:
     # running/count/stop already claimed by the caller under _SIM_LOCK (atomic start).
-    interval_s = interval_ms / 1000.0
-    start = time.monotonic()
+    # HARDWARE-timed trigger train: ONE call arms the ESP32 esp_timer, which clocks
+    # every pulse at the real rate. The host does NOT pace pulses — it only polls
+    # progress. (The old HTTP-per-pulse loop ran ~4.6x too slow: 47 ms/pulse instead
+    # of the real ~10 ms, which stretched the whole scan and tripped TotalTimeout.)
+    rate_hz = int(round(1000.0 / interval_ms)) if interval_ms > 0 else 1000
+    if rate_hz < 1:
+        rate_hz = 1
     try:
-        for i in range(count):
+        r = sync_post_burst(host, count, rate_hz, timeout=3.0)
+        if not r.get("ok"):
+            return
+        time.sleep(0.3)   # let the train start before the first status poll
+        while True:
             with _SIM_LOCK:
                 if _SIM_STATE["stop"]:
+                    try:
+                        sync_post_burst_stop(host, timeout=1.5)
+                    except Exception:
+                        pass
                     break
-            sync_post_fire(host)   # a dropped fire is tolerated (schedule has interPulseMs slack)
+            st = {}
+            try:
+                st = sync_get_burst_status(host, timeout=1.5)
+            except Exception:
+                pass
             with _SIM_LOCK:
-                _SIM_STATE["fired"] = i + 1
-            if interval_s > 0:
-                # Pace against a WALL-CLOCK deadline so the whole train spans ~duration
-                # even though each fire itself costs bridge round-trip time (a fixed
-                # per-iteration sleep would add the fire time on top and overrun).
-                delay = (start + (i + 1) * interval_s) - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
+                _SIM_STATE["fired"] = int(st.get("fired", _SIM_STATE.get("fired", 0)))
+            if not st.get("running", False):
+                break   # train finished (all pulses fired) or was stopped
+            time.sleep(0.3)
     finally:
         with _SIM_LOCK:
             _SIM_STATE["running"] = False
+        # Stop the telemetry push and finalize the power-state report.
+        for c2, l2 in CONTROLLERS.items():
+            if c2 in _LIVE_PUSH and l2.client.connected:
+                set_scan_telemetry(l2, c2 - 1, False)
+        RUN_RECORDER.stop()
 
 
 def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
@@ -1146,9 +1608,10 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     t_all = time.monotonic()
     reqs: list = []      # (frame_type, payload, flags) in send order
     labels: list = []
+    cur_fil: list = []   # filament index for each req slot (None for non-current frames)
 
-    reqs.append((SHV_SET_ACTIVE_LIST, MAPPING.active_list(controller), 0)); labels.append("active_list")
-    reqs.append((CH_SET_I2C_ENABLE_MASK, bytes([MAPPING.channel_mask(controller) & 0xFF]), 0)); labels.append("mask")
+    reqs.append((SHV_SET_ACTIVE_LIST, MAPPING.active_list(controller), 0)); labels.append("active_list"); cur_fil.append(None)
+    reqs.append((CH_SET_I2C_ENABLE_MASK, bytes([MAPPING.channel_mask(controller) & 0xFF]), 0)); labels.append("mask"); cur_fil.append(None)
 
     # Per-filament currents — the ~48 frames/controller that DOMINATE the download.
     # Skip any whose (idle, active) matches what we last downloaded to this controller
@@ -1173,16 +1636,16 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
         reqs.append((CH_FILAMENT_CURRENTS,
                      bytes([ch, pos]) + _u16(val[0]) + _u16(val[1]),
                      FLAG_SINGLE))
-        labels.append("currents")
+        labels.append("currents"); cur_fil.append(f)
 
     cfg = plan.get("config") or {}
     reqs.append((SHV_SET_CONFIG,
                  _u32(int(cfg.get("interPulseMs", 3000))) + _u16(int(cfg.get("maxOnMs", 40)))
                  + _u32(int(cfg.get("totalMs", 60000))) + bytes([int(cfg.get("triggerEdge", 0)) & 0xFF]), 0))
-    labels.append("config")
+    labels.append("config"); cur_fil.append(None)
 
     # emission table — full global list (entry carries global filament 0-95)
-    reqs.append((SHV_CLEAR_TABLE, b"", 0)); labels.append("emit_clear")
+    reqs.append((SHV_CLEAR_TABLE, b"", 0)); labels.append("emit_clear"); cur_fil.append(None)
     emit = plan.get("emission") or []
     ent = bytearray()
     for e in emit:
@@ -1193,10 +1656,10 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
         count = min(SHV_EMIT_CHUNK, n - start)
         emit_frames += 1
         reqs.append((SHV_SET_ENTRIES, _u16(start) + bytes([count]) + bytes(ent[start * 4:(start + count) * 4]), 0))
-        labels.append("emit")
+        labels.append("emit"); cur_fil.append(None)
 
     # heating deltas — only THIS controller's filaments (local ch, pos)
-    reqs.append((SHV_HEAT_CLEAR, b"", 0)); labels.append("heat_clear")
+    reqs.append((SHV_HEAT_CLEAR, b"", 0)); labels.append("heat_clear"); cur_fil.append(None)
     heat = [h for h in (plan.get("heating") or [])
             if filament_to_board(int(h["filament"]))[0] == controller]
     heat.sort(key=lambda h: int(h["triggerIndex"]))
@@ -1209,7 +1672,7 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     for start in range(0, hn, SHV_HEAT_CHUNK):
         count = min(SHV_HEAT_CHUNK, hn - start)
         reqs.append((SHV_HEAT_SET_ENTRIES, _u16(start) + bytes([count]) + bytes(hent[start * 8:(start + count) * 8]), 0))
-        labels.append("heat")
+        labels.append("heat"); cur_fil.append(None)
 
     total = len(reqs)
 
@@ -1218,6 +1681,10 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
             _DL_PROGRESS[controller] = {"phase": "pipelined", "done": d, "total": total}
 
     _on_prog(0)
+    # Pause the background PING for this link while we own the bridge exclusively.
+    # The PING competes for _request_lock every 1 s and stalls download frames for
+    # up to 0.6 s each time it fires — pausing eliminates that dead time.
+    link.set_poll_paused(True)
     # Pipeline depth: a deep window (8) overwhelms the ESP32 bridge's buffering on a
     # slow/variable link — frames execute on the RP2350 but their ACKs come back after
     # the per-frame deadline, so the pipeline false-fails them and serial-retries at 3 s
@@ -1249,25 +1716,29 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     fails = [labels[i] for i, x in enumerate(oks) if not x]
     ok = not fails
 
-    # Refresh the currents cache to firmware truth. On full success the firmware now
-    # holds `want` (sent + skipped). On ANY failure clear it so the next download
-    # re-sends every current (correctness over speed).
+    # Refresh the currents cache to firmware truth. On full success the firmware
+    # holds `want` (sent + skipped). On partial failure, only evict the filaments
+    # whose current frames actually failed — the rest are still good in firmware.
+    failed_fils = {cur_fil[i] for i, x in enumerate(oks) if not x and cur_fil[i] is not None}
     with _DL_LOCK:
-        if ok:
-            _DL_CURRENTS_CACHE[controller] = want
-        else:
-            _DL_CURRENTS_CACHE.pop(controller, None)
+        merged = dict(_DL_CURRENTS_CACHE.get(controller, {}))
+        merged.update(want)                          # promote sent+skipped to cache truth
+        for f in failed_fils:
+            merged.pop(f, None)                      # evict only the frames that failed
+        _DL_CURRENTS_CACHE[controller] = merged
 
+    link.set_poll_paused(False)
     total_ms = round((time.monotonic() - t_all) * 1000)
     with _DL_LOCK:
         _DL_PROGRESS[controller] = {"phase": "done", "done": total, "total": total}
     per_frame = total_ms / max(1, total)
-    print(f"[download] P{controller + 1} (pipelined, w=8): {total_ms} ms, {total} frames "
+    print(f"[download] P{controller + 1}: {total_ms} ms, {total} frames "
           f"({per_frame:.0f} ms/frame) | currents {cur_n}f (+{cur_skipped} cached) · emit {emit_frames}f · heat {hn // SHV_HEAT_CHUNK + 1}f"
           + (f" · {len(fails)} FAILED: {fails[:6]}" if fails else ""), flush=True)
 
     return {"controller": controller, "ok": ok, "emit": n, "heat": hn,
-            "frames": total, "fails": len(fails),
+            "frames": total, "curSent": cur_n, "curCached": cur_skipped,
+            "fails": len(fails), "failLabels": fails[:12],
             "timing": {"total": total_ms}}
 
 
@@ -1363,18 +1834,52 @@ class CtHandler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         pass
 
+    # CORS preflight — other programs (and pages served from another origin)
+    # call this API directly; the bridge itself is already open on the LAN.
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._cors_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     # --- GET ----------------------------------------------------------------
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path.startswith("/api/"):
+            _note_client(self._client(), self.client_address[0], path)
         if path == "/api/geometry":
             self._json(GEOMETRY)
         elif path == "/api/scan":
             self._json({"results": do_scan()})
+        elif path == "/api/lock":
+            # Who (if anyone) currently holds the exclusive-write lease.
+            self._json({"ok": True, "lock": _lease_snapshot(), "you": self._client()})
+        elif path == "/api/clients":
+            # Everyone that has called this API recently — so a program can see
+            # it is not alone on the bench before it starts driving hardware.
+            with _ACCESS_LOCK:
+                clients = sorted(_CLIENTS.values(), key=lambda r: r["last_seen"], reverse=True)
+                clients = [dict(r, idle_s=round(time.time() - r["last_seen"], 1)) for r in clients]
+            self._json({"ok": True, "you": self._client(), "clients": clients,
+                        "lock": _lease_snapshot()})
         elif path == "/api/status":
             self._json({"controllers": {str(k): c.status() for k, c in CONTROLLERS.items()},
-                        "master": MASTER})
+                        "master": MASTER, "lock": _lease_snapshot(), "you": self._client()})
         elif path == "/api/mapping":
             self._json({"ok": True, "mapping": MAPPING.as_dict()})
+        elif path == "/api/telemetry" and _LIVE_PUSH:
+            # PUSH mode (during a scan): the firmware streams cached currents every
+            # ~50 ms; we assemble the snapshot from RECEIVED events with NO request,
+            # so the frontend can poll this at ~20 fps. Geometry/firing come from the
+            # separate /api/run-status poll. Synthetic run state keeps the live view fast.
+            rows: dict[int, dict] = {}
+            for cid in list(_LIVE_PUSH):
+                link = CONTROLLERS.get(cid)
+                if link and link.client.connected:
+                    rows.update(read_pushed_telemetry(link, cid - 1))
+            RUN_RECORDER.observe(rows.values())
+            self._json({"telemetry": list(rows.values()), "firing": [],
+                        "run": {str(c): {"state": 2} for c in _LIVE_PUSH}})
         elif path == "/api/telemetry":
             # Real per-filament telemetry for the ring: batch INA219 (V/I) per
             # connected controller, merged by the board map. Plus the live firing
@@ -1397,14 +1902,28 @@ class CtHandler(BaseHTTPRequestHandler):
                             firing.append(fi)
                 except Exception:
                     pass
-                # Skip the INA mux sweep while firing — it shares the I2C bus and
-                # would stall pulses (simple_hv_schedule_design.md). ShvGetStatus
-                # carries the firing filament during a run.
-                if not running:
-                    try:
+                # While firing, DON'T do the live INA mux sweep — it shares the I2C
+                # bus and stalls pulses. Instead read the CC-loop CACHED currents
+                # (0x3A, no I2C) so the ring still shows real heating feedback and we
+                # can verify power states during the run. Idle => full live INA read.
+                try:
+                    if running:
+                        rows.update(read_cached_telemetry(link, cid - 1))
+                    else:
                         rows.update(read_telemetry(link, cid - 1))
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
+            # Feed the run recorder so an end-of-run report can confirm each active
+            # filament actually reached its target current. Auto start on the first
+            # running poll (if a sim didn't already start it with the scheduled set)
+            # and auto finalize when the run ends.
+            running_now = any(s and s.get("state") == 2 for s in run_state.values())
+            if running_now:
+                if not RUN_RECORDER.active:
+                    RUN_RECORDER.start()
+                RUN_RECORDER.observe(rows.values())
+            elif RUN_RECORDER.active:
+                RUN_RECORDER.stop()
             self._json({"telemetry": list(rows.values()), "firing": firing, "run": run_state})
         elif path == "/api/board-snapshot":
             # 64-board matrix for the selected controller (?controller=N).
@@ -1564,6 +2083,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 data = fpath.read_bytes()
                 ctype = "text/csv" if name.endswith(".csv") else "application/octet-stream"
                 self.send_response(HTTPStatus.OK)
+                self._cors_headers()
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Disposition", f"attachment; filename={name}")
                 self.send_header("Content-Length", str(len(data)))
@@ -1572,9 +2092,16 @@ class CtHandler(BaseHTTPRequestHandler):
         elif path == "/api/stm32/ads1115":
             host, err = self._master_host()
             self._json({"ok": False, "error": err} if err else stm32_ads1115(host))
+        elif path == "/api/stm32/adc-window":
+            host, err = self._master_host()
+            n = int(self._query().get("n", "1000"))
+            self._json({"ok": False, "error": err} if err else stm32_adc_window(host, n))
         elif path == "/api/stm32/hv-status":
             host, err = self._master_host()
-            self._json({"ok": False, "error": err} if err else stm32_hv_status(host))
+            if err:
+                self._json({"ok": False, "error": err})
+            else:
+                self._json(stm32_hv_status(host))
         elif path == "/api/stm32/ds3502":
             host, err = self._master_host()
             self._json({"ok": False, "error": err} if err else stm32_ds3502_get(host, self._query().get("ch", "ev")))
@@ -1606,6 +2133,23 @@ class CtHandler(BaseHTTPRequestHandler):
             # Scan-simulation fire progress (the GUI polls this while it runs).
             with _SIM_LOCK:
                 self._json({"ok": True, **_SIM_STATE})
+        elif path == "/api/run-report":
+            # Power-state verification: live tracking while a run is active, and the
+            # finalized report (per filament: peak current vs active target) after.
+            self._json({"ok": True, **RUN_RECORDER.status()})
+        elif path == "/api/cached-currents":
+            # ONE paged bulk read (0x3A, no I2C) of CC-loop cached currents per
+            # controller — the gentle way to read all boards. NEVER poll single-board.
+            out = {}
+            for cid, link in CONTROLLERS.items():
+                if not link.client.connected:
+                    continue
+                try:
+                    boards = read_cached_currents_by_board(link, MAPPING.channels_used(cid - 1))
+                    out[str(cid)] = [{"channel": c, "mux": m, **v} for (c, m), v in sorted(boards.items())]
+                except Exception as exc:
+                    out[str(cid)] = {"error": str(exc)}
+            self._json({"ok": True, "controllers": out})
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
@@ -1622,6 +2166,20 @@ class CtHandler(BaseHTTPRequestHandler):
                     out[str(k)] = {"connected": True, "status": st, "rp_age_ms": rp_age}
                 except Exception as exc:
                     out[str(k)] = {"connected": True, "error": str(exc), "rp_age_ms": rp_age}
+            # Universal push teardown: tear the push down once the run has actually
+            # STARTED (state 2 seen) and then stopped — guards the Armed-but-not-yet-
+            # firing window right after enable. pollRunStatus polls this throughout.
+            global _PUSH_SAW_RUN
+            if _LIVE_PUSH:
+                any_running = any((v.get("status") or {}).get("state") == 2 for v in out.values())
+                if any_running:
+                    _PUSH_SAW_RUN = True
+                elif _PUSH_SAW_RUN:
+                    for c2 in list(_LIVE_PUSH):
+                        l2 = CONTROLLERS.get(c2)
+                        if l2 and l2.client.connected:
+                            set_scan_telemetry(l2, c2 - 1, False)
+                    _PUSH_SAW_RUN = False
             self._json({"controllers": out})
         else:
             self._serve_static(path)
@@ -1631,8 +2189,63 @@ class CtHandler(BaseHTTPRequestHandler):
         global SCAN_MASK   # read (diagnosis branch) + written (channel-mask branch)
         path = self.path.split("?", 1)[0]
         body = self._read_json()
+        client = self._client(body)
+        _note_client(client, self.client_address[0], path)
+        held = self._lease_guard(path, body, client)
+        if held is not None:
+            return self._json(
+                {"ok": False, "error": f"another client holds the write lease: {held['owner']}"
+                                       + (f" ({held['note']})" if held["note"] else ""),
+                 "lock": held},
+                HTTPStatus.CONFLICT)
         try:
-            if path == "/api/connect":
+            if path == "/api/lock":
+                # Cooperative exclusive-write lease. {action: acquire|renew|release|
+                # status, ttl, note, steal} — acquire and renew are the same call.
+                action = str(body.get("action", "acquire")).lower()
+                if action in ("acquire", "renew", "lock", "release", "unlock") and client.startswith("anon@"):
+                    # Two unnamed programs on the SAME machine would share the
+                    # address-derived identity — one could then renew or release
+                    # the other's lease, or slip a write past it. Holding the
+                    # lease therefore requires saying who you are.
+                    return self._json(
+                        {"ok": False, "error": "identify yourself to use the lease: send an "
+                                               "X-CT-Client header or a \"client\" field",
+                         "you": client, "lock": _lease_snapshot()},
+                        HTTPStatus.BAD_REQUEST)
+                if action in ("acquire", "renew", "lock"):
+                    ok = _lease_acquire(client, body.get("ttl", LOCK_TTL_DEFAULT_S),
+                                        body.get("note", ""), steal=bool(body.get("steal")))
+                    self._json({"ok": ok, "lock": _lease_snapshot(), "you": client,
+                                **({} if ok else {"error": "held by another client"})},
+                               HTTPStatus.OK if ok else HTTPStatus.CONFLICT)
+                elif action in ("release", "unlock"):
+                    ok = _lease_release(client, force=bool(body.get("steal")))
+                    self._json({"ok": ok, "lock": _lease_snapshot(), "you": client,
+                                **({} if ok else {"error": "held by another client"})})
+                else:
+                    self._json({"ok": True, "lock": _lease_snapshot(), "you": client})
+            elif path == "/api/raw":
+                # Generic frame passthrough: full RP2350B protocol access for
+                # programs that need a command this backend has no builder for.
+                # {controller, type: 0x79|"0x79", payload: "hex"|[bytes], flags, timeout}
+                cid = int(body.get("controller", 0))
+                link = CONTROLLERS.get(cid)
+                if not link:
+                    return self._json({"ok": False, "error": "bad controller"}, HTTPStatus.OK)
+                if not link.client.connected:
+                    return self._json({"ok": False, "error": f"{link.name} not connected"}, HTTPStatus.OK)
+                try:
+                    ftype = _coerce_int(body.get("type", body.get("frame_type")))
+                    payload = _coerce_bytes(body.get("payload"))
+                    resp = link.client.send_request(
+                        ftype, payload, flags=_coerce_int(body.get("flags"), 0),
+                        timeout=float(body.get("timeout", 2.0)))
+                    self._json({"ok": True, "type": ftype, "name": TYPE_NAMES.get(ftype),
+                                "response": resp})
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
+            elif path == "/api/connect":
                 cid = int(body.get("controller", 0))
                 link = CONTROLLERS.get(cid)
                 if not link:
@@ -1740,6 +2353,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     try:
                         results.append(download_to_controller(link, cid - 1, plan, channels))
                     except Exception as exc:
+                        link.set_poll_paused(False)   # ensure poll resumes even on exception
                         results.append({"controller": cid - 1, "ok": False, "error": str(exc)})
                 if not results:
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
@@ -2060,6 +2674,45 @@ class CtHandler(BaseHTTPRequestHandler):
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(stm32_ds3502_set(host, str(body.get("ch", "ev")), int(body.get("wiper", 0))))
+            elif path == "/api/hv/set-v":
+                # LUT-based voltage set: chan=emission|focus, volts=magnitude.
+                # Loads the calibrated wiper→V LUT, interpolates, writes DS3502.
+                # Falls back to linear approximation when no LUT is available.
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                raw_chan = str(body.get("chan", "emission"))
+                chan = "focus" if raw_chan.startswith("f") else "emission"
+                try:
+                    mag_v = abs(float(body.get("volts", 0)))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "invalid volts"}, HTTPStatus.OK)
+                wiper, expect_v, method = _lut_wiper_for_v(chan, mag_v)
+                r = stm32_ds3502_set(host, _HV_DS_CH[chan], wiper)
+                ok = r.get("ok", False)
+                out: dict = {"ok": ok, "chan": chan, "wiper": wiper,
+                             "expect_v": round(expect_v, 1), "method": method}
+                if not ok:
+                    out["error"] = r.get("error") or "DS3502 write failed"
+                self._json(out)
+            elif path == "/api/hv/set-i":
+                # Linear emission-current set: ma=target mA (0–85.7).
+                # DS3502 "ei" wiper is linearly proportional to current reference.
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                try:
+                    ma = abs(float(body.get("ma", 0)))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "invalid ma"}, HTTPStatus.OK)
+                wiper = max(0, min(127, round(ma / _EM_I_FULL_MA * 127)))
+                r = stm32_ds3502_set(host, "ei", wiper)
+                ok = r.get("ok", False)
+                out2: dict = {"ok": ok, "wiper": wiper,
+                              "expect_ma": round(wiper / 127 * _EM_I_FULL_MA, 2)}
+                if not ok:
+                    out2["error"] = r.get("error") or "DS3502 write failed"
+                self._json(out2)
             elif path == "/api/stm32/hv-enable":
                 host, err = self._master_host()
                 if err:
@@ -2129,6 +2782,15 @@ class CtHandler(BaseHTTPRequestHandler):
                     # Claim it ATOMICALLY here (not inside the thread) so two near-
                     # simultaneous starts can't both pass the guard and double-fire.
                     _SIM_STATE.update(running=True, fired=0, count=count, stop=False, controller=cid)
+                # Arm the run recorder with the scheduled filament set so the report
+                # can flag any that were scheduled but never reached ACTIVE.
+                RUN_RECORDER.start(expect=body.get("expect"),
+                                   active_mA=int(body.get("active_mA", 2900)))
+                # Turn on the firmware's CACHED telemetry PUSH (~20 fps, no I2C) on
+                # every connected controller so the live view streams during the scan.
+                for c2, l2 in CONTROLLERS.items():
+                    if l2.client.connected:
+                        set_scan_telemetry(l2, c2 - 1, True)
                 threading.Thread(target=_run_scan_sim, args=(link.host, count, interval_ms, cid),
                                  daemon=True).start()
                 self._json({"ok": True, "count": count, "interval_ms": interval_ms, "controller": cid})
@@ -2141,6 +2803,30 @@ class CtHandler(BaseHTTPRequestHandler):
                 if not link or not link.client.connected:
                     return self._json({"ok": False, "error": "controller not connected"}, HTTPStatus.OK)
                 self._json(shv_op(link, body))
+            elif path == "/api/hv-diag165":
+                # Raw 165 readback diagnostic (HvDiag165 0x7F).
+                # body: {controller, channel, test_byte, settle_ms}
+                # response: {ok, channel, test_byte, r0, r1, r2, r3, status}
+                cid = int(body.get("controller", 1))
+                link = CONTROLLERS.get(cid)
+                if not link or not link.client.connected:
+                    return self._json({"ok": False, "error": "controller not connected"}, HTTPStatus.OK)
+                channel = int(body.get("channel", 0))
+                test_byte = int(body.get("test_byte", 0x55))
+                settle_ms = int(body.get("settle_ms", 5))
+                settle_ms = max(0, min(settle_ms, 100))
+                payload = bytes([channel & 0xFF, test_byte & 0xFF, settle_ms & 0xFF])
+                raw = link.request(0x7F, payload, flags=0, timeout=2.0 + settle_ms * 4 / 1000).get("raw") or []
+                if not raw or raw[0] != 0x00:
+                    status_byte = raw[0] if raw else 0xFF
+                    return self._json({"ok": False, "status": status_byte, "raw": raw}, HTTPStatus.OK)
+                self._json({"ok": True, "status": 0,
+                            "channel": raw[1] if len(raw) > 1 else channel,
+                            "test_byte": raw[2] if len(raw) > 2 else test_byte,
+                            "r0": raw[3] if len(raw) > 3 else None,
+                            "r1": raw[4] if len(raw) > 4 else None,
+                            "r2": raw[5] if len(raw) > 5 else None,
+                            "r3": raw[6] if len(raw) > 6 else None})
             elif path == "/api/schedule":
                 # Stage the scan schedule. For now we just validate + retain it;
                 # streaming it to the RP2350B schedule table (0x70-0x7B) lands
@@ -2157,6 +2843,34 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
 
     # --- helpers ------------------------------------------------------------
+    def _client(self, body: dict[str, Any] | None = None) -> str:
+        """Who is calling. Programs identify themselves with an `X-CT-Client`
+        header (or a `client` field in the body) so the lease can tell them
+        apart; anything anonymous is identified by its address, which is enough
+        for /api/clients and for a lease taken by an ad-hoc script."""
+        cid = self.headers.get("X-CT-Client") or (body or {}).get("client")
+        cid = str(cid).strip() if cid else ""
+        return cid[:64] if cid else f"anon@{self.client_address[0]}"
+
+    def _lease_guard(self, path: str, body: dict[str, Any], client: str):
+        """None when this POST may proceed, else the blocking lease snapshot.
+        Only WRITES are gated: /api/cmd and /api/power-cmd carrying a read-only
+        command pass, as does anything that never touches the link."""
+        if path in _UNGATED_POSTS:
+            return None
+        held = _lease_blocking(client)
+        if held is None:
+            return None
+        if path in ("/api/cmd", "/api/power-cmd") and _is_read_command(body.get("command", "")):
+            return None
+        return held
+
+    def _cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-CT-Client")
+        self.send_header("Access-Control-Max-Age", "600")
+
     def _query(self) -> dict[str, str]:
         q = self.path.split("?", 1)
         out: dict[str, str] = {}
@@ -2199,6 +2913,7 @@ class CtHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
         self.end_headers()
         with _suppress():
             self.wfile.write(data)
@@ -2226,10 +2941,16 @@ class CtHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    host = os.environ.get("CT_GUI_HOST", "127.0.0.1")
+    # Bind all interfaces by default: this process owns the single-client bridge
+    # sockets, so every other program on the bench reaches the hardware through
+    # this API. Set CT_GUI_HOST=127.0.0.1 to keep it to this machine.
+    host = os.environ.get("CT_GUI_HOST", "0.0.0.0")
     port = int(os.environ.get("CT_GUI_PORT", "8770"))
     server = ThreadingHTTPServer((host, port), CtHandler)
     print(f"CT GUI server listening on http://{host}:{port}")
+    if host == "0.0.0.0":
+        lan = primary_local_ip()
+        print(f"  open http://127.0.0.1:{port}" + (f" · shared API on http://{lan}:{port}" if lan else ""))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

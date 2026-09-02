@@ -15,6 +15,9 @@
  * live; real /api telemetry will drop into ingestTelemetry() unchanged.
  */
 
+// First import: it installs the fetch wrapper that stamps this tab's client id
+// on every /api call, so no module can issue an unidentified request.
+import { lock } from './client.js';
 import { CT, mod as ctMod, filamentBaseAngle as ctFilamentBaseAngle } from './ct/constants.js';
 import { CTGeometry } from './ct/renderer.js';
 import { initControllers } from './controllers.js';
@@ -23,6 +26,7 @@ import { ScheduleGantt } from './gantt.js';
 import { initPower } from './power.js';
 import { initMapping } from './mapping.js';
 import { initTests } from './tests.js';
+import { initSticky } from './sticky.js';
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (msg) => { $('statusBar').textContent = msg; };
@@ -86,6 +90,8 @@ const filaments = Array.from({ length: N }, () => ({
   idleA: 1.5, activeA: 3,    // cathode heating currents (A)
   ocp: 4000, dcHv: false, // debug: per-board OCP (mA, firmware default 4 A), DC HV bit
   dead: false,            // disabled filament — omitted from the schedule (§8.4)
+  noHv: false,            // heats normally but fires no HV pulse (excluded from emission schedule)
+  noHeat: false,          // fires HV pulse but receives no heating deltas (always at idle current)
 }));
 
 // Heating plan — bound to the emission schedule. Per the firmware design
@@ -95,7 +101,7 @@ const filaments = Array.from({ length: N }, () => ({
 // per-filament defaults; the rest are plan-wide.
 // holdMs = stay ACTIVE this long after the last pulse before demoting to IDLE.
 // activeCount = max filaments allowed ACTIVE at once (the hot-band cap).
-const heatingSchedule = { tSettleMs: 1000, rotationMs: 30000, holdMs: 200, activeCount: 40 };
+const heatingSchedule = { tSettleMs: 4000, rotationMs: 30000, holdMs: 200, activeCount: 43 };
 // per-filament power for the PLAN total-power estimate (W). Live mode uses the
 // real measured P = V·I instead.
 const powerEst = { idleW: 1.8, activeW: 32 };
@@ -146,13 +152,11 @@ function applyGantryFromIndex() {
 // Idle. Everything outside the window sleeps. Real telemetry replaces this in
 // ingestTelemetry().
 function refreshStates() {
-  // Plan view always simulates. During a live hardware run/sim the firmware executes
-  // the EXACT downloaded plan, so we color the ring by that plan at the live trigger
-  // too — that IS the real scanning status (the ACTIVE heating band the firmware
-  // promotes, with the geometry positioned by pollRunStatus → gotoSeq to the firing
-  // filament). Debug view still reflects actual per-filament telemetry only.
-  const liveRun = (viewMode === 'live' && runMonitorTimer);
-  if (viewMode !== 'plan' && !liveRun) return;
+  // Only the Plan view (design + Dry run) simulates the heating band from the plan.
+  // Live reflects REAL hardware: per-filament state/V/I come from INA219 telemetry
+  // (startLiveTelemetry) and the firing filament from ShvGetStatus (pollRunStatus).
+  // Never paint plan estimates over a live run — that's fake data.
+  if (viewMode !== 'plan') return;
   // Bound-schedule heating: every filament rests at IDLE (warm pool); the
   // derived plan promotes the hot band (collimator window + T_settle lead) to
   // ACTIVE at the current pulse trigger. The firing filament emits.
@@ -204,6 +208,7 @@ window.ingestTelemetry = ingestTelemetry;
 const MAX_ROWS = 8192;            // firmware schedule cap
 let schedule = [];
 let totalTriggers = 0;           // total SyncIn pulses in one rotation
+let filamentOrder = null;        // null = natural (0..95); array = custom ring-pos→filament map
 let liveSeq = 0;
 // the pulse-trigger position of the current scan row
 function currentTrigger() { return schedule[liveSeq] ? schedule[liveSeq].trigger : 0; }
@@ -254,8 +259,9 @@ function buildSchedule() {
   let trig = 0; // pulse-indexed trigger timeline (a burst spans `pulses` triggers)
   while (sim.ringStep < N) {
     if (rows.length >= MAX_ROWS) { scheduleTruncated = true; break; }
-    const fil = ctMod(sim.collimatorCenter - HALF + sim.windowPos, N);
-    if (!filaments[fil].dead) { // dead filaments fire nothing — a known gap
+    const logPos = ctMod(sim.collimatorCenter - HALF + sim.windowPos, N);
+    const fil = filamentOrder ? (filamentOrder[logPos] ?? logPos) : logPos;
+    if (!filaments[fil].dead && !filaments[fil].noHv) { // dead/noHv fire nothing
       const burstLen = Math.max(1, filaments[fil].pulses);
       rows.push({
         seq: rows.length,
@@ -296,6 +302,7 @@ function rebuildSchedule() {
 }
 
 function applyScheduleView() {
+  drawGantt();   // always redraw Gantt when plan or view changes (heating params, schedule rebuild, view toggle)
   if (!scheduleTable) return;
   if (scheduleView === 'heating') {
     scheduleTable.setColumns(['Trigger', 'Filament', '→ State', 'Current'],
@@ -367,6 +374,7 @@ function planHeating() {
   // emission bursts per filament, in pulse-trigger units {start, end}
   const burstsByFil = new Map();
   for (const r of schedule) {
+    if (filaments[r.filament].noHeat) continue; // noHeat filaments fire but get no heating deltas
     let a = burstsByFil.get(r.filament);
     if (!a) burstsByFil.set(r.filament, (a = []));
     a.push({ start: r.trigger, end: r.trigger + r.burstLen });
@@ -463,15 +471,37 @@ function renderValidation() {
   if (!el) return;
   const v = heatingPlan && heatingPlan.validation;
   if (!v) { el.textContent = ''; el.className = 'plan-verdict'; return; }
-  el.className = 'plan-verdict ' + (v.ok ? 'ok' : 'bad');
+  const A = heatingSchedule.activeCount, C = CT.COVERAGE, T = heatingSchedule.tSettleMs;
+  const underwindow = A < C;
+  el.className = 'plan-verdict ' + (underwindow ? 'bad' : v.ok ? 'ok' : 'bad');
   el.title = '# active is the target hot-band size. The pre-heat lead is solved so the actual ' +
     'peak ACTIVE count lands on it = collimator window + filaments pre-heated ahead + post-fire hold tail.';
-  const tgt = v.peak === heatingSchedule.activeCount ? '' : ` (target ${heatingSchedule.activeCount})`;
+  if (underwindow) {
+    let hint = '';
+    if (A > 1) {
+      const minRotS = Math.ceil(T * 96 / (A - 1) / 1000);
+      hint = ` Dev: set coverage=1, rotation ≥ <b>${minRotS} s</b>.`;
+    }
+    el.innerHTML = `<div><b>⚠ # active (${A}) &lt; coverage (${C})</b> — ` +
+      `window has ${C} filaments; reduce coverage to ≤ ${A} for this hot-band target.${hint}</div>`;
+    return;
+  }
+  const tgt = v.peak === A ? '' : ` (target ${A})`;
+  let settleHint = '';
+  if (!v.settleOk) {
+    const lb = heatingPlan.leadBursts, len = heatingPlan.len;
+    if (lb > 0) {
+      const minRotS = Math.ceil(T * len / lb / 1000);
+      settleHint = ` Increase rotation to ≥ <b>${minRotS} s</b>, or raise # active.`;
+    } else {
+      settleHint = ' No lead slots (coverage=# active). Raise # active above coverage, or reduce coverage.';
+    }
+  }
   el.innerHTML =
     `<div>Hot band <b>${v.peak}</b> ACTIVE${tgt} = ${v.windowN} window + ${v.leadN} lead + ${v.holdN} hold.</div>` +
     `<div><b>${v.settleOk ? '✓ settle OK' : '✗ settle short'}</b> — pre-heat ` +
-    `<b>${Math.round(v.leadMs)} ms</b> ${v.settleOk ? '≥' : '<'} ${heatingSchedule.tSettleMs} ms T settle` +
-    (v.settleOk ? '.' : ' — raise # active or rotation time.') + `</div>`;
+    `<b>${Math.round(v.leadMs)} ms</b> ${v.settleOk ? '≥' : '<'} ${T} ms T settle` +
+    (v.settleOk ? '.' : settleHint) + `</div>`;
 }
 
 // move the geometry to schedule[seq]; fire its filament when stepping
@@ -504,12 +534,28 @@ function resyncSchedule() {
 
 function advance() {
   if (!schedule.length) { rebuildSchedule(); return; }
-  gotoSeq(liveSeq + 1, true);
+  // Step by ring-step, not by schedule row, so the animation moves at 1 ring step
+  // per frame regardless of how many window positions (coverage) each step contains.
+  const curRing = schedule[liveSeq] ? schedule[liveSeq].ringStep : -1;
+  let next = liveSeq + 1;
+  while (next < schedule.length && schedule[next].ringStep === curRing) next++;
+  if (next >= schedule.length) next = 0;
+  gotoSeq(next, true);
 }
 
 function reset() {
   stopPlay();
+  stopRunMonitor();
+  // Clear all filament simulation state.
   for (const f of filaments) { f.mAs = 0; f.state = STATE.STOP; f.voltage_mV = 0; f.current_mA = 0; }
+  // Reset scan position so the rebuilt schedule and gotoSeq(0) start from filament 0.
+  state.collimatorCenter = 0;
+  state.windowPos = 0;
+  state.ringStep = 0;
+  state.gantryAngle = 0;
+  state.gantryIndex = state.filamentDir > 0 ? 0 : 2 * state.gantrySteps;
+  state.sweepDir = state.filamentDir;
+  setViewMode('plan');   // switch to plan so simulated states are rendered, not stale live data
   rebuildSchedule();
 }
 
@@ -600,6 +646,8 @@ function renderPower() {
 // ---- play loop --------------------------------------------------------------
 function startPlay() {
   if (playTimer) return;
+  if (viewMode !== 'plan') setViewMode('plan');
+  if (!schedule.length) rebuildSchedule();
   const fps = parseInt($('speedInput').value, 10) || 12;
   playTimer = setInterval(advance, 1000 / fps);
   $('playBtn').textContent = '⏸ Pause';
@@ -656,7 +704,8 @@ function setViewMode(mode) {
   // only Plan can simulate-and-play and edit the motion/schedule
   const plan = mode === 'plan';
   if (!plan) stopDryRun();   // a dry run only makes sense in Plan view
-  for (const id of ['playBtn', 'stepBtn', 'resetBtn', 'dryRunBtn']) { const el = $(id); if (el) el.disabled = !plan; }
+  // dryRunBtn still requires plan mode (it auto-switches); play/step/reset auto-switch themselves
+  const dryBtn = $('dryRunBtn'); if (dryBtn) dryBtn.disabled = false;
   // schSync rebuilds the schedule from the live geometry (Plan-only). Apply-all only
   // edits the plan's per-filament currents/pulses (they download with the schedule),
   // so it must work in ANY view — that's how you set idle/active currents for a run.
@@ -666,7 +715,7 @@ function setViewMode(mode) {
     ? 'Live — reflects the actual gantry position and INA219 sensor data from the controllers.'
     : mode === 'debug'
       ? 'Debug — pick any filament to set heating / fire pulses. Right-click the V·I or mAs rings to edit heating power.'
-      : 'Plan — edit the scan schedule and Play it. Right-click a filament to disable/enable it.');
+      : 'Plan — edit the scan schedule and Play it. Right-click a filament: Enable / No HV (heat-only) / No heat / Disable.');
   if (plan) refreshStates();
   else clearLiveData();   // plan placeholder V/I must NOT carry into live/debug
   if (mode === 'live') startLiveTelemetry(); else stopLiveTelemetry();
@@ -687,12 +736,28 @@ function clearLiveData() {
 // There is no batch power-state read, so each filament's state is INFERRED from
 // its measured heating current (relative to its configured idle/active target).
 let liveTelemetryTimer = null;
+let liveTelemetryStop = false;
+let lastRunActive = false;   // set by pollTelemetry from the run state
+// Adaptive cadence: while a schedule is RUNNING the firmware PUSHES cached
+// currents (~20 fps, no I2C, no request), and the backend serves them from the
+// received stream — so we poll at 50 ms (20 fps) to SEE the power sequence
+// advance smoothly. Idle uses the heavier live INA read at 1 s.
+const TELE_FAST_MS = 50, TELE_IDLE_MS = 1000;
 function startLiveTelemetry() {
-  if (liveTelemetryTimer) return;
-  liveTelemetryTimer = setInterval(pollTelemetry, 1000);
-  pollTelemetry();
+  if (liveTelemetryTimer || liveTelemetryStop === 'running') return;
+  liveTelemetryStop = false;
+  const tick = async () => {
+    if (liveTelemetryStop || viewMode !== 'live') { liveTelemetryTimer = null; return; }
+    await pollTelemetry();
+    if (liveTelemetryStop || viewMode !== 'live') { liveTelemetryTimer = null; return; }
+    liveTelemetryTimer = setTimeout(tick, lastRunActive ? TELE_FAST_MS : TELE_IDLE_MS);
+  };
+  liveTelemetryTimer = setTimeout(tick, 0);
 }
-function stopLiveTelemetry() { if (liveTelemetryTimer) { clearInterval(liveTelemetryTimer); liveTelemetryTimer = null; } }
+function stopLiveTelemetry() {
+  liveTelemetryStop = true;
+  if (liveTelemetryTimer) { clearTimeout(liveTelemetryTimer); liveTelemetryTimer = null; }
+}
 
 function inferState(f, mA, present) {
   if (!present) return STATE.STOP;
@@ -708,6 +773,7 @@ async function pollTelemetry() {
   try { data = await (await fetch('/api/telemetry')).json(); } catch { return; }
   const tele = data.telemetry || [];
   const running = Object.values(data.run || {}).some((s) => s && s.state === 2);
+  lastRunActive = running;   // drives the adaptive telemetry cadence
   if (!tele.length && !running) { setStatus('Live — no telemetry (controllers disconnected or bridge slot busy).'); return; }
   const present = tele.filter((t) => t.present).length;
   const rows = tele.map((t) => {
@@ -975,7 +1041,7 @@ function attachPlotDrag(cv) {
     const fil = i >= 0 ? i : filFromAngle(p.ang);
     e.preventDefault();
     if (viewMode === 'debug') showHeatPopup(e.clientX, e.clientY, fil);
-    else toggleDead(fil); // plan mode
+    else showFilMenu(e.clientX, e.clientY, fil); // plan mode: 4-state menu
   });
   cv.addEventListener('mousemove', (e) => {
     const rect = cv.getBoundingClientRect();
@@ -1031,6 +1097,44 @@ function toggleDead(i) {
   setStatus(`Filament ${i} ${filaments[i].dead ? 'disabled (dead) — omitted from the schedule' : 'enabled'}.`);
 }
 
+// Quick scan-subset: mark every nth non-dead filament as noHv=false, rest noHv=true.
+// n=0 or n>=N clears all noHv flags (= full scan).
+function applyScanSubset(n) {
+  if (!n || n >= N) {
+    for (const f of filaments) f.noHv = false;
+    setStatus('Scan subset cleared — all filaments in emission schedule.');
+  } else {
+    const step = Math.max(1, Math.round(N / n));
+    for (let i = 0; i < N; i++) {
+      if (filaments[i].dead) continue;
+      filaments[i].noHv = (i % step !== 0);
+    }
+    const active = filaments.filter((f) => !f.dead && !f.noHv).length;
+    setStatus(`Scan subset: ${active} filaments will fire (every ${step} positions). Others heat-only.`);
+  }
+  refreshFilList(); rebuildSchedule();
+}
+
+// ---- filament right-click context menu (plan mode) --------------------------
+let filMenuTarget = -1;
+function setFilState(i, dead, noHv, noHeat) {
+  const f = filaments[i];
+  f.dead = dead; f.noHv = noHv; f.noHeat = noHeat;
+  if (dead) { f.state = STATE.STOP; f.mAs = 0; }
+  hideFilMenu(); refreshFilList(); rebuildSchedule();
+  const label = dead ? 'disabled' : noHv ? 'heat-only (no HV)' : noHeat ? 'fires cold (no heat)' : 'enabled';
+  setStatus(`Filament ${i} → ${label}.`);
+}
+function showFilMenu(clientX, clientY, fil) {
+  filMenuTarget = fil;
+  $('filMenuIdx').textContent = fil;
+  const m = $('filMenu'); m.hidden = false;
+  const w = m.offsetWidth || 140, h = m.offsetHeight || 100;
+  m.style.left = Math.max(4, Math.min(clientX, window.innerWidth - w - 4)) + 'px';
+  m.style.top  = Math.max(4, Math.min(clientY, window.innerHeight - h - 4)) + 'px';
+}
+function hideFilMenu() { $('filMenu').hidden = true; filMenuTarget = -1; }
+
 function resetGantry() {
   state.gantryAngle = 0;
   state.gantryIndex = state.filamentDir > 0 ? 0 : 2 * state.gantrySteps;
@@ -1059,7 +1163,9 @@ function buildFilList() {
       `<input data-i="${i}" data-k="pulses" type="number" min="1" value="${f.pulses}">` +
       `<input data-i="${i}" data-k="durationUs" type="number" min="1" value="${f.durationUs}">` +
       `<input data-i="${i}" data-k="idleA" type="number" min="0" step="0.1" value="${f.idleA}">` +
-      `<input data-i="${i}" data-k="activeA" type="number" min="0" step="0.1" value="${f.activeA}">`;
+      `<input data-i="${i}" data-k="activeA" type="number" min="0" step="0.1" value="${f.activeA}">` +
+      `<input data-i="${i}" data-k="noHv" type="checkbox" title="Heat only — no HV pulse" ${f.noHv ? 'checked' : ''}>` +
+      `<input data-i="${i}" data-k="noHeat" type="checkbox" title="Fire cold — no heating deltas" ${f.noHeat ? 'checked' : ''}>`;
     frag.appendChild(row);
   }
   el.appendChild(frag);
@@ -1067,21 +1173,25 @@ function buildFilList() {
     const inp = e.target;
     if (inp.tagName !== 'INPUT') return;
     const i = +inp.dataset.i, k = inp.dataset.k;
-    const intK = (k === 'pulses' || k === 'durationUs');
-    filaments[i][k] = intK ? Math.max(1, parseInt(inp.value, 10) || 1) : Math.max(0, parseFloat(inp.value) || 0);
+    const boolK = (k === 'noHv' || k === 'noHeat');
+    const intK  = (k === 'pulses' || k === 'durationUs');
+    filaments[i][k] = boolK ? inp.checked : intK ? Math.max(1, parseInt(inp.value, 10) || 1) : Math.max(0, parseFloat(inp.value) || 0);
     scheduleRebuildDebounced();
   });
 }
 function refreshFilList() {
   const el = $('filList');
   if (!el.dataset.built) return;
-  el.querySelectorAll('input').forEach((inp) => { inp.value = filaments[+inp.dataset.i][inp.dataset.k]; });
+  el.querySelectorAll('input').forEach((inp) => {
+    const v = filaments[+inp.dataset.i][inp.dataset.k];
+    if (inp.type === 'checkbox') inp.checked = !!v; else inp.value = v;
+  });
 }
 
 // host-side persistence of the per-filament plan (pulses / duration / currents)
 const FIL_STORE = 'ct_fil_settings';
 function saveFilSettings() {
-  const data = filaments.map((f) => ({ pulses: f.pulses, durationUs: f.durationUs, idleA: f.idleA, activeA: f.activeA, dead: f.dead }));
+  const data = filaments.map((f) => ({ pulses: f.pulses, durationUs: f.durationUs, idleA: f.idleA, activeA: f.activeA, noHv: f.noHv, noHeat: f.noHeat }));
   try { localStorage.setItem(FIL_STORE, JSON.stringify(data)); $('schStatus').textContent = 'Saved per-filament settings to host.'; }
   catch (e) { $('schStatus').textContent = 'Save failed: ' + e; }
 }
@@ -1199,7 +1309,7 @@ function buildPlan() {
   }));
   const currents = {};
   filaments.forEach((f, i) => {
-    if (f.dead) return;
+    if (f.dead || f.noHeat) return;
     currents[i] = { idle_mA: Math.round(f.idleA * 1000), active_mA: Math.round(f.activeA * 1000) };
   });
   // Derive the firmware config from the actual schedule instead of hardcoding:
@@ -1209,12 +1319,13 @@ function buildPlan() {
   //  - triggerEdge 0 = rising; match this to the target's Sync I/O 'Ext edge'.
   const maxWidthUs = emission.reduce((m, e) => Math.max(m, e.widthUs), 0);
   const rotationMs = heatingSchedule.rotationMs || 0;
+  const repeats = Math.max(1, parseInt(($('hwRepeats') || {}).value, 10) || 1);
   const pulses = totalTriggers || emission.reduce((s, e) => s + e.numPulses, 0) || 1;
   const pulseMs = rotationMs ? rotationMs / pulses : 0;
   const config = {
     interPulseMs: Math.max(3000, Math.ceil(pulseMs * 4)),
     maxOnMs: Math.max(40, Math.ceil(maxWidthUs / 1000) + 1),
-    totalMs: Math.max(60000, Math.ceil(rotationMs * 2)),
+    totalMs: Math.max(60000, Math.ceil(rotationMs * repeats * 2)),
     triggerEdge: 0,
   };
   return { emission, heating, currents, config };
@@ -1239,15 +1350,20 @@ async function hwDownload() {
     } catch { /* keep the bar alive */ }
   }, 400);
   try {
-    const j = await postJSON('/api/download', { plan: buildPlan() });
+    // ~108 frames per controller must land back-to-back — hold the write lease
+    // so another program on the shared API can't interleave a write mid-transfer.
+    const j = await lock.hold('schedule download',
+      () => postJSON('/api/download', { plan: buildPlan() }));
     progDone = true; clearInterval(progTimer); progTimer = null;
     if (!j.ok && j.error) { hwMsg(`Download failed: ${j.error}`); return; }
     const s = (ms) => ((ms || 0) / 1000).toFixed(1) + 's';
     const parts = (j.results || []).map((r) => {
       const t = r.timing || {};
       const perf = (t.total && r.frames) ? ` · ${Math.round(t.total / r.frames)} ms/frame` : '';
+      const cacheInfo = r.curCached > 0 ? ` · ${r.curCached} cur cached` : '';
+      const failInfo = r.fails ? ` · ${r.fails} failed: ${(r.failLabels || []).join(', ') || '?'}` : '';
       const breakdown = t.total != null
-        ? `<br>&nbsp;&nbsp;<span class="hint">${r.frames} frames in ${s(t.total)}${perf}${r.fails ? ' · ' + r.fails + ' failed' : ''}</span>`
+        ? `<br>&nbsp;&nbsp;<span class="hint">${r.frames} frames in ${s(t.total)}${perf}${cacheInfo}${failInfo}</span>`
         : '';
       return `P${r.controller + 1}: ${r.ok ? '✓' : '✗'} ${r.emit} emit / ${r.heat} heat${breakdown}`;
     });
@@ -1279,13 +1395,16 @@ async function hwArm() {
   const repeats = Math.max(1, parseInt($('hwRepeats').value, 10) || 1);
   if (!runState.override && !runState.prepActive && !confirm('Pre-heat (Active first batch) has not been run — the lead filaments may fire cold. Arm anyway?')) return;
   // The firmware arm gate requires every participating filament at PowerState
-  // >= Sleep (isolated-12V on); a board left in Stop => IsoOff. For emission-only
-  // runs the firmware won't auto-idle (it only does so when a heating stream is
-  // loaded), so bring the schedule's filaments to Idle here first. Idempotent —
-  // Idle on an already-warm board is a no-op.
-  const parts0 = [...new Set(schedule.map((r) => r.filament).filter((f) => f != null && f !== 255))];
+  // >= Sleep (isolated-12V on); a board left in Stop => IsoOff. So bring the
+  // schedule's filaments UP to Idle here first — but NEVER demote the ones already
+  // pre-heated ACTIVE by "Active first batch" (the cold-start band). Those already
+  // satisfy the gate (iso on); idling them here was the bug that dropped the
+  // just-warmed lead filaments back to Idle on Arm.
+  const firstBatch = new Set(firstBatchFilaments() || []);
+  const parts0 = [...new Set(schedule.map((r) => r.filament)
+    .filter((f) => f != null && f !== 255 && !firstBatch.has(f)))];
   if (parts0.length) {
-    hwMsg(`Idling ${parts0.length} participating filament(s) (arm prerequisite)…`);
+    hwMsg(`Idling ${parts0.length} participating filament(s) (arm prerequisite; keeping ${firstBatch.size} pre-heated Active)…`);
     try {
       // Pass the per-filament idleA setpoints so arm-prerequisite idling lands on
       // the plan's currents (the backend applies currents[idx] only to `filaments`).
@@ -1293,6 +1412,23 @@ async function hwArm() {
       if (!jp.ok) hwMsg(`⚠ Idle prep partial (applied ${jp.applied || 0}/${parts0.length}) — arming anyway…`);
     } catch (e) { hwMsg('Idle prep failed: ' + e + ' — aborting arm.'); return; }
   }
+  // Re-send ShvSetConfig with the current rotation × repeats so totalMs is always
+  // consistent with what is actually being armed — even if repeats changed since download.
+  const armConfig = buildPlan().config;
+  try {
+    await Promise.all([1, 2].map((c) =>
+      postJSON('/api/shv', { controller: c, op: 'set_config', ...armConfig }).catch(() => {})
+    ));
+  } catch { /* non-fatal */ }
+  // Set fault policy before arming so the firmware uses the chosen policy for this run.
+  const faultBoard    = $('hwFaultContBoard')    && $('hwFaultContBoard').checked    ? 1 : 0;
+  const faultMismatch = $('hwFaultContMismatch') && $('hwFaultContMismatch').checked ? 1 : 0;
+  try {
+    await Promise.all([1, 2].map((c) =>
+      postJSON('/api/shv', { controller: c, op: 'fault_policy', board: faultBoard, mismatch: faultMismatch })
+        .catch(() => {})
+    ));
+  } catch { /* non-fatal; old firmware without 0x81 just ignores this */ }
   hwMsg('Arming…');
   try {
     const j = await postJSON('/api/arm', { repeats });
@@ -1373,8 +1509,12 @@ async function hwSimulateScan() {
   } catch { /* fall through to the plan-derived count */ }
   if (!count) count = triggers;
   if (!count) { hwMsg('No schedule to simulate — build & download one first.'); return; }
+  // The scheduled filament set + a nominal active target, so the run recorder can
+  // flag any filament that was scheduled to fire but never reached ACTIVE current.
+  const expect = [...new Set(schedule.map((r) => r.filament))];
+  const activeMa = Math.round(Math.max(...filaments.map((f) => f.activeA || 0), 2.9) * 1000);
   try {
-    const j = await postJSON('/api/sync/simulate', { controller: 1, count, duration_s: durationS });
+    const j = await postJSON('/api/sync/simulate', { controller: 1, count, duration_s: durationS, expect, active_mA: activeMa });
     if (!j.ok) { hwMsg('Simulate Scan failed: ' + (j.error || '?')); return; }
     hwMsg(`Simulating scan: ${count} triggers over ${durationS.toFixed(1)}s (fired at chain head P1) — watch the CT plot & run status.`);
     setViewMode('live'); startRunMonitor();   // track the schedule advancing
@@ -1407,7 +1547,14 @@ async function hwPrep(state, label, opts) {
 // per-filament CC current (mA) so Idle/Active land on the right setpoint
 function prepCurrents(field) {
   const out = {};
-  filaments.forEach((f, i) => { if (!f.dead) out[i] = Math.round(f[field] * 1000); });
+  filaments.forEach((f, i) => { if (!f.dead && !f.noHeat) out[i] = Math.round(f[field] * 1000); });
+  return out;
+}
+// Filaments that participate in heating: neither dead nor noHeat.
+// Used to exclude disabled/emission-only filaments from prep commands.
+function heatedFilaments() {
+  const out = [];
+  filaments.forEach((f, i) => { if (!f.dead && !f.noHeat) out.push(i); });
   return out;
 }
 // the schedule's cold-start band = filaments the heating plan has ACTIVE at trigger 0
@@ -1421,13 +1568,46 @@ function firstBatchFilaments() {
 // Poll ShvGetStatus: totalPulsesDone → schedule playhead, firmware filament/state.
 let runMonitorTimer = null;
 const SHV_STATE_NAME = { 0: 'Idle', 1: 'Armed', 2: 'Running', 3: 'Complete', 4: 'Fault' };
+const SHV_STOP_NAME  = ['None', 'Complete', 'Mismatch(HC165)', 'InterPulseTimeout', 'TotalTimeout', 'Fault(HW)', 'Disarmed'];
 const SHV_REJECT = ['None (armed)', 'IndexOutOfWindow', 'WidthTooLarge', 'EmptyTable', 'TpsDisabled', 'TpsFault', 'IsoOff', 'NotReady', 'StateConflict'];
+// Scan interpolation: after each poll, rAF-drives the geometry playhead smoothly
+// between polls using the measured pulses/ms rate. Only active during a live scan.
+let _scanInterp = null; // { pulsesDone, pulsesTarget, pulsesPerMs, ts, raf }
+function _scanInterpFrame() {
+  if (!_scanInterp) return;
+  const elapsed = performance.now() - _scanInterp.ts;
+  const est = Math.min(_scanInterp.pulsesTarget, Math.round(_scanInterp.pulsesDone + elapsed * _scanInterp.pulsesPerMs));
+  if (viewMode === 'live' && schedule.length && est > 0) {
+    const rotPos = totalTriggers > 0 ? ((est - 1) % totalTriggers) + 1 : est;
+    let idx = -1;
+    for (let i = 0; i < schedule.length; i++) { if (schedule[i].trigger <= rotPos) idx = i; else break; }
+    if (idx >= 0 && idx !== liveSeq) { liveSeq = idx; sync(); }
+  }
+  _scanInterp.raf = requestAnimationFrame(_scanInterpFrame);
+}
+function _stopScanInterp() {
+  if (_scanInterp) { cancelAnimationFrame(_scanInterp.raf); _scanInterp = null; }
+}
+
+let _runMonitorGen = 0;
 function startRunMonitor() {
   if (runMonitorTimer) return;
-  runMonitorTimer = setInterval(pollRunStatus, 500);
+  runMonitorTimer = setTimeout(_runMonitorTick, 100);
   pollRunStatus();
 }
-function stopRunMonitor() { if (runMonitorTimer) { clearInterval(runMonitorTimer); runMonitorTimer = null; } }
+function stopRunMonitor() {
+  if (runMonitorTimer) { clearTimeout(runMonitorTimer); runMonitorTimer = null; }
+  _runMonitorGen++;   // invalidates any in-flight tick
+  _stopScanInterp();
+}
+function _runMonitorTick() {
+  runMonitorTimer = null;
+  const gen = _runMonitorGen;
+  pollRunStatus().then(() => {
+    if (_runMonitorGen !== gen) return; // stopRunMonitor called during poll
+    runMonitorTimer = setTimeout(_runMonitorTick, _scanInterp ? 200 : 500);
+  });
+}
 
 async function pollRunStatus() {
   let data;
@@ -1459,7 +1639,7 @@ async function pollRunStatus() {
     if (s.state === 1) anyArmed = true;
     if (s.state === 2) anyRunning = true;
     if (s.state === 3) anyComplete = true;
-    if (s.state === 4) fault = { ctrl: k, fil: s.faultFilament };
+    if (s.state === 4) fault = { ctrl: k, fil: s.faultFilament, reason: s.stopReason };
     // firmware-reported live firing filament (255 = none/idle)
     if (s.filamentIndex != null && s.filamentIndex !== 255) firingFil = s.filamentIndex;
     const fil = (s.filamentIndex == null || s.filamentIndex === 255) ? '—' : s.filamentIndex;
@@ -1467,27 +1647,44 @@ async function pollRunStatus() {
     const hb = stale ? ' · ⚠hb-stale' : '';
     statePieces.push(`P${k}: ${SHV_STATE_NAME[s.state] || s.state} · firing fil ${fil} · pulse ${s.totalPulsesDone}/${s.totalPulsesTarget || '?'}${hb}`);
   }
-  // ---- link the live firing filament to the CT plot (live view) ----
-  // Position the geometry to the firmware-reported firing filament so the ring
-  // highlights exactly what's firing; fall back to the pulse cursor's row.
-  if (viewMode === 'live' && schedule.length) {
+  // ---- track the schedule playhead on the CT plot (live view) ----
+  // Follow the pulse CURSOR (global pulses done) → the schedule row at that trigger.
+  // This advances SEQUENTIALLY with the run; do NOT jump to a firing filament's first
+  // schedule occurrence (that yanks the ring around whenever a filament repeats).
+  if (viewMode === 'live' && schedule.length && doneMax > 0) {
+    const rotPos = totalTriggers > 0 ? ((doneMax - 1) % totalTriggers) + 1 : doneMax;
     let idx = -1;
-    if (cursor != null) { for (let i = 0; i < schedule.length; i++) { if (schedule[i].trigger <= cursor) idx = i; else break; } }
-    if (firingFil != null && (idx < 0 || schedule[idx].filament !== firingFil)) {
-      const j = schedule.findIndex((r) => r.filament === firingFil);
-      if (j >= 0) idx = j;
-    }
+    for (let i = 0; i < schedule.length; i++) { if (schedule[i].trigger <= rotPos) idx = i; else break; }
     if (idx >= 0) { gotoSeq(idx, false); updateTableActive(); }
+  }
+  // Start/update rAF interpolation while running so geometry moves smoothly between polls.
+  if (anyRunning && targetMax > 0 && doneMax > 0) {
+    const prevDone = _scanInterp ? _scanInterp.pulsesDone : 0;
+    const prevTs   = _scanInterp ? _scanInterp.ts : performance.now();
+    const dtMs = performance.now() - prevTs;
+    const rate = dtMs > 50 ? (doneMax - prevDone) / dtMs : (_scanInterp ? _scanInterp.pulsesPerMs : 0);
+    if (!_scanInterp) { _scanInterp = { pulsesDone: doneMax, pulsesTarget: targetMax, pulsesPerMs: rate, ts: performance.now(), raf: 0 }; requestAnimationFrame(_scanInterpFrame); }
+    else { _scanInterp.pulsesDone = doneMax; _scanInterp.pulsesTarget = targetMax; _scanInterp.pulsesPerMs = rate; _scanInterp.ts = performance.now(); }
+  } else { _stopScanInterp(); }
+  // Sync the GUI's armed flag to FIRMWARE truth (survives a page reload): if the
+  // firmware is armed/running/faulted, reflect it so the gate offers Disarm rather
+  // than a re-Arm that would StateConflict, and Simulate stays enabled. Idle/Complete
+  // release it so a fresh run can be armed.
+  const fwArmed = anyArmed || anyRunning || !!fault;
+  if (fwArmed !== runState.armed) {
+    runState.armed = fwArmed;
+    if (fwArmed) runState.verified = true;   // firmware only arms a verified table
+    refreshRunGate();
   }
   // arm-state badge (firmware-authoritative). A dead/unresponsive RP2350 is the
   // most critical state — surface it above run state so it can't be missed.
   if (anyDead) setArmState('✗ RP2350 unresponsive', 'fault');
-  else if (fault) setArmState(`✗ fault (fil ${fault.fil})`, 'fault');
+  else if (fault) setArmState(`✗ fault fil${fault.fil} · ${SHV_STOP_NAME[fault.reason] || fault.reason}`, 'fault');
   else if (anyRunning) setArmState('● running', 'running');
   else if (anyArmed) setArmState('● armed', 'armed');
   else if (anyComplete) setArmState('✓ complete', 'complete');
   else setArmState('idle', 'idle');
-  const f = fault ? ` — ⚠ FAULT P${fault.ctrl} fil ${fault.fil}` : '';
+  const f = fault ? ` — ⚠ FAULT P${fault.ctrl} fil ${fault.fil} · ${SHV_STOP_NAME[fault.reason] || ('stop=' + fault.reason)}` : '';
   hwMsg(`${statePieces.join(' · ') || 'no controller'}${f}`);
   // live scan progress bar — firmware pulses done / target (0 while merely armed)
   const prog = $('hwProgress');
@@ -1504,12 +1701,60 @@ async function pollRunStatus() {
         : `${pct}% · ${doneMax}/${targetMax || '?'} pulses`;
     }
   }
-  // Once the run is definitively finished (every controller Complete, none still
-  // running/armed, no fault, all connected), stop hammering the single RP2350 link
-  // at 2 Hz — the '✓ complete' badge persists. Re-arm / Simulate restarts the poll.
+  // When the run ends (complete or fault), stop the SyncIn pulse generator so it
+  // doesn't auto-start the next arm. Done for both paths — firmware stopped but the
+  // ESP32 pulse task keeps running until explicitly told to stop.
+  const runEnded = (anyComplete || fault) && !anyRunning && !anyArmed;
+  if (runEnded) {
+    fetch('/api/sync/simulate-stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .catch(() => {});
+  }
+  // Stop polling on clean Complete; for Fault keep the monitor alive so the badge
+  // stays updated but poll at the slow rate (no interp).
   if (anyComplete && !anyRunning && !anyArmed && !fault && !anyDead) {
     stopRunMonitor();
+    showRunReport();
+  } else if (fault && !anyRunning) {
+    stopRunMonitor();
   }
+}
+
+// After a run: fetch the power-state verification report and surface whether every
+// filament that fired actually reached ACTIVE current (proof the scan wasn't blind).
+// Also reads back ShvFaultPolicy (0x81) to show faulted slots from this run.
+async function showRunReport() {
+  // Read faulted slots from both controllers (only when "Continue on fault" was set,
+  // so the firmware recorded them rather than stopping at the first fault).
+  const faultContinue = ($('hwFaultContBoard') && $('hwFaultContBoard').checked) ||
+                        ($('hwFaultContMismatch') && $('hwFaultContMismatch').checked);
+  if (faultContinue) {
+    try {
+      // Query each connected controller for its faulted slots bitmask.
+      const [fp1, fp2] = await Promise.all([
+        postJSON('/api/shv', { controller: 1, op: 'fault_policy' }),
+        postJSON('/api/shv', { controller: 2, op: 'fault_policy' }),
+      ]);
+      const faultLines = [];
+      for (const [label, fp] of [['P1', fp1], ['P2', fp2]]) {
+        if (!fp || !fp.ok) continue;
+        // Map faulted power slots to global filament indices via MAPPING.
+        // slot i on this controller → filament = active_list[i] (returned by get_active_list).
+        const slots = fp.faultedSlots || [];
+        const extra = fp.mismatchCount > 0 ? ` · ${fp.mismatchCount} HC165 mismatch(es)` : '';
+        faultLines.push(`${label}: ${slots.length ? `${slots.length} faulted slot(s): ${slots.slice(0, 12).join(',')}${slots.length > 12 ? '…' : ''}` : 'no faulted slots'}${extra}`);
+      }
+      if (faultLines.length) hwMsg(`Fault report — ${faultLines.join(' · ')}`);
+    } catch { /* non-fatal */ }
+  }
+  let d;
+  try { d = await (await fetch('/api/run-report')).json(); } catch { return; }
+  const rep = d && d.report;
+  if (!rep || !rep.n_active) return;
+  const miss = rep.missing || [];
+  const verdict = miss.length === 0
+    ? `✓ all ${rep.n_active} fired filaments confirmed at ACTIVE current`
+    : `⚠ ${rep.n_confirmed}/${rep.n_active} confirmed — NEVER reached ACTIVE: ${miss.join(', ')}`;
+  hwMsg(`Run report — ${verdict} · ${rep.samples} telemetry samples over ${rep.duration_s}s · saved to run_reports/`);
 }
 
 // ---- I2C self-test / channel mask / diagnosis (ported from wifi_gui) ---------
@@ -1814,8 +2059,8 @@ function init() {
   refreshRunGate();   // initial gate/lock state
   $('hwPrepStop').addEventListener('click', () => hwPrep(STATE.STOP, 'Stop all'));
   $('hwPrepSleep').addEventListener('click', () => hwPrep(STATE.SLEEP, 'Sleep all'));
-  $('hwPrepStandby').addEventListener('click', () => hwPrep(STATE.STANDBY, 'Standby all'));
-  $('hwPrepIdle').addEventListener('click', () => hwPrep(STATE.IDLE, 'Idle all', { currents: prepCurrents('idleA') }));
+  $('hwPrepStandby').addEventListener('click', () => { const f = heatedFilaments(); hwPrep(STATE.STANDBY, `Standby heated (${f.length})`, { filaments: f }); });
+  $('hwPrepIdle').addEventListener('click', () => { const f = heatedFilaments(); hwPrep(STATE.IDLE, `Idle heated (${f.length})`, { filaments: f, currents: prepCurrents('idleA') }); });
   $('hwPrepActive').addEventListener('click', () => {
     const fils = firstBatchFilaments();
     if (!fils || !fils.length) { hwMsg('No heating plan — build a schedule first.'); return; }
@@ -1829,8 +2074,58 @@ function init() {
     for (const f of filaments) { f.pulses = pulses; f.durationUs = dur; f.idleA = idleA; f.activeA = activeA; }
     refreshFilList(); rebuildSchedule();
   });
+  // Idle/active current apply to ALL filaments the moment the field is committed
+  // (Enter or blur) — so changing the current in the GUI actually takes effect
+  // without needing the separate "Apply all" click. The firmware default (1.5 A)
+  // is only a fallback; the GUI value is authoritative once set + downloaded.
+  // (Re-Download to push the new setpoints to the hardware.)
+  $('hsIdleA').addEventListener('change', () => {
+    const v = Math.max(0, parseFloat($('hsIdleA').value) || 0);
+    for (const f of filaments) f.idleA = v;
+    refreshFilList(); rebuildSchedule();
+    hwMsg && hwMsg(`Idle current set to ${v} A for all filaments — Download to apply on hardware.`);
+  });
+  $('hsActiveA').addEventListener('change', () => {
+    const v = Math.max(0, parseFloat($('hsActiveA').value) || 0);
+    for (const f of filaments) f.activeA = v;
+    refreshFilList(); rebuildSchedule();
+    hwMsg && hwMsg(`Active current set to ${v} A for all filaments — Download to apply on hardware.`);
+  });
 
   $('filListDetails').addEventListener('toggle', (e) => { if (e.target.open) buildFilList(); });
+
+  $('filOrderApply').addEventListener('click', () => {
+    const raw = $('filOrderInput').value.trim();
+    const status = $('filOrderStatus');
+    if (!raw) { filamentOrder = null; status.textContent = 'Natural order restored.'; rebuildSchedule(); return; }
+    const nums = raw.split(/[\s,]+/).filter(Boolean).map(Number);
+    if (nums.some(n => !Number.isInteger(n) || n < 0 || n > 95)) {
+      status.textContent = `✗ Invalid values — all must be integers 0–95.`; return;
+    }
+    const uniq = new Set(nums);
+    if (uniq.size !== nums.length) {
+      status.textContent = `✗ Duplicates found (${nums.length - uniq.size} repeated).`; return;
+    }
+    filamentOrder = nums;
+    status.textContent = `✓ Custom order applied (${nums.length} entr${nums.length === 1 ? 'y' : 'ies'}).`;
+    rebuildSchedule();
+  });
+  $('filOrderReset').addEventListener('click', () => {
+    filamentOrder = null;
+    $('filOrderInput').value = '';
+    $('filOrderStatus').textContent = 'Natural order restored.';
+    rebuildSchedule();
+  });
+
+  // filament context menu (plan mode right-click)
+  $('filMenuEnable').addEventListener('click', () => { if (filMenuTarget >= 0) setFilState(filMenuTarget, false, false, false); });
+  $('filMenuNoHv').addEventListener('click',   () => { if (filMenuTarget >= 0) setFilState(filMenuTarget, false, true,  false); });
+  $('filMenuNoHeat').addEventListener('click', () => { if (filMenuTarget >= 0) setFilState(filMenuTarget, false, false, true);  });
+  $('filMenuDead').addEventListener('click',   () => { if (filMenuTarget >= 0) setFilState(filMenuTarget, true,  false, false); });
+  document.addEventListener('mousedown', (e) => {
+    if (!$('filMenu').hidden && !$('filMenu').contains(e.target)) hideFilMenu();
+  });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideFilMenu(); });
 
   // heating-plan parameters: re-derive the bound heating layer on change
   const onPlanParam = (id, key) => $(id).addEventListener('input', (e) => {
@@ -1839,7 +2134,11 @@ function init() {
   });
   onPlanParam('hsSettle', 'tSettleMs');
   onPlanParam('hsHold', 'holdMs');
-  onPlanParam('hsRot', 'rotationMs');
+  // hsRot is in seconds (user-facing); rotationMs stored in ms internally
+  $('hsRotS').addEventListener('input', (e) => {
+    heatingSchedule.rotationMs = Math.max(500, Math.round((parseFloat(e.target.value) || 0) * 1000));
+    planHeating(); applyScheduleView(); updateScheduleHeader(); sync();
+  });
   $('hsActive').addEventListener('input', (e) => {
     heatingSchedule.activeCount = Math.max(1, parseInt(e.target.value, 10) || 40);
     planHeating(); applyScheduleView(); updateScheduleHeader(); sync();
@@ -1898,7 +2197,7 @@ function init() {
   });
 
   $('playBtn').addEventListener('click', togglePlay);
-  $('stepBtn').addEventListener('click', () => { stopPlay(); advance(); });
+  $('stepBtn').addEventListener('click', () => { stopPlay(); if (viewMode !== 'plan') setViewMode('plan'); advance(); });
   $('dryRunBtn').addEventListener('click', toggleDryRun);
   $('resetBtn').addEventListener('click', reset);
   $('speedInput').addEventListener('input', (e) => {
@@ -1934,8 +2233,24 @@ function init() {
 
   $('gantrySlider').min = -state.gantryMax;
   $('gantrySlider').max = state.gantryMax;
+  // Put back every field's last value BEFORE the schedule is (re)built — the
+  // restored plan parameters must be in the DOM when rebuildSchedule reads them.
+  // Runs last in the wiring order so the synthetic input/change events land on
+  // handlers that are already attached.
+  initSticky();
   if (!loadFilSettings(true)) rebuildSchedule(); // restore host settings, else fresh build
   setViewMode('live');  // start on real hardware — no simulated data until Plan is chosen
+  // On load, detect a firmware that's already armed/running/faulted (e.g. after a
+  // page reload mid-run) and start the run monitor, so the GUI reflects it — Arm
+  // stays disabled (no StateConflict re-arm), Disarm is available, Simulate works.
+  setTimeout(async () => {
+    try {
+      const d = await (await fetch('/api/run-status')).json();
+      const active = Object.values(d.controllers || {}).some(
+        (c) => c.status && [1, 2, 4].includes(c.status.state));  // Armed/Running/Fault
+      if (active && !runMonitorTimer) { setViewMode('live'); startRunMonitor(); }
+    } catch { /* not connected yet — the next arm/sim starts the monitor */ }
+  }, 2500);
 }
 
 document.addEventListener('DOMContentLoaded', init);
