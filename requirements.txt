@@ -1,0 +1,2 @@
+# No third-party dependencies. Requires Python 3.11+.
+# stdlib only: http.server, json, socket, threading, struct, urllib
