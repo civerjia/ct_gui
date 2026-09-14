@@ -23,13 +23,16 @@ import { CTGeometry } from './ct/renderer.js';
 import { initControllers } from './controllers.js';
 import { initScheduleTable } from './schedule.js';
 import { ScheduleGantt } from './gantt.js';
-import { initPower } from './power.js';
+import { initPower, renderMaskBits } from './power.js';
 import { initMapping } from './mapping.js';
 import { initTests } from './tests.js';
 import { initSticky } from './sticky.js';
+import { $, setMsg, clampNumberInputs } from './dom.js';
+import { postJ as postJSON } from './net.js';
+// aliased: this file's own `state` (below) is unrelated CT-geometry sim state
+import { state as ctState } from './state.js';
 
-const $ = (id) => document.getElementById(id);
-const setStatus = (msg) => { $('statusBar').textContent = msg; };
+const setStatus = (msg) => setMsg('statusBar', msg);
 let HALF = (CT.COVERAGE - 1) / 2; // window half-width (# active = 2·HALF+1)
 const N = CT.N_FILAMENTS;
 
@@ -70,8 +73,8 @@ function filamentToHw(i) {
 // (0-7). Derived from the per-filament controller assignment so it stays correct
 // mid-edit (before Apply repopulates the server slot detail). Returns null when
 // unassigned or overflowing the 64 slots (can't fire). Shape matches filamentToHw.
-function filamentToBoard(i) {
-  const get = window.ctFilamentController;
+export function filamentToBoard(i) {
+  const get = ctState.filamentController;
   if (!get) return null;
   const c = get(i);
   if (c !== 0 && c !== 1) return null;        // unassigned
@@ -624,7 +627,7 @@ function sync() {
 function renderPower() {
   let active = 0, idle = 0, p1 = 0, p2 = 0;
   const live = viewMode === 'live';
-  const getCtrl = window.ctFilamentController;   // filament idx -> 0 (P1) / 1 (P2) / other
+  const getCtrl = ctState.filamentController;   // filament idx -> 0 (P1) / 1 (P2) / other
   for (let i = 0; i < filaments.length; i++) {
     const f = filaments[i];
     if (!f || f.dead) continue;
@@ -807,7 +810,7 @@ async function cmd(fil, command, extra) {
   });
   return r.json();
 }
-const heatMsg = (m) => { $('heatStatus').textContent = m; };
+const heatMsg = (m) => setMsg('heatStatus', m);
 function highlightState(st) {
   document.querySelectorAll('#heatStateSeg button').forEach((b) => b.classList.toggle('active', +b.dataset.state === st));
   // Active/Idle expose the CC current; Voltage exposes the manual mV.
@@ -1229,10 +1232,9 @@ async function uploadSchedule() {
 }
 
 // ---- real-hardware bound schedule: download / arm / trigger / monitor -------
-const hwMsg = (m) => { const e = $('hwRunStatus'); if (e) e.innerHTML = m; };
-const postJSON = async (path, body) => (await fetch(path, {
-  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-})).json();
+// html:true — status lines here are built from internally generated HTML
+// fragments (`<br>`-joined per-controller results, `<b>` emphasis).
+const hwMsg = (m) => setMsg('hwRunStatus', m, { html: true });
 
 // ---- guided run-sequence gating --------------------------------------------
 // Each step unlocks the next; later actions stay disabled until prerequisites
@@ -1242,7 +1244,7 @@ const postJSON = async (path, body) => (await fetch(path, {
 const runState = { hwChecked: false, downloaded: false, verified: false, prepActive: false, armed: false, override: false };
 const scanReady = () => schedule.length > 0;
 const settleOk = () => !!(heatingPlan && heatingPlan.validation && heatingPlan.validation.ok);
-const hwConnected = () => { const c = window.ctConnected || {}; return !!(c[1] || c[2]); };
+const hwConnected = () => { const c = ctState.connected || {}; return !!(c[1] || c[2]); };
 function setGate(id, ok, text) {
   const e = $(id); if (!e) return;
   e.classList.toggle('ok', !!ok);
@@ -1290,13 +1292,13 @@ function setArmState(label, cls) {
   e.textContent = label;
   e.className = 'hw-armstate ' + cls;
 }
-window.ctRefreshRunGate = refreshRunGate;
+ctState.refreshRunGate = refreshRunGate;
 // A changed/rebuilt schedule (or lost connection) invalidates a prior download.
 function invalidateRun() { runState.downloaded = runState.verified = runState.prepActive = runState.armed = false; refreshRunGate(); }
 // Called by controllers.js on a connected->disconnected transition: a reboot can
 // clear the firmware schedule table, so also drop the hardware-check + arm gate so
 // the operator must re-verify (or Override) before arming again.
-window.ctInvalidateRun = () => { runState.hwChecked = false; invalidateRun(); };
+ctState.invalidateRun = () => { runState.hwChecked = false; invalidateRun(); };
 
 // Translate the GUI's bound schedule into the host plan (logical filament 0-95;
 // the backend maps to global 0-127 + per-controller split).
@@ -1758,29 +1760,19 @@ async function showRunReport() {
 }
 
 // ---- I2C self-test / channel mask / diagnosis (ported from wifi_gui) ---------
-const i2cMsg = (m) => { const e = $('i2cResult'); if (e) e.innerHTML = m; };
+const i2cMsg = (m) => setMsg('i2cResult', m, { html: true });
 
 // channel enable mask — 8 toggle bits (default 0x3F = first 6 channels).
-// Single source of truth lives on window so the Boards-matrix card mirror
-// (power.js) stays in sync with this I²C-section control.
-if (window.ctChannelMask == null) window.ctChannelMask = 0x3F;
-function buildMaskBits() {
-  const el = $('i2cMaskBits'); if (!el) return;
-  el.innerHTML = '';
-  for (let ch = 0; ch < 8; ch++) {
-    const b = document.createElement('button');
-    b.className = 'mask-bit' + ((window.ctChannelMask >> ch) & 1 ? ' on' : '');
-    b.textContent = ch + 1;
-    b.title = `Channel ${ch + 1} ${(window.ctChannelMask >> ch) & 1 ? 'enabled' : 'disabled'}`;
-    b.addEventListener('click', () => { window.ctChannelMask ^= (1 << ch); maskChanged(); });
-    el.appendChild(b);
-  }
-}
+// Single source of truth lives in state.js so the Boards-matrix card mirror
+// (power.js) stays in sync with this I²C-section control. Rendering is
+// power.js's renderMaskBits() (same 8-bit-toggle markup it uses for the
+// Boards card + HV grid) — was a hand-duplicated copy here.
+function buildMaskBits() { renderMaskBits('i2cMaskBits'); }
 // Re-render this control AND the Boards-matrix mirror (+ its grid grey-out) so
 // a toggle in either place is reflected in both.
-function maskChanged() { buildMaskBits(); if (window.ctRenderBoardMask) window.ctRenderBoardMask(); }
-window.ctMaskChanged = maskChanged;
-function reflectMask(mask) { if (mask != null) { window.ctChannelMask = mask & 0xFF; maskChanged(); } }
+function maskChanged() { buildMaskBits(); if (ctState.renderBoardMask) ctState.renderBoardMask(); }
+ctState.maskChanged = maskChanged;
+function reflectMask(mask) { if (mask != null) { ctState.channelMask = mask & 0xFF; maskChanged(); } }
 
 // Per-controller diagnostic caches, keyed by controller id (string). Holds the
 // raw present masks, the deep-diagnosis map, the TCA9554 register read, and the
@@ -1984,12 +1976,12 @@ async function i2cSelftest() {
 }
 async function i2cSetMask() {
   try {
-    const j = await postJSON('/api/channel-mask', { mask: window.ctChannelMask });
+    const j = await postJSON('/api/channel-mask', { mask: ctState.channelMask });
     const en = [];
-    for (let c = 0; c < 8; c++) if ((window.ctChannelMask >> c) & 1) en.push('CH' + (c + 1));
+    for (let c = 0; c < 8; c++) if ((ctState.channelMask >> c) & 1) en.push('CH' + (c + 1));
     i2cMsg('Polling ' + (en.join(', ') || 'no channels') + ' (host scan set, 0x'
-      + (window.ctChannelMask & 0xFF).toString(16).toUpperCase().padStart(2, '0') + '). Refreshing boards…');
-    if (window.ctRefreshBoards) window.ctRefreshBoards();
+      + (ctState.channelMask & 0xFF).toString(16).toUpperCase().padStart(2, '0') + '). Refreshing boards…');
+    if (ctState.refreshBoards) ctState.refreshBoards();
   } catch (e) { i2cMsg('Set mask failed: ' + e); }
 }
 async function i2cMuxReset() {
@@ -2017,7 +2009,7 @@ function init() {
     onRowClick: (row) => { stopPlay(); gotoSeq(row.seq, false); },
   });
   gantt = new ScheduleGantt($('schGantt'));
-  window.ctRedrawGantt = () => { try { gantt._resize(); drawGantt(); } catch (e) {} };
+  ctState.redrawGantt = () => { try { gantt._resize(); drawGantt(); } catch (e) {} };
   document.querySelectorAll('#schViewSeg .seg-btn').forEach((b) =>
     b.addEventListener('click', () => setScheduleView(b.dataset.view)));
   $('filSaveBtn').addEventListener('click', saveFilSettings);
@@ -2038,8 +2030,8 @@ function init() {
   $('i2cMaskSetBtn').addEventListener('click', i2cSetMask);
   // Let the Boards-matrix card (power.js) reuse the same get (present scan,
   // which reflects channel_mask back) and set handlers.
-  window.ctI2cGetMask = i2cPresent;
-  window.ctI2cSetMask = i2cSetMask;
+  ctState.i2cGetMask = i2cPresent;
+  ctState.i2cSetMask = i2cSetMask;
   $('hwDownloadBtn').addEventListener('click', hwDownload);
   $('hwVerifyBtn').addEventListener('click', hwVerify);
   $('hwArmBtn').addEventListener('click', hwArm);
@@ -2238,6 +2230,11 @@ function init() {
   // Runs last in the wiring order so the synthetic input/change events land on
   // handlers that are already attached.
   initSticky();
+  // Catches every plain number input NOT already wired by a card's own
+  // render function (index.html's own static inputs — the ones injected
+  // later via power.js/tests.js's *_HTML templates wire themselves at
+  // render time, since they don't exist in the DOM yet when this runs).
+  clampNumberInputs(document);
   if (!loadFilSettings(true)) rebuildSchedule(); // restore host settings, else fresh build
   setViewMode('live');  // start on real hardware — no simulated data until Plan is chosen
   // On load, detect a firmware that's already armed/running/faulted (e.g. after a

@@ -80,6 +80,66 @@ from `../wifi_gui/net_protocol.py` — and exposes:
 | `/api/mux-reset` | POST | pulse the TCA9548A reset line (`CH_RESET_MUX 0x5F`) and re-detect (power-cutting) |
 | `/api/trigger` | POST | `{count}` → bench test: pulse SyncIn via the ESP32 `/sync/fire` |
 | `/api/geometry` | GET | machine geometry constants |
+| `/api/raw` | POST | `{controller, type, payload, flags, timeout}` → any protocol frame, verbatim |
+| `/api/shv` | POST | `{controller, op, …}` → any Simple-HV-schedule opcode (`ShvSetActiveList`…`ShvHeatGetInfo` 0x70–0x7E, plus `ShvFaultPolicy` 0x81 / `ShvTriggerDelay` 0x82) on one controller |
+| `/api/cached-currents` | GET | paged bulk read of `ChGetCachedCurrents` 0x3A per controller — **no I2C**, safe to poll mid-run |
+| `/api/filament-currents` | GET | same 0x3A read, merged/keyed by global filament 0–95 across both controllers |
+| `/api/hv-diag165` | POST | `{controller, channel, test_byte, settle_ms}` → `HvDiag165` 0x7F, raw 74HC165 write/read-back diagnostic |
+| `/api/hv-shift-hz` | POST | `{controller, hz}` → `HvSetShiftHz` 0x80, sets the 165-readback bit-bang SCK frequency (set-only) |
+| `/api/lock` | GET/POST | the cooperative write lease (see *Sharing the bench*) |
+| `/api/clients` | GET | who else has called this API recently |
+
+## Sharing the bench (several programs, one bridge)
+
+The ESP32 bridge is **single-client**: `tcp_bridge.cpp` accepts one socket on
+:3333 and hard-rejects every other connect, so only one process can ever own a
+controller. `backend.py` is that process — it owns both bridge sockets,
+serializes every frame on the link's request lock and routes responses by seq —
+so **any number of programs share the hardware by speaking HTTP to this API**
+instead of grabbing :3333 for themselves.
+
+- Works the same for programs **on this machine** (a notebook, a bench script,
+  a second browser tab — all hitting `127.0.0.1:8770`) and for programs on
+  **other machines**: the server binds all interfaces (`CT_GUI_HOST=127.0.0.1`
+  to keep it local) and answers **CORS**, so tools elsewhere on the LAN and
+  pages served from another origin can call it too.
+- **Reads are always free.** Writes interleave frame-by-frame and are free too.
+- A program that needs a stretch of *uninterrupted* time (schedule download,
+  calibration sweep, an armed run) takes the **lease**: while it is held, only
+  the holder may write — everyone else gets `409` plus who holds it. Read
+  commands (`CH_GET_*`, `HV_GET_*`, `ShvGet*`, presence/diagnosis scans) stay
+  allowed throughout: a lease reserves the right to *change* the hardware, not
+  to look at it. The lease always expires (default 30 s, renewable, 600 s max),
+  so a client that dies mid-run can never wedge the bench.
+- Identify yourself with an `X-CT-Client: <name>` header (or a `client` field in
+  the body). Taking the lease **requires** a name and the name must be unique
+  per process (append a PID): two unnamed programs on the same machine would
+  otherwise share their address-derived identity and could renew, release, or
+  write past each other's lease. Only the holder can release it (`steal: true`
+  overrides — for when a program died without releasing and you don't want to
+  wait out its TTL). `GET /api/clients` lists everyone currently on the API,
+  `GET /api/lock` the current holder; the GUI shows a 🔒 badge while somebody
+  else holds it.
+
+```python
+import os, requests
+API = "http://127.0.0.1:8770"                      # or http://bench-host:8770
+ME = {"X-CT-Client": f"sweep.py#{os.getpid()}"}    # unique per process
+
+requests.post(f"{API}/api/lock", json={"action": "acquire", "ttl": 60,
+                                       "note": "impedance sweep"}, headers=ME)
+try:
+    requests.post(f"{API}/api/cmd", headers=ME, json={           # named command
+        "controller": 1, "command": "CH_SET_POWER_STATE", "channel": 0,
+        "mux_port": 0, "state": 4, "arg16": 1200})
+    requests.post(f"{API}/api/raw", headers=ME, json={           # or any raw frame
+        "controller": 1, "type": "0x79", "payload": ""})
+finally:
+    requests.post(f"{API}/api/lock", json={"action": "release"}, headers=ME)
+```
+
+The GUI plays by the same rules: each tab has its own client id and takes the
+lease around a schedule download and a Cal & Test run (`static/client.js`).
 
 ## Real-hardware bound schedule (download · arm · trigger · monitor)
 
@@ -104,6 +164,18 @@ The **Hardware run** panel (schedule card):
   identical **global cursor** → the ring playhead; `filamentIndex` is the live
   firing filament; `state`/`faultFilament` surface completion/abort. In **Live**
   view the ring tracks the firmware cursor.
+- **Fault policy** — `ShvFaultPolicy 0x81` sets two independent stop/continue
+  switches *before* arming: a board CC/OCP fault, and a 74HC165 read-back
+  mismatch (which under "continue" is force-written and still fires at its
+  intended width). Under "continue" the run's `stop_reason` never trips —
+  the only record is `mismatch_count` + the `faulted_slots` bitmask, both
+  reset on each fresh arm. `ShvTriggerDelay 0x82` offsets SyncIn→fire by a
+  fixed µs (PIO precision mode only; `applies=0` means the live fire path
+  can't honour it, so a set can't silently do nothing).
+- Live currents during a run are read via `ChGetCachedCurrents 0x3A`
+  (`/api/cached-currents`, `/api/filament-currents`) — the CC loop's
+  already-measured values, **no I2C**, so polling it doesn't stall pulses
+  the way an INA219 sweep would.
 
 ## Scan schedule + bound heating plan
 
@@ -137,6 +209,12 @@ In Debug, the editor maps each control to a firmware command
 - **OCP** → `CH_SET_TPS_OCP_THRESHOLD` 0x28 · **Heating I (measured)** →
   `CH_GET_INA219` 0x24 · **DC HV** read/toggle → `HV_GET_ALL_BYTES` 0x13 /
   `HV_SET_BIT` 0x10 · **Fire pulse** → `HV_PULSE` 0x16.
+- **165 shift-chain bench diagnostics** (signal-integrity work, no HV/heating
+  involved): `HvDiag165` 0x7F writes/reads back a test byte on one channel's
+  74HC165 chain to separate a write fault from a read-back fault
+  (`/api/hv-diag165`); `HvSetShiftHz` 0x80 sets that chain's bit-bang SCK
+  frequency (100 Hz–2 MHz, set-only, survives until reboot — for a
+  spike-free waveform on long cables) (`/api/hv-shift-hz`).
 
 Frames are built in `backend.py` (the firmware protocol is ahead of the WiFi
 GUI's `net_protocol`) and proxied via `POST /api/cmd {controller, command, …}`.
@@ -167,7 +245,15 @@ GUI's `net_protocol`) and proxied via `POST /api/cmd {controller, command, …}`
 python3 tools/ct_gui/backend.py
 ```
 
-Then open <http://127.0.0.1:8770>.
+Then open <http://127.0.0.1:8770> (other machines: `http://<this-host>:8770`).
+
+Every input field remembers the last value you typed or picked
+(`static/sticky.js` → localStorage) and restores it on load, so a reload or a
+rebuilt card never resets the bench setup. Fields marked `data-nostick` are
+deliberately not remembered: the **Override** safety gate and the two
+live-capture checkboxes (**Auto 2 Hz**, **Live**), which would otherwise start
+hardware traffic by themselves at page load. `ctSticky.clear()` in the console
+forgets everything.
 
 - **Play / Step / Reset** drive the scan; **Space** toggles play, **→** steps.
 - The collimator/active-filament/gantry sliders scrub the geometry directly.

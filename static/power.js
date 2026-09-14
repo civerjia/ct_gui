@@ -6,26 +6,18 @@
  * build_command_payload and proxied via POST /api/power-cmd {controller, command, …}.
  */
 
-import { calApi } from './tests.js';
-
-const $p = (id) => document.getElementById(id);
-// Always resolve to an object with `ok` — a network/parse failure becomes
-// {ok:false,error} instead of a thrown rejection, so callers that show a
-// "… in progress" line always get to replace it with the result or the error.
-const postJ = async (path, body) => {
-  try {
-    return await (await fetch(path, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
-    })).json();
-  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
-};
+import { calApi, liveRefV, setLiveRefV, peakToMa } from './tests.js';
+import { $ as $p, setMsg, clampNumberInputs } from './dom.js';
+import { postJ, sleep } from './net.js';
+import { state } from './state.js';
+import { filamentToBoard } from './app.js';
 
 let pwTarget = 1;                       // selected controller (1 or 2) — boards/HV-grid
 // The STM32 (HV monitor/setpoints + ADC waveform/pulses) lives only on the MASTER
 // controller; those calls route there regardless of the selected target.
-const masterId = () => window.ctMaster || 1;
+const masterId = () => state.master || 1;
 const masterConnected = () => !!connectedSet[masterId()];
-const POLL_MS = 1000;                    // board snapshot + HV grid refresh period
+const POLL_MS = 500;                     // board snapshot + HV grid refresh period
 const REFRESH_S = (POLL_MS / 1000).toFixed(0) + ' s';
 const powerCmd = (command, extra) => postJ('/api/power-cmd', { controller: pwTarget, command, ...extra });
 
@@ -57,32 +49,55 @@ const I_MAX_MA = OCP_MAX_MA;              // current capability = hardware ceili
 // power-state ladder (CH_SET_POWER_STATE arg = mA for Idle/Active, mV for Voltage)
 const STATE_STANDBY = 3, STATE_IDLE = 4, STATE_ACTIVE = 5, STATE_VOLTAGE = 6;
 let bmState = STATE_IDLE;
-function reflectStateArg() {
-  document.querySelectorAll('#bmStateSeg button').forEach((b) => b.classList.toggle('active', +b.dataset.state === bmState));
-  const row = document.getElementById('bmStateArgRow'), unit = document.getElementById('bmArgUnit');
-  if (!row) return;
-  // hides ONLY the value field (an inline label); the Apply button stays visible
-  // so Stop/Sleep/Standby (no setpoint) can still be applied.
-  const arg = document.getElementById('bmStateArg');
-  // current is clamped to the hardware capability (4233 mA). OCP is a separate,
-  // overwritable setting — NOT a limit on the current field.
-  if (bmState === STATE_VOLTAGE) { row.style.display = ''; unit.textContent = 'Voltage (mV)'; if (arg) arg.max = V_MAX_MV; }
-  else if (bmState === STATE_IDLE || bmState === STATE_ACTIVE) { row.style.display = ''; unit.textContent = 'Current (mA)'; if (arg) arg.max = I_MAX_MA; }
-  else { row.style.display = 'none'; }
-  // impedance sweep is only meaningful in Voltage mode
-  const z = document.getElementById('bmZSection');
-  if (z) z.style.display = bmState === STATE_VOLTAGE ? '' : 'none';
-}
 // Batch power-state selector (applies to every selected board), independent of
-// the single-board one above.
+// the single-board one above — same UI reflection logic, parameterized (was
+// two hand-duplicated copies differing only in element-id prefix).
 let bmBatchState = STATE_IDLE;
-function reflectBatchStateArg() {
-  document.querySelectorAll('#bmBatchStateSeg button').forEach((b) => b.classList.toggle('active', +b.dataset.bstate === bmBatchState));
-  const row = document.getElementById('bmBatchStateArgRow'), unit = document.getElementById('bmBatchArgUnit'), arg = document.getElementById('bmBatchStateArg');
+
+// Reflects a power-state segmented-button selector's UI: which button is
+// active, the value row's visibility/unit/max, and (single-board only) the
+// impedance-sweep section, which is only meaningful in Voltage mode.
+// current is clamped to the hardware capability (4233 mA). OCP is a separate,
+// overwritable setting — NOT a limit on the current field. The row hides
+// ONLY the value field (an inline label); the Apply button stays visible so
+// Stop/Sleep/Standby (no setpoint) can still be applied.
+function reflectStateArgFor(segSel, dataAttr, state, rowId, unitId, argId, extraId) {
+  document.querySelectorAll(segSel).forEach((b) => b.classList.toggle('active', +b.dataset[dataAttr] === state));
+  const row = document.getElementById(rowId), unit = document.getElementById(unitId);
   if (!row) return;
-  if (bmBatchState === STATE_VOLTAGE) { row.style.display = ''; unit.textContent = 'Voltage (mV)'; if (arg) arg.max = V_MAX_MV; }
-  else if (bmBatchState === STATE_IDLE || bmBatchState === STATE_ACTIVE) { row.style.display = ''; unit.textContent = 'Current (mA)'; if (arg) arg.max = I_MAX_MA; }
+  const arg = document.getElementById(argId);
+  if (state === STATE_VOLTAGE) { row.style.display = ''; unit.textContent = 'Voltage (mV)'; if (arg) arg.max = V_MAX_MV; }
+  else if (state === STATE_IDLE || state === STATE_ACTIVE) { row.style.display = ''; unit.textContent = 'Current (mA)'; if (arg) arg.max = I_MAX_MA; }
   else { row.style.display = 'none'; }
+  if (extraId) { const z = document.getElementById(extraId); if (z) z.style.display = state === STATE_VOLTAGE ? '' : 'none'; }
+}
+function reflectStateArg() {
+  reflectStateArgFor('#bmStateSeg button', 'state', bmState, 'bmStateArgRow', 'bmArgUnit', 'bmStateArg', 'bmZSection');
+}
+function reflectBatchStateArg() {
+  reflectStateArgFor('#bmBatchStateSeg button', 'bstate', bmBatchState, 'bmBatchStateArgRow', 'bmBatchArgUnit', 'bmBatchStateArg');
+}
+
+// Wires a power-state segmented-button selector: clicking a button saves the
+// current arg-field value into that state's own memory (Idle/Active/Voltage
+// each remember what the user last typed, independently), switches state,
+// restores the new state's remembered value (or its default, first time),
+// and reflects the UI. Shared by the single-board and batch selectors, each
+// with its own state variable (via getState/setState) and its own memory.
+function wireStateSeg(segSel, dataAttr, argId, getState, setState, reflect) {
+  const memory = { [STATE_IDLE]: 1000, [STATE_ACTIVE]: 3000, [STATE_VOLTAGE]: 800 };
+  document.querySelectorAll(segSel).forEach((b) =>
+    b.addEventListener('click', () => {
+      const prev = getState();
+      const next = +b.dataset[dataAttr];
+      setState(next);
+      const arg = document.getElementById(argId);
+      if (arg) {
+        if (prev in memory) memory[prev] = +arg.value;
+        if (next in memory) arg.value = memory[next];
+      }
+      reflect();
+    }));
 }
 const boardSel = new Set(['0.0']);      // multi-select "ch.mux" keys
 const bKey = (b) => `${b.channel}.${b.mux_port}`;
@@ -94,11 +109,10 @@ function boardMask() {
   return mask;
 }
 
-// Channel-enable mask mirror. Single source of truth = window.ctChannelMask,
+// Channel-enable mask mirror. Single source of truth = state.channelMask,
 // shared with the I²C-section control in app.js. Masked-off channels are
 // dimmed + non-selectable in the grid and skipped by the select-all helpers.
-if (window.ctChannelMask == null) window.ctChannelMask = 0x3F;
-const chEnabled = (ch) => !!((window.ctChannelMask >> ch) & 1);
+const chEnabled = (ch) => !!((state.channelMask >> ch) & 1);
 
 // Drop any selected boards (and move the single-board anchor off) channels the
 // mask just disabled, so batch ops never reach a masked-off channel.
@@ -110,9 +124,10 @@ function pruneMaskedSelection() {
   }
 }
 
-// 8-bit channel-enable toggles. Rendered into both the Boards card (#bmMaskBits)
-// and the HV grid (#hvMaskBits) — both mirror the shared window.ctChannelMask.
-function renderMaskBits(containerId) {
+// 8-bit channel-enable toggles. Rendered into the Boards card (#bmMaskBits),
+// the HV grid (#hvMaskBits), and (imported by app.js) the I²C section
+// (#i2cMaskBits) — all three mirror the shared state.channelMask.
+export function renderMaskBits(containerId) {
   const el = $p(containerId); if (!el) return;
   el.innerHTML = '';
   for (let ch = 0; ch < 8; ch++) {
@@ -121,10 +136,10 @@ function renderMaskBits(containerId) {
     b.textContent = ch + 1;
     b.title = `Channel ${ch + 1} ${chEnabled(ch) ? 'enabled' : 'disabled'}`;
     b.addEventListener('click', () => {
-      window.ctChannelMask ^= (1 << ch);
-      // ctMaskChanged (app.js) re-renders every mirror and the I²C control;
+      state.channelMask ^= (1 << ch);
+      // state.maskChanged (app.js) re-renders every mirror and the I²C control;
       // fall back to a local refresh if app.js hasn't wired it yet.
-      if (window.ctMaskChanged) window.ctMaskChanged();
+      if (state.maskChanged) state.maskChanged();
       else { renderMaskBits(containerId); }
     });
     el.appendChild(b);
@@ -134,7 +149,7 @@ function renderBoardMaskBits() { renderMaskBits('bmMaskBits'); }
 
 // app.js calls this after any mask change (from any control) to keep the Boards
 // card + HV grid mirrors and their grid grey-outs in sync.
-window.ctRenderBoardMask = () => {
+state.renderBoardMask = () => {
   pruneMaskedSelection(); renderBoardMaskBits(); renderBoardGrid();
   pruneHvMaskedSelection(); renderMaskBits('hvMaskBits'); renderHvGrid();
 };
@@ -263,7 +278,23 @@ const BOARDS_HTML = `
   </div>
   <div id="bmStatus" class="summary"></div>`;
 
-const bmMsg = (m) => { const e = $p('bmStatus'); if (e) e.textContent = m; };
+const bmMsg = (m) => setMsg('bmStatus', m);
+
+// Shift-click rectangular block-select: given the drag anchor and the
+// clicked cell (both {[rowKey]:_, [colKey]:_} shaped), selects every ENABLED
+// row's cells in the rectangle between them into `sel` (a Set of "row.col"
+// string keys), clearing any prior selection. Shared by the Boards matrix
+// (channel × mux_port) and the HV grid (channel × bit) — same algorithm,
+// different axis names; each grid's own ctrl-click/plain-click handling
+// stays inline below since those genuinely differ (Boards selects + reads
+// board info; HV grid's plain click doesn't select at all, it actuates the
+// switch directly).
+function selectRect(sel, anchor, cur, rowKey, colKey, isRowEnabled) {
+  const r0 = Math.min(anchor[rowKey], cur[rowKey]), r1 = Math.max(anchor[rowKey], cur[rowKey]);
+  const c0 = Math.min(anchor[colKey], cur[colKey]), c1 = Math.max(anchor[colKey], cur[colKey]);
+  sel.clear();
+  for (let r = r0; r <= r1; r++) { if (!isRowEnabled(r)) continue; for (let c = c0; c <= c1; c++) sel.add(`${r}.${c}`); }
+}
 
 function renderBoardGrid() {
   const grid = $p('bmGrid'); if (!grid) return;
@@ -277,11 +308,16 @@ function renderBoardGrid() {
     tile.className = 'status-tile ' + cls + (boardSel.has(k) ? ' selected' : '')
       + (chEnabled(b.channel) ? '' : ' masked')
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');
-    const dot = (on, ch, fa) => `<span class="dot ${fa ? 'fault' : on ? 'on' : 'off'}">${ch}</span>`;
-    const hv = `<span class="hv-badge ${b.hv_overcurrent ? 'on' : 'off'}" title="HV current ${b.hv_overcurrent ? 'sensed (>1 mA)' : 'none'}">HV</span>`;
+    // valid=false means that field's read failed (e.g. a board design with
+    // the HV-current chip removed) -- the value itself is meaningless, so
+    // render "unknown" (dashed/hatched), never a confident-looking off.
+    const dot = (on, ch, fa, valid = true) =>
+      `<span class="dot ${!valid ? 'unknown' : fa ? 'fault' : on ? 'on' : 'off'}">${valid ? ch : '?'}</span>`;
+    const hvValid = b.hv_overcurrent_valid;
+    const hv = `<span class="hv-badge ${!hvValid ? 'unknown' : b.hv_overcurrent ? 'on' : 'off'}" title="HV current ${!hvValid ? 'unavailable (chip not present)' : b.hv_overcurrent ? 'sensed (>1 mA)' : 'none'}">HV</span>`;
     tile.innerHTML = hv
       + `<span class="tile-title">${b.label}</span>`
-      + `<span class="tile-dots">${dot(b.present, 'P')}${dot(b.iso_enabled, 'I')}${dot(b.tps_enabled, 'T', b.tps_fault)}${dot(b.tps_fault, 'F', b.tps_fault)}</span>`
+      + `<span class="tile-dots">${dot(b.present, 'P')}${dot(b.iso_enabled, 'I', false, b.iso_enabled_valid)}${dot(b.tps_enabled, 'T', b.tps_fault, b.tps_enabled_valid)}${dot(b.tps_fault, 'F', b.tps_fault, b.tps_fault_valid)}</span>`
       + `<span class="tile-measure">${b.present
           ? `<span>${(b.bus_mV / 1000).toFixed(2)} V</span><span>${b.current_mA} mA</span>`
           : '<span>—</span>'}</span>`;
@@ -290,10 +326,7 @@ function renderBoardGrid() {
       if (e.shiftKey) {
         // Rectangular block from the anchor (boardPrimary) to this cell —
         // selects every enabled board in channels [r0..r1] × ports [c0..c1].
-        const r0 = Math.min(boardPrimary.channel, b.channel), r1 = Math.max(boardPrimary.channel, b.channel);
-        const c0 = Math.min(boardPrimary.mux_port, b.mux_port), c1 = Math.max(boardPrimary.mux_port, b.mux_port);
-        boardSel.clear();
-        for (let c = r0; c <= r1; c++) { if (!chEnabled(c)) continue; for (let m = c0; m <= c1; m++) boardSel.add(`${c}.${m}`); }
+        selectRect(boardSel, boardPrimary, { channel: b.channel, mux_port: b.mux_port }, 'channel', 'mux_port', chEnabled);
         renderBoardGrid();                               // anchor stays put so the block can be re-dragged
       } else if (e.ctrlKey || e.metaKey) {
         if (boardSel.has(k)) boardSel.delete(k); else boardSel.add(k);
@@ -312,15 +345,15 @@ function renderBoardGrid() {
 function renderOneBoard() {
   const b = boardCache.find((x) => x.channel === boardPrimary.channel && x.mux_port === boardPrimary.mux_port);
   $p('bmOneLabel').textContent = b ? b.label : `CH${boardPrimary.channel + 1}.${boardPrimary.mux_port + 1}`;
-  const badge = (id, on, fault) => {
+  const badge = (id, on, fault, valid = true) => {
     const e = $p(id); if (!e) return;
-    e.className = 'b-badge ' + (fault ? 'fault' : on ? 'on' : 'off');
-    e.textContent = fault ? '!' : on ? '✓' : '·';
+    e.className = 'b-badge ' + (!valid ? 'unknown' : fault ? 'fault' : on ? 'on' : 'off');
+    e.textContent = !valid ? '?' : fault ? '!' : on ? '✓' : '·';
   };
   badge('bmbPresent', b && b.present);
-  badge('bmbTps', b && b.tps_enabled);
-  badge('bmbIso', b && b.iso_enabled);
-  badge('bmbFault', b && b.tps_fault, b && b.tps_fault);
+  badge('bmbTps', b && b.tps_enabled, false, !b || b.tps_enabled_valid);
+  badge('bmbIso', b && b.iso_enabled, false, !b || b.iso_enabled_valid);
+  badge('bmbFault', b && b.tps_fault, b && b.tps_fault, !b || b.tps_fault_valid);
   const v = (b && b.present) ? b.bus_mV : 0, i = (b && b.present) ? b.current_mA : 0;
   $p('bmOneV').textContent = (b && b.present) ? (v / 1000).toFixed(3) + ' V' : '—';
   $p('bmOneI').textContent = (b && b.present) ? i + ' mA' : '—';
@@ -379,7 +412,6 @@ async function readTpsRegs(silent) {
 // ---- filament impedance sweep ----------------------------------------------
 // Voltage-mode scan 0.8→1.5 V (0.1 V step); dwell at each step for thermal
 // equilibrium, read INA219, then least-squares fit V = a·I² + R0 and plot.
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let zPoints = [], zFit = null;
 
 // the fit model, typeset as MathML (native, offline LaTeX-quality). Symbolic
@@ -437,15 +469,11 @@ async function measureImpedance() {
     $p('bmZMeasure').disabled = false;
   }
   if (zPoints.length < 3) { $p('bmZResult').textContent = `only ${zPoints.length} valid point(s) — enable ISO+TPS and check the board`; drawZ(); return; }
-  // least-squares V = a·I² + R0 : basis [I², 1]
-  // V = (a·I² + R0)·I = a·I³ + R0·I  → R = V/I = a·I² + R0 (R0 = cold resistance).
-  // LSQ basis [I³, I]: [sI6 sI4; sI4 sI2][a;R0] = [sI3V; sIV].
-  let sI6 = 0, sI4 = 0, sI2 = 0, sI3V = 0, sIV = 0; const n = zPoints.length;
-  for (const p of zPoints) { const i = p.i, i2 = i * i, i3 = i2 * i; sI6 += i3 * i3; sI4 += i2 * i2; sI2 += i2; sI3V += i3 * p.v; sIV += i * p.v; }
-  const det = sI6 * sI2 - sI4 * sI4;
-  let a = det ? (sI3V * sI2 - sI4 * sIV) / det : 0;
-  let R0 = det ? (sI6 * sIV - sI4 * sI3V) / det : 0;
-  if (R0 < 0) { R0 = 0; a = sI6 ? sI3V / sI6 : 0; }   // constrain R₀ ≥ 0, refit a
+  // least-squares V = (a·I² + R0)·I — same fit as tests.js's calApi.fitR0
+  // (the single-board Cal & Test panel below uses it directly); this sweep
+  // predates that shared helper, kept its own inline copy until now.
+  const n = zPoints.length;
+  const { a, R0 } = calApi.fitR0(zPoints);
   zFit = { a, R0 };
   drawZ();
   $p('bmZFormula').innerHTML = zMathML(a, R0);
@@ -496,7 +524,10 @@ async function refreshBoards(fast) {
   renderBoardGrid(); renderOneBoard();
   bmMsg(`Power ${pwTarget} — ${boardCache.filter((b) => b.present).length}/64 present · INA219 refresh ${REFRESH_S}.`);
 }
-window.ctRefreshBoards = refreshBoards;
+state.refreshBoards = refreshBoards;
+// Resync the Emission/Focus enable buttons to the actual hardware state.
+// Called by tests.js after any test run that may have changed HV state.
+state.syncHvButtons = () => readHvStatus(true);
 
 let connectedSet = {};
 function boardTargetConnected() { return !!connectedSet[pwTarget]; }
@@ -516,6 +547,7 @@ async function voutSrOne({ channel, mux_port }, ocp, sr) {
 
 function wireBoards() {
   $p('boardsCard').innerHTML = BOARDS_HTML;
+  clampNumberInputs($p('boardsCard'));
   // anchorFromSel: park the shift-block anchor on the lowest selected cell (or the
   // first enabled board) so a later shift-click starts from a real, visible origin.
   const anchorFromSel = () => {
@@ -530,10 +562,10 @@ function wireBoards() {
   // Channel-enable mask (mirror of the I²C-section control). Get = present scan
   // (its response reflects channel_mask back via app.js); Set = push the mask.
   renderBoardMaskBits();
-  $p('bmMaskGetBtn').onclick = () => { if (window.ctI2cGetMask) window.ctI2cGetMask(); else refreshBoards(); };
+  $p('bmMaskGetBtn').onclick = () => { if (state.i2cGetMask) state.i2cGetMask(); else refreshBoards(); };
   $p('bmMaskSetBtn').onclick = async () => {
-    if (window.ctI2cSetMask) { window.ctI2cSetMask(); return; }
-    const j = await postJ('/api/channel-mask', { mask: window.ctChannelMask });
+    if (state.i2cSetMask) { state.i2cSetMask(); return; }
+    const j = await postJ('/api/channel-mask', { mask: state.channelMask });
     bmMsg(j.ok === false ? (j.error || 'set mask failed') : 'channel mask set');
   };
   const run = async (p) => { const j = await p; bmMsg(j.ok ? 'ok' : (j.error || 'failed')); refreshBoards(true); };
@@ -552,18 +584,8 @@ function wireBoards() {
   $p('bmOneSetOcp').onclick = async () => { await run(powerCmd('CH_SET_TPS_OCP_THRESHOLD', { ...single(), threshold_mA: Math.min(OCP_MAX_MA, +$p('bmOneOcp').value) })); readTpsRegs(); };
   // Power state (CH_SET_POWER_STATE 0x35) — routed via /api/cmd (firmware-ahead
   // of build_command_payload). Idle/Active carry mA; Voltage carries mV.
-  document.querySelectorAll('#bmStateSeg button').forEach((b) =>
-    b.addEventListener('click', () => {
-      bmState = +b.dataset.state;
-      // each state gets its own sensible default — don't carry Active's current into Idle
-      const arg = $p('bmStateArg');
-      if (arg) {
-        if (bmState === STATE_IDLE) arg.value = 1000;
-        else if (bmState === STATE_ACTIVE) arg.value = 3000;
-        else if (bmState === STATE_VOLTAGE) arg.value = 800;
-      }
-      reflectStateArg();
-    }));
+  wireStateSeg('#bmStateSeg button', 'state', 'bmStateArg',
+    () => bmState, (v) => { bmState = v; }, reflectStateArg);
   $p('bmApplyState').onclick = async () => {
     const cap = bmState === STATE_VOLTAGE ? V_MAX_MV : I_MAX_MA;
     const arg = (bmState === STATE_IDLE || bmState === STATE_ACTIVE || bmState === STATE_VOLTAGE)
@@ -575,17 +597,8 @@ function wireBoards() {
   reflectStateArg();
   // Batch power state — applies the chosen state to every selected board (loops
   // CH_SET_POWER_STATE per board; 0x35 has no board-mask form).
-  document.querySelectorAll('#bmBatchStateSeg button').forEach((b) =>
-    b.addEventListener('click', () => {
-      bmBatchState = +b.dataset.bstate;
-      const arg = $p('bmBatchStateArg');
-      if (arg) {
-        if (bmBatchState === STATE_IDLE) arg.value = 1000;
-        else if (bmBatchState === STATE_ACTIVE) arg.value = 3000;
-        else if (bmBatchState === STATE_VOLTAGE) arg.value = 800;
-      }
-      reflectBatchStateArg();
-    }));
+  wireStateSeg('#bmBatchStateSeg button', 'bstate', 'bmBatchStateArg',
+    () => bmBatchState, (v) => { bmBatchState = v; }, reflectBatchStateArg);
   $p('bmBatchApplyState').onclick = async () => {
     const keys = [...boardSel];
     if (!keys.length) { bmMsg('no boards selected'); return; }
@@ -639,6 +652,46 @@ function pruneHvMaskedSelection() {
   }
 }
 
+// Setpoint rows + enable buttons shared between the primary HV card
+// (suffix='') and the index.html "HV Control & Monitor" mirror card
+// (suffix='2', rendered below Hardware Run) — was hand-duplicated markup
+// in index.html that could silently drift from here when a field changed.
+function hvSetpointRowsHtml(suffix) {
+  return `
+    <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (the output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper and writes it directly (no closed loop, no drift). Cal sweeps the wiper 0→127 and reads the measured V at each step to (re)build the LUT — enable Emission HV first.">
+      <label class="numlabel"><span class="cap">Emission −V</span><input id="emVset${suffix}" type="number" min="0" max="350" value="0" /></label>
+      <span id="emVmeas${suffix}" class="pot-est">—</span>
+      <button id="emVsetBtn${suffix}" class="xs">Set V</button>
+      <button id="emVcalBtn${suffix}" class="xs">Cal</button>
+    </div>
+    <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (the output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper and writes it directly (no closed loop, no drift). Cal sweeps the wiper 0→127 and reads the measured V at each step to (re)build the LUT — enable Focus HV first.">
+      <label class="numlabel"><span class="cap">Focus −V</span><input id="focVset${suffix}" type="number" min="0" max="495" value="0" /></label>
+      <span id="focVmeas${suffix}" class="pot-est">—</span>
+      <button id="focVsetBtn${suffix}" class="xs">Set V</button>
+      <button id="focVcalBtn${suffix}" class="xs">Cal</button>
+    </div>
+    <div class="bm-set-row hv-set">
+      <label class="numlabel"><span class="cap">Emission I</span><input id="dsEi${suffix}" type="number" min="0" max="127" value="0" /></label>
+      <span id="dsEiEst${suffix}" class="pot-est">~0 mA</span>
+      <button id="dsSet${suffix}" class="xs">Set I</button>
+      <button id="dsRead${suffix}" class="xs">Read</button>
+    </div>`;
+}
+function hvEnableRowHtml(suffix) {
+  return `
+    <div class="hv-row">
+      <span class="hv-en-group">
+        <button id="hvEnEmOn${suffix}" class="xs hv-en-btn on-btn">Emission ON</button>
+        <button id="hvEnEmOff${suffix}" class="xs hv-en-btn off-btn">Emission OFF</button>
+      </span>
+      <span class="hv-en-group">
+        <button id="hvEnFocOn${suffix}" class="xs hv-en-btn on-btn">Focus ON</button>
+        <button id="hvEnFocOff${suffix}" class="xs hv-en-btn off-btn">Focus OFF</button>
+      </span>
+    </div>
+    <div id="dsStatus${suffix}" class="summary"></div>`;
+}
+
 const HV_HTML = `
   <div class="batch-box">
     <div class="block-title">HV grid <button id="hvMonitor" class="xs">Monitor: ON</button> <span class="hint">click=toggle · shift/ctrl=multi</span></div>
@@ -668,8 +721,11 @@ const HV_HTML = `
       <button id="hvRefresh" class="xs">Refresh</button>
       <label class="hw-override" title="Force mode: send force=true instead of verify=true when toggling bits. Use when the switch feedback is unreliable or the filament is shorted."><input type="checkbox" id="hvForce" /> Force</label>
     </div>
-    <div class="hv-row">
+    <div class="hv-row" title="Software-timed pulse (RP2350 delayMicroseconds) — NOT the hardware-clocked PIO engine the Simple HV schedule card below uses. Its envelope is not precisely aligned to the real switch transition, so don't use this to time/measure pulse current — use Simple HV schedule + the STM32 per-pulse detector for that.">
       <label class="numlabel">Pulse µs <input id="hvPulseUs" type="number" min="1" value="100" /></label>
+      <label class="numlabel" title="PostOnly: fire, no readback check. Pre+Post / Pre+Post+Level: reads the switch feedback before AND after the pulse and reports the actually-measured width + any bit that didn't actuate as commanded.">verify
+        <select id="hvPulseVerify"><option value="0">PostOnly</option><option value="1">Pre+Post</option><option value="2">Pre+Post+Level</option></select>
+      </label>
       <button id="hvPulse" class="xs">Fire pulse</button>
     </div>
     <div class="hv-row" title="Pulse-INDEPENDENT ADC ground truth: the STM32 sums N samples on-chip over the window and returns mean/min/max/rms/std over UART (no SPI, no pulse needed). At 1 MSPS, 1 ms = 1000 samples. Arms the ADC if idle.">
@@ -682,24 +738,7 @@ const HV_HTML = `
 
   <div class="batch-box">
     <div class="block-title">HV setpoints <span class="hint">— LUT wiper (no drift)</span></div>
-    <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (the output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper and writes it directly (no closed loop, no drift). Cal sweeps the wiper 0→127 and reads the measured V at each step to (re)build the LUT — enable Emission HV first.">
-      <label class="numlabel"><span class="cap">Emission −V</span><input id="emVset" type="number" min="0" max="350" value="0" /></label>
-      <span id="emVmeas" class="pot-est">—</span>
-      <button id="emVsetBtn" class="xs">Set V</button>
-      <button id="emVcalBtn" class="xs">Cal</button>
-    </div>
-    <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (the output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper and writes it directly (no closed loop, no drift). Cal sweeps the wiper 0→127 and reads the measured V at each step to (re)build the LUT — enable Focus HV first.">
-      <label class="numlabel"><span class="cap">Focus −V</span><input id="focVset" type="number" min="0" max="495" value="0" /></label>
-      <span id="focVmeas" class="pot-est">—</span>
-      <button id="focVsetBtn" class="xs">Set V</button>
-      <button id="focVcalBtn" class="xs">Cal</button>
-    </div>
-    <div class="bm-set-row hv-set">
-      <label class="numlabel"><span class="cap">Emission I</span><input id="dsEi" type="number" min="0" max="127" value="0" /></label>
-      <span id="dsEiEst" class="pot-est">~0 mA</span>
-      <button id="dsSet" class="xs">Set I</button>
-      <button id="dsRead" class="xs">Read</button>
-    </div>
+    ${hvSetpointRowsHtml('')}
     <div class="block-title" style="margin-top:6px">Direct wiper <span class="hint">— raw DS3502 (bypasses the closed loop)</span></div>
     <div class="bm-set-row hv-set" title="Write the DS3502 wiper directly (0–127), bypassing the closed loop — to isolate firmware-loop vs GUI/hardware. Clr the closed loop first or it will overwrite this. Watch the monitor's Emission V.">
       <label class="numlabel"><span class="cap">Em-V wiper</span><input id="evWiper" type="number" min="0" max="127" value="0" /></label>
@@ -713,18 +752,14 @@ const HV_HTML = `
       <button id="fvWiperSet" class="xs">Set</button>
       <button id="fvWiperGet" class="xs">Read</button>
     </div>
-    <div class="hv-row">
-      <button id="hvEnEm" class="xs hv-en off">Emission: ?</button>
-      <button id="hvEnFoc" class="xs hv-en off">Focus: ?</button>
-    </div>
-    <div id="dsStatus" class="summary"></div>
+    ${hvEnableRowHtml('')}
   </div>
 
   <div class="batch-box">
     <div class="block-title">HV monitor <span class="hint">— ADS1115</span></div>
     <div class="row wrap">
       <button id="adsRead" class="xs">Read</button>
-      <label class="chk"><input id="adsAuto" type="checkbox" checked /> Auto 2 Hz</label>
+      <label class="chk"><input id="adsAuto" type="checkbox" checked data-nostick /> Auto 10 Hz</label>
     </div>
     <div class="detail-top">
       <div class="metric"><span class="metric-label">1.2V ref</span><span id="adsRef" class="metric-value">—</span></div>
@@ -818,10 +853,7 @@ function renderHvGrid() {
       if (!chEnabled(ch)) return;                        // masked channel: non-interactive
       if (e.shiftKey) {
         // rectangular block from the anchor to this cell (enabled channels only)
-        const r0 = Math.min(hvPrimary.channel, ch), r1 = Math.max(hvPrimary.channel, ch);
-        const c0 = Math.min(hvPrimary.bit, b), c1 = Math.max(hvPrimary.bit, b);
-        hvSel.clear();
-        for (let c = r0; c <= r1; c++) { if (!chEnabled(c)) continue; for (let m = c0; m <= c1; m++) hvSel.add(`${c}.${m}`); }
+        selectRect(hvSel, hvPrimary, { channel: ch, bit: b }, 'channel', 'bit', chEnabled);
         renderHvGrid();
       } else if (e.ctrlKey || e.metaKey) {
         hvSel.has(k) ? hvSel.delete(k) : hvSel.add(k);
@@ -840,28 +872,59 @@ function renderHvGrid() {
 // Monitor gates the periodic HV feedback read — OFF = no SCK/LOAD activity from
 // the GUI (so a scope sees a quiet bus). A manual Refresh still forces a read.
 let hvMonitorOn = true;
+// Suppress periodic (non-forced) refreshHv calls while an optimistic force-write
+// is in flight, so the stale server snapshot doesn't flicker the tile back.
+let hvForcePending = 0;
 async function refreshHv(force) {
   if (!boardTargetConnected() || (!hvMonitorOn && !force)) { return; }
+  if (!force && hvForcePending > 0) { return; }   // optimistic write in flight — skip
   let j; try { j = await (await fetch(`/api/hv-snapshot?controller=${pwTarget}`)).json(); } catch { return; }
   if (j.ok) { hvDesired = j.desired; hvFeedback = j.feedback; renderHvGrid(); }
 }
 function hvForceChecked() { const el = $p('hvForce'); return !!(el && el.checked); }
 async function hvSetBit(ch, b, val) {
-  const extra = hvForceChecked() ? { channel: ch, bit: b, value: val, force: true }
-                                 : { channel: ch, bit: b, value: val, verify: true };
-  await powerCmd('HV_SET_BIT', extra);
-  refreshHv();
+  const force = hvForceChecked();
+  const extra = force ? { channel: ch, bit: b, value: val, force: true }
+                      : { channel: ch, bit: b, value: val, verify: true };
+  if (force) {
+    // Optimistic update: flip the local desired bit and re-render immediately.
+    // Suppress periodic refreshHv until the command lands and we re-sync.
+    if (val) hvDesired[ch] |=  (1 << b);
+    else     hvDesired[ch] &= ~(1 << b);
+    renderHvGrid();
+    hvForcePending++;
+    powerCmd('HV_SET_BIT', extra).then(() => refreshHv(true)).finally(() => { hvForcePending = Math.max(0, hvForcePending - 1); });
+  } else {
+    await powerCmd('HV_SET_BIT', extra);
+    await refreshHv(true);
+  }
 }
 function hvSelMask() { const m = [0, 0, 0, 0, 0, 0, 0, 0]; for (const k of hvSel) { const [c, b] = k.split('.').map(Number); m[c] |= (1 << b); } return m; }
 async function hvSelSet(val) {
   const force = hvForceChecked();
-  for (const k of hvSel) {
-    const [c, b] = k.split('.').map(Number);
-    const extra = force ? { channel: c, bit: b, value: val, force: true }
-                        : { channel: c, bit: b, value: val, verify: true };
-    await powerCmd('HV_SET_BIT', extra);
+  if (force) {
+    // Optimistic update for all selected bits at once, then send commands serially.
+    for (const k of hvSel) {
+      const [c, b] = k.split('.').map(Number);
+      if (val) hvDesired[c] |=  (1 << b);
+      else     hvDesired[c] &= ~(1 << b);
+    }
+    renderHvGrid();
+    hvForcePending++;
+    try {
+      for (const k of hvSel) {
+        const [c, b] = k.split('.').map(Number);
+        await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: val, force: true });
+      }
+      await refreshHv(true);
+    } finally { hvForcePending = Math.max(0, hvForcePending - 1); }
+  } else {
+    for (const k of hvSel) {
+      const [c, b] = k.split('.').map(Number);
+      await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: val, verify: true });
+    }
+    await refreshHv(true);
   }
-  refreshHv();
 }
 // Pause/resume the target controller's background PING. The toggle test fires
 // ~2 round-trips per switch on the shared bridge socket; without this they'd
@@ -971,14 +1034,21 @@ async function hvSwitchTest() {
 
 function wireHv() {
   $p('hvCard').innerHTML = HV_HTML;
+  clampNumberInputs($p('hvCard'));
+  // index.html's "HV Control & Monitor" mirror card (below Hardware Run)
+  // shares this same setpoint/enable markup — rendered here so it can't
+  // drift from the primary card. The monitor metrics there are a
+  // deliberately smaller, static subset, left hand-written.
+  const hvMirror = $p('hvMirrorSetpoints');
+  if (hvMirror) { hvMirror.innerHTML = hvSetpointRowsHtml('2') + hvEnableRowHtml('2'); clampNumberInputs(hvMirror); }
   renderHvGrid();
-  // channel-enable mask mirror (shared window.ctChannelMask) — same control as
+  // channel-enable mask mirror (shared state.channelMask) — same control as
   // the Boards matrix; masked channels are greyed out + skipped by Toggle test.
   renderMaskBits('hvMaskBits');
-  $p('hvMaskGetBtn').onclick = () => { if (window.ctI2cGetMask) window.ctI2cGetMask(); else refreshHv(true); };
+  $p('hvMaskGetBtn').onclick = () => { if (state.i2cGetMask) state.i2cGetMask(); else refreshHv(true); };
   $p('hvMaskSetBtn').onclick = async () => {
-    if (window.ctI2cSetMask) { window.ctI2cSetMask(); return; }
-    const j = await postJ('/api/channel-mask', { mask: window.ctChannelMask });
+    if (state.i2cSetMask) { state.i2cSetMask(); return; }
+    const j = await postJ('/api/channel-mask', { mask: state.channelMask });
     $p('hvStatus').textContent = j.ok === false ? (j.error || 'set mask failed') : 'channel mask set';
   };
   $p('hvSelOn').onclick = () => hvSelSet(true);
@@ -997,15 +1067,32 @@ function wireHv() {
     $p('hvMonitor').classList.toggle('off', !hvMonitorOn);
     if (hvMonitorOn) refreshHv(true);
   };
-  $p('hvPulse').onclick = async () => { const j = await powerCmd('HV_PULSE', { hv_mask: hvSelMask(), width_us: +$p('hvPulseUs').value, verify_mode: 0 }); $p('hvStatus').textContent = j.ok ? 'pulse fired' : (j.error || 'pulse failed'); refreshHv(); };
+  $p('hvPulse').onclick = async () => {
+    const widthUs = +$p('hvPulseUs').value, verify_mode = +$p('hvPulseVerify').value;
+    const j = await powerCmd('HV_PULSE', { hv_mask: hvSelMask(), width_us: widthUs, verify_mode });
+    if (!j.ok) { $p('hvStatus').textContent = j.error || 'pulse failed'; refreshHv(); return; }
+    // decoded.measured_width_us/on_error_mask/off_error_mask only come back
+    // non-trivial for verify_mode Pre+Post(1)/Pre+Post+Level(2) — see
+    // HvScheduleEngine::manualPulse on the RP2350; PostOnly never measures.
+    const d = j.response && j.response.decoded;
+    const parts = ['pulse fired'];
+    if (d && verify_mode > 0) {
+      parts.push(`measured ${d.measured_width_us} µs (requested ${widthUs})`);
+      const bad = (mask) => (mask || []).some((b) => b !== 0);
+      const onErr = bad(d.on_error_mask), offErr = bad(d.off_error_mask);
+      if (onErr || offErr) parts.push(`⚠ switch didn't actuate as commanded (${[onErr && 'ON', offErr && 'OFF'].filter(Boolean).join('+')} phase)`);
+    }
+    $p('hvStatus').textContent = parts.join(' · ');
+    refreshHv();
+  };
   // Non-pulse ADC summary: STM32 sums N samples on-chip over the window and returns
   // mean/min/max/rms/std over UART (ground truth, no SPI, no pulse). Tries first; if
   // the ADC isn't streaming it arms the detector (pulse-arm @ 1 MSPS) and retries.
-  // Emission current from raw ADC count — SAME affine formula as the per-pulse
-  // measurement (tests.js peakToMa). Affine, so mean/min/max map directly and
-  // pk-pk/σ scale by the slope (the DC offset cancels in a difference/spread).
-  const emiPeakToMa = (c) => 2 * (c * 3.1 / 4095 - 0.5 * 1.155) / 6.8 / 8.2 * 1000;
-  const EMI_MA_PER_COUNT = emiPeakToMa(1) - emiPeakToMa(0);
+  // Emission current from raw ADC count — tests.js's peakToMa() is THE
+  // conversion (imported, not re-derived here); affine, so mean/min/max
+  // map directly and pk-pk/σ scale by the slope (the DC offset cancels in
+  // a difference/spread).
+  const EMI_MA_PER_COUNT = peakToMa(1) - peakToMa(0);
   $p('adcWinBtn').onclick = async () => {
     const ms = Math.max(0.1, parseFloat($p('adcWinMs').value) || 1);
     const n = Math.max(1, Math.round(ms * 1000));   // 1 MSPS → samples
@@ -1016,11 +1103,11 @@ function wireHv() {
     if (!j.ok) {                       // ADC likely idle — arm the detector, retry
       st.textContent = 'arming ADC…';
       await postJ('/api/adc/pulse-arm', { controller: masterId(), rate: 1000000 });
-      await new Promise((r) => setTimeout(r, 200));
+      await sleep(200);
       j = await measure();
     }
     if (!j.ok) { st.textContent = `ADC summary failed: ${j.error || 'is the ADC/STM32 up?'}`; return; }
-    const meanMa = emiPeakToMa(j.mean), minMa = emiPeakToMa(j.min), maxMa = emiPeakToMa(j.max);
+    const meanMa = peakToMa(j.mean), minMa = peakToMa(j.min), maxMa = peakToMa(j.max);
     const ppMa = j.pp * EMI_MA_PER_COUNT, stdMa = j.std * EMI_MA_PER_COUNT;
     st.textContent =
       `${ms} ms · ${j.n} samp — Ie mean ${meanMa.toFixed(2)} mA · σ ${stdMa.toFixed(2)} mA · ` +
@@ -1074,33 +1161,37 @@ function wireHv() {
   };
   wireWiper('ev', 'evWiper', 'evWiperEst', 'evWiperSet', 'evWiperGet', 'Em-V');
   wireWiper('fv', 'fvWiper', 'fvWiperEst', 'fvWiperSet', 'fvWiperGet', 'Foc-V');
-  // Enable buttons = the COMMANDED state (sticky): a click flips instantly, sends
-  // hv-enable, and only reverts if the command FAILS. The 2 Hz poll must NOT yank
-  // them — otherwise the next click recomputes its direction from the (lagging)
-  // real pin and you lose control of the toggle. The ACTUAL live pin level is the
-  // monitor's "Emission HV / Focus HV" tiles (H·On / L·Off). readHvStatus(true)
-  // syncs the buttons to reality once, on (re)connect / target-switch.
-  const hvEnClick = async (chan, id, label) => {
+  // Enable buttons = two EXPLICIT, ABSOLUTE commands per channel (ON / OFF) —
+  // not a toggle. Each click always sends that exact state via hv-enable,
+  // regardless of whatever the buttons currently show. The clicked button
+  // highlights immediately (optimistic) and only reverts if the command
+  // FAILS. The ACTUAL live pin level is the monitor's "Emission HV / Focus
+  // HV" tiles (H·On / L·Off). readHvStatus(true) syncs the highlighted
+  // button to reality once, on (re)connect / target-switch.
+  const hvEnClick = async (chan, prefix, label, want) => {
     if (!hvConnGuard()) return;
-    const next = $p(id).dataset.on !== '1';
-    setHvEnBtn(id, label, next);               // flip immediately — no waiting for the round-trip
-    hvFb(`${label}: turning ${next ? 'ON' : 'OFF'} …`);
+    const onBtn = $p(prefix + 'On');
+    const prev = onBtn.dataset.commanded;   // '1' / '0' / '' (unknown), for revert-on-failure
+    setHvEnBtn(prefix, label, want);        // highlight immediately — no waiting for the round-trip
+    hvFb(`${label}: turning ${want ? 'ON' : 'OFF'} …`);
     // The hv_enable command shares the single STM32 UART with the 2 Hz ads/hv_status
     // poll; a click that lands while the STM32 is mid-transaction misses the firmware's
     // 250 ms ACK window and the device returns HTTP 502 (UART busy). Retry the transient
     // busy-502 (same pattern as ds3502SetRetry) instead of surfacing it to the user.
     let j;
     for (let i = 0; i < 4; i++) {
-      j = await postJ('/api/stm32/hv-enable', { controller: masterId(), ch: chan, on: next });
+      j = await postJ('/api/stm32/hv-enable', { controller: masterId(), ch: chan, on: want });
       if (j.ok || j.status !== 502) break;     // only retry the busy-bus 502
       hvFb(`${label}: STM32 link busy, retrying ${i + 1}/4…`);
       await sleep(250);
     }
-    if (!j.ok) setHvEnBtn(id, label, !next);   // command still failed → undo the flip
-    hvFb(j.ok ? `${label} ${next ? 'ON' : 'OFF'}` : `${label} ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
+    if (!j.ok) setHvEnBtn(prefix, label, prev === '' ? null : prev === '1');   // command failed → undo the optimistic highlight
+    hvFb(j.ok ? `${label} ${want ? 'ON' : 'OFF'}` : `${label} ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
   };
-  $p('hvEnEm').onclick = () => hvEnClick('emission', 'hvEnEm', 'Emission');
-  $p('hvEnFoc').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus');
+  $p('hvEnEmOn').onclick   = () => hvEnClick('emission', 'hvEnEm', 'Emission', true);
+  $p('hvEnEmOff').onclick  = () => hvEnClick('emission', 'hvEnEm', 'Emission', false);
+  $p('hvEnFocOn').onclick  = () => hvEnClick('focus', 'hvEnFoc', 'Focus', true);
+  $p('hvEnFocOff').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus', false);
   // Mirror HV control+monitor (foldable card below Hardware Run): same master-STM32
   // handlers; its monitor/button values are kept in sync via the *2-suffixed IDs in
   // setHvPin / setHvEnBtn / adsRead / pollHvLoop / hvFb. Skips cleanly if absent.
@@ -1108,8 +1199,10 @@ function wireHv() {
   if ($p('emVcalBtn2')) $p('emVcalBtn2').onclick = () => hvLutCalibrate('emission');
   if ($p('focVsetBtn2')) $p('focVsetBtn2').onclick = () => hvLutSet('focus', 'focVset2');
   if ($p('focVcalBtn2')) $p('focVcalBtn2').onclick = () => hvLutCalibrate('focus');
-  if ($p('hvEnEm2')) $p('hvEnEm2').onclick = () => hvEnClick('emission', 'hvEnEm', 'Emission');
-  if ($p('hvEnFoc2')) $p('hvEnFoc2').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus');
+  if ($p('hvEnEmOn2')) $p('hvEnEmOn2').onclick = () => hvEnClick('emission', 'hvEnEm', 'Emission', true);
+  if ($p('hvEnEmOff2')) $p('hvEnEmOff2').onclick = () => hvEnClick('emission', 'hvEnEm', 'Emission', false);
+  if ($p('hvEnFocOn2')) $p('hvEnFocOn2').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus', true);
+  if ($p('hvEnFocOff2')) $p('hvEnFocOff2').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus', false);
   // Mirror Emission-I (DS3502 wiper) — same 'ei' channel + retry path as the main card.
   if ($p('dsEi2')) {
     $p('dsEi2').addEventListener('input', updatePotEsts);
@@ -1133,12 +1226,16 @@ function wireHv() {
   }
   setHvEnBtn('hvEnEm', 'Emission', false);   // start OFF (boot-safe) — updates primary + mirror
   setHvEnBtn('hvEnFoc', 'Focus', false);
-  // ADS1115 monitor + DS3502 wiper readout — same 2 Hz auto-poll, on by default
+  // ADS1115 monitor + DS3502 wiper readout — 10 Hz auto-poll, on by default.
+  // adsRead() guards itself (adsBusy) so an in-flight read just makes this
+  // tick a no-op rather than stacking overlapping requests — safe to ask
+  // for 100ms even though the actual STM32+UART+HTTP round trip may take
+  // longer; it naturally throttles to whatever that round trip supports.
   let adsTimer = null;
   const tick = () => { adsRead(); readHvStatus(false); };   // tiles live; buttons stay on the commanded state (poll must not yank a toggle)
   // Load both HV LUTs once at wire time and show their status next to Set V.
   refreshLutStatus('emission'); refreshLutStatus('focus');
-  const adsAutoApply = (on) => { clearInterval(adsTimer); adsTimer = on ? setInterval(tick, 500) : null; };
+  const adsAutoApply = (on) => { clearInterval(adsTimer); adsTimer = on ? setInterval(tick, 100) : null; };
   $p('adsRead').onclick = tick;
   $p('adsAuto').onchange = (e) => adsAutoApply(e.target.checked);
   adsAutoApply($p('adsAuto').checked);
@@ -1148,7 +1245,7 @@ function wireHv() {
 // ---- single-board calibration & test (selected board on the target controller)
 // Per-board mirror of the all-filament suite (tests.js); reuses calApi primitives.
 let sbBusy = false, sbAbort = false, sbSel = 2, sbCtrl = 1;
-const sbMsg = (m) => { const e = $p('sbResult'); if (e) e.textContent = m; };
+const sbMsg = (m) => setMsg('sbResult', m);
 function sbSetRunning(on) { sbBusy = on; $p('sbRun').disabled = on; $p('sbAbort').disabled = !on; }
 async function sbWaitHv(chan, magV, timeoutMs = 8000) {
   // LUT setpoint (no closed loop): map V→wiper, write it, let it settle. Returns
@@ -1273,7 +1370,8 @@ async function sbImpedance(ctrl, ch, pos) {
     }
     await calApi.setState(ctrl, ch, pos, 2, 0);
   } finally { await calApi.setState(ctrl, ch, pos, 2, 0); }
-  const R0 = calApi.fitR0(curve);
+  const fit = calApi.fitR0(curve);
+  const R0 = fit ? fit.R0 : null;
   sbMsg(R0 == null ? `${curve.length} pts — need ≥3 to fit` : `R₀ = ${R0.toFixed(3)} Ω (${curve.length} pts)`);
   if (curve.length >= 3 && fil != null) await calApi.saveCalibration('impedance_sweep_sb', { params: { startMv, endMv, stepMv, dwellMs: dwell }, curves: { [fil]: curve }, r0: { [fil]: R0 } });
 }
@@ -1303,10 +1401,10 @@ function wireSingleBoardTests() {
     sbAbort = false; sbSetRunning(true);
     // Pause the GUI's background pollers (board snapshot, ADS, HV) so they don't
     // pile concurrent load on the master ESP32 while the test streams + fires.
-    window.ctTestRunning = true;
+    state.testRunning = true;
     try { await fn(ctrl, ch, pos); }
     catch (e) { sbMsg('error: ' + ((e && e.message) || e)); }
-    finally { window.ctTestRunning = false; sbSetRunning(false); }
+    finally { state.testRunning = false; sbSetRunning(false); if (state.syncHvButtons) state.syncHvButtons(); }
   };
 }
 // DS3502 wiper (0–127) → estimated HV output (HV design doc / ds3502 scaling memo).
@@ -1324,7 +1422,7 @@ function updatePotEsts() {
 }
 
 // prominent, immediate feedback for every HV-setpoint action
-function hvFb(msg, kind) { for (const e of [$p('dsStatus'), $p('dsStatus2')]) if (e) { e.textContent = msg; e.className = 'summary hv-fb ' + (kind || ''); } }
+function hvFb(msg, kind) { forMirrored('dsStatus', (e) => { e.textContent = msg; e.className = 'summary hv-fb ' + (kind || ''); }); }
 function hvConnGuard() {
   if (masterConnected()) return true;
   hvFb(`Master (Power ${masterId()}) not connected — Scan & Connect it first.`, 'bad'); return false;
@@ -1353,7 +1451,7 @@ let hvCalBusy = false;
 async function hvLutCalibrate(chan) {
   if (!hvConnGuard() || hvCalBusy) return;
   if (!confirm(`Calibrate the ${chan} HV LUT?\n\nThis sweeps the DS3502 wiper 0→127 with HV ENERGISED and records the measured voltage at each step. Enable ${chan} HV first — the sweep will not energise it for you. The wiper is zeroed when done.`)) return;
-  hvCalBusy = true; window.ctTestRunning = true;   // pause background pollers during the sweep
+  hvCalBusy = true; state.testRunning = true;   // pause background pollers during the sweep
   try {
     hvFb(`${chan}: calibrating LUT …`);
     const r = await calApi.lutCalibrate(chan, {
@@ -1363,8 +1461,15 @@ async function hvLutCalibrate(chan) {
     if (!r.ok) { hvFb(`${chan} cal ${hvErr(r)}`, 'bad'); return; }
     hvFb(`${chan} LUT saved — ${r.points.length} pts, range ≤ −${r.max_mag} V`, 'ok');
     refreshLutStatus(chan);
-  } finally { hvCalBusy = false; window.ctTestRunning = false; }
+  } finally { hvCalBusy = false; state.testRunning = false; if (state.syncHvButtons) state.syncHvButtons(); }
 }
+// Applies fn to $p(id) and its mirror-panel twin $p(id+'2') (the "HV
+// Control & Monitor" card below Hardware Run) — skips cleanly if either is
+// absent. The one place that knows about the '2' mirror-id convention.
+function forMirrored(id, fn) {
+  for (const e of [$p(id), $p(id + '2')]) if (e) fn(e);
+}
+
 // Inline LUT status next to Set V (emVmeas/focVmeas + mirror). Loads on demand.
 async function refreshLutStatus(chan) {
   const id = chan === 'focus' ? 'focVmeas' : 'emVmeas';
@@ -1374,27 +1479,32 @@ async function refreshLutStatus(chan) {
   const title = lut
     ? `Calibrated ${lut.ts || ''} · ${lut.points.length} points, max −${lut.max_mag} V. Set V interpolates this LUT.`
     : 'No LUT yet — enable HV, then press Cal to build the wiper→voltage table.';
-  for (const e of [$p(id), $p(id + '2')]) if (e) { e.textContent = txt; e.title = title; }
+  forMirrored(id, (e) => { e.textContent = txt; e.title = title; });
 }
 
 let adsBusy = false;
 // Blank every monitor field. Called on any failed read so stale HV numbers are
 // never left on screen looking live — a safety monitor must read '—', not lie.
 function blankAds(msg, kind) {
-  for (const id of ['adsRef', 'adsFocus', 'adsEmI', 'adsEmV']) for (const e of [$p(id), $p(id + '2')]) if (e) e.textContent = '—';
+  for (const id of ['adsRef', 'adsFocus', 'adsEmI', 'adsEmV']) forMirrored(id, (e) => { e.textContent = '—'; });
   for (const id of ['ctHvEmV', 'ctHvEmI', 'ctHvFocV']) { const e = $p(id); if (e) e.textContent = '—'; }
   // hvEmStatus/hvFocStatus are owned by readHvStatus() (hv_status pin level) — not blanked here.
   const s = $p('adsStatus'); if (s) { s.textContent = msg; s.className = 'summary ' + (kind || ''); }
 }
 async function adsRead() {
-  if (window.ctTestRunning) return;             // a Cal & Test owns the master — don't add load
+  if (state.testRunning) return;             // a Cal & Test owns the master — don't add load
   if (adsBusy || !masterConnected()) return;   // never overlap / flood the bridge (STM32 on master)
   adsBusy = true;
   try {
     const j = await (await fetch(`/api/stm32/ads1115?controller=${masterId()}`)).json();
     if (!j.ok) { blankAds(j.error || 'read failed', 'bad'); return; }
     const f = (v, u) => (v == null ? '—' : (+v).toFixed(2) + u);
-    const setM = (id, v) => { for (const e of [$p(id), $p(id + '2')]) if (e) e.textContent = v; };   // primary + mirror
+    const setM = (id, v) => forMirrored(id, (e) => { e.textContent = v; });
+    // ref_mv is a LIVE measurement of the external differential circuit's
+    // reference (nominally ~1.2V, board-to-board and drift can move it) --
+    // peakToMa() (tests.js) reads liveRefV instead of a hardcoded constant
+    // so the current conversion tracks the real reference.
+    setLiveRefV(j.ref_mv);
     setM('adsRef', f(j.ref_mv, ' mV'));
     setM('adsFocus', f(j.focus_v, ' V'));
     setM('adsEmI', f(j.emiss_i_ma, ' mA'));
@@ -1414,19 +1524,26 @@ async function adsRead() {
 }
 
 
-// Emission/Focus enable buttons = the COMMANDED (believed) state, sticky — the
-// click toggle. The live REAL pin level is the "Emission HV / Focus HV" monitor
-// tiles (setHvPin, H·On / L·Off). Button label: On / Off / — (unknown).
-function setHvEnBtn(id, label, on) {
-  const tag = on == null ? '—' : on ? 'On' : 'Off';
-  for (const b of [$p(id), $p(id + '2')]) {   // primary + mirror panel (below Hardware Run)
-    if (!b) continue;
-    b.dataset.on = on ? '1' : '0';
-    // color = state: red = commanded ON, green = OFF/safe, gray = unknown. Click toggles.
-    b.innerHTML = `<span class="hv-en-dot">●</span> ${label} ${tag}`;
-    b.className = 'xs hv-en ' + (on == null ? 'unk' : on ? 'on' : 'off');
-    b.title = on == null ? `${label}: unknown` : `${label}: commanded ${on ? 'ON (energized)' : 'OFF'} — click to toggle (real pin level is in the HV monitor)`;
-  }
+// Emission/Focus enable = two separate, always-clickable buttons (ON / OFF) per
+// channel — each sends an absolute state, never a toggle. `on` here is the
+// COMMANDED (believed) state, used only to highlight which of the two buttons
+// matches it; it never changes what a click sends. The live REAL pin level is
+// the "Emission HV / Focus HV" monitor tiles (setHvPin, H·On / L·Off).
+function setHvEnBtn(prefix, label, on) {
+  const commanded = on == null ? '' : on ? '1' : '0';
+  const known = on == null ? 'unknown' : on ? 'commanded ON (energized)' : 'commanded OFF';
+  // active = filled/highlighted (matches the commanded state); the other
+  // button stays a plain outline — always clickable, never disabled.
+  forMirrored(prefix + 'On', (e) => {
+    e.dataset.commanded = commanded;
+    e.className = 'xs hv-en-btn on-btn' + (on === true ? ' active' : '');
+    e.title = `${label}: ${known} — click to command ON`;
+  });
+  forMirrored(prefix + 'Off', (e) => {
+    e.dataset.commanded = commanded;
+    e.className = 'xs hv-en-btn off-btn' + (on === false ? ' active' : '');
+    e.title = `${label}: ${known} — click to command OFF`;
+  });
 }
 // HV monitor tile = the ACTUAL emission/focus pin level read by the STM32
 // (hv_status emission_on/focus_on). H → On, L → Off. This is the trustworthy
@@ -1434,12 +1551,11 @@ function setHvEnBtn(id, label, on) {
 // in firmware, so the tiles are driven from here — the same field the Emission /
 // Focus buttons command — instead of the ADS flags. on==null ⇒ unknown ('—').
 function setHvPin(id, on) {
-  for (const e of [$p(id), $p(id + '2')]) {   // primary + mirror panel
-    if (!e) continue;
-    if (on == null) { e.textContent = '—'; e.className = 'metric-value'; continue; }
+  forMirrored(id, (e) => {
+    if (on == null) { e.textContent = '—'; e.className = 'metric-value'; return; }
     e.textContent = on ? 'H · On' : 'L · Off';            // raw pin level + meaning
     e.className = 'metric-value ' + (on ? 'st-on' : 'st-off');
-  }
+  });
 }
 // hv_status emission_on/focus_on are now correct in firmware (the earlier reversed
 // polarity is fixed), so we consume them straight. If a future firmware regresses,
@@ -1464,23 +1580,89 @@ async function readHvStatus(syncButtons) {
   if (syncButtons) { setHvEnBtn('hvEnEm', 'Emission', em); setHvEnBtn('hvEnFoc', 'Focus', fo); }
 }
 
-// ---- Emission & Schedule card: waveform + per-pulse + ShV -------------------
-const EMI_HTML = `
-  <div class="batch-box">
-    <div class="block-title">Emission current waveform <span class="hint">— STM32 ADC · Capture=PSRAM shot · Live/Fire/GP40=ring</span></div>
-    <div class="row wrap">
-      <label class="numlabel">samples <input id="wfN" type="number" min="64" max="32768" value="2048" /></label>
-      <label class="numlabel">kSPS <input id="wfRate" type="number" min="1" max="1000" value="1000" /></label>
-      <button id="wfCapture" class="xs">Capture</button>
-      <button id="wfTrig" class="xs" title="ESP32 fires GP37 now and pulls the full-rate window around it from the running ring (debug). Requires Live.">Fire ▶</button>
-      <button id="wfTrigGp40" class="xs" title="Wait for the next external GP40 edge (RP2350-echoed fire) and pull the fire-correlated window from the ring. Requires Live.">GP40 ▶</button>
-      <label class="chk" title="Continuous rolling capture from the STM32 ADC ring. While live the same stream also feeds per-pulse measurements."><input id="wfLive" type="checkbox" /> Live</label>
-    </div>
-    <canvas id="wfCanvas" class="adc-plot" width="600" height="160"></canvas>
-    <div id="wfStats" class="summary"></div>
-    <div id="wfStatus" class="summary">no capture yet</div>
-  </div>
+// ---- Dynamic-row table editor -----------------------------------------------
+// Replaces free-text "comma per line" entry (the old ShV table + capability-
+// test pairs) with one bounded <input type=number min max> per field, so an
+// out-of-range value can be flagged (row-invalid, live) and can't survive to
+// Upload/Run (clamped on blur) — text parsing had no such guard.
+function rowTableHtml(id, cols) {
+  const hasResolve = cols.some((c) => c.resolve);
+  return `<table class="row-table" id="${id}"><thead><tr>`
+    + cols.map((c) => `<th title="${c.title || ''}">${c.label}</th>`).join('')
+    + (hasResolve ? '<th>resolves to</th>' : '') + '<th></th></tr></thead>'
+    + `<tbody id="${id}Body"></tbody></table>`;
+}
+function rowTableAddRow(id, cols, vals) {
+  const tbody = $p(id + 'Body'); if (!tbody) return;
+  const hasResolve = cols.some((c) => c.resolve);
+  const tr = document.createElement('tr');
+  // min/max/def/vals are all in STORED (wire) units. An optional `offset`
+  // shifts only what's DISPLAYED, e.g. offset:1 shows a 0-7 wire value as
+  // 1-8 -- this GUI shows channels/bits 1-based everywhere else
+  // (CH${channel+1}, per bmOneLabel/hvSwitchTest), so a raw 0-based number
+  // here would be the one place that broke that convention.
+  tr.innerHTML = cols.map((c, i) => {
+    const off = c.offset || 0;
+    const v = (vals && vals[i] != null) ? vals[i] : c.def;
+    return `<td><input type="number" min="${c.min + off}" max="${c.max + off}" step="1" value="${v + off}" data-col="${c.key}" /></td>`;
+  }).join('') + (hasResolve ? '<td class="row-resolve hint" data-resolve-cell></td>' : '')
+    + '<td><button type="button" class="xs shv-rm" title="Remove this row">×</button></td>';
+  // "resolves to" live-translates a raw filament index to the 1-based board
+  // label (P${controller}.CH${channel+1}.${mux+1}) the rest of this GUI
+  // shows, so it doesn't have to be mentally converted either.
+  const updateResolve = () => {
+    if (!hasResolve) return;
+    const cell = tr.querySelector('[data-resolve-cell]');
+    cell.textContent = cols.filter((c) => c.resolve)
+      .map((c) => c.resolve(+tr.querySelector(`[data-col="${c.key}"]`).value - (c.offset || 0))).join(' · ');
+  };
+  cols.forEach((c) => {
+    const off = c.offset || 0;
+    const inp = tr.querySelector(`[data-col="${c.key}"]`);
+    const invalid = () => { const n = +inp.value; return inp.value === '' || !Number.isFinite(n) || n < c.min + off || n > c.max + off; };
+    inp.addEventListener('input', () => { inp.classList.toggle('row-invalid', invalid()); updateResolve(); });
+    inp.addEventListener('blur', () => {
+      let n = Math.round(+inp.value);
+      if (!Number.isFinite(n)) n = c.def + off;
+      inp.value = Math.min(c.max + off, Math.max(c.min + off, n));
+      inp.classList.remove('row-invalid');
+      updateResolve();
+    });
+  });
+  updateResolve();
+  tr.querySelector('.shv-rm').onclick = () => tr.remove();
+  tbody.appendChild(tr);
+}
+function rowTableValues(id, cols) {
+  const tbody = $p(id + 'Body'); if (!tbody) return [];
+  return [...tbody.querySelectorAll('tr')].map((tr) => {
+    const row = {};
+    cols.forEach((c) => { row[c.key] = +tr.querySelector(`[data-col="${c.key}"]`).value - (c.offset || 0); });
+    return row;
+  });
+}
+// filament is the only 0-based machine value a human types directly here —
+// live-resolve it to the 1-based board label everything else in this GUI
+// uses (CH${channel+1}.${mux+1}, per bmOneLabel/hvSwitchTest elsewhere) so
+// "filament 0" doesn't have to be mentally translated to "P1.CH1.1".
+const resolveFilament = (f) => {
+  const b = filamentToBoard(f);
+  if (!b) return '→ unassigned (no board slot)';
+  const mismatch = b.controller !== pwTarget ? ` ⚠ not target P${pwTarget}` : '';
+  return `→ P${b.controller}.CH${b.channel + 1}.${b.mux + 1}${mismatch}`;
+};
+const SHV_ENTRY_COLS = [
+  { key: 'filament', label: 'filament', min: 0, max: 95, def: 0, title: 'Global filament index 0-95 — see Filament → Power for its board.', resolve: resolveFilament },
+  { key: 'numPulses', label: 'pulses', min: 1, max: 255, def: 5, title: 'How many pulses to fire on this filament.' },
+  { key: 'width', label: 'µs', min: 1, max: 65535, def: 1000, title: 'Pulse width, microseconds.' },
+];
+const SHV_CAP_COLS = [
+  { key: 'bit', label: 'bit', min: 0, max: 7, def: 0, offset: 1, title: 'HV switch bit within the channel — shown 1-8 to match the rest of this GUI; sent to the board as 0-7.' },
+  { key: 'width', label: 'µs', min: 1, max: 65535, def: 500, title: 'Pulse width, microseconds.' },
+];
 
+// ---- Emission & Schedule card: per-pulse + ShV -------------------------------
+const EMI_HTML = `
   <div class="batch-box">
     <div class="block-title">Per-pulse measurements <span class="hint">— STM32 1 MSPS · Stream arms the ADC; one event per detected pulse</span></div>
     <div class="row wrap">
@@ -1493,24 +1675,9 @@ const EMI_HTML = `
   </div>
 
   <div class="batch-box">
-    <div class="block-title">Fire-correlated pulses <span class="hint">— ESP32 Mode 2 · one summary per GP40 edge (RING_PULSE, TCP 3334)</span></div>
-    <div class="row wrap" title="Arms the ESP32 to measure the ring window around every external GP40 fire edge (baseline/peak/width/integral). Needs the ring — turn Live on. Distinct from the STM32 detector above; pick one to avoid double-counting.">
-      <label class="numlabel">pre <input id="rpPre" type="number" min="0" max="16000" value="256" /></label>
-      <label class="numlabel">post <input id="rpPost" type="number" min="1" max="16000" value="2048" /></label>
-      <label class="numlabel">thresh <input id="rpThresh" type="number" min="0" value="100" /></label>
-      <label class="numlabel">report <select id="rpReport"><option value="1">summary</option><option value="2">raw</option><option value="3">both</option></select></label>
-      <button id="rpArm" class="xs">Arm</button>
-      <button id="rpDisarm" class="xs" disabled>Disarm</button>
-    </div>
-    <div id="rpStatus" class="summary">idle — turn Live on (ring), then Arm; events arrive per GP40 fire</div>
-    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>seq</th><th>t µs</th><th>base mA</th><th>peak mA</th><th>peak@</th><th>width</th><th>∫ mA·µs</th></tr></thead><tbody id="rpBody"></tbody></table></div>
-  </div>
-
-  <div class="batch-box">
-    <div class="block-title">Record measurement <span class="hint">— raw ADC waveform + per-pulse → host files</span></div>
-    <div class="row wrap" title="Records the raw STM32 ADC samples (ring tap → .bin) AND the per-pulse measurements (→ .csv) to host files for the whole session. Use decim to fit the WiFi link if you see drops.">
+    <div class="block-title">Record measurement <span class="hint">— per-pulse → host .csv</span></div>
+    <div class="row wrap" title="Arms the STM32 detector (same as Stream above) and records every per-pulse measurement to a host .csv for the whole session.">
       <label class="numlabel">kSPS <input id="recRate" type="number" min="1" max="1000" value="1000" /></label>
-      <label class="numlabel">decim <input id="recDecim" type="number" min="1" max="2048" value="1" /></label>
       <button id="recStart" class="xs quick">● Record</button>
       <button id="recStop" class="xs" disabled>Stop</button>
     </div>
@@ -1519,7 +1686,7 @@ const EMI_HTML = `
   </div>
 
   <details class="batch-box" id="syncDetails">
-    <summary class="block-title">ESP32 Sync I/O <span class="hint">— trigger lines</span></summary>
+    <summary class="block-title">ESP32 Sync I/O <span class="hint">— trigger lines, used by Simple HV schedule below</span></summary>
     <div id="syncLines" class="summary">lines: —</div>
     <div class="bm-set-row">
       <label class="numlabel">SyncOut edge <select id="syncOutEdge"><option value="rising">rising</option><option value="falling">falling</option></select></label>
@@ -1539,9 +1706,10 @@ const EMI_HTML = `
 
   <details class="batch-box" open>
     <summary class="block-title">Simple HV schedule <span class="hint">— ShV 0x70–0x7B</span></summary>
+    <div class="hint" style="margin:2px 0 8px">Bench workflow for firing a schedule on THIS target controller only (independent of the main CT scan): <b>1</b> push the mapping so the board knows which power slot is which filament, <b>2</b> set timeouts, <b>3</b> build the table of what to fire, <b>4</b> Arm then trigger it (external SyncIn, or Simulate below). <b>5</b> is a separate bypass that fires HV immediately, for testing one switch — it does not use the table or need Arm.</div>
 
     <div class="shv-group">
-      <div class="shv-grouplabel">Active list <span class="hint">— mapping → power slots</span></div>
+      <div class="shv-grouplabel">1. Active list <span class="hint">— mapping → power slots</span></div>
       <div class="hv-row">
         <button id="shvPushList" class="xs" title="Push the host filament→power mapping (64-byte ShvSetActiveList) to this target controller. Edit it in the Filament → Power card.">Push mapping</button>
         <button id="shvGetList" class="xs" title="Read this controller's active list and count how many of its 64 power slots map to a filament.">Read</button>
@@ -1549,214 +1717,102 @@ const EMI_HTML = `
     </div>
 
     <div class="shv-group">
-      <div class="shv-grouplabel">Config — timeouts</div>
+      <div class="shv-grouplabel">2. Config — timeouts</div>
       <div class="bm-set-row">
-        <label class="numlabel">inter ms <input id="shvInter" type="number" value="3000" /></label>
-        <label class="numlabel">maxOn ms <input id="shvMaxOn" type="number" value="40" /></label>
+        <label class="numlabel" title="Max gap between one pulse ending and the next SyncIn trigger before the schedule gives up (InterPulseTimeout).">inter ms <input id="shvInter" type="number" min="1" value="3000" /></label>
+        <label class="numlabel" title="Longest a single pulse is allowed to stay on before the schedule force-stops it.">maxOn ms <input id="shvMaxOn" type="number" min="1" value="40" /></label>
       </div>
       <div class="bm-set-row">
-        <label class="numlabel">total ms <input id="shvTotal" type="number" value="60000" /></label>
-        <label class="numlabel" title="Edge of the SyncIn trigger the schedule fires on. Match this to the Sync I/O 'Ext edge'.">trig edge
+        <label class="numlabel" title="Whole-run timeout from Arm to completion (TotalTimeout).">total ms <input id="shvTotal" type="number" min="1" value="60000" /></label>
+        <label class="numlabel" title="Edge of the SyncIn trigger the schedule fires on. Match this to the ESP32 Sync I/O 'Ext edge' above.">trig edge
           <select id="shvTrigEdge"><option value="rising">rising</option><option value="falling">falling</option></select></label>
         <button id="shvSetCfg" class="xs">Set cfg</button>
+      </div>
+      <div class="bm-set-row">
+        <label class="numlabel" title="Delay from the SyncIn trigger edge to when the pulse actually starts. A separate setting from the timeouts above — Get/Set it independently. Some firing modes (e.g. bit-bang fallback) can't honour a nonzero delay; Get/Set both report whether it currently applies.">trigger delay µs <input id="shvTrigDelay" type="number" min="0" value="0" /></label>
+        <button id="shvTrigDelayGet" class="xs">Get</button>
+        <button id="shvTrigDelaySet" class="xs">Set</button>
       </div>
     </div>
 
     <div class="shv-group">
-      <div class="shv-grouplabel">Table <span class="hint">— filament,numPulses,widthUs per line</span></div>
-      <textarea id="shvEntries" rows="3" class="shv-entries">0,5,1000</textarea>
+      <div class="shv-grouplabel">3. Schedule table <span class="hint">— one row per firing step</span></div>
+      <div class="hint" style="margin-bottom:4px">Each row fires <b>pulses</b> pulses of <b>µs</b> width on one <b>filament</b>, in row order. Upload sends the table to this controller; Arm (step 4) then waits for a trigger to run it start to finish.</div>
+      ${rowTableHtml('shvEntries', SHV_ENTRY_COLS)}
       <div class="hv-row">
+        <button id="shvAddRow" type="button" class="xs">+ Add row</button>
         <button id="shvUpload" class="xs">Upload</button>
-        <button id="shvClear" class="xs">Clear</button>
+        <button id="shvClear" class="xs" title="Clears the TABLE ON THE CONTROLLER (SHV_CLEAR_TABLE) — not just this editor.">Clear device table</button>
         <button id="shvInfo" class="xs">Info</button>
         <button id="shvHeatInfo" class="xs">Heat info</button>
       </div>
     </div>
 
     <div class="shv-group">
-      <div class="shv-grouplabel">Run <span class="hint">— fires on SyncIn</span></div>
+      <div class="shv-grouplabel">4. Run <span class="hint">— fires on SyncIn</span></div>
       <div class="hv-row">
         <button id="shvArm" class="xs quick">Arm</button>
         <button id="shvDisarm" class="xs">Disarm</button>
         <button id="shvStatus" class="xs">Status</button>
         <button id="shvLog" class="xs">Log</button>
       </div>
+      <div class="shv-grouplabel" style="margin-top:6px">Simulate SyncIn <span class="hint">— ESP32 SyncOut burst, for bench-testing without a real external trigger</span></div>
+      <div class="shv-row-entry">
+        <input id="shvSimCount" class="shv-pulses" type="number" min="1" value="5" title="Total SyncOut pulses to fire (auto-filled from the table's pulse total)" style="flex:1">
+        <span class="shv-row-unit">pulses</span>
+        <input id="shvSimInterval" class="shv-pulses" type="number" min="1" value="500" title="Interval between pulses (ms)" style="flex:1">
+        <span class="shv-row-unit">ms</span>
+        <button id="shvSimStart" class="xs quick shv-rm">Fire</button>
+        <button id="shvSimStop" class="xs shv-rm" disabled>Stop</button>
+      </div>
+      <div id="shvSimStatus" class="summary" style="font-size:10px;min-height:1.2em"></div>
     </div>
 
     <div class="shv-group">
-      <div class="shv-grouplabel shv-warn">⚠ Capability test — FIRES HV</div>
-      <div class="bm-set-row">
-        <label class="numlabel">ch <input id="shvCapCh" type="number" min="0" max="7" value="0" /></label>
-        <label class="numlabel">bit,µs pairs <input id="shvCapPairs" type="text" value="0,500 1,1500" title="space-separated bit,widthUs" /></label>
-        <button id="shvCapRun" class="xs">Run</button>
+      <div class="shv-grouplabel shv-warn">5. ⚠ Capability test — FIRES HV NOW</div>
+      <div class="hint" style="margin-bottom:4px">Bypasses the table and Arm above — pulses one channel's HV switch bits immediately, for bench-testing a switch without building a schedule.</div>
+      <label class="numlabel">channel <input id="shvCapCh" type="number" min="1" max="8" value="1" title="HV channel whose switch bits this pulses — shown 1-8 to match the rest of this GUI; sent to the board as 0-7." /></label>
+      ${rowTableHtml('shvCapPairs', SHV_CAP_COLS)}
+      <div class="hv-row">
+        <button id="shvCapAddRow" type="button" class="xs">+ Add row</button>
+        <button id="shvCapRun" class="xs danger">Run</button>
       </div>
     </div>
 
     <pre id="shvResult" class="summary shv-result"></pre>
   </details>`;
 
-let pulseList = [], pulseSince = 0, pulseTimer = null, wfTimer = null, pulseArmed = false;
+let pulseList = [], pulseSince = 0, pulseTimer = null, pulseArmed = false;
 
-// Emission current from a raw ADC count (wifi_gui conversion):
-//   V = raw·3.1/4095 (ESP32 ADC_ATTEN_12);  Ie = 2·(V − 0.5·1.155)/6.8/8.2 A → mA.
-const emissionMa = (raw) => 2 * (raw * 3.1 / 4095 - 0.5 * 1.155) / 6.8 / 8.2 * 1000;
+// Emission current from a raw ADC count — tests.js's peakToMa() is THE
+// conversion; this is just the name used throughout this file's pulse
+// table rendering below (not an independent formula — see peakToMa's own
+// comment in tests.js for the R_sense/gain constants and where liveRefV
+// comes from). Was an independent duplicate here that drifted out of
+// sync with peakToMa's own R_sense correction — don't reintroduce that;
+// change constants in tests.js only.
+const emissionMa = peakToMa;
 // mA per ADC count (slope only) — use for deviations (σ) and bg-relative sums
 // (integral) where the constant offset cancels.
-const EMI_MA_PER_COUNT = 2 * (3.1 / 4095) / 6.8 / 8.2 * 1000;
-function drawWaveform(samples, rate, trigIdx) {
-  const c = $p('wfCanvas'); if (!c || !samples.length) return;
-  const ctx = c.getContext('2d'), W = c.width, H = c.height;
-  ctx.clearRect(0, 0, W, H); ctx.fillStyle = '#070b0e'; ctx.fillRect(0, 0, W, H);
-  // ---- emission-current stats (wifi_gui conversion) ----
-  // V = raw·3.1/4095 (ESP32 ADC_ATTEN_12);  Ie = 2·(V − 0.5·1.155)/6.8/8.2 A → mA.
-  let lo = Infinity, hi = -Infinity, sum = 0, sum2 = 0;
-  for (const s of samples) { if (s < lo) lo = s; if (s > hi) hi = s; sum += s; sum2 += s * s; }
-  const n = samples.length;
-  const mean = sum / n;
-  const sigma = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
-  const avgMa = emissionMa(mean), sigMa = sigma * EMI_MA_PER_COUNT, curMa = emissionMa(samples[n - 1]);
-  const se = $p('wfStats');
-  if (se) se.innerHTML = `current <b>${curMa.toFixed(2)}</b> mA · average <b>${avgMa.toFixed(2)}</b> mA · σ <b>${sigMa.toFixed(2)}</b> mA`;
-  const span = Math.max(1, hi - lo);
-  // trigger marker (vertical amber line at the trigger sample)
-  if (trigIdx != null && trigIdx >= 0 && trigIdx < samples.length) {
-    const tx = (trigIdx / (samples.length - 1)) * W;
-    ctx.strokeStyle = '#f2c14e'; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
-    ctx.beginPath(); ctx.moveTo(tx, 0); ctx.lineTo(tx, H); ctx.stroke(); ctx.setLineDash([]);
-  }
-  ctx.strokeStyle = '#3fb6a0'; ctx.lineWidth = 1; ctx.beginPath();
-  for (let i = 0; i < samples.length; i++) {
-    const x = (i / (samples.length - 1)) * W;
-    const y = H - ((samples[i] - lo) / span) * (H - 8) - 4;
-    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-  }
-  ctx.stroke();
-  const tg = trigIdx != null ? ` · trig@${trigIdx}` : '';
-  $p('wfStatus').textContent = `${samples.length} samples · ${lo}–${hi} raw${rate ? ' · ' + rate + ' Hz' : ''}${tg}`;
-}
-let wfBusy = false;
-async function wfCapture() {
-  if (wfBusy) return;                                   // shots are synchronous — never overlap
-  if (!masterConnected()) { $p('wfStatus').textContent = `Master (Power ${masterId()}) not connected`; return; }
-  wfBusy = true;
-  try { await wfCaptureInner(); } finally { wfBusy = false; }
-}
-async function wfCaptureInner() {
-  const n = +$p('wfN').value;
-  const rate = Math.max(1, +$p('wfRate').value || 1000) * 1000;   // kSPS → SPS
-  $p('wfStatus').textContent = `capturing ${n} @ ${rate / 1000} kSPS…`;
-  // Bounded STM32 ADC shot over SPI (the only ADC) — blocks ~n/fs s server-side.
-  let j;
-  try { j = await (await fetch(`/api/adc/spi-shot?controller=${masterId()}&n=${n}&rate=${rate}`)).json(); }
-  catch (e) { $p('wfStatus').textContent = `capture error — ${String((e && e.message) || e)}`; return; }
-  if (!j.ok) { $p('wfStatus').textContent = j.error || 'capture failed'; return; }
-  drawWaveform(j.samples || [], j.rate_hz);
-}
-// ---- live rolling waveform from the continuous STM32 ADC ring ---------------
-let wfLive = false;
-async function wfLiveTick() {
-  if (wfBusy) return;
-  wfBusy = true;
-  try {
-    const n = +$p('wfN').value;
-    const j = await (await fetch(`/api/adc/ring-peek?controller=${pwTarget}&n=${n}`)).json();
-    if (j.ok) drawWaveform(j.samples || [], j.rate_hz);
-    else $p('wfStatus').textContent = j.error || 'ring peek failed';
-  } catch (e) { /* keep the live loop alive */ } finally { wfBusy = false; }
-}
-async function wfSetLive(on) {
-  const cb = $p('wfLive');
-  if (on) {
-    const rate = Math.max(1, +$p('wfRate').value || 1000) * 1000;
-    $p('wfStatus').textContent = 'starting ring…';
-    const j = await postJ('/api/adc/ring-start', { controller: pwTarget, rate });
-    if (!j.ok) { if (cb) cb.checked = false; $p('wfStatus').textContent = `ring start failed — ${j.error || j.message || ''}`; return; }
-    wfLive = true;
-    clearInterval(wfTimer); wfTimer = setInterval(wfLiveTick, 250);   // 4 Hz rolling
-    $p('wfStatus').textContent = `live @ ${rate / 1000} kSPS — rolling (also feeds per-pulse)`;
-  } else {
-    wfLive = false;
-    clearInterval(wfTimer); wfTimer = null;
-    await postJ('/api/adc/ring-stop', { controller: pwTarget });
-    $p('wfStatus').textContent = 'live stopped';
-  }
-}
-// Continuous → trigger → retrieve: fire SyncOut and pull the trigger-aligned
-// full-rate window out of the running ring. Needs Live (the ring) running.
-const WF_RING_CAP = 16384;   // adc_spi kRingSamples — pre+post+1 must fit the ring
-// src: 'fire' = ESP32 pulses GP37 now (debug); 'gp40' = wait for the external
-// RP2350-echoed edge (fire-correlated). Both pull the window from the live ring.
-async function wfTrigCapture(src) {
-  if (wfBusy) return;
-  if (!wfLive) { $p('wfStatus').textContent = 'turn Live on first (the ring must be running)'; return; }
-  wfBusy = true;
-  try {
-    // Window must fit the ring (pre+post+1 ≤ cap); clamp the requested count.
-    const total = Math.min(+$p('wfN').value, WF_RING_CAP - 1);
-    const pre = Math.max(0, Math.round(total * 0.25)), post = Math.max(1, total - pre);
-    const clamp = (+$p('wfN').value > WF_RING_CAP - 1) ? ' (clamped to ring)' : '';
-    $p('wfStatus').textContent = src === 'gp40'
-      ? `waiting for GP40 edge — pre ${pre} / post ${post}${clamp}…`
-      : `firing — pre ${pre} / post ${post}${clamp}…`;
-    const j = await postJ('/api/adc/ring-window', { controller: pwTarget, pre, post, src });
-    if (!j.ok) { $p('wfStatus').textContent = `${src === 'gp40' ? 'GP40' : 'trigger'} ${j.error || j.message || 'failed'}`; return; }
-    drawWaveform(j.samples || [], j.rate_hz, j.pre);
-  } finally { wfBusy = false; }
-}
-// ---- measurement recorder: raw ADC waveform + per-pulse → host files --------
+const EMI_MA_PER_COUNT = peakToMa(1) - peakToMa(0);
+// ---- measurement recorder: per-pulse → host .csv -----------------------------
 let recTimer = null;
 async function recPoll() {
   let j; try { j = await (await fetch('/api/record/status')).json(); } catch { return; }
   if (!j.ok || !j.recording) { if (!j.recording) $p('recStatus').textContent = 'idle'; return; }
-  const M = (j.adc_samples || 0) / 1e6;
-  const obs = j.rate_hz_obs ? `${Math.round(j.rate_hz_obs / 1000)} kSPS` : '—';
-  const drop = (j.drops || j.missed_packets) ? ` · ⚠ drops ${j.drops}/miss ${j.missed_packets}` : '';
-  $p('recStatus').textContent = `● REC ${j.duration_s || 0}s · ADC ${M.toFixed(2)}M samp @ ${obs} · pulses ${j.pulse_events}${drop}`;
-}
-// ---- ESP32 fire-correlated per-pulse (Mode 2, RING_PULSE over TCP 3334) -----
-let rpList = [], rpSince = 0, rpTimer = null, rpArmed = false;
-function rpRender() {
-  const body = $p('rpBody'); if (!body) return;
-  body.innerHTML = rpList.slice(-50).map((e) =>
-    `<tr><td>${e.seq}</td><td>${e.t_edge_us}</td>`
-    + `<td>${emissionMa(e.baseline).toFixed(2)}</td>`
-    + `<td>${emissionMa(e.peak).toFixed(2)}</td>`
-    + `<td>${e.peak_index}</td><td>${e.width}</td>`
-    + `<td>${(e.integral * EMI_MA_PER_COUNT).toFixed(1)}</td></tr>`).join('');
-}
-async function rpTick() {
-  let j; try { j = await (await fetch(`/api/ringpulse/events?since=${rpSince}`)).json(); } catch { return; }
-  if (!j.ok) return;
-  if (j.events && j.events.length) {
-    rpList.push(...j.events); if (rpList.length > 4096) rpList = rpList.slice(-4096);
-    rpSince = j.events[j.events.length - 1].eid; rpRender();
-  }
-  $p('rpStatus').textContent = `${rpArmed ? '● armed' : 'idle'} · ${j.connected ? '3334 connected' : 'disconnected'} · ${rpList.length} events`;
-}
-function wireRingPulse() {
-  $p('rpArm').onclick = async () => {
-    $p('rpStatus').textContent = 'arming…';
-    const j = await postJ('/api/ringpulse/arm', { controller: pwTarget, rate: 1000000,
-      pre: +$p('rpPre').value, post: +$p('rpPost').value, thresh: +$p('rpThresh').value, report: +$p('rpReport').value });
-    if (!j.ok) { $p('rpStatus').textContent = `arm ${j.error || j.message || 'failed'}`; return; }
-    rpArmed = true; $p('rpArm').disabled = true; $p('rpDisarm').disabled = false;
-    clearInterval(rpTimer); rpTimer = setInterval(rpTick, 500); rpTick();
-  };
-  $p('rpDisarm').onclick = async () => {
-    await postJ('/api/ringpulse/disarm', { controller: pwTarget });
-    rpArmed = false; $p('rpArm').disabled = false; $p('rpDisarm').disabled = true;
-    clearInterval(rpTimer); rpTimer = null; $p('rpStatus').textContent = 'disarmed';
-  };
+  $p('recStatus').textContent = `● REC ${j.duration_s || 0}s · pulses ${j.pulse_events}`;
 }
 function wireRecord() {
   $p('recStart').onclick = async () => {
     const rate = Math.max(1, +$p('recRate').value || 1000) * 1000;
-    const decim = Math.max(1, +$p('recDecim').value || 1);
     $p('recStatus').textContent = 'starting…';
-    const j = await postJ('/api/record/start', { controller: pwTarget, rate, decim });
+    const j = await postJ('/api/record/start', { controller: pwTarget, rate });
     if (!j.ok) { $p('recStatus').textContent = `start failed — ${j.error || ''}`; return; }
     $p('recStart').disabled = true; $p('recStop').disabled = false; $p('recStart').classList.add('danger');
-    $p('recFiles').textContent = `recording → ${j.adc_file} · ${j.pulse_file}`;
+    // detector_arm (backend.py) shares the STM32 detector arm with Stream
+    // above -- if Stream is already running, this joins it (Stream's rate
+    // wins; a mismatched recRate here is silently not applied).
+    $p('recFiles').textContent = `recording → ${j.pulse_file}` + (j.shared ? ` (sharing detector with: ${(j.other_users || []).join(', ')})` : '');
     clearInterval(recTimer); recTimer = setInterval(recPoll, 1000); recPoll();
   };
   $p('recStop').onclick = async () => {
@@ -1764,9 +1820,9 @@ function wireRecord() {
     clearInterval(recTimer); recTimer = null;
     $p('recStart').disabled = false; $p('recStop').disabled = true; $p('recStart').classList.remove('danger');
     if (j.ok) {
-      $p('recStatus').textContent = `saved · ADC ${(((j.adc_samples || 0)) / 1e6).toFixed(2)}M samp · ${j.pulse_events || 0} pulses`;
-      const dl = (f) => `<a href="/api/record/download?file=${f}" download>${f}</a>`;
-      $p('recFiles').innerHTML = j.adc_file ? `${dl(j.adc_file)} · ${dl(j.pulse_file)}` : '';
+      $p('recStatus').textContent = `saved · ${j.pulse_events || 0} pulses`
+        + (j.still_armed_for && j.still_armed_for.length ? ` (detector still armed for: ${j.still_armed_for.join(', ')})` : '');
+      $p('recFiles').innerHTML = j.pulse_file ? `<a href="/api/record/download?file=${j.pulse_file}" download>${j.pulse_file}</a>` : '';
     } else { $p('recStatus').textContent = j.error || 'stop failed'; }
   };
 }
@@ -1806,10 +1862,14 @@ const shv = (op, extra) => postJ('/api/shv', { controller: pwTarget, op, ...extr
 // names from the current firmware (simple_hv_schedule.h enums)
 const SHV_STATE = ['Idle', 'Armed', 'Running', 'Complete', 'Fault'];
 const SHV_STOP = ['None', 'Complete', 'Mismatch', 'InterPulseTimeout', 'TotalTimeout', 'Fault', 'Disarmed'];
-const SHV_REJECT = ['None (armed)', 'IndexOutOfWindow', 'WidthTooLarge', 'EmptyTable', 'TpsDisabled', 'TpsFault', 'IsoOff', 'NotReady', 'StateConflict'];
+// index 0 (no rejection) means something different per op: "armed and
+// waiting for a trigger" for arm(), but "fired, no rejection" for the
+// capability test -- keep the bare name here and append the op-specific
+// gloss only where it actually applies (see the two call sites below).
+const SHV_REJECT = ['None', 'IndexOutOfWindow', 'WidthTooLarge', 'EmptyTable', 'TpsDisabled', 'TpsFault', 'IsoOff', 'NotReady', 'StateConflict'];
 const nm = (arr, i) => (i == null ? '?' : (arr[i] || i));
 
-const shvMsg = (t) => { const e = $p('shvResult'); if (e) e.textContent = t; };
+const shvMsg = (t) => setMsg('shvResult', t);
 function shvShow(j, label) {
   const lab = label || 'op';
   let t;
@@ -1819,9 +1879,10 @@ function shvShow(j, label) {
       + `entry ${s.entryIndex}/${s.entryCount} · filament ${s.filamentIndex === 255 ? '—' : s.filamentIndex} · pulses ${s.totalPulsesDone}/${s.totalPulsesTarget}\n`
       + `elapsed ${s.elapsedMs} ms` + (s.faultFilament !== 255 ? ` · fault fil ${s.faultFilament}` : '');
   } else if (j && j.reject != null && j.results) {            // capability test (0xFFFF = 165 verify mismatch)
-    t = `reject: ${nm(SHV_REJECT, j.reject)}\n` + j.results.map((r) => `  bit ${r.bit}: ${r.measuredUs === 0xFFFF ? 'verify MISMATCH' : 'measured ' + r.measuredUs + ' µs'}`).join('\n');
+    // r.bit comes back over the wire 0-based; +1 to match the 1-based input above.
+    t = `reject: ${nm(SHV_REJECT, j.reject)}\n` + j.results.map((r) => `  bit ${r.bit + 1}: ${r.measuredUs === 0xFFFF ? 'verify MISMATCH' : 'measured ' + r.measuredUs + ' µs'}`).join('\n');
   } else if (j && j.reject != null) {                          // arm
-    t = `${j.ok ? '✓ armed' : '✗ arm rejected'} — ${nm(SHV_REJECT, j.reject)}`;
+    t = `${j.ok ? '✓ armed' : '✗ arm rejected'} — ${nm(SHV_REJECT, j.reject)}${j.reject === 0 ? ' (armed, waiting for trigger)' : ''}`;
   } else if (j && j.records) {                                 // pulse log
     t = `${j.records.length}/${j.total} records\n` + j.records.map((r) => `  fil ${r.filament} seq ${r.seq} t ${r.tOnUs}µs dur ${r.durationUs}µs${r.flags ? ' flags 0x' + r.flags.toString(16) : ''}`).join('\n');
   } else if (j && j.entryCount != null) {                      // table info
@@ -1830,10 +1891,14 @@ function shvShow(j, label) {
     t = `✓ heat entries ${j.heatCount}/${j.maxHeatEntries}`;
   } else if (j && j.interPulseMs != null) {                    // get config
     t = `inter ${j.interPulseMs} ms · maxOn ${j.maxOnMs} ms · total ${j.totalMs} ms · edge ${j.triggerEdge ? 'falling' : 'rising'}`;
+  } else if (j && j.delayUs != null) {                         // trigger delay get/set
+    t = `trigger delay ${j.delayUs} µs` + (j.applies ? '' : ' — ⚠ NOT honoured by the current firing mode (e.g. bit-bang fallback)');
   } else if (j && j.mapped != null) {                          // active-list read
     t = `✓ active list: ${j.mapped}/64 power slots mapped`;
   } else if (j && j.count != null) {                           // set_entries (upload)
-    t = `${j.ok ? '✓' : '✗'} ${lab} — ${j.count} entr${j.count === 1 ? 'y' : 'ies'}`;
+    const res = j.resolved && j.resolved.length
+      ? ' → fil [' + j.resolved.map((f) => f === 255 ? '?' : f).join(', ') + ']' : '';
+    t = `${j.ok ? '✓' : '✗'} ${lab} — ${j.count} entr${j.count === 1 ? 'y' : 'ies'}${res}`;
   } else {
     t = (j && j.ok) ? `✓ ${lab}` : `✗ ${lab} failed${j && j.error ? ': ' + j.error : ''}`;
   }
@@ -1841,44 +1906,32 @@ function shvShow(j, label) {
 }
 // In-progress + labelled result wrapper so every ShV button gives feedback.
 async function shvDo(label, op, extra) { shvMsg(label + '…'); shvShow(await shv(op, extra), label); }
-function parseShvEntries() {
-  return $p('shvEntries').value.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
-    const [filament, numPulses, width] = l.split(',').map(Number);
-    return { filament, numPulses, width };
-  });
-}
+function parseShvEntries() { return rowTableValues('shvEntries', SHV_ENTRY_COLS); }
 
 function wireEmission() {
   $p('emissionCard').innerHTML = EMI_HTML;
-  // Capture: a single frame — peek the live ring if running, else a bounded shot.
-  $p('wfCapture').onclick = () => (wfLive ? wfLiveTick() : wfCapture());
-  $p('wfTrig').onclick = () => wfTrigCapture('fire');
-  $p('wfTrigGp40').onclick = () => wfTrigCapture('gp40');
-  $p('wfLive').onchange = (e) => wfSetLive(e.target.checked);
+  clampNumberInputs($p('emissionCard'));
   $p('pulseStream').onclick = async () => {
     if (pulseTimer) {
       clearInterval(pulseTimer); pulseTimer = null; $p('pulseStream').classList.remove('danger');
-      // If WE armed the STM32 (and Live doesn't own the ring), disarm it.
-      if (pulseArmed && !wfLive) { await postJ('/api/adc/pulse-disarm', { controller: pwTarget }); pulseArmed = false; }
+      if (pulseArmed) {
+        // detector_arm/disarm (backend.py) is reference-counted between this
+        // and Record measurement -- if Record is still using it, this just
+        // releases Stream's claim without actually disarming the STM32.
+        const j = await postJ('/api/adc/pulse-disarm', { controller: pwTarget });
+        pulseArmed = false;
+        if (j.still_armed_for) $p('pulseSummary').textContent = `stream stopped (detector still armed for: ${j.still_armed_for.join(', ')})`;
+      }
       return;
     }
-    // The STM32 only emits EVT_PULSE while its ADC is armed. Use pulse-arm
-    // (detector only, no ESP32 SPI ring read → no WiFi-load) unless Live already
-    // owns the ring (which arms the STM32 anyway).
-    if (!wfLive) {
-      $p('pulseSummary').textContent = 'arming STM32 detector…';
-      let j = await postJ('/api/adc/pulse-arm', { controller: pwTarget, rate: 1000000 });
-      // A leftover ring (Live waveform / recorder) makes the detector-only arm
-      // fail with 409 "ring running" — stop the ring and retry once.
-      if (!j.ok && (j.status === 409 || /ring/i.test(`${j.message || ''} ${j.error || ''}`))) {
-        await postJ('/api/adc/ring-stop', { controller: pwTarget });
-        j = await postJ('/api/adc/pulse-arm', { controller: pwTarget, rate: 1000000 });
-      }
-      if (!j.ok) { $p('pulseSummary').textContent = `can't arm STM32 — ${j.error || j.message || 'arm failed'}`; return; }
-      pulseArmed = true;
-    }
+    // The STM32 only emits EVT_PULSE while its ADC is armed (detector mode).
+    $p('pulseSummary').textContent = 'arming STM32 detector…';
+    const j = await postJ('/api/adc/pulse-arm', { controller: pwTarget, rate: 1000000 });
+    if (!j.ok) { $p('pulseSummary').textContent = `can't arm STM32 — ${j.error || j.message || 'arm failed'}`; return; }
+    pulseArmed = true;
     pulseTimer = setInterval(pulseTick, 500); $p('pulseStream').classList.add('danger'); pulseTick();
-    if (!pulseList.length) $p('pulseSummary').textContent = 'armed — waiting for pulses…';
+    if (j.shared) $p('pulseSummary').textContent = `armed — sharing the detector with: ${(j.other_users || []).join(', ')}`;
+    else if (!pulseList.length) $p('pulseSummary').textContent = 'armed — waiting for pulses…';
   };
   $p('pulseClear').onclick = async () => {
     // Empty the display AND advance the cursor to the server's latest id, so the
@@ -1897,26 +1950,88 @@ function wireEmission() {
     renderPulses();
   });
   wireRecord();
-  wireRingPulse();
   $p('shvPushList').onclick = () => shvDo('mapping pushed', 'push_active_list');
   $p('shvGetList').onclick = () => shvDo('read active list', 'get_active_list');
   $p('shvSetCfg').onclick = () => shvDo('config set', 'set_config', {
     interPulseMs: +$p('shvInter').value, maxOnMs: +$p('shvMaxOn').value, totalMs: +$p('shvTotal').value,
     triggerEdge: $p('shvTrigEdge').value === 'falling' ? 1 : 0 });
+  $p('shvTrigDelayGet').onclick = async () => {
+    const j = await shv('trigger_delay', {});
+    if (j.ok) $p('shvTrigDelay').value = j.delayUs;
+    shvShow(j, 'trigger delay');
+  };
+  $p('shvTrigDelaySet').onclick = async () => {
+    const j = await shv('trigger_delay', { delay_us: +$p('shvTrigDelay').value });
+    if (j.ok) $p('shvTrigDelay').value = j.delayUs;
+    shvShow(j, 'trigger delay set');
+  };
+  rowTableAddRow('shvEntries', SHV_ENTRY_COLS, [0, 5, 1000]);
+  $p('shvAddRow').onclick = () => rowTableAddRow('shvEntries', SHV_ENTRY_COLS);
   $p('shvUpload').onclick = () => shvDo('uploaded', 'set_entries', { entries: parseShvEntries() });
-  $p('shvClear').onclick = () => shvDo('table cleared', 'clear_table');
+  $p('shvClear').onclick = () => shvDo('device table cleared', 'clear_table');
   $p('shvInfo').onclick = () => shvDo('table info', 'table_info');
   $p('shvHeatInfo').onclick = () => shvDo('heat info', 'heat_info');
   $p('shvArm').onclick = () => shvDo('armed', 'arm', { repeats: 1 });
   $p('shvDisarm').onclick = () => shvDo('disarmed', 'disarm');
   $p('shvStatus').onclick = () => shvDo('status', 'status');
   $p('shvLog').onclick = () => shvDo('pulse log', 'pulse_log', { start: 0 });
+
+  let shvSimTimer = null;
+  function shvSimSetRunning(on) {
+    $p('shvSimStart').disabled = on;
+    $p('shvSimStop').disabled = !on;
+  }
+  function shvSimPoll() {
+    fetch('/api/sync/simulate-status').then((r) => r.json()).then((j) => {
+      if (!j.ok) return;
+      const el = $p('shvSimStatus'); if (!el) return;
+      if (j.running) {
+        el.textContent = `running — ${j.fired}/${j.count} pulses fired`;
+      } else {
+        el.textContent = j.fired > 0 ? `done — ${j.fired} pulses sent` : 'idle';
+        clearInterval(shvSimTimer); shvSimTimer = null;
+        shvSimSetRunning(false);
+      }
+    }).catch(() => {});
+  }
+  $p('shvSimStart').onclick = async () => {
+    // Auto-fill count from table rows if the field hasn't been edited.
+    const tableTotal = parseShvEntries().reduce((s, e) => s + (e.numPulses || 0), 0);
+    if (tableTotal > 0) $p('shvSimCount').value = tableTotal;
+    const count = Math.max(1, +$p('shvSimCount').value);
+    const interval_ms = Math.max(1, +$p('shvSimInterval').value);
+    $p('shvSimStatus').textContent = 'starting…';
+    const j = await postJ('/api/sync/simulate', { controller: pwTarget, count, interval_ms });
+    if (!j.ok) { $p('shvSimStatus').textContent = 'failed: ' + (j.error || 'unknown'); return; }
+    $p('shvSimStatus').textContent = `running — 0/${count} pulses fired`;
+    shvSimSetRunning(true);
+    if (shvSimTimer) clearInterval(shvSimTimer);
+    shvSimTimer = setInterval(shvSimPoll, 400);
+  };
+  $p('shvSimStop').onclick = async () => {
+    await postJ('/api/sync/simulate-stop', {});
+    $p('shvSimStatus').textContent = 'stopping…';
+  };
   // capability test (ShvCapabilityTest 0x7B) — FIRES HV
-  $p('shvCapRun').onclick = () => {
-    const pairs = $p('shvCapPairs').value.trim().split(/\s+/).filter(Boolean).map((s) => {
-      const [bit, width] = s.split(',').map(Number); return { bit, width };
-    });
-    shvDo('capability test', 'capability', { channel: +$p('shvCapCh').value, pairs });
+  rowTableAddRow('shvCapPairs', SHV_CAP_COLS, [0, 500]);
+  rowTableAddRow('shvCapPairs', SHV_CAP_COLS, [1, 1500]);
+  $p('shvCapAddRow').onclick = () => rowTableAddRow('shvCapPairs', SHV_CAP_COLS);
+  $p('shvCapRun').onclick = async () => {
+    // Guard against a double-click (or an impatient repeat click while the
+    // first request is still in flight) firing two overlapping capability
+    // tests -- the schedule engine only allows one at a time, so a second
+    // request landing mid-flight gets rejected with StateConflict even
+    // though nothing is actually wrong. The button has no other reason to
+    // be clickable again before the first request resolves.
+    const btn = $p('shvCapRun');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const pairs = rowTableValues('shvCapPairs', SHV_CAP_COLS);
+      await shvDo('capability test', 'capability', { channel: +$p('shvCapCh').value - 1, pairs });
+    } finally {
+      btn.disabled = false;
+    }
   };
 
   // ESP32 Sync I/O
@@ -1955,7 +2070,7 @@ export function initPower() {
 
   // fold/unfold heating gantt — when opened, the canvas needs a (re)draw
   const gd = $p('ganttDetails');
-  if (gd) gd.addEventListener('toggle', () => { if (gd.open && window.ctRedrawGantt) window.ctRedrawGantt(); });
+  if (gd) gd.addEventListener('toggle', () => { if (gd.open && state.redrawGantt) state.redrawGantt(); });
 
   // target-controller selector
   document.querySelectorAll('#pwTargetSeg .seg-btn').forEach((b) =>
@@ -2014,7 +2129,7 @@ function powerPanelVisible() {
 // read on demand only (selecting a board / switching controllers).
 async function pollPower() {
   if (pollBusy) return;          // never overlap — reads serialize on the single link
-  if (window.ctTestRunning) { updateTargetStatus(); return; }   // pause during a Cal & Test
+  if (state.testRunning) { updateTargetStatus(); return; }   // pause during a Cal & Test
   if (document.hidden) return;   // tab backgrounded → nothing to draw
   pollBusy = true;
   try {

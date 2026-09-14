@@ -8,6 +8,8 @@
  * the per-filament controller assignment and uploads the active list.
  */
 
+import { state } from './state.js';
+
 const mapApi = async (path, opts) => (await fetch(path, opts)).json();
 const mapPost = (body) => mapApi('/api/mapping', {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -61,7 +63,7 @@ function ingestMapping(meta) {
     mapAssign[r.filament] = (r.controller === 0 || r.controller === 1) ? r.controller : null;
     mapRows[r.filament] = r;
   });
-  window.ctFilamentController = (f) => mapAssign[f];   // expose for the ring / other modules
+  state.filamentController = (f) => mapAssign[f];   // expose for the ring / other modules
   renderMapGrid(); updateMapCounts();
 }
 

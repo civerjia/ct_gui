@@ -44,6 +44,38 @@ export function drawFilaments(r) {
       continue;
     }
 
+    // noHv: heats normally but fires no HV pulse — show heating bars + hollow ring circle
+    if (f.noHv) {
+      r._radialBar(a, viBase, viBase + 2, hw, offV, 'rgba(120,150,162,0.16)');
+      r._radialBar(a, viBase, viBase + 2, hw, offI, 'rgba(120,150,162,0.16)');
+      r._radialBar(a, masBase, masBase + 2, hwM, 0, 'rgba(154,110,210,0.16)');
+      const vFrac = clamp01(f.voltage_mV / s.vMax), iFrac = clamp01(f.current_mA / s.iMax);
+      if (vFrac > 0.004) r._radialBar(a, viBase, viBase + CT.VI_LEN * vFrac, hw, offV, '#3fb6a0');
+      if (iFrac > 0.004) r._radialBar(a, viBase, viBase + CT.VI_LEN * iFrac, hw, offI, '#f2c14e');
+      const p = r._filamentPos(i), sx = r._x(p.x), sy = r._y(p.y);
+      ctx.strokeStyle = 'rgba(100,170,240,0.75)'; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.arc(sx, sy, 3.2, 0, 2 * Math.PI); ctx.stroke();
+      if (isHover) { ctx.strokeStyle = 'rgba(255,255,255,0.5)'; r._annulusStroke((masBase + viTop) / 2, a - CT.STEP_DEG / 2, a + CT.STEP_DEG / 2); }
+      continue;
+    }
+
+    // noHeat: fires HV but gets no heating deltas (always at idle) — amber dot, no heating bars
+    if (f.noHeat) {
+      const p = r._filamentPos(i), sx = r._x(p.x), sy = r._y(p.y);
+      const rad = isActive ? 4.4 : 3;
+      ctx.fillStyle = isActive ? 'rgba(242,140,50,1.0)' : 'rgba(210,140,60,0.75)';
+      ctx.beginPath(); ctx.arc(sx, sy, rad, 0, 2 * Math.PI); ctx.fill();
+      if (isHover) { ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.4; r._annulusStroke((masBase + viTop) / 2, a - CT.STEP_DEG / 2, a + CT.STEP_DEG / 2); }
+      if ((i % LABEL_EVERY === 0) || (r.opts.indices && i % 4 === 0) || isActive) {
+        const lr = viTop + 9, ar = a * D2R;
+        ctx.fillStyle = isActive ? '#ff9a9a' : 'rgba(170,190,200,0.7)';
+        ctx.font = (i % LABEL_EVERY === 0 ? '700 ' : '') + '9px var(--mono, monospace)';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(String(i), r._x(lr * Math.cos(ar)), r._y(lr * Math.sin(ar)));
+      }
+      continue;
+    }
+
     // dim baseline stubs so the ring always reads full
     r._radialBar(a, viBase, viBase + 2, hw, offV, 'rgba(120,150,162,0.16)');
     r._radialBar(a, viBase, viBase + 2, hw, offI, 'rgba(120,150,162,0.16)');

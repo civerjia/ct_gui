@@ -45,14 +45,11 @@ from net_protocol import (
     adc_ring_start,
     adc_ring_stop,
     adc_ring_peek,
-    adc_ring_tap_start,
-    adc_ring_tap_stop,
     adc_ring_window,
     adc_ring_window_data,
     adc_pulse_arm,
     adc_pulse_disarm,
     primary_local_ip,
-    AdcUdpListener,
     EspCmdClient,
     pulse_events_get,
     stm32_ds3502_get,
@@ -112,6 +109,13 @@ def build_payload(command: str, b: dict):
     if command == "HV_SET_BIT":              # 0x10: ch,bit,value,verifyMode
         mode = 2 if b.get("force") else (1 if b.get("verify", True) else 0)
         return 0x10, 0, bytes([ch, int(b["bit"]) & 0xFF, 1 if b.get("value") else 0, mode])
+    if command == "HV_SET_MULTI_CHANNEL":    # 0x15: channelMask, values[8], writeMode
+        # -> status, appliedMask, verifiedMask, failedMask, desired[8], feedback[8]
+        mode = 2 if b.get("force") else (1 if b.get("verify", True) else 0)
+        chmask = int(b.get("channel_mask", 0)) & 0xFF
+        values = bytes((int(x) & 0xFF) for x in list(b.get("values") or [0] * 8)[:8])
+        values = values + bytes(8 - len(values))
+        return 0x15, 0, bytes([chmask]) + values + bytes([mode])
     if command == "HV_PULSE":                # 0x16: ch,bit,width_us32,verifyMode
         return 0x16, FLAG_SINGLE, bytes([ch, int(b.get("bit", mux)) & 0xFF]) + int(b.get("width_us", 0)).to_bytes(4, "little") + bytes([int(b.get("verify_mode", 0)) & 0xFF])
     raise ValueError(f"unknown command {command}")
@@ -301,6 +305,8 @@ SHV_HEAT_CLEAR = 0x7C
 SHV_HEAT_SET_ENTRIES = 0x7D
 SHV_HEAT_GET_INFO = 0x7E      # -> OK + u16 heatCount + u16 maxHeatEntries
 SHV_FAULT_POLICY = 0x81       # GET/SET board+mismatch policies; response has faulted-slots bitmask
+SHV_TRIGGER_DELAY = 0x82      # GET/SET SyncIn trigger delay (µs); response reports whether it applies
+HV_SET_SHIFT_HZ = 0x80        # SET-only: 165-readback bit-bang SCK frequency (Hz), clamped 100-2e6
 CH_FILAMENT_CURRENTS = 0x39
 CH_SET_POWER_STATE = 0x35        # ch,mux,state,arg16 (Idle/Active→mA, Voltage→mV)
 CH_SET_I2C_ENABLE_MASK = 0x34
@@ -313,6 +319,16 @@ CH_RESET_MUX = 0x5F             # pulse TCA9548A reset + re-detect (power-cuttin
 CH_TCA9554_SELF_TEST = 0x60     # per-pin TCA9554 toggle test
 CH_READ_TCA9554 = 0x61          # read-only TCA9554 Config/Input/Output dump
 ALL_BOARDS_MASK = bytes([0xFF] * 8)
+
+# TPS55289 IOUT_LIMIT register (tps55289_registers.h kIoutLimitAddr) — used to
+# read back CH_SET_TPS_OCP_THRESHOLD (0x28), which is SET-only in firmware, via
+# CH_READ_TPS_REGISTER (0x29). Decode matches the firmware's own SET-side
+# encoding (tps55289.cpp setOcpThresholdAmps/Millivolts): mA -> mV
+# (= mA * kOcpSenseResistorOhms) -> code (= round(mV / 0.5 mV LSB)), register =
+# kIoutLimitEnable(0x80) | (code & kIoutLimitMask(0x7F)).
+_TPS_IOUT_LIMIT_REG = 0x02
+_OCP_SENSE_RESISTOR_OHMS = 0.015   # tps55289_board_constants::kOcpSenseResistorOhms
+_OCP_MA_PER_CODE = 0.5 / _OCP_SENSE_RESISTOR_OHMS   # ≈ 33.33 mA/code
 _DIAG_CHIPS = ["mux", "tps", "ina", "enable_io", "fault_io", "iso_io", "hv_io"]
 
 
@@ -398,6 +414,13 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
                 "present": False, "mux_present": False, "tps_present": False, "ina_present": False,
                 "iso_enabled": False, "tps_enabled": False, "tps_fault": False,
                 "hv_overcurrent": False, "bus_mV": 0, "current_mA": 0,
+                # *_valid=False means that field's read failed (missing/faulty
+                # chip, e.g. a board design with the HV-current chip removed) --
+                # the corresponding value field is MEANINGLESS, not "confirmed
+                # off". Only trust iso_enabled/etc. when its _valid twin is True.
+                # See RP2350 uart_protocol.md 14.7 / firmware a0d71a3.
+                "iso_enabled_valid": False, "tps_enabled_valid": False,
+                "tps_fault_valid": False, "hv_overcurrent_valid": False,
             }
 
     def apply_slice(raw, start, field):
@@ -421,18 +444,30 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
                 apply_slice(raw, 17, "tps_present")
                 apply_slice(raw, 25, "ina_present")
                 apply_slice(raw, 25, "present")
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"board_snapshot: CH_GET_PRESENT failed: {exc}")
         try:
             resp = link.client.send_request(CH_GET_BOARD_BITMAPS, bytes(ALL_BOARDS_MASK), timeout=3.0)
             if resp.get("status_code") == 0x00:
-                raw = resp.get("raw") or []     # status, targeted[8], iso_en, tps_en, tps_fault, hv_oc
+                raw = resp.get("raw") or []     # status, targeted[8], iso_en, tps_en, tps_fault,
+                                                 # hv_oc, iso_valid, tps_valid, tps_fault_valid,
+                                                 # hv_overcurrent_valid (firmware a0d71a3+)
                 apply_slice(raw, 9, "iso_enabled")
                 apply_slice(raw, 17, "tps_enabled")
                 apply_slice(raw, 25, "tps_fault")
                 apply_slice(raw, 33, "hv_overcurrent")
-        except Exception:
-            pass
+                # Validity masks are appended (older firmware's response is just
+                # shorter here) -- apply_slice's len() guard already makes this a
+                # no-op against pre-a0d71a3 firmware, so *_valid just stays False
+                # (safe: the GUI treats that as "unknown", same as before this fix).
+                apply_slice(raw, 41, "iso_enabled_valid")
+                apply_slice(raw, 49, "tps_enabled_valid")
+                apply_slice(raw, 57, "tps_fault_valid")
+                apply_slice(raw, 65, "hv_overcurrent_valid")
+            else:
+                print(f"board_snapshot: CH_GET_BOARD_BITMAPS status_code={resp.get('status_code')!r}")
+        except Exception as exc:
+            print(f"board_snapshot: CH_GET_BOARD_BITMAPS failed: {exc}")
     # INA219 V/I, keyed directly by (channel, mux) over the host SCAN_MASK — NOT
     # the filament map. So enabling a channel in the "channels enabled" control
     # surfaces that channel's boards (e.g. CH7) immediately, independent of which
@@ -881,12 +916,27 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
         if "mismatch" in body:
             payload = (payload or bytes([0])) + bytes([int(body["mismatch"]) & 0x01])
         raw = link.request(SHV_FAULT_POLICY, payload).get("raw") or []
-        # response: [status, board, mismatch, mismatch_count(4 LE), slots(8 LE)] = 14 bytes
+        # response: [status, board, mismatch, mismatch_count(4 LE), slots(8 LE)] = 15 bytes
         if raw and raw[0] == 0 and len(raw) >= 15:
             slots64 = _le(raw, 7, 8)
             faulted = [i for i in range(64) if (slots64 >> i) & 1]
+            controller = int(body.get("controller", 1)) - 1
+            faulted_filaments = [f for s in faulted
+                                 for f in (MAPPING._board_to_fil.get((controller, s)),) if f is not None]
             return {"ok": True, "board": raw[1], "mismatch": raw[2],
-                    "mismatchCount": _le(raw, 3, 4), "faultedSlots": faulted}
+                    "mismatchCount": _le(raw, 3, 4), "faultedSlots": faulted,
+                    "faultedFilaments": faulted_filaments}
+        return {"ok": False}
+    if op == "trigger_delay":
+        # GET or SET the SyncIn->fire trigger delay (µs). Request body:
+        # delay_us (optional). Response: {ok, delayUs, applies} -- "applies"
+        # is False when the live fire path (e.g. PIO precision mode) can't
+        # honour the delay, so a set can't silently do nothing.
+        payload = _u16(int(body["delay_us"])) if "delay_us" in body else b""
+        raw = link.request(SHV_TRIGGER_DELAY, payload).get("raw") or []
+        # response: [status, us_lo, us_hi, applies] = 4 bytes
+        if raw and raw[0] == 0 and len(raw) >= 4:
+            return {"ok": True, "delayUs": _le(raw, 1, 2), "applies": bool(raw[3])}
         return {"ok": False}
     return {"ok": False, "error": "unknown op"}
 
@@ -910,6 +960,40 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         "totalPulsesDone": le32(13),      # the global playhead cursor
         "elapsedMs": le32(17),
         "faultFilament": p[21] if len(p) > 21 else 0xFF,
+        # Appended firing-path capability byte (older RP2350B firmware omits
+        # it -- treat missing as unknown, not "precision off"). bit0 matters
+        # most for anything watching kReadyOut (ready_relay's hardware-synced
+        # ADC trigger): that envelope is produced ONLY in PIO precision mode,
+        # and precision silently falls back to bit-bang if PIO failed to
+        # init at boot or `pio off` was issued -- a run then looks completely
+        # normal from shv_status while the envelope never appears, AND
+        # (for a multi-pulse entry) the schedule needs one external SyncIn
+        # trigger PER pulse instead of auto-firing the whole entry from one.
+        "capabilityFlags": p[22] if len(p) > 22 else None,
+        "precisionMode": bool(p[22] & 0x01) if len(p) > 22 else None,
+        "pulseEnvelopeAvailable": bool(p[22] & 0x02) if len(p) > 22 else None,
+        "shvTriggerDelayApplies": bool(p[22] & 0x04) if len(p) > 22 else None,
+        "shvTriggerDelayNonzero": bool(p[22] & 0x08) if len(p) > 22 else None,
+        # Appended re-stage/trigger diagnostics (RP2350 firmware 2197472+;
+        # older firmware's shorter response leaves these None, not 0 -- don't
+        # conflate "not reported" with "reported zero"). See uncounted's
+        # semantics specifically: it distinguishes "the PIO fired the pulse
+        # but the GPIO edge-count ISR missed it" (uncounted>0, bookkeeping
+        # bug) from "the trigger edge genuinely never arrived" (uncounted==0,
+        # edges short of target) -- these look identical from totalPulsesDone
+        # alone and need this field to tell apart.
+        "triggerEdges": le32(23) if len(p) >= 27 else None,
+        "uncounted": le32(27) if len(p) >= 31 else None,
+        "underfed": le32(31) if len(p) >= 35 else None,
+        "mismatches": le32(35) if len(p) >= 39 else None,
+        # rbSaturated (firmware 7528a75+): times the 165 read-back FIFO was
+        # found full when a pulse was accounted. NOT independent of
+        # uncounted -- a discarded read-back makes the FIFO level understate
+        # how many pulses fired, so when rbSaturated>0 the recovery
+        # under-credits. Per the RP2350 session: uncounted is exact only
+        # when rbSaturated==0; otherwise treat it as a LOWER BOUND, not a
+        # count.
+        "rbSaturated": le32(39) if len(p) >= 43 else None,
     }
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -1267,23 +1351,64 @@ def _coerce_int(value: Any, default: int = 0) -> int:
     return int(value)
 
 # ---------------------------------------------------------------------------
-# Measurement recorder. A session records BOTH streams to host files while a
-# capture runs: (1) the raw STM32 ADC waveform via the ring UDP/TCP tap →
-# rec_<ts>_adc.bin (u16 LE), and (2) the STM32 per-pulse measurements polled
-# from /pulse_events → rec_<ts>_pulses.csv. start() arms ring+tap on the master
-# host; stop() tears it down and finalizes the files.
+# Measurement recorder. Records the STM32 per-pulse measurements (polled from
+# /pulse_events) to rec_<ts>_pulses.csv for the whole session. start() arms
+# the STM32 detector directly (adc_pulse_arm, same as the GUI's Per-pulse
+# "Stream" button) rather than the ADC ring — the ring puts the STM32 in
+# SPI-shot mode (sink=1), which stops it emitting per-pulse events at all
+# (sync_on_falling/rising_edge only calls pulse_detector_edge_rise/fall in
+# detector mode, sink=0), so a ring-based recorder would silently write an
+# empty pulse .csv. There is no longer a raw-ADC-waveform (.bin) recording
+# mode for the same reason.
 # ---------------------------------------------------------------------------
 RECORD_DIR = Path(__file__).resolve().parent / "recordings"
-RECORD_PORT = 3336   # host TCP port the ESP32 ring tap connects back to
+
+# The STM32 pulse detector is ONE physical ADC shared by two independent GUI
+# controls with their own arm/disarm buttons: the Per-pulse "Stream" button
+# (/api/adc/pulse-arm|disarm) and "Record measurement" (MeasurementRecorder,
+# below). Each used to arm/disarm it directly -- so starting Record while
+# Stream was running, then stopping EITHER one, silently disarmed the ADC out
+# from under the other (Stream kept polling with no new events and no error;
+# Record's .csv just stopped growing). Reference-counted per host so the real
+# arm/disarm only happens on a 0->1 / 1->0 transition of the user set.
+_DETECTOR_USERS: dict[str, set[str]] = {}
+_DETECTOR_LOCK = threading.Lock()
+
+
+def detector_arm(host: str, rate_hz: int, user: str) -> dict[str, Any]:
+    """Arm the shared STM32 pulse detector for `user` ('stream'/'record').
+    Only the first user actually arms the hardware; a later joiner shares
+    that arm as-is -- if it wanted a different rate_hz, that's ignored (one
+    ADC, one rate) and `shared`/`other_users` is set so the GUI can say so."""
+    with _DETECTOR_LOCK:
+        users = _DETECTOR_USERS.setdefault(host, set())
+        if not users:
+            r = adc_pulse_arm(host, rate_hz)
+            if not r.get("ok"):
+                return r
+            users.add(user)
+            return {"ok": True}
+        others = users - {user}
+        users.add(user)
+        return {"ok": True, "shared": True, "other_users": sorted(others)}
+
+
+def detector_disarm(host: str, user: str) -> dict[str, Any]:
+    """Release `user`'s claim on the shared detector arm; only actually
+    disarms the hardware once no other user still wants it armed."""
+    with _DETECTOR_LOCK:
+        users = _DETECTOR_USERS.setdefault(host, set())
+        users.discard(user)
+        if users:
+            return {"ok": True, "shared": True, "still_armed_for": sorted(users)}
+        return adc_pulse_disarm(host)
 
 
 class MeasurementRecorder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.listener = AdcUdpListener()
         self.active = False
         self.host: str | None = None
-        self.adc_path: Path | None = None
         self.pulse_path: Path | None = None
         self.pulse_count = 0
         self.started: float | None = None
@@ -1291,32 +1416,16 @@ class MeasurementRecorder:
         self._pulse_stop = threading.Event()
         self._last_error: str | None = None
 
-    def start(self, host: str, rate_hz: int, decim: int) -> dict[str, Any]:
+    def start(self, host: str, rate_hz: int) -> dict[str, Any]:
         with self._lock:
             if self.active:
                 return {"ok": False, "error": "already recording"}
-            ip = primary_local_ip()
-            if not ip:
-                return {"ok": False, "error": "could not determine host IP for the tap"}
             RECORD_DIR.mkdir(exist_ok=True)
             ts = time.strftime("%Y%m%d_%H%M%S")
-            self.adc_path = RECORD_DIR / f"rec_{ts}_adc.bin"
             self.pulse_path = RECORD_DIR / f"rec_{ts}_pulses.csv"
-            # 1. listener (TCP server) recording raw samples to the .bin file
-            r = self.listener.start(RECORD_PORT, record_path=str(self.adc_path))
-            if not r.get("ok"):
-                return {"ok": False, "error": f"listener: {r.get('error')}"}
-            # 2. ring + tap on the device → connects back to ip:RECORD_PORT
-            rs = adc_ring_start(host, rate_hz)
-            if not rs.get("ok"):
-                self.listener.stop()
-                return {"ok": False, "error": f"ring start: {rs.get('error') or rs.get('message')}"}
-            tp = adc_ring_tap_start(host, ip, RECORD_PORT, decim)
-            if not tp.get("ok"):
-                adc_ring_stop(host)
-                self.listener.stop()
-                return {"ok": False, "error": f"tap start: {tp.get('error') or tp.get('message')}"}
-            # 3. pulse-event recorder thread → .csv
+            pa = detector_arm(host, rate_hz, "record")
+            if not pa.get("ok"):
+                return {"ok": False, "error": f"pulse arm: {pa.get('error') or pa.get('message')}"}
             self.pulse_count = 0
             self._pulse_stop.clear()
             self._pulse_thread = threading.Thread(
@@ -1326,8 +1435,8 @@ class MeasurementRecorder:
             self.host = host
             self.started = time.time()
             self._last_error = None
-            return {"ok": True, "adc_file": self.adc_path.name, "pulse_file": self.pulse_path.name,
-                    "host_ip": ip, "port": RECORD_PORT, "rate_hz": rate_hz, "decim": decim}
+            return {"ok": True, "pulse_file": self.pulse_path.name, "rate_hz": rate_hz,
+                    "shared": pa.get("shared", False), "other_users": pa.get("other_users", [])}
 
     def _pulse_loop(self, host: str) -> None:
         try:
@@ -1357,32 +1466,25 @@ class MeasurementRecorder:
             if not self.active:
                 return {"ok": True, "already": True}
             host = self.host
+            still_armed_for: list[str] = []
             try:
-                adc_ring_tap_stop(host)
-                adc_ring_stop(host)
+                dd = detector_disarm(host, "record")
+                still_armed_for = dd.get("still_armed_for", [])
             except Exception:
                 pass
             self._pulse_stop.set()
-            self.listener.stop()
             if self._pulse_thread is not None:
                 self._pulse_thread.join(timeout=2.0)
                 self._pulse_thread = None
             self.active = False
-            st = self.listener.status()
-            return {"ok": True, "adc_samples": st.get("samples", 0),
-                    "pulse_events": self.pulse_count,
-                    "adc_file": self.adc_path.name if self.adc_path else None,
-                    "pulse_file": self.pulse_path.name if self.pulse_path else None}
+            return {"ok": True, "pulse_events": self.pulse_count,
+                    "pulse_file": self.pulse_path.name if self.pulse_path else None,
+                    "still_armed_for": still_armed_for}
 
     def status(self) -> dict[str, Any]:
-        st = self.listener.status()
         dur = (time.time() - self.started) if (self.started and self.active) else None
-        return {"recording": self.active,
-                "adc_samples": st.get("samples", 0), "adc_packets": st.get("packets", 0),
-                "drops": st.get("drops_device", 0), "missed_packets": st.get("missed_packets", 0),
-                "rate_hz_obs": st.get("rate_hz_obs"), "pulse_events": self.pulse_count,
+        return {"recording": self.active, "pulse_events": self.pulse_count,
                 "duration_s": round(dur, 1) if dur else None,
-                "adc_file": self.adc_path.name if self.adc_path else None,
                 "pulse_file": self.pulse_path.name if self.pulse_path else None,
                 "error": self._last_error}
 
@@ -1814,6 +1916,86 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
             "total": len(fils), "failed": failed, "state": int(state)}
 
 
+def hv_grid_set(link: "ControllerLink", controller: int, filaments,
+                on: bool, force: bool) -> dict:
+    """Set the ISO HV-grid switch bit for a batch of filaments (this
+    controller's only). `filaments`=None -> every populated board.
+
+    Reads the current per-channel desired byte first so untouched bits in
+    the same channel byte are preserved, then writes back via
+    HvSetMultiChannel (0x15) — one frame per touched channel, not one per
+    filament. `force`=True uses writeMode=2 (bypasses firmware fault/verify
+    checks) — same semantics as the GUI's Force checkbox."""
+    if filaments is None:
+        fils = MAPPING.filaments(controller)
+    else:
+        fils = [int(f) for f in filaments
+                if filament_to_board(int(f))[0] == controller]
+    if not fils:
+        return {"controller": controller, "ok": True, "applied": [], "failed": []}
+    by_ch: dict[int, list[int]] = {}
+    for f in fils:
+        _, ch, pos, _ = filament_to_board(f)
+        if ch is None:                    # unslotted/overflow -> no board to address
+            continue
+        by_ch.setdefault(ch, []).append(pos)
+    if not by_ch:
+        return {"controller": controller, "ok": True, "applied": [], "failed": []}
+    ft, flags, payload = build_payload("HV_GET_ALL_BYTES", {})
+    cur = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
+    cur_raw = cur.get("raw") if isinstance(cur, dict) else None
+    desired = list(cur_raw[1:9]) if (cur_raw and len(cur_raw) >= 9) else [0] * 8
+    values = list(desired)
+    chmask = 0
+    for ch, positions in by_ch.items():
+        byte = desired[ch]
+        for pos in positions:
+            byte = (byte | (1 << pos)) if on else (byte & ~(1 << pos) & 0xFF)
+        values[ch] = byte
+        chmask |= (1 << ch)
+    ft, flags, payload = build_payload("HV_SET_MULTI_CHANNEL", {
+        "channel_mask": chmask, "values": values, "force": force,
+    })
+    resp = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
+    raw = resp.get("raw") if isinstance(resp, dict) else None
+    applied_mask = raw[1] if raw and len(raw) >= 2 else 0
+    applied, failed = [], []
+    for f in fils:
+        _, ch, _pos, _ = filament_to_board(f)
+        if ch is None:
+            continue
+        (applied if applied_mask & (1 << ch) else failed).append(f)
+    return {"controller": controller, "ok": not failed, "applied": applied, "failed": failed}
+
+
+def set_ocp_threshold_batch(link: "ControllerLink", controller: int, filaments,
+                            threshold_ma: int) -> dict:
+    """Set the per-board TPS55289 IOUT_LIMIT (steady-state OCP threshold) for
+    a batch of filaments. CH_SET_TPS_OCP_THRESHOLD (0x28) is single-board
+    only in firmware — no masked/batch form exists like CH_SET_POWER_STATE
+    — so this loops one frame per filament, same pattern as prep_filaments.
+    `filaments`=None -> every populated board this controller owns."""
+    if filaments is None:
+        fils = MAPPING.filaments(controller)
+    else:
+        fils = [int(f) for f in filaments
+                if filament_to_board(int(f))[0] == controller]
+    applied, failed = [], []
+    for f in fils:
+        _, ch, pos, _ = filament_to_board(f)
+        if ch is None:
+            continue
+        ft, flags, payload = build_payload("CH_SET_TPS_OCP_THRESHOLD", {
+            "channel": ch, "mux_port": pos, "threshold_mA": threshold_ma,
+        })
+        try:
+            resp = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
+            (applied if _status_ok(resp) else failed).append(f)
+        except Exception:
+            failed.append(f)
+    return {"controller": controller, "ok": not failed, "applied": applied, "failed": failed}
+
+
 def do_scan() -> list[dict[str, Any]]:
     """Every host with :3333 open (the ESP32 bridge), newest scan."""
     out = []
@@ -1850,6 +2032,9 @@ class CtHandler(BaseHTTPRequestHandler):
         if path == "/api/geometry":
             self._json(GEOMETRY)
         elif path == "/api/scan":
+            # Discover ESP32 bridges on the LAN: do_scan() probes every host with
+            # TCP :3333 open, and for each hit also checks whether the RP2350
+            # controller behind it answers a protocol frame. No hardware write.
             self._json({"results": do_scan()})
         elif path == "/api/lock":
             # Who (if anyone) currently holds the exclusive-write lease.
@@ -1863,9 +2048,15 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "you": self._client(), "clients": clients,
                         "lock": _lease_snapshot()})
         elif path == "/api/status":
+            # Session snapshot: each controller's cached connection state
+            # (ControllerLink.status(), no live hardware read), the current
+            # MASTER (STM32-routing) selection, and the write-lease holder.
             self._json({"controllers": {str(k): c.status() for k, c in CONTROLLERS.items()},
                         "master": MASTER, "lock": _lease_snapshot(), "you": self._client()})
         elif path == "/api/mapping":
+            # Read the HOST-owned filament<->power mapping (FilamentMapping.as_dict()).
+            # No hardware access — this is the host's own view; it only reaches the
+            # firmware's active-list table via POST /api/mapping {upload: true}.
             self._json({"ok": True, "mapping": MAPPING.as_dict()})
         elif path == "/api/telemetry" and _LIVE_PUSH:
             # PUSH mode (during a scan): the firmware streams cached currents every
@@ -1986,6 +2177,12 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "present": present, "count": len(present),
                         "note": "boards left at Sleep (iso on) after the scan"})
         elif path == "/api/hv-snapshot":
+            # Raw per-channel ISO-grid bitmap for one controller (?controller=1|2,
+            # via _target_link — not MASTER). HV_GET_ALL_BYTES (0x13) returns two
+            # 8-byte arrays, one byte per channel (bit = board position 0-7):
+            # desired = last-commanded 74HC595 relay state; feedback = what the
+            # 74HC165 readback chain actually measured. Unresolved byte-array form
+            # — see /api/hv-grid-status for the per-filament breakdown.
             link = self._target_link()
             if not link or not link.client.connected:
                 self._json({"ok": False, "error": "controller not connected"})
@@ -1996,6 +2193,11 @@ class CtHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)})
         elif path == "/api/adc/burst":
+            # ESP32-local ADC (GP10, adc_sampler-driven) burst read via the
+            # bridge's own /adc/burst — a DIFFERENT ADC path from
+            # /api/adc/spi-shot's STM32 SPI capture, and unused in the current
+            # wiring (the STM32 path is the only ADC actually in the signal
+            # chain), but still functional. ?n=sample count. Routed to MASTER.
             host, err = self._master_host()
             if err:
                 self._json({"ok": False, "error": err})
@@ -2063,18 +2265,30 @@ class CtHandler(BaseHTTPRequestHandler):
                                 "total": int(hdr.get("x-ring-total", 0) or 0),
                                 "gaps": int(hdr.get("x-ring-gaps", 0) or 0)})
         elif path == "/api/pulse-events":
+            # Poll new STM32-detected pulse events (from whichever capture last
+            # armed the pulse_detector — a ring, pulse-arm, or spi-shot) with
+            # id > ?since=. since is the host's paging cursor; the response's
+            # last_id should be passed back on the next call for the delta only.
             host, err = self._master_host()
             if err:
                 self._json({"ok": False, "error": err})
             else:
                 self._json(pulse_events_get(host, int(self._query().get("since", "0"))))
         elif path == "/api/ringpulse/events":
+            # Poll buffered RING_PULSE_EVENT frames the ESP32 pushes over the
+            # separate framed esp_cmd TCP socket (port 3334) once Mode-2
+            # fire-correlated capture is armed (POST /api/ringpulse/arm).
+            # since is the eid paging cursor; response merges ESPCMD.status()
+            # (connected/buffered/last_eid) alongside the event list.
             since = int(self._query().get("since", "0"))
             self._json({"ok": True, "events": ESPCMD.events_since(since), **ESPCMD.status()})
         elif path == "/api/record/status":
+            # Status of the host-side recorder (MeasurementRecorder): running
+            # flag, sample/packet/drop counters, and the .bin/.csv file names
+            # for the run started by POST /api/record/start.
             self._json({"ok": True, **RECORDER.status()})
         elif path == "/api/record/download":
-            # Serve a recorded file from RECORD_DIR (raw .bin or pulses .csv).
+            # Serve a recorded pulses .csv from RECORD_DIR.
             name = os.path.basename(self._query().get("file", ""))
             fpath = RECORD_DIR / name
             if not name or not fpath.is_file():
@@ -2090,25 +2304,50 @@ class CtHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
         elif path == "/api/stm32/ads1115":
+            # Proxy to the ESP32 bridge's own STM32 sub-endpoint `/stm32/ads1115`
+            # (see config_portal.cpp) — reads all 4 ADS1115 channels (raw codes,
+            # mV, and engineering units) over the STM32's I2C bus. Routed to
+            # whichever controller is MASTER (STM32 hangs off one power only).
             host, err = self._master_host()
             self._json({"ok": False, "error": err} if err else stm32_ads1115(host))
         elif path == "/api/stm32/adc-window":
+            # Proxy to `/stm32/adc_window?n=` — a pulse-INDEPENDENT windowed
+            # summary (min/max/mean/rms/std/pp) over the next n high-speed ADC
+            # samples (1000 = 1 ms @ 1 MSPS). Requires the STM32 high-speed ADC
+            # already streaming (arm a ring/pulse/spi-shot first) — this is
+            # ground truth read straight off the STM32, not from any host cache.
             host, err = self._master_host()
             n = int(self._query().get("n", "1000"))
             self._json({"ok": False, "error": err} if err else stm32_adc_window(host, n))
         elif path == "/api/stm32/hv-status":
+            # Proxy to `/stm32/hv_status` — the ACTUAL HV enable GPIO levels
+            # (emission_on/focus_on read from the pin, not the commanded state)
+            # plus ads1115_alert and amc3301_diag fault flags. This pin-level
+            # read is what the GUI's Emission/Focus On/Off tiles display.
             host, err = self._master_host()
             if err:
                 self._json({"ok": False, "error": err})
             else:
                 self._json(stm32_hv_status(host))
         elif path == "/api/stm32/ds3502":
+            # Proxy to `/stm32/ds3502?ch=` — reads back one DS3502 digital-pot
+            # wiper (0-127) over I2C. ch selects the pot: 'ev'=emission voltage,
+            # 'ei'=emission current, 'fv'=focus voltage (or numeric 0|1|2).
             host, err = self._master_host()
             self._json({"ok": False, "error": err} if err else stm32_ds3502_get(host, self._query().get("ch", "ev")))
         elif path == "/api/sync/status":
+            # Read the ESP32 bridge's own SyncIn/SyncOut hardware-trigger
+            # config/state for ONE controller (?controller=1|2, via
+            # _target_host — NOT MASTER, since each ESP32 has its own
+            # SyncIn/SyncOut GPIO wiring independent of which one hosts the STM32).
             host, err = self._target_host()
             self._json({"ok": False, "error": err} if err else sync_get_status(host))
         elif path == "/api/stm32/hv-target":
+            # Proxy to `/stm32/hv_get_target?chan=` — reads the STM32's
+            # closed-loop HV state for a channel (target ADC counts, last_adc,
+            # active, at_target). The loop itself is started by POST
+            # /api/stm32/hv-set-target; noted elsewhere as unreliable versus
+            # the host-side LUT+direct-wiper approach POST /api/hv/set-v uses.
             host, err = self._master_host()
             self._json({"ok": False, "error": err} if err else stm32_hv_get_target(host, self._query().get("chan", "emission")))
         elif path == "/api/hv-lut":
@@ -2124,6 +2363,103 @@ class CtHandler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": f"LUT read failed: {exc}"})
             else:
                 self._json({"ok": False, "error": "no LUT — calibrate first"})
+        elif path == "/api/hv-grid-status":
+            # Per-filament ISO HV-grid switch state (desired + measured feedback
+            # bit) for one controller (?controller=1|2, default 1) — the readback
+            # counterpart to POST /api/hv-grid.
+            link = self._target_link()
+            if not link or not link.client.connected:
+                return self._json({"ok": False, "error": "controller not connected"})
+            cid = int(self._query().get("controller", "1") or 1)
+            ft, flags, payload = build_payload("HV_GET_ALL_BYTES", {})
+            resp = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
+            raw = resp.get("raw") if isinstance(resp, dict) else None
+            if not raw or len(raw) < 17 or raw[0] != 0:
+                return self._json({"ok": False, "error": "HV_GET_ALL_BYTES failed"})
+            desired, feedback = list(raw[1:9]), list(raw[9:17])
+            out = {}
+            for f in MAPPING.filaments(cid - 1):
+                _, ch, pos, _ = filament_to_board(f)
+                if ch is None:
+                    continue
+                out[str(f)] = {"desired": bool(desired[ch] & (1 << pos)),
+                               "feedback": bool(feedback[ch] & (1 << pos))}
+            self._json({"ok": True, "controller": cid, "filaments": out})
+        elif path == "/api/filament-status":
+            # Single-board heating status: the RP2350's own last-commanded
+            # PowerState + fault kind for ONE filament (CH_GET_POWER_STATE,
+            # 0x36, single-board). Distinct from /api/filament-currents
+            # (measured mA, cached, no I2C) — this is state+fault, direct I2C.
+            filament = int(self._query().get("filament", -1))
+            cid0, ch, pos, _ = filament_to_board(filament)
+            if cid0 is None or ch is None:
+                return self._json({"ok": False, "error": f"filament {filament} has no board"})
+            cid = cid0 + 1
+            link = CONTROLLERS.get(cid)
+            if not link or not link.client.connected:
+                return self._json({"ok": False, "error": f"controller {cid} not connected"})
+            ft, flags, payload = build_payload("CH_GET_POWER_STATE", {"channel": ch, "mux_port": pos})
+            try:
+                resp = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
+            except Exception as exc:
+                return self._json({"ok": False, "error": str(exc)})
+            raw = resp.get("raw") if isinstance(resp, dict) else None
+            if not raw or len(raw) < 5:
+                return self._json({"ok": False, "error": "bad response"})
+            ok = raw[0] == 0
+            self._json({"ok": ok, "filament": filament, "controller": cid,
+                        "channel": ch, "mux_port": pos,
+                        "state": raw[3] if ok else None,
+                        "fault": raw[4] if ok else None})
+        elif path == "/api/ocp-threshold":
+            # Read back ONE filament's configured TPS55289 IOUT_LIMIT (steady-
+            # state OCP trip current, mA), ?filament=N. CH_SET_TPS_OCP_THRESHOLD
+            # (0x28) is SET-ONLY -- no matching "get" opcode -- so this reads the
+            # raw register directly (CH_READ_TPS_REGISTER 0x29, reg=0x02) and
+            # decodes it the SAME way the firmware's own SET path encodes it
+            # (tps55289.cpp setOcpThresholdAmps/Millivolts): mA -> mV (=
+            # mA * kOcpSenseResistorOhms) -> code (= round(mV / 0.5 mV LSB)),
+            # register = kIoutLimitEnable(0x80) | (code & 0x7F). Single-board
+            # I2C read: fine as a one-off, do NOT loop this to poll many boards.
+            filament = int(self._query().get("filament", -1))
+            cid0, ch, pos, _ = filament_to_board(filament)
+            if cid0 is None or ch is None:
+                return self._json({"ok": False, "error": f"filament {filament} has no board"})
+            cid = cid0 + 1
+            link = CONTROLLERS.get(cid)
+            if not link or not link.client.connected:
+                return self._json({"ok": False, "error": f"controller {cid} not connected"})
+            payload = bytes([ch & 0xFF, pos & 0xFF, _TPS_IOUT_LIMIT_REG, 1])
+            try:
+                resp = link.client.send_request(0x29, payload, flags=0, timeout=2.0)
+            except Exception as exc:
+                return self._json({"ok": False, "error": str(exc)})
+            raw = resp.get("raw") if isinstance(resp, dict) else None
+            if not raw or len(raw) < 6 or raw[0] != 0x00:
+                return self._json({"ok": False, "error": "bad response",
+                                   "filament": filament, "controller": cid})
+            regval = raw[5] & 0xFF   # width_bytes=1 -> value's low byte is the register
+            enabled = bool(regval & 0x80)
+            code = regval & 0x7F
+            threshold_ma = round(code * _OCP_MA_PER_CODE) if enabled else 0
+            self._json({"ok": True, "filament": filament, "controller": cid,
+                        "channel": ch, "mux_port": pos,
+                        "enabled": enabled, "threshold_ma": threshold_ma})
+        elif path == "/api/ocp-startup":
+            # Read the global per-controller two-stage OCP floor (?controller=1|2).
+            cid = int(self._query().get("controller", "1") or 1)
+            link = CONTROLLERS.get(cid)
+            if not link or not link.client.connected:
+                return self._json({"ok": False, "error": f"controller {cid} not connected"})
+            try:
+                resp = link.client.send_request(0x37, b"", flags=0, timeout=2.0)
+            except Exception as exc:
+                return self._json({"ok": False, "error": str(exc)})
+            raw = resp.get("raw") if isinstance(resp, dict) else None
+            ok = bool(raw) and raw[0] == 0 and len(raw) >= 5
+            self._json({"ok": ok, "controller": cid,
+                        "startup_ma": _le(raw, 1, 2) if ok else None,
+                        "steady_ma": _le(raw, 3, 2) if ok else None})
         elif path == "/api/download-progress":
             # Live download progress (the GUI polls this while /api/download blocks).
             with _DL_LOCK:
@@ -2150,6 +2486,21 @@ class CtHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     out[str(cid)] = {"error": str(exc)}
             self._json({"ok": True, "controllers": out})
+        elif path == "/api/filament-currents":
+            # Same bulk, run-safe (NO I2C) cached-currents read as above, but
+            # keyed by GLOBAL filament index (0-95) across BOTH connected
+            # controllers merged into one dict — matches ct_simple_control's
+            # filament-index-first API. Confirms idle_one/active_one actually
+            # landed at the commanded target; safe to poll even mid-run.
+            out = {}
+            for cid, link in CONTROLLERS.items():
+                if not link.client.connected:
+                    continue
+                try:
+                    out.update(read_cached_telemetry(link, cid - 1))
+                except Exception:
+                    pass
+            self._json({"ok": True, "filaments": out})
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
@@ -2246,6 +2597,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
             elif path == "/api/connect":
+                # Open the framed TCP session (port 3333) to one controller's
+                # ESP32 bridge. body: {controller, host}. Drops the local
+                # currents cache first — a reconnect may be to a freshly
+                # reflashed board with an empty firmware table, so the next
+                # download must re-send CH_FILAMENT_CURRENTS unconditionally.
+                # The bridge accepts only ONE TCP client at a time; if another
+                # client already holds the slot this reports that instead of
+                # a silent offline state.
                 cid = int(body.get("controller", 0))
                 link = CONTROLLERS.get(cid)
                 if not link:
@@ -2271,6 +2630,9 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": err, "status": link.status()}, HTTPStatus.OK)
                 self._json({"ok": True, "status": link.status()})
             elif path == "/api/disconnect":
+                # Close the framed TCP session to one controller (body:
+                # {controller}). Host-side only — no frame is sent to the RP2350;
+                # the bridge notices the socket drop on its own.
                 cid = int(body.get("controller", 0))
                 link = CONTROLLERS.get(cid)
                 if not link:
@@ -2388,6 +2750,13 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 self._json({"ok": all(r.get("match") for r in results.values()), "results": results})
             elif path == "/api/arm":
+                # Arm the bound Simple-HV schedule on EVERY connected controller
+                # (SHV_ARM, 0x77). body: {repeats}. Firmware validates the
+                # loaded table (active-list coverage vs. board presence) before
+                # arming and returns a nonzero reject code on failure — e.g. a
+                # scheduled filament whose board isn't present rejects with
+                # IsoOff. repeats sets how many times the bound sequence plays
+                # per trigger cycle.
                 repeats = int(body.get("repeats", 1))
                 payload = _u16(max(1, repeats))
                 results = {}
@@ -2404,6 +2773,11 @@ class CtHandler(BaseHTTPRequestHandler):
                 self._json({"ok": all(r.get("ok") for r in results.values()) if results else False,
                             "results": results})
             elif path == "/api/disarm":
+                # Disarm the schedule engine on every connected controller
+                # (SHV_DISARM, 0x78) — the firmware clears the ENTIRE HV ISO
+                # relay bank instantly via ctrl_->clearAll() (74HC595 /SRCLR
+                # pin), independent of whatever per-channel state
+                # HV_SET_BIT/HV_SET_MULTI_CHANNEL last commanded.
                 results = {}
                 for cid, link in CONTROLLERS.items():
                     if not link.client.connected:
@@ -2413,6 +2787,42 @@ class CtHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         results[str(cid)] = {"ok": False, "error": str(exc)}
                 self._json({"ok": True, "results": results})
+            elif path == "/api/filament-state":
+                # TRUE single-board CH_SET_POWER_STATE (0x35, FLAG_SINGLE) — one
+                # filament, one frame, no masking/grouping machinery. This is the
+                # RP2350's own single-board wire format, distinct from the batched
+                # board_mask form /api/filament-prep uses even for a 1-filament
+                # call. Use this for isolated single-filament control.
+                filament = int(body.get("filament", -1))
+                state = int(body.get("state", 0))
+                if state < 1 or state > 6:
+                    return self._json({"ok": False, "error": "bad state"}, HTTPStatus.OK)
+                arg = int(body.get("arg", 0))
+                cid0, ch, pos, _ = filament_to_board(filament)
+                if cid0 is None or ch is None:
+                    return self._json({"ok": False, "error": f"filament {filament} has no board"}, HTTPStatus.OK)
+                cid = cid0 + 1
+                link = CONTROLLERS.get(cid)
+                if not link or not link.client.connected:
+                    return self._json({"ok": False, "error": f"controller {cid} not connected"}, HTTPStatus.OK)
+                try:
+                    st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+                    if st and st.get("state") == 2:
+                        return self._json({"ok": False, "error": "running — disarm first"}, HTTPStatus.OK)
+                except Exception:
+                    pass
+                ft, flags, payload = build_payload("CH_SET_POWER_STATE", {
+                    "channel": ch, "mux_port": pos, "state": state, "arg": arg,
+                })
+                try:
+                    resp = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
+                except Exception as exc:
+                    return self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
+                raw = resp.get("raw") if isinstance(resp, dict) else None
+                applied = bool(raw and len(raw) >= 4 and raw[3] == 1)
+                self._json({"ok": _status_ok(resp) and applied, "filament": filament,
+                            "controller": cid, "channel": ch, "mux_port": pos,
+                            "state": state, "arg": arg})
             elif path == "/api/filament-prep":
                 # CT-scan prep ladder — apply one PowerState to a batch of
                 # filaments across BOTH connected controllers. Refused while a
@@ -2443,6 +2853,85 @@ class CtHandler(BaseHTTPRequestHandler):
                 applied = sum(int(r.get("applied") or 0) for r in results.values())
                 self._json({"ok": all(r.get("ok") for r in results.values()), "results": results,
                             "failed": failed, "applied": applied})
+            elif path == "/api/ocp-threshold":
+                # Per-board TPS55289 IOUT_LIMIT (steady-state OCP threshold, mA)
+                # for a batch of filaments across BOTH connected controllers.
+                # body: {filaments: [...]|None, threshold_ma: int}. No native
+                # batch opcode exists — loops one frame per filament.
+                try:
+                    threshold_ma = int(body.get("threshold_ma"))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "threshold_ma required"}, HTTPStatus.OK)
+                filaments = body.get("filaments")   # None = all populated boards
+                results = {}
+                for cid, link in CONTROLLERS.items():
+                    if not link.client.connected:
+                        continue
+                    try:
+                        results[str(cid)] = set_ocp_threshold_batch(link, cid - 1, filaments, threshold_ma)
+                    except Exception as exc:
+                        results[str(cid)] = {"ok": False, "error": str(exc)}
+                if not results:
+                    return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
+                failed = [int(f) for r in results.values() for f in (r.get("failed") or [])]
+                applied = [int(f) for r in results.values() for f in (r.get("applied") or [])]
+                self._json({"ok": all(r.get("ok") for r in results.values()), "results": results,
+                            "failed": failed, "applied": applied})
+            elif path == "/api/ocp-startup":
+                # Global per-controller two-stage OCP floor (CH_STARTUP_OCP,
+                # 0x37) — NOT per-board. STARTUP rides the cold inrush on
+                # turn-on; STEADY applies ~2 s later for close-in protection.
+                # body: {controller, startup_ma, steady_ma (optional)}.
+                cid = int(body.get("controller", MASTER))
+                link = CONTROLLERS.get(cid)
+                if not link or not link.client.connected:
+                    return self._json({"ok": False, "error": f"controller {cid} not connected"}, HTTPStatus.OK)
+                try:
+                    startup_ma = int(body.get("startup_ma"))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "startup_ma required"}, HTTPStatus.OK)
+                # CH_STARTUP_OCP (0x37) wire format: [] get, [mA16] set startup
+                # only, [mA16,mA16] set both — build_payload only covers the
+                # 2-byte set form, so build the frame directly here.
+                payload = _u16(startup_ma)
+                if "steady_ma" in body:
+                    payload += _u16(int(body["steady_ma"]))
+                try:
+                    resp = link.client.send_request(0x37, payload, flags=0, timeout=2.0)
+                except Exception as exc:
+                    return self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
+                raw = resp.get("raw") if isinstance(resp, dict) else None
+                ok = bool(raw) and raw[0] == 0 and len(raw) >= 5
+                self._json({"ok": ok, "controller": cid,
+                            "startup_ma": _le(raw, 1, 2) if ok else None,
+                            "steady_ma": _le(raw, 3, 2) if ok else None})
+            elif path == "/api/hv-grid":
+                # ISO HV-grid switch toggle for a batch of filaments (or every
+                # populated board) across BOTH connected controllers. body:
+                # {filaments: [...]|None, on: bool, force: bool=true}.
+                # force=true bypasses firmware fault/verify checks — same
+                # semantics as the GUI's Force checkbox; use when the switch
+                # feedback is unreliable or the filament is known-shorted.
+                # Callers are expected to pre-filter dead filaments out of
+                # `filaments` before calling (ct_simple_control does this via
+                # its client-side dead mask).
+                on = bool(body.get("on"))
+                force = bool(body.get("force", True))
+                filaments = body.get("filaments")   # None = all populated boards
+                results = {}
+                for cid, link in CONTROLLERS.items():
+                    if not link.client.connected:
+                        continue
+                    try:
+                        results[str(cid)] = hv_grid_set(link, cid - 1, filaments, on, force)
+                    except Exception as exc:
+                        results[str(cid)] = {"ok": False, "error": str(exc)}
+                if not results:
+                    return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
+                applied = [f for r in results.values() for f in (r.get("applied") or [])]
+                failed = [f for r in results.values() for f in (r.get("failed") or [])]
+                self._json({"ok": all(r.get("ok") for r in results.values()), "results": results,
+                            "applied": applied, "failed": failed})
             elif path == "/api/calibration/save":
                 # Persist an emission-current calibration to the host disk (JSON +
                 # flat CSV). body: {name, params, curves:{filament:[{heatA,mA,peak}]}}.
@@ -2598,25 +3087,41 @@ class CtHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
             elif path == "/api/adc/ring-start":
+                # Arm the STM32 for CONTINUOUS ADC capture and start the
+                # ESP32's core-1 task draining DATA_READY blocks into a PSRAM
+                # ring (adc_spi.cpp ring_*). The same stream also feeds the
+                # STM32 pulse_detector, so /api/pulse-events fills while this
+                # runs. body: {rate (Hz, default 1 MSPS)}. Routed to MASTER.
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(adc_ring_start(host, int(body.get("rate", 1000000))))
             elif path == "/api/adc/ring-stop":
+                # Stop the continuous ring capture started by ring-start
+                # (also halts the pulse_detector feed it was driving).
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(adc_ring_stop(host))
             elif path == "/api/adc/pulse-arm":
+                # Arm the STM32 ADC for pulse-detect ONLY (EVT_PULSE pushed
+                # over UART) — no continuous SPI transfer to the ESP32, so it
+                # doesn't load WiFi the way ring-start does. Use for per-pulse
+                # measurement/calibration where only /api/pulse-events matters.
+                # body: {rate (Hz, default 1 MSPS)}. Shares the arm with
+                # Record measurement (detector_arm) — see its comment.
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
-                self._json(adc_pulse_arm(host, int(body.get("rate", 1000000))))
+                self._json(detector_arm(host, int(body.get("rate", 1000000)), "stream"))
             elif path == "/api/adc/pulse-disarm":
+                # Release Stream's claim on the shared detector arm — see
+                # detector_disarm: only actually disarms if Record isn't
+                # also using it right now.
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
-                self._json(adc_pulse_disarm(host))
+                self._json(detector_disarm(host, "stream"))
             elif path == "/api/adc/ring-window":
                 # Continuous → trigger → retrieve: arm a trigger-aligned window
                 # on the running ring (optionally firing SyncOut), download it,
@@ -2659,17 +3164,29 @@ class CtHandler(BaseHTTPRequestHandler):
                                int(body.get("thresh", 100)), int(body.get("report", 1)))
                 self._json(r if r.get("ok") else {"ok": False, "error": f"arm status {r.get('status')}"})
             elif path == "/api/ringpulse/disarm":
+                # Disarm the ESP32's Mode-2 fire-correlated per-pulse capture
+                # (RING_PULSE_DISARM over the framed esp_cmd socket, port 3334)
+                # that /api/ringpulse/arm armed.
                 self._json(ESPCMD.disarm())
             elif path == "/api/record/start":
+                # Start the host-side recorder (MeasurementRecorder): arms the
+                # STM32 detector (adc_pulse_arm, same as Per-pulse "Stream")
+                # and polls /api/pulse-events into a .csv. body: {rate (Hz)}.
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 rate = max(1, int(body.get("rate", 1000000)))
-                decim = max(1, int(body.get("decim", 1)))
-                self._json(RECORDER.start(host, rate, decim))
+                self._json(RECORDER.start(host, rate))
             elif path == "/api/record/stop":
+                # Stop the recorder — disarms the detector and joins the
+                # pulse-event poller from record/start; response carries the
+                # final pulse count and file name (fetch via GET /api/record/download).
                 self._json(RECORDER.stop())
             elif path == "/api/stm32/ds3502-set":
+                # Proxy to `/stm32/ds3502` POST — writes one DS3502 digital-pot
+                # wiper (0-127) directly over I2C. body: {ch, wiper}. Raw/manual
+                # set; /api/hv/set-v and /api/hv/set-i wrap this with LUT/linear
+                # conversion from a physical unit (volts/mA) instead.
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
@@ -2714,11 +3231,21 @@ class CtHandler(BaseHTTPRequestHandler):
                     out2["error"] = r.get("error") or "DS3502 write failed"
                 self._json(out2)
             elif path == "/api/stm32/hv-enable":
+                # Proxy to `/stm32/hv_enable` — toggles the HV enable GPIO for
+                # one channel directly (body: {ch: 'emission'|'focus', on}).
+                # Direct pin control, independent of the closed-loop target
+                # machinery below.
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(stm32_hv_enable_set(host, str(body.get("ch", "emission")), bool(body.get("on"))))
             elif path == "/api/stm32/hv-set-target":
+                # Proxy to `/stm32/hv_set_target` — starts the STM32's closed
+                # HV loop for one channel: it steps the DS3502 wiper by
+                # max_step per iteration until the ADS1115 reading is within
+                # tol counts of target. body: {chan, target (ADC counts), tol,
+                # max_step}. Noted elsewhere as unreliable versus the
+                # host-side LUT+direct-wiper approach POST /api/hv/set-v uses.
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
@@ -2726,6 +3253,9 @@ class CtHandler(BaseHTTPRequestHandler):
                                                int(body.get("target", 0)), int(body.get("tol", 4)),
                                                int(body.get("max_step", 1))))
             elif path == "/api/stm32/hv-clear-target":
+                # Proxy to `/stm32/hv_clear_target` — stops the closed HV loop
+                # for a channel (body: {chan}); the wiper is left wherever it
+                # last stepped to, not reset.
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
@@ -2750,6 +3280,17 @@ class CtHandler(BaseHTTPRequestHandler):
                 (CALIB_DIR / f"hv_lut_p{MASTER}_{chan}_{stamp}.json").write_text(json.dumps(rec, indent=2))
                 self._json({"ok": True, "path": str(fp), **rec})
             elif path in ("/api/sync/config", "/api/sync/fire", "/api/sync/abort"):
+                # Three ESP32-hardware-trigger sub-endpoints for ONE controller
+                # (body: {controller, ...}), each proxied to its own bridge —
+                # each ESP32 has its own SyncIn/SyncOut GPIO wiring:
+                #   sync/config -> POST /sync/config: sets SyncOut edge/width_us,
+                #     SyncIn ready_active polarity, ext_trig_edge (fields passed
+                #     through as strings, whichever keys are present in body).
+                #   sync/fire   -> POST /sync/fire: manually pulses SyncOut once
+                #     (bench test / single-shot, distinct from the paced
+                #     background train POST /api/sync/simulate drives).
+                #   sync/abort  -> POST /sync/abort: cancels any pending
+                #     sync-triggered capture/wait on that ESP32.
                 link = CONTROLLERS.get(int(body.get("controller", 0)))
                 if not link or not link.host:
                     return self._json({"ok": False, "error": "controller not connected"}, HTTPStatus.OK)
@@ -2795,10 +3336,21 @@ class CtHandler(BaseHTTPRequestHandler):
                                  daemon=True).start()
                 self._json({"ok": True, "count": count, "interval_ms": interval_ms, "controller": cid})
             elif path == "/api/sync/simulate-stop":
+                # Signal the background scan-simulation thread (started by
+                # POST /api/sync/simulate) to stop after its current
+                # iteration — sets _SIM_STATE.stop; the thread checks this
+                # flag between paced sync/fire calls, it does not abort mid-pulse.
                 with _SIM_LOCK:
                     _SIM_STATE["stop"] = True
                 self._json({"ok": True})
             elif path == "/api/shv":
+                # Single entry point for every Simple-HV-schedule engine
+                # opcode (SHV_* 0x70-0x82: active-list push/read, table
+                # clear/set/info, config set/get, arm/disarm, status, pulse
+                # log, capability timing test, heat-table clear/set/info,
+                # fault policy, trigger delay) on ONE controller. body:
+                # {controller, op, ...op-specific fields} — see shv_op() for
+                # the exact wire format and response shape per op.
                 link = CONTROLLERS.get(int(body.get("controller", 0)))
                 if not link or not link.client.connected:
                     return self._json({"ok": False, "error": "controller not connected"}, HTTPStatus.OK)
@@ -2827,6 +3379,30 @@ class CtHandler(BaseHTTPRequestHandler):
                             "r1": raw[4] if len(raw) > 4 else None,
                             "r2": raw[5] if len(raw) > 5 else None,
                             "r3": raw[6] if len(raw) > 6 else None})
+            elif path == "/api/hv-shift-hz":
+                # SET-only (HvSetShiftHz 0x80): the 165-readback bit-bang SCK
+                # frequency, for signal-integrity testing on long cables.
+                # There is no separate "get" request — the firmware always
+                # requires a 4-byte set and echoes back the ACTUAL frequency
+                # in effect (clamped 100 Hz-2 MHz), which may differ slightly
+                # from what was requested. Survives until next reboot.
+                # body: {controller, hz}
+                cid = int(body.get("controller", MASTER))
+                link = CONTROLLERS.get(cid)
+                if not link or not link.client.connected:
+                    return self._json({"ok": False, "error": f"controller {cid} not connected"}, HTTPStatus.OK)
+                try:
+                    hz = int(body["hz"])
+                except (KeyError, TypeError, ValueError):
+                    return self._json({"ok": False, "error": "hz required"}, HTTPStatus.OK)
+                try:
+                    resp = link.client.send_request(HV_SET_SHIFT_HZ, _u32(hz), flags=0, timeout=2.0)
+                except Exception as exc:
+                    return self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
+                raw = resp.get("raw") if isinstance(resp, dict) else None
+                ok = bool(raw) and raw[0] == 0 and len(raw) >= 5
+                self._json({"ok": ok, "controller": cid,
+                            "actualHz": _le(raw, 1, 4) if ok else None})
             elif path == "/api/schedule":
                 # Stage the scan schedule. For now we just validate + retain it;
                 # streaming it to the RP2350B schedule table (0x70-0x7B) lands

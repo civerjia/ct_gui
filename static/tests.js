@@ -14,16 +14,10 @@
  * filament's own controller from /api/mapping. HV is always torn down in finally.
  */
 
-const tPostJ = async (path, body) => {
-  try {
-    return await (await fetch(path, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
-    })).json();
-  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
-};
-const tGetJ = async (path) => { try { return await (await fetch(path)).json(); } catch (e) { return { ok: false, error: String(e) }; } };
-const tSleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const $t = (id) => document.getElementById(id);
+import { lock } from './client.js';
+import { $ as $t, setMsg, clampNumberInputs } from './dom.js';
+import { postJ as tPostJ, getJ as tGetJ, sleep as tSleep } from './net.js';
+import { state } from './state.js';
 
 // ---- scaling ----------------------------------------------------------------
 const ADS_MV_PER_COUNT = 6144 / 32768;
@@ -31,7 +25,23 @@ const HV_FULL_V = { emission: 350, focus: 1000 };
 const voltToCount = (chan, magV) => Math.round((Math.abs(magV) / HV_FULL_V[chan] * 5000) / ADS_MV_PER_COUNT);
 const EMI_FULL_MA = 85.7;
 const emiLimitWiper = (mA) => Math.max(0, Math.min(127, Math.round(mA / EMI_FULL_MA * 127)));
-const peakToMa = (peak) => 2 * (peak * 3.1 / 4095 - 0.5 * 1.155) / 6.8 / 8.2 * 1000;
+// THE single conversion from a raw STM32 ADC count to emission mA --
+// power.js's emissionMa is a plain alias of this (import it, don't
+// redefine it), and ct_simple_control.py's pulse_ma() is a Python port.
+// This exact formula was independently duplicated 3+ times before and
+// drifted out of sync once already — see git history. Change the
+// R_sense/gain constants HERE ONLY (and in pulse_ma() on the Python side).
+// raw is the STM32's own 12-bit ADC code (VDDA≈3.3V ref, no VREFBUF), not
+// an ESP32 ADC_ATTEN_12 reading; R_sense=4.7Ω, G=8.2 (AMC3301).
+// liveRefV is the external differential circuit's reference, a real
+// measured voltage (ADS1115's "1.2V ref" channel, currently ~1.227V,
+// drifts board-to-board/with temperature) -- NOT a fixed constant. Lives
+// here (not power.js) so both modules read the same value without a
+// circular import; power.js's adsRead() keeps it fresh via setLiveRefV()
+// every ADS1115 poll. 1.227 is only the fallback before the first read.
+export let liveRefV = 1.227;
+export function setLiveRefV(ref_mv) { if (ref_mv != null) liveRefV = ref_mv / 1000; }
+export const peakToMa = (peak) => 2 * (peak * 3.3 / 4095 - 0.5 * liveRefV) / 4.7 / 8.2 * 1000;
 
 // ---- hardware helpers -------------------------------------------------------
 async function loadFilMap() {
@@ -104,8 +114,14 @@ async function dsWrite(ch, wiper) {
 function lutWiperForV(chan, magV) {
   const lut = lutCache[chan]; if (!lut) return null;
   const sign = (lut.points.find((p) => p.v !== 0) || { v: -1 }).v < 0 ? -1 : 1;
-  const pts = lut.points.map((p) => ({ w: p.wiper, m: Math.abs(p.v) }))
-    .sort((a, b) => a.m - b.m);                              // by magnitude, ascending
+  // Sort by wiper index (sweep order), then keep only monotonically increasing
+  // magnitudes. A glitched sample at the top of the sweep (e.g. wiper=127 → 4V
+  // after wiper=114 → 365V) would otherwise sort to pts[0] and corrupt
+  // interpolation for low target voltages.
+  const raw = lut.points.map((p) => ({ w: p.wiper, m: Math.abs(p.v) }))
+    .sort((a, b) => a.w - b.w);
+  const pts = []; let maxSeen = -1;
+  for (const p of raw) { if (p.m >= maxSeen) { pts.push(p); maxSeen = p.m; } }
   const T = Math.abs(magV);
   if (T <= pts[0].m) return { wiper: pts[0].w, expectV: sign * pts[0].m, clamped: T < pts[0].m && pts[0].m > 0 };
   const last = pts[pts.length - 1];
@@ -233,14 +249,18 @@ async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
 
 // ---- run lifecycle ----------------------------------------------------------
 let testBusy = false, abortFlag = false;
-const tMsg = (m, cls) => { const e = $t('testStatus'); if (e) { e.textContent = m; e.className = 'summary' + (cls ? ' ' + cls : ''); } };
+const tMsg = (m, cls) => setMsg('testStatus', m, { cls: 'summary' + (cls ? ' ' + cls : '') });
 function setRunning(on) {
   testBusy = on;
   // Pause the GUI's background pollers so they don't pile load on the master
   // ESP32 while a (HV-energising, ring-streaming) test runs.
-  window.ctTestRunning = on;
+  state.testRunning = on;
   document.querySelectorAll('.test-run').forEach((b) => { b.disabled = on; });
   const ab = $t('testAbort'); if (ab) ab.disabled = !on;
+  // Re-sync the Emission/Focus enable buttons after the test — tests drive HV
+  // directly (calApi) without touching the button state, so prevConn stays true
+  // and the normal pollPower re-sync path never fires after the test ends.
+  if (!on && state.syncHvButtons) state.syncHvButtons();
 }
 async function guard(needHv) {
   if (testBusy) return false;
@@ -251,7 +271,10 @@ async function guard(needHv) {
 async function runTest(fn, needHv) {
   if (!(await guard(needHv))) return;
   abortFlag = false; setRunning(true);
-  try { await fn(); }
+  // A calibration run drives HV + heating over many steps and must not have
+  // another program's writes land between them — hold the shared write lease
+  // for the whole test (auto-renewed, always released, self-expiring).
+  try { await lock.hold('cal & test run', fn); }
   catch (e) { tMsg('Test error: ' + ((e && e.message) || e), 'bad'); }
   finally { setRunning(false); }
 }
@@ -305,8 +328,11 @@ function drawCurve(canvasId, pts, opt) {
   for (const p of pts) { ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), 2.5, 0, 7); ctx.fill(); }
 }
 
-// least-squares fit V = (a·I² + R0)·I  → R0 = cold resistance (Ω). Reused from
-// power.js measureImpedance: basis [I³, I], curve = [{v(volts), i(amps)}].
+// least-squares fit V = (a·I² + R0)·I = a·I³ + R0·I → R0 = cold resistance (Ω),
+// a = the I²-coefficient (self-heating term; power.js's measureImpedance also
+// needs this one for its on-screen formula, hence returning both instead of
+// just R0). curve = [{v(volts), i(amps)}]. The one and only implementation —
+// this used to also be copy-pasted inline in power.js.
 function fitR0(curve) {
   if (!curve || curve.length < 3) return null;
   let sI6 = 0, sI4 = 0, sI2 = 0, sI3V = 0, sIV = 0;
@@ -315,7 +341,7 @@ function fitR0(curve) {
   let a = det ? (sI3V * sI2 - sI4 * sIV) / det : 0;
   let R0 = det ? (sI6 * sIV - sI4 * sI3V) / det : 0;
   if (R0 < 0) { R0 = 0; a = sI6 ? sI3V / sI6 : 0; }
-  return R0;
+  return { a, R0 };
 }
 
 // =========================================================================
@@ -540,8 +566,14 @@ async function test3() {
   drawBars('t3Plot', [], { yLabel: 'Vem (V)', yMax: magV * 1.1, fmt: (v) => v.toFixed(1) });
 
   try {
-    tMsg('Emission OFF (wiper=0), all → SLEEP…');
-    await hvEnable('emission', false); await lutZeroV('emission');
+    // Zero the emission voltage wiper so the emission rail sits at ~0 V baseline
+    // regardless of whether the STM32 supply enable can be toggled. The leak
+    // measurement only needs emiss_v ≈ 0; it does not require the supply to be
+    // fully disabled. Try to disable too, but don't abort if the STM32 refuses.
+    tMsg('Zeroing emission wiper…');
+    await dsWrite('ev', 0);
+    await hvEnable('emission', false);
+    await tSleep(400);
     const p = await tPostJ('/api/filament-prep', { state: 2 });
     if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
 
@@ -718,7 +750,7 @@ async function test6() {
         }
       }
       await setState(m.ctrl, m.ch, m.pos, 2, 0);                   // STOP before next
-      const R0 = fitR0(curves[f]); r0s[f] = R0; done++;
+      const fit = fitR0(curves[f]); const R0 = fit ? fit.R0 : null; r0s[f] = R0; done++;
       bars.push({ f, value: R0 == null ? Infinity : R0, cls: R0 == null ? 'open' : (R0 < shortR ? 'short' : 'ok') });
       drawBars('t6Plot', bars, { yLabel: 'R₀ (Ω)', yMax: 0.6, fmt: (v) => v.toFixed(2) });
     }
@@ -863,6 +895,7 @@ export const calApi = {
 export function initTests() {
   const host = $t('testsCard'); if (!host) return;
   host.innerHTML = TESTS_HTML;
+  clampNumberInputs(host);
   document.querySelectorAll('#testSeg .seg-btn').forEach((b) =>
     b.addEventListener('click', () => showTest(+b.dataset.test)));
   showTest(1);

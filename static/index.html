@@ -406,28 +406,11 @@
             <summary class="section-head foldable-summary">
               <h2>HV Control &amp; Monitor <span class="hint">— master STM32 · LUT −V</span></h2>
             </summary>
-            <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper (no closed loop). Cal sweeps the wiper to (re)build the LUT — enable Emission HV first.">
-              <label class="numlabel"><span class="cap">Emission −V</span><input id="emVset2" type="number" min="0" max="350" value="0" /></label>
-              <span id="emVmeas2" class="pot-est">—</span>
-              <button id="emVsetBtn2" class="xs">Set V</button>
-              <button id="emVcalBtn2" class="xs">Cal</button>
-            </div>
-            <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper (no closed loop). Cal sweeps the wiper to (re)build the LUT — enable Focus HV first.">
-              <label class="numlabel"><span class="cap">Focus −V</span><input id="focVset2" type="number" min="0" max="495" value="0" /></label>
-              <span id="focVmeas2" class="pot-est">—</span>
-              <button id="focVsetBtn2" class="xs">Set V</button>
-              <button id="focVcalBtn2" class="xs">Cal</button>
-            </div>
-            <div class="bm-set-row hv-set" title="Emission current limit — DS3502 wiper (0–127), written directly (no closed loop). The mA estimate is approximate (~85 mA at full scale). Enable Emission HV first.">
-              <label class="numlabel"><span class="cap">Emission I</span><input id="dsEi2" type="number" min="0" max="127" value="0" /></label>
-              <span id="dsEiEst2" class="pot-est">~0 mA</span>
-              <button id="dsSet2" class="xs">Set I</button>
-              <button id="dsRead2" class="xs">Read</button>
-            </div>
-            <div class="hv-row">
-              <button id="hvEnEm2" class="xs hv-en off">Emission ?</button>
-              <button id="hvEnFoc2" class="xs hv-en off">Focus ?</button>
-            </div>
+            <!-- setpoint rows + enable buttons are rendered by power.js's
+                 wireHv() (hvSetpointRowsHtml('2') + hvEnableRowHtml('2')) —
+                 the same markup as the primary HV card, so this can't drift
+                 from it when a setpoint field changes there. -->
+            <div id="hvMirrorSetpoints"></div>
             <div class="detail-top">
               <div class="metric"><span class="metric-label">Emission V</span><span id="adsEmV2" class="metric-value">—</span></div>
               <div class="metric"><span class="metric-label">Focus V</span><span id="adsFocus2" class="metric-value">—</span></div>
@@ -435,7 +418,6 @@
               <div class="metric"><span class="metric-label">Emission HV</span><span id="hvEmStatus2" class="metric-value">—</span></div>
               <div class="metric"><span class="metric-label">Focus HV</span><span id="hvFocStatus2" class="metric-value">—</span></div>
             </div>
-            <div id="dsStatus2" class="summary"></div>
           </details>
 
         </aside>

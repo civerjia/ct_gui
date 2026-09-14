@@ -310,6 +310,7 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .dot.off { background: #b8c0c6; }
 .dot.fault { background: #c0392b; }
 .dot.absent { background: #d8d0c3; color: var(--muted); }
+.dot.unknown { background: repeating-linear-gradient(45deg, #d8d0c3, #d8d0c3 3px, #c7bda8 3px, #c7bda8 6px); color: var(--muted); }
 .selection-toolbar { gap: 6px; flex-wrap: wrap; background: #f3f0ea; border-radius: 8px; padding: 6px 8px; }
 .board-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 3px; margin: 8px 0; }
 .status-tile { position: relative; border: 1px solid var(--line); border-radius: 6px; padding: 3px 2px; display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer; background: #fbf9f4; min-width: 0; }
@@ -337,6 +338,7 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .hv-badge { font-family: var(--mono); font-size: 7px; font-weight: 800; line-height: 1; padding: 1px 3px; border-radius: 4px; border: 1px solid var(--line); }
 .hv-badge.on { background: #f3d6e6; color: #8a1056; border-color: #d98ab5; }
 .hv-badge.off { background: #efece5; color: #b8b0a2; }
+.hv-badge.unknown { background: #efece5; color: #b8b0a2; border-style: dashed; }
 .status-tile .hv-badge { position: absolute; top: 2px; right: 2px; }
 .batch-box { border: 1px dashed var(--line); border-radius: 8px; padding: 8px; margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .batch-box .row { margin: 0; gap: 6px; }
@@ -402,18 +404,39 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .shv-grouplabel .hint { text-transform: none; letter-spacing: 0; font-weight: 600; }
 .shv-grouplabel.shv-warn { color: #c9a227; }
 .shv-result { white-space: pre-wrap; max-height: 160px; overflow: auto; font-family: var(--mono); font-size: 10px; margin-top: 6px; }
+/* Dynamic-row table editor (ShV schedule table / capability-test pairs) —
+   replaces free-text "comma per line" entry with one bounded number input
+   per field, so an out-of-range value can't silently be typed in. */
+.row-table { width: 100%; border-collapse: collapse; margin-bottom: 4px; }
+.row-table th { text-align: left; font-size: 10px; color: var(--muted); font-weight: 600; padding: 0 4px 2px; }
+.row-table td { padding: 1px 4px 1px 0; }
+.row-table input[type="number"] { box-sizing: border-box; width: 100%; height: 22px; font-size: 11px; padding: 0 4px;
+                                   border: 1px solid var(--line); border-radius: 4px; background: #fbf9f4; }
+.row-table input.row-invalid { border-color: #c0392b; background: #fdecea; }
+.row-table td.row-resolve { font-size: 10px; white-space: nowrap; padding-left: 6px; }
+/* Same out-of-range highlight, for the plain (non-row-table) number inputs
+   clampNumberInputs() (dom.js) wires up across the app. */
+input[type="number"].num-invalid { border-color: #c0392b; background: #fdecea; }
+@media (prefers-color-scheme: dark) {
+  input[type="number"].num-invalid { background: #3a2220; }
+}
+:root[data-theme="dark"] input[type="number"].num-invalid { background: #3a2220; }
+@media (prefers-color-scheme: dark) {
+  .row-table input[type="number"] { background: #1e1c18; }
+  .row-table input.row-invalid { background: #3a2220; }
+}
+:root[data-theme="dark"] .row-table input[type="number"] { background: #1e1c18; }
+:root[data-theme="dark"] .row-table input.row-invalid { background: #3a2220; }
 button.danger { background: var(--ink); color: #fff; }
 button.off { background: #efece5; color: var(--muted); }
-/* HV enable toggle — unmistakable: red = energized, green = off/safe, gray = unknown */
-.hv-en { font-weight: 700; display: inline-flex; align-items: center; gap: 5px; }
-.hv-en .hv-en-dot { font-size: 11px; }
-.hv-en .hv-en-act { opacity: 0.7; }
-.hv-en.on  { background: #c0392b; color: #fff; }                                 /* HV ON  = red */
-.hv-en.on .hv-en-dot { color: #ffd9d4; }
-.hv-en.off { background: #eef7f3; color: #2c7a6b; border: 1px solid rgba(63,182,160,0.55); }  /* OFF = green */
-.hv-en.off .hv-en-dot { color: #3fb6a0; }
-.hv-en.unk { background: #efece5; color: var(--muted); }
-.hv-en.unk .hv-en-dot { color: #b8c0c6; }
+/* HV enable — two explicit, always-clickable buttons per channel (ON / OFF),
+   never a toggle. `.active` marks whichever matches the commanded state;
+   unmistakable: red = energized, green = off/safe, plain outline = the
+   button NOT matching the current commanded state (still fully clickable). */
+.hv-en-group { display: inline-flex; gap: 2px; margin-right: 8px; }
+.hv-en-btn { font-weight: 700; background: #efece5; color: var(--muted); border: 1px solid transparent; }
+.hv-en-btn.on-btn.active  { background: #c0392b; color: #fff; }                                  /* HV ON  = red */
+.hv-en-btn.off-btn.active { background: #eef7f3; color: #2c7a6b; border-color: rgba(63,182,160,0.55); }  /* OFF = green */
 /* prominent HV-setpoint feedback line */
 .hv-fb { margin-top: 6px; padding: 5px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; background: #f3f0ea; }
 .hv-fb.ok { background: #eef7f3; color: #2c7a6b; }
@@ -428,6 +451,7 @@ button.off { background: #efece5; color: var(--muted); }
 .b-badge { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; font-size: 10px; font-weight: 800; color: #fff; background: #b8c0c6; }
 .b-badge.on { background: #3fb6a0; }
 .b-badge.off { background: #b8c0c6; }
+.b-badge.unknown { background: repeating-linear-gradient(45deg, #b8c0c6, #b8c0c6 3px, #a5adb3 3px, #a5adb3 6px); }
 .b-badge.fault { background: #c0392b; }
 /* impedance-fit formula (MathML, below the sweep plot) */
 .z-formula { text-align: center; margin: 6px 0 2px; font-size: 15px; color: var(--ink); }
