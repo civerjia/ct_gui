@@ -1601,6 +1601,7 @@ function stopRunMonitor() {
   if (runMonitorTimer) { clearTimeout(runMonitorTimer); runMonitorTimer = null; }
   _runMonitorGen++;   // invalidates any in-flight tick
   _stopScanInterp();
+  ctState.scheduleRunning = false;   // power.js's fast board-poll can resume 10 Hz
 }
 function _runMonitorTick() {
   runMonitorTimer = null;
@@ -1649,6 +1650,9 @@ async function pollRunStatus() {
     const hb = stale ? ' · ⚠hb-stale' : '';
     statePieces.push(`P${k}: ${SHV_STATE_NAME[s.state] || s.state} · firing fil ${fil} · pulse ${s.totalPulsesDone}/${s.totalPulsesTarget || '?'}${hb}`);
   }
+  // A real hardware schedule is actually running -> power.js's board-matrix
+  // poll backs off from 10 Hz (this run-status poll already covers progress).
+  ctState.scheduleRunning = anyRunning;
   // ---- track the schedule playhead on the CT plot (live view) ----
   // Follow the pulse CURSOR (global pulses done) → the schedule row at that trigger.
   // This advances SEQUENTIALLY with the run; do NOT jump to a firing filament's first

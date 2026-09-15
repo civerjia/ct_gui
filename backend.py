@@ -397,7 +397,7 @@ CH_GET_BOARD_BITMAPS = 0x26     # iso/tps enable + tps fault + hv overcurrent ma
 
 
 def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHANNELS,
-                   vi_only: bool = False) -> list:
+                   vi_only: bool = False, cached: bool = False) -> list:
     """64-board snapshot for the boards matrix: present/tps/ina presence (0x25),
     iso/tps enable + fault (0x26), and INA219 V/I (0x24). Returns 64 board dicts.
 
@@ -405,7 +405,17 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
     bitmap round-trips — the values that actually change frame-to-frame. The GUI
     merges these into its cache and does a full snapshot only occasionally, so the
     matrix numbers stay live at ~1 Hz even while the single-client link is busy
-    with user commands. (The enable/fault/mux bitmaps change rarely.)"""
+    with user commands. (The enable/fault/mux bitmaps change rarely.)
+
+    cached=True (implies vi_only) swaps that live 0x24 INA219 read for the
+    zero-I2C 0x3A cached-currents read (read_cached_currents_by_board) —
+    it costs the RP2350 nothing (no bus I/O at all, live or otherwise), so
+    it's the mode to poll at high frequency (10 Hz) or while a schedule is
+    firing. Trade-off: the CC-loop cache only has current, not bus_mV or a
+    presence flag, so only current_mA is updated per board; bus_mV/present/
+    ina_present carry over from the last (non-cached) snapshot — same
+    "only the volatile field moves" pattern vi_only already uses for the
+    bitmap fields."""
     boards = {}
     for ch in range(8):
         for mux in range(8):
@@ -421,6 +431,20 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
                 # See RP2350 uart_protocol.md 14.7 / firmware a0d71a3.
                 "iso_enabled_valid": False, "tps_enabled_valid": False,
                 "tps_fault_valid": False, "hv_overcurrent_valid": False,
+                # False means this tick's current read didn't cover this board
+                # (link timeout/contention, or a partial cached-read response) --
+                # current_mA here is just the fresh dict's 0 default, NOT a
+                # confirmed zero. The frontend must not treat it as real data;
+                # see refreshBoards()'s merge, which only overwrites current_mA
+                # when this is True (same "keep last value on no data" pattern
+                # already used for bus_mV/present in the cached branch below).
+                "current_mA_valid": False,
+                # Same idea, for CH_GET_PRESENT: a failed/timed-out call on this
+                # tick must not be allowed to blank the whole matrix's presence
+                # (and with it the current_mA display, which both render
+                # functions gate on `present`) -- the frontend keeps the last
+                # known presence/bus_mV when this is False.
+                "present_valid": False,
             }
 
     def apply_slice(raw, start, field):
@@ -431,7 +455,7 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
                 if raw[start + ch] & (1 << mux):
                     boards[(ch, mux)][field] = True
 
-    if not vi_only:
+    if not vi_only and not cached:
         try:
             resp = link.client.send_request(CH_GET_PRESENT, bytes(ALL_BOARDS_MASK), timeout=3.0)
             if resp.get("status_code") == 0x00:
@@ -444,6 +468,8 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
                 apply_slice(raw, 17, "tps_present")
                 apply_slice(raw, 25, "ina_present")
                 apply_slice(raw, 25, "present")
+                for b in boards.values():
+                    b["present_valid"] = True
         except Exception as exc:
             print(f"board_snapshot: CH_GET_PRESENT failed: {exc}")
         try:
@@ -468,17 +494,38 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
                 print(f"board_snapshot: CH_GET_BOARD_BITMAPS status_code={resp.get('status_code')!r}")
         except Exception as exc:
             print(f"board_snapshot: CH_GET_BOARD_BITMAPS failed: {exc}")
-    # INA219 V/I, keyed directly by (channel, mux) over the host SCAN_MASK — NOT
-    # the filament map. So enabling a channel in the "channels enabled" control
-    # surfaces that channel's boards (e.g. CH7) immediately, independent of which
-    # filaments are mapped there.
-    try:
-        for (ch, mux), v in read_ina_by_board(link, _scan_channels()).items():
-            if (ch, mux) in boards:
-                boards[(ch, mux)].update(bus_mV=v["bus_mV"], current_mA=v["current_mA"],
-                                         ina_present=v["present"], present=v["present"])
-    except Exception:
-        pass
+    # Keyed directly by (channel, mux) over the host SCAN_MASK — NOT the
+    # filament map. So enabling a channel in the "channels enabled" control
+    # surfaces that channel's boards (e.g. CH7) immediately, independent of
+    # which filaments are mapped there.
+    if cached:
+        # No I2C at all — only current_mA is available from the CC-loop
+        # cache; leave bus_mV/present/ina_present at their defaults above
+        # (the GUI's own merge keeps its last live values for those, same
+        # as it already does for the bitmap fields on a vi_only tick).
+        try:
+            for (ch, mux), v in read_cached_currents_by_board(link, _scan_channels()).items():
+                if (ch, mux) in boards:
+                    boards[(ch, mux)]["current_mA"] = v["current_mA"]
+                    # bit 7 of mode = "measuredMilliAmps is NOT a live measurement"
+                    # (port not in Current mode, or CC-loop re-armed and hasn't
+                    # measured yet) -- RP2350 firmware 57c605b. Below that fix,
+                    # this field had no defined value outside Current mode and
+                    # we were rendering it as a real reading anyway (root cause
+                    # of the "current flickers to 0" report -- see cross-session
+                    # thread with rp2350bfilamentcontroller-39).
+                    boards[(ch, mux)]["current_mA_valid"] = not (v.get("mode", 0) & 0x80)
+        except Exception:
+            pass
+    else:
+        try:
+            for (ch, mux), v in read_ina_by_board(link, _scan_channels()).items():
+                if (ch, mux) in boards:
+                    boards[(ch, mux)].update(bus_mV=v["bus_mV"], current_mA=v["current_mA"],
+                                             ina_present=v["present"], present=v["present"],
+                                             current_mA_valid=True)
+        except Exception:
+            pass
     return [boards[(ch, mux)] for ch in range(8) for mux in range(8)]
 
 
@@ -612,7 +659,11 @@ def read_ina_by_board(link: "ControllerLink", channels) -> dict:
         if 0 <= int(c) < 8:
             mask[int(c)] = 0xFF
     out: dict[tuple, dict] = {}
-    page_start, max_entries, guard = 0, 16, 0
+    # 33 = the confirmed max entries/page this 7-byte-entry response can carry
+    # (RP2350 firmware 9973f10) -- above it writeUartFrame used to silently
+    # drop the reply (no error, no data, caller waits out the full timeout).
+    # Halves the page count for a 48-port sweep (3 pages -> 2).
+    page_start, max_entries, guard = 0, 33, 0
     while guard < 16:
         guard += 1
         payload = bytes(mask) + bytes([page_start & 0xFF, max_entries & 0xFF])
@@ -654,7 +705,8 @@ def read_cached_currents_by_board(link: "ControllerLink", channels) -> dict:
         if 0 <= int(c) < 8:
             mask[int(c)] = 0xFF
     out: dict[tuple, dict] = {}
-    page_start, max_entries, guard = 0, 32, 0
+    # 33 = confirmed max entries/page (see read_ina_by_board's comment).
+    page_start, max_entries, guard = 0, 33, 0
     while guard < 16:
         guard += 1
         payload = bytes(mask) + bytes([page_start & 0xFF, max_entries & 0xFF])
@@ -683,11 +735,23 @@ def read_cached_telemetry(link: "ControllerLink", controller: int) -> dict:
         fil = MAPPING.filament_for_board(controller, ch, mux)
         if fil is None:
             continue
-        # mode: 0 voltage, 1 current (Idle/Active), 2/3 fault. Regulated => present.
-        present = v.get("mode", 0) != 0
+        raw_mode = v.get("mode", 0)
+        # bit 7 = "measuredMilliAmps is NOT a live measurement" (RP2350 fw
+        # 57c605b) -- mask it off before reading the low-bit mode (0 voltage,
+        # 1 current Idle/Active, 2/3 fault) so a not-yet-measured board isn't
+        # misread as present via a stray high bit. current_mA is None (not 0)
+        # when invalid -- ingestTelemetry()/app.js already has a `!= null`
+        # guard on current_mA (not on state, which still updates from
+        # inferState() using this null -- that can still show a brief STOP
+        # for an ACTIVE board between measurements; not fixed here, same
+        # class of issue as the boards-matrix one but not the one reported).
+        cc_mode = raw_mode & 0x7F
+        current_valid = not (raw_mode & 0x80)
+        present = cc_mode != 0
         out[fil] = {"index": fil, "present": present, "bus_mV": 0,
-                    "current_mA": v.get("current_mA", 0), "target_mA": v.get("target_mA", 0),
-                    "cc_mode": v.get("mode", 0), "cached": True}
+                    "current_mA": v.get("current_mA", 0) if current_valid else None,
+                    "target_mA": v.get("target_mA", 0),
+                    "cc_mode": cc_mode, "cached": True}
     return out
 
 
@@ -1071,6 +1135,7 @@ GEOMETRY = {
     "channels_used": 6,
     "boards_per_channel": 8,
 }
+
 
 
 class ControllerLink:
@@ -2093,15 +2158,22 @@ class CtHandler(BaseHTTPRequestHandler):
                             firing.append(fi)
                 except Exception:
                     pass
-                # While firing, DON'T do the live INA mux sweep — it shares the I2C
-                # bus and stalls pulses. Instead read the CC-loop CACHED currents
-                # (0x3A, no I2C) so the ring still shows real heating feedback and we
-                # can verify power states during the run. Idle => full live INA read.
+                # Always read the CC-loop CACHED currents (0x3A, no I2C) here, not
+                # the live INA sweep. While firing this avoids sharing the I2C bus
+                # and stalling pulses (the original reason for this branch); at
+                # idle, the live sweep's own cost (CH_GET_PRESENT-equivalent probe
+                # + several paged round-trips every ~1s poll) was the single
+                # biggest consumer of the shared RP2350 link -- see the cross-
+                # session thread with rp2350bfilamentcontroller-39 on the ~10s
+                # /api/cmd lag this caused. present now reflects CC-loop
+                # regulation state (mode != 0), not raw I2C presence, so a board
+                # that's plugged in but idle/voltage-mode shows as not-present
+                # here -- same tradeoff already accepted for the "running" case,
+                # now applied uniformly. The Boards matrix's own CH_GET_PRESENT
+                # (a separate, slower-cadence poll) is still the source of truth
+                # for physical presence.
                 try:
-                    if running:
-                        rows.update(read_cached_telemetry(link, cid - 1))
-                    else:
-                        rows.update(read_telemetry(link, cid - 1))
+                    rows.update(read_cached_telemetry(link, cid - 1))
                 except Exception:
                     pass
             # Feed the run recorder so an end-of-run report can confirm each active
@@ -2120,22 +2192,28 @@ class CtHandler(BaseHTTPRequestHandler):
             # 64-board matrix for the selected controller (?controller=N).
             # ?vi=1 → lightweight V/I-only refresh (skips the two bitmap reads); the
             # GUI merges it into its cache for a live ~1 Hz numbers update.
+            # ?cached=1 → same merge, but current_mA comes from the zero-I2C 0x3A
+            # CC-loop cache instead of a live 0x24 INA219 read — costs the RP2350
+            # nothing, safe to poll fast (10 Hz) or while a schedule is firing.
             q = self.path.split("?", 1)
             cid = 1
             vi_only = False
+            cached = False
             if len(q) > 1:
                 for kv in q[1].split("&"):
                     if kv.startswith("controller="):
                         cid = int(kv.split("=", 1)[1] or 1)
                     elif kv.startswith("vi="):
                         vi_only = kv.split("=", 1)[1] in ("1", "true", "yes")
+                    elif kv.startswith("cached="):
+                        cached = kv.split("=", 1)[1] in ("1", "true", "yes")
             link = CONTROLLERS.get(cid)
             if not link or not link.client.connected:
                 self._json({"ok": False, "error": "controller not connected", "boards": []})
             else:
                 try:
-                    self._json({"ok": True, "vi_only": vi_only,
-                                "boards": board_snapshot(link, cid - 1, vi_only=vi_only)})
+                    self._json({"ok": True, "vi_only": vi_only, "cached": cached,
+                                "boards": board_snapshot(link, cid - 1, vi_only=vi_only, cached=cached)})
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc), "boards": []})
         elif path == "/api/present-filaments":

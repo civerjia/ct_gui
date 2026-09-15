@@ -19,4 +19,11 @@ export const state = {
   refreshBoards: null,      // fn (power.js) <- app.js
   syncHvButtons: null,      // fn (power.js) <- tests.js
   testRunning: false,       // shared busy flag (power.js/tests.js)
+  scheduleRunning: false,   // a REAL hardware schedule is armed/running (app.js's
+                             // runMonitorTimer/pollRunStatus) -> power.js; distinct
+                             // from testRunning (Cal & Test owns the master, not a
+                             // scan). Used to gate the fast board-poll rate: fine to
+                             // go fast normally, but a real run already gets its own
+                             // dedicated status polling and firing shouldn't also
+                             // compete with a fast INA sweep for the link.
 };

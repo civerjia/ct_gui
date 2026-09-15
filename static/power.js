@@ -17,8 +17,16 @@ let pwTarget = 1;                       // selected controller (1 or 2) — boar
 // controller; those calls route there regardless of the selected target.
 const masterId = () => state.master || 1;
 const masterConnected = () => !!connectedSet[masterId()];
-const POLL_MS = 500;                     // board snapshot + HV grid refresh period
-const REFRESH_S = (POLL_MS / 1000).toFixed(0) + ' s';
+// Board snapshot + HV grid refresh period. Fast (10 Hz) normally — the fast
+// tick is a zero-I2C cached-current read (board_snapshot cached=1), cheap
+// enough for that. Slower while a REAL hardware schedule is armed/running
+// (state.scheduleRunning, set by app.js's run monitor): that already has its
+// own dedicated status polling, so the boards matrix doesn't need to chase
+// 10 Hz too and compete for the link with firing.
+const POLL_MS_FAST = 100;
+const POLL_MS_RUN = 500;
+const pollMs = () => (state.scheduleRunning ? POLL_MS_RUN : POLL_MS_FAST);
+const pollHz = () => Math.round(1000 / pollMs());
 const powerCmd = (command, extra) => postJ('/api/power-cmd', { controller: pwTarget, command, ...extra });
 
 // ---- boards matrix ----------------------------------------------------------
@@ -500,29 +508,85 @@ async function readStartupOcp() {
 // at ~1 Hz without paying for the two bitmap round-trips (enable/fault/mux presence
 // change rarely and come from the periodic full refresh). fast=false → full snapshot.
 let boardGen = 0;   // bumped on every refresh + controller switch; stale responses drop
+let lastKnownConn = false;   // debounces boardTargetConnected()'s transient reconnect blips
 async function refreshBoards(fast) {
   const conn = boardTargetConnected();
-  if (!conn) { boardCache = emptyBoards(); renderBoardGrid(); renderOneBoard(); bmMsg(`Power ${pwTarget} not connected.`); return; }
+  if (!conn) {
+    bmMsg(`Power ${pwTarget} not connected.`);
+    // Only actually blank the matrix on a SUSTAINED disconnect (we were
+    // connected as of the last call, now we're not) — boardTargetConnected()
+    // flaps briefly on the RP2350 :3333 link's documented reconnect blip
+    // (same root cause as the ok:false fix above), and blanking on every
+    // blip was the real "whole row flickers" bug — this check ran before
+    // board_snapshot() was even reached, so no amount of current_mA_valid/
+    // present_valid/ok:false fixing downstream could ever have caught it.
+    if (lastKnownConn) { boardCache = emptyBoards(); renderBoardGrid(); renderOneBoard(); }
+    lastKnownConn = false;
+    return;
+  }
+  lastKnownConn = true;
   const gen = ++boardGen, target = pwTarget;   // this call supersedes any in-flight one
   let j;
-  try { j = await (await fetch(`/api/board-snapshot?controller=${target}${fast ? '&vi=1' : ''}`)).json(); } catch { return; }
+  // cached=1 → zero-I2C CC-loop current cache (backend.py board_snapshot cached
+  // mode) instead of a live INA219 sweep — cheap enough to poll fast (10 Hz,
+  // see wirePowerPoll's schedule below) and safe even while a real schedule
+  // is firing.
+  try { j = await (await fetch(`/api/board-snapshot?controller=${target}${fast ? '&cached=1' : ''}`)).json(); } catch { return; }
   // Drop the response if a newer refresh started or the user switched controllers
   // mid-flight — otherwise stale (e.g. Power 1) data lands after the switch to Power 2.
   if (gen !== boardGen || target !== pwTarget) return;
-  if (!j.ok) { if (!fast) { boardCache = emptyBoards(); renderBoardGrid(); bmMsg(j.error || 'snapshot failed'); } return; }
+  // ok:false is a TRANSIENT per-request failure (e.g. the RP2350 :3333 link's
+  // documented reconnect blip — link.client.connected flaps briefly, this is
+  // normal and NOT the same as the user disconnecting, which the earlier
+  // !conn check above already handles by blanking the matrix). Don't wipe
+  // boardCache here — that was the actual "whole row flickers" bug: every
+  // transient link blip blanked the entire matrix for one refresh cycle,
+  // bypassing current_mA_valid/present_valid entirely since it happens
+  // before board_snapshot() even runs. Just skip this update and retry next
+  // tick; the last known state stays on screen.
+  if (!j.ok) { if (!fast) bmMsg(j.error || 'snapshot failed'); return; }
   const rows = (j.boards && j.boards.length) ? j.boards : emptyBoards();
   if (fast && boardCache && boardCache.length === rows.length) {
-    // merge only the volatile fields; keep bitmap-derived flags from the last full read
+    // Cached mode only has current_mA (no I2C -> no bus_mV/present read at all);
+    // merge just that and keep bus_mV/present/ina_present/bitmap flags from the
+    // last full (non-cached) read — same "only the volatile field moves"
+    // pattern this merge already used for the bitmap fields.
     const by = new Map(rows.map((b) => [`${b.channel}.${b.mux_port}`, b]));
     for (const b of boardCache) {
       const n = by.get(`${b.channel}.${b.mux_port}`);
-      if (n) { b.bus_mV = n.bus_mV; b.current_mA = n.current_mA; b.present = n.present; b.ina_present = n.ina_present; }
+      // current_mA_valid=false means this tick's read didn't actually cover this
+      // board (link timeout/contention, or a partial cached response) — the 0 in
+      // n.current_mA is just the backend's fresh-dict default, not a real
+      // reading. Keep the last known value instead of flickering to 0 on every
+      // failed/partial tick.
+      if (n && n.current_mA_valid) b.current_mA = n.current_mA;
     }
   } else {
+    // Full (non-cached, live INA219) snapshot: same failure mode applies here
+    // too (a partial/timed-out link.request() leaves current_mA_valid=false
+    // for boards this call didn't actually reach) — patch those back to their
+    // last known current_mA instead of letting the wholesale replace below
+    // zero them out.
+    const prev = new Map((boardCache || []).map((b) => [`${b.channel}.${b.mux_port}`, b]));
+    for (const b of rows) {
+      const p = prev.get(`${b.channel}.${b.mux_port}`);
+      if (!p) continue;
+      if (!b.current_mA_valid) b.current_mA = p.current_mA;
+      // present_valid=false means CH_GET_PRESENT itself failed/timed out this
+      // tick — every board in the response defaults to present:false, which
+      // would blank the whole matrix's current display (both render
+      // functions gate on `present`). Keep the last known presence/bus_mV
+      // instead of flickering the entire matrix to "—" on a single failed read.
+      if (!b.present_valid) {
+        b.present = p.present; b.mux_present = p.mux_present;
+        b.tps_present = p.tps_present; b.ina_present = p.ina_present;
+        b.bus_mV = p.bus_mV;
+      }
+    }
     boardCache = rows;
   }
   renderBoardGrid(); renderOneBoard();
-  bmMsg(`Power ${pwTarget} — ${boardCache.filter((b) => b.present).length}/64 present · INA219 refresh ${REFRESH_S}.`);
+  bmMsg(`Power ${pwTarget} — ${boardCache.filter((b) => b.present).length}/64 present · current refresh ${pollHz()} Hz.`);
 }
 state.refreshBoards = refreshBoards;
 // Resync the Emission/Focus enable buttons to the actual hardware state.
@@ -866,7 +930,9 @@ function renderHvGrid() {
     });
     grid.appendChild(tile);
   }
-  const s = $p('hvStatus'); if (s) s.textContent = `${on}/64 on · ${mm} mismatch${hvMonitorOn ? ' · refresh ' + REFRESH_S : ' · monitor off'}`;
+  // HV grid refreshes once every POLL_PHASES base ticks (see pollPower), not every tick.
+  const hvRefreshS = ((pollMs() * POLL_PHASES) / 1000).toFixed(1) + ' s';
+  const s = $p('hvStatus'); if (s) s.textContent = `${on}/64 on · ${mm} mismatch${hvMonitorOn ? ' · refresh ' + hvRefreshS : ' · monitor off'}`;
 }
 
 // Monitor gates the periodic HV feedback read — OFF = no SCK/LOAD activity from
@@ -1226,16 +1292,23 @@ function wireHv() {
   }
   setHvEnBtn('hvEnEm', 'Emission', false);   // start OFF (boot-safe) — updates primary + mirror
   setHvEnBtn('hvEnFoc', 'Focus', false);
-  // ADS1115 monitor + DS3502 wiper readout — 10 Hz auto-poll, on by default.
-  // adsRead() guards itself (adsBusy) so an in-flight read just makes this
-  // tick a no-op rather than stacking overlapping requests — safe to ask
-  // for 100ms even though the actual STM32+UART+HTTP round trip may take
-  // longer; it naturally throttles to whatever that round trip supports.
+  // ADS1115 monitor + DS3502 wiper readout — 2 Hz auto-poll, on by default.
+  // adsRead()/readHvStatus() each guard against overlapping themselves, but
+  // the ESP32's onboard HTTP server (config_portal) is a legacy single-
+  // threaded WebServer that only ever services ONE client at a time and
+  // shares its Arduino loop() with the RP2350 :3333 relay -- firing BOTH
+  // calls concurrently at 100ms (a prior session tightened this from 500ms
+  // without accounting for that) piled up concurrent requests faster than
+  // it could drain them, stalling loop() for hundreds of ms per cycle and
+  // taking the RP2350 command latency down with it. 500ms restores the
+  // margin that made the per-call guards sufficient again; also serialize
+  // the two calls (await adsRead() before starting readHvStatus()) so this
+  // tick never has more than one request in flight against that server.
   let adsTimer = null;
-  const tick = () => { adsRead(); readHvStatus(false); };   // tiles live; buttons stay on the commanded state (poll must not yank a toggle)
+  const tick = async () => { await adsRead(); await readHvStatus(false); };   // tiles live; buttons stay on the commanded state (poll must not yank a toggle)
   // Load both HV LUTs once at wire time and show their status next to Set V.
   refreshLutStatus('emission'); refreshLutStatus('focus');
-  const adsAutoApply = (on) => { clearInterval(adsTimer); adsTimer = on ? setInterval(tick, 100) : null; };
+  const adsAutoApply = (on) => { clearInterval(adsTimer); adsTimer = on ? setInterval(tick, 500) : null; };
   $p('adsRead').onclick = tick;
   $p('adsAuto').onchange = (e) => adsAutoApply(e.target.checked);
   adsAutoApply($p('adsAuto').checked);
@@ -1566,18 +1639,27 @@ const hvFix = (v) => (v == null ? null : (HV_STATUS_POLARITY_REVERSED ? !v : v))
 // pulls the enable BUTTONS to the real pin state — done only on (re)connect /
 // target-switch; the 2 Hz monitor poll passes false so it never yanks a button
 // out from under the user's click.
+let hvStatusBusy = false;
 async function readHvStatus(syncButtons) {
   const blank = () => {
     setHvPin('hvEmStatus', null); setHvPin('hvFocStatus', null);
     if (syncButtons) { setHvEnBtn('hvEnEm', 'Emission', null); setHvEnBtn('hvEnFoc', 'Focus', null); }
   };
   if (!masterConnected()) { blank(); return; }
-  let j;
-  try { j = await (await fetch(`/api/stm32/hv-status?controller=${masterId()}`)).json(); }
-  catch { blank(); return; }
-  const em = hvFix(j.ok ? j.emission_on : null), fo = hvFix(j.ok ? j.focus_on : null);
-  setHvPin('hvEmStatus', em); setHvPin('hvFocStatus', fo);
-  if (syncButtons) { setHvEnBtn('hvEnEm', 'Emission', em); setHvEnBtn('hvEnFoc', 'Focus', fo); }
+  if (hvStatusBusy) return;   // never overlap / flood the bridge (STM32 on master) — an
+                              // unguarded 10 Hz tick piled up concurrent requests on the
+                              // ESP32's single-threaded onboard HTTP server and stalled
+                              // its main loop (and with it the RP2350 :3333 relay) for
+                              // hundreds of ms per cycle once a few had queued up.
+  hvStatusBusy = true;
+  try {
+    let j;
+    try { j = await (await fetch(`/api/stm32/hv-status?controller=${masterId()}`)).json(); }
+    catch { blank(); return; }
+    const em = hvFix(j.ok ? j.emission_on : null), fo = hvFix(j.ok ? j.focus_on : null);
+    setHvPin('hvEmStatus', em); setHvPin('hvFocStatus', fo);
+    if (syncButtons) { setHvEnBtn('hvEnEm', 'Emission', em); setHvEnBtn('hvEnFoc', 'Focus', fo); }
+  } finally { hvStatusBusy = false; }
 }
 
 // ---- Dynamic-row table editor -----------------------------------------------
@@ -2076,8 +2158,12 @@ export function initPower() {
   document.querySelectorAll('#pwTargetSeg .seg-btn').forEach((b) =>
     b.addEventListener('click', () => selectController(+b.dataset.ctrl, b)));
 
-  // poll connection state + board snapshot
-  setInterval(pollPower, POLL_MS);
+  // poll connection state + board snapshot. Self-rescheduling (not
+  // setInterval) so the rate can follow pollMs()'s fast/run split above —
+  // picked fresh before each call, not fixed at wire-up time.
+  (function scheduleNextPoll() {
+    setTimeout(async () => { await pollPower(); scheduleNextPoll(); }, pollMs());
+  })();
   pollPower();
 }
 
@@ -2108,7 +2194,7 @@ async function selectController(n, btn) {
 let pollBusy = false;
 let prevConn = false;
 let pollTick = 0;
-const POLL_PHASES = 5;
+const POLL_PHASES = 5;   // full/presence refresh every ~500ms (2 Hz) -- hard requirement
 // True only when the matrix is actually on screen. When it's not (different tab /
 // backgrounded), skip its reads so the single-client link stays free for the CT
 // geometry live view. Robust check: checkVisibility() where available, else box size.
@@ -2120,13 +2206,19 @@ function powerPanelVisible() {
   const r = el.getBoundingClientRect();
   return r.width > 0 && r.height > 0;
 }
-// One poll per second. INA219 V/I is the live operational signal, so EVERY tick
-// does the cheap V/I refresh and the matrix numbers stay current. The only other
-// periodic reads are the presence/enable/fault snapshot (phase 0) and the HV grid
-// (phase 2) — both change rarely and are spread onto their own ticks so no tick
-// holds the link long enough to stall the V/I refresh. TPS OCP/delay/slew are
-// debug config that don't change during a run, so they are NOT polled — they're
-// read on demand only (selecting a board / switching controllers).
+// Every fast tick does the cheap cached-current V/I merge, so the matrix
+// numbers stay live. The presence/enable/fault snapshot (phase 0, CH_GET_PRESENT
+// + CH_GET_BOARD_BITMAPS) and the HV grid (phase 2) are on their own tick within
+// the same POLL_PHASES cycle -- currently 5, i.e. 2 Hz, a hard requirement (not
+// a tuning knob) even though CH_GET_PRESENT alone costs ~54ms of real I2C on a
+// 48-port mask. The other two fixes from the same investigation (33-entry pages,
+// idle Ring telemetry moved to the cached path -- see cross-session thread with
+// rp2350bfilamentcontroller-39) cut enough load off the shared RP2350 link that
+// 2 Hz presence should no longer reproduce the ~10s on-demand /api/cmd lag this
+// was chasing; re-verify under real concurrent use if that regresses. TPS
+// OCP/delay/slew are debug config that don't change during a run, so they are
+// NOT polled — they're read on demand only (selecting a board / switching
+// controllers).
 async function pollPower() {
   if (pollBusy) return;          // never overlap — reads serialize on the single link
   if (state.testRunning) { updateTargetStatus(); return; }   // pause during a Cal & Test
