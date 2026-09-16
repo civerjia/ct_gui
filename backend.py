@@ -100,10 +100,13 @@ def build_payload(command: str, b: dict):
         return 0x28, FLAG_SINGLE, bytes([ch, mux]) + _u16(int(b["threshold_mA"]))
     if command == "CH_GET_INA219":           # 0x24: ch,mux -> status,ch,mux,present,busMv16,mA16
         return 0x24, FLAG_SINGLE, bytes([ch, mux])
-    # NOTE: no single-board CH_GET_CACHED_CURRENTS here BY DESIGN. Cached currents
-    # are read in bulk via read_cached_currents_by_board / /api/cached-currents
-    # (one paged request for all boards). Never loop single-board reads — it floods
-    # the one shared bridge link and starves the CC loop.
+    if command == "CH_GET_CACHED_CURRENTS":  # 0x3A single form: ch,mux ->
+        # status,ch,mux,mode,measured16,target16. Use this for ONE filament only
+        # (e.g. wait_for_current's poll): it's one tiny frame instead of the
+        # paged all-board sweep. For MANY boards always use the bulk/paged
+        # read_cached_currents_by_board — never loop this per board, that floods
+        # the one shared bridge link and starves the CC loop.
+        return 0x3A, FLAG_SINGLE, bytes([ch, mux])
     if command == "HV_GET_ALL_BYTES":        # 0x13: desired[8]+feedback[8]
         return 0x13, 0, b""
     if command == "HV_SET_BIT":              # 0x10: ch,bit,value,verifyMode
@@ -311,6 +314,9 @@ CH_FILAMENT_CURRENTS = 0x39
 CH_SET_POWER_STATE = 0x35        # ch,mux,state,arg16 (Idle/Active→mA, Voltage→mV)
 CH_SET_I2C_ENABLE_MASK = 0x34
 CH_GET_INA219 = 0x24
+HV_REFRESH_FEEDBACK = 0x14      # REALLY re-reads the 74HC165 (payload 0xFF = all 8
+                                 # channels in one frame). 0x13 HV_GET_ALL_BYTES is a
+                                 # CACHE COPY -- never use it to confirm a read-back.
 CH_GET_CACHED_CURRENTS = 0x3A    # CC-loop cached currents, NO I2C (run-safe telemetry)
 CH_GET_PRESENT = 0x25            # I2C presence scan (mux/tps/ina/io per board)
 CH_GET_DIAGNOSIS = 0x2E         # deep diagnosis: addr-ACK / reg-read / operational
@@ -507,14 +513,16 @@ def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHA
             for (ch, mux), v in read_cached_currents_by_board(link, _scan_channels()).items():
                 if (ch, mux) in boards:
                     boards[(ch, mux)]["current_mA"] = v["current_mA"]
-                    # bit 7 of mode = "measuredMilliAmps is NOT a live measurement"
+                    # 0x80 of mode = "measuredMilliAmps is NOT a live measurement"
                     # (port not in Current mode, or CC-loop re-armed and hasn't
                     # measured yet) -- RP2350 firmware 57c605b. Below that fix,
                     # this field had no defined value outside Current mode and
                     # we were rendering it as a real reading anyway (root cause
                     # of the "current flickers to 0" report -- see cross-session
-                    # thread with rp2350bfilamentcontroller-39).
-                    boards[(ch, mux)]["current_mA_valid"] = not (v.get("mode", 0) & 0x80)
+                    # thread with rp2350bfilamentcontroller-39). 0x40 = the sample
+                    # could not be produced at all; also not a reading. Keep this
+                    # in step with _cached_entry()'s mask.
+                    boards[(ch, mux)]["current_mA_valid"] = not (v.get("mode", 0) & 0xC0)
         except Exception:
             pass
     else:
@@ -726,33 +734,147 @@ def read_cached_currents_by_board(link: "ControllerLink", channels) -> dict:
     return out
 
 
+def _cached_entry(fil: int, raw_mode: int, current_mA, target_mA) -> dict:
+    """Decode ONE cached-current entry into the per-filament dict shape. Shared by
+    the paged bulk read and the single-board read so both return byte-identical
+    fields -- a caller must never be able to tell which path served it.
+
+    The mode byte carries the real mode in the LOW bits (0 voltage, 1 current
+    Idle/Active, 2/3 fault) plus TWO independent flags, both of which must be
+    masked off before the mode is read (channel_controller.h:216-224):
+      0x80 kCcModeStaleFlag       -- measuredMilliAmps is not a live measurement
+      0x40 kCcModeUnavailableFlag -- the sample could not be produced AT ALL
+                                     (channel not ready). Distinct from stale.
+    Masking only 0x80 (as this did) leaves 0x40 in the mode, so an unavailable
+    board decodes as mode 64 -- nonzero, i.e. reported PRESENT and regulating.
+    The bulk read sets stale|unavailable = 0xC0 on any board it failed to sample,
+    so that path produced exactly this.
+
+    current_mA is None (not 0) when stale or unavailable -- clients must
+    `is not None` guard it (ct_simple_control.wait_for_current does; app.js's
+    ingestTelemetry has the same guard on current_mA but NOT on state, which
+    still updates from inferState() using this null -- that can still show a
+    brief STOP for an ACTIVE board between measurements; pre-existing)."""
+    CC_STALE, CC_UNAVAILABLE = 0x80, 0x40
+    cc_mode = raw_mode & ~(CC_STALE | CC_UNAVAILABLE) & 0xFF
+    unavailable = bool(raw_mode & CC_UNAVAILABLE)
+    current_valid = not (raw_mode & CC_STALE) and not unavailable
+    # bus_mV is None, NOT 0. The 0x3A response has no voltage field at all --
+    # status, channel, muxPort, mode, measMa, targetMa, and nothing else (measured
+    # on the wire 2026-09-16). A 0 here was a number this host invented: it reads
+    # as a plausible measurement and never was one, which is the exact failure
+    # this whole audit was about, sitting in the function that decodes the flags
+    # for it. The docstring even said "bus_mV is unavailable here" while returning
+    # a value for it. Want a voltage -> 0x24 (read_telemetry / ?live=1); that is
+    # the only command that carries one.
+    return {"index": fil, "present": (cc_mode != 0) and not unavailable,
+            "bus_mV": None,
+            "current_mA": current_mA if current_valid else None,
+            "target_mA": target_mA, "cc_mode": cc_mode,
+            "unavailable": unavailable, "cached": True}
+
+
 def read_cached_telemetry(link: "ControllerLink", controller: int) -> dict:
     """Per-FILAMENT CC-loop cached currents mapped to global filament 0-95. The
     run-safe sibling of read_telemetry (no I2C). `present` is inferred from the CC
-    mode (a board the loop is regulating is present); bus_mV is unavailable here."""
+    mode (a board the loop is regulating is present); bus_mV is unavailable here.
+
+    BULK path (paged, all used channels in one sweep). For exactly one filament
+    use read_cached_telemetry_one -- different firmware command, far cheaper."""
     out: dict[int, dict] = {}
     for (ch, mux), v in read_cached_currents_by_board(link, MAPPING.channels_used(controller)).items():
         fil = MAPPING.filament_for_board(controller, ch, mux)
         if fil is None:
             continue
-        raw_mode = v.get("mode", 0)
-        # bit 7 = "measuredMilliAmps is NOT a live measurement" (RP2350 fw
-        # 57c605b) -- mask it off before reading the low-bit mode (0 voltage,
-        # 1 current Idle/Active, 2/3 fault) so a not-yet-measured board isn't
-        # misread as present via a stray high bit. current_mA is None (not 0)
-        # when invalid -- ingestTelemetry()/app.js already has a `!= null`
-        # guard on current_mA (not on state, which still updates from
-        # inferState() using this null -- that can still show a brief STOP
-        # for an ACTIVE board between measurements; not fixed here, same
-        # class of issue as the boards-matrix one but not the one reported).
-        cc_mode = raw_mode & 0x7F
-        current_valid = not (raw_mode & 0x80)
-        present = cc_mode != 0
-        out[fil] = {"index": fil, "present": present, "bus_mV": 0,
-                    "current_mA": v.get("current_mA", 0) if current_valid else None,
-                    "target_mA": v.get("target_mA", 0),
-                    "cc_mode": cc_mode, "cached": True}
+        out[fil] = _cached_entry(fil, v.get("mode", 0),
+                                 v.get("current_mA", 0), v.get("target_mA", 0))
     return out
+
+
+# Does this firmware flag a FAILED single-board 0x3A sample, or return a bare 0?
+# Keyed by controller; None = not probed yet. See _single_read_is_trusted().
+_SINGLE_0X3A_TRUSTED: dict[int, bool] = {}
+
+
+def _single_read_is_trusted(link: "ControllerLink", controller: int) -> bool:
+    """True if this firmware's SINGLE-board 0x3A flags an unreadable board.
+
+    Firmware 5bff25c made a failed CcCurrentSample default to stale|unavailable,
+    which fixed the single-board branch; before it, the paged branch flagged a
+    failed read (0xC0) while the single branch returned mode 0 / 0 mA -- a board
+    that isn't there, reported as present-and-idle. VERIFIED on hardware
+    2026-09-16: the flashed firmware has the paged fix but not the single one, so
+    this is a live difference, not a theoretical one.
+
+    That matters because wait_for_current() polls the single path: on such a
+    firmware, stop_one(verify=True) against an absent board reports "reached
+    0.0 mA" for a reading that never happened. So probe once per controller and
+    fall back to the (correct, slower) paged read when the single path can't be
+    trusted, rather than assuming either firmware.
+
+    The probe: find a board the PAGED read flags unavailable and ask for it
+    singly. If the single read calls it valid, the firmware lacks the fix. No
+    such board (everything readable) => nothing to distinguish, assume trusted
+    and re-probe later rather than caching a guess."""
+    cached = _SINGLE_0X3A_TRUSTED.get(controller)
+    if cached is not None:
+        return cached
+    try:
+        paged = read_cached_telemetry(link, controller)
+    except Exception:
+        return True                      # can't probe now; don't cache
+    probe = next((f for f, v in paged.items() if v.get("current_mA") is None), None)
+    if probe is None:
+        return True                      # nothing unreadable to probe with; don't cache
+    ft, flags, payload = build_payload("CH_GET_CACHED_CURRENTS",
+                                       {"channel": 0, "mux_port": 0})
+    cid0, ch, mux, _ = filament_to_board(int(probe))
+    ft, flags, payload = build_payload("CH_GET_CACHED_CURRENTS",
+                                       {"channel": ch, "mux_port": mux})
+    try:
+        resp = link.request(ft, payload, flags=flags, timeout=1.5)
+    except Exception:
+        return True                      # don't cache a failed probe
+    dec = resp.get("decoded") if isinstance(resp, dict) else None
+    if not isinstance(dec, dict) or "mode" not in dec:
+        return True
+    trusted = bool(dec.get("mode", 0) & 0xC0)   # flagged it too => fix present
+    _SINGLE_0X3A_TRUSTED[controller] = trusted
+    if not trusted:
+        print(f"[0x3A] controller {controller + 1}: firmware does NOT flag failed "
+              f"single-board reads (pre-5bff25c) — routing single reads through the "
+              f"paged read so an unreadable board can't report as 0 mA")
+    return trusted
+
+
+def read_cached_telemetry_one(link: "ControllerLink", controller: int, fil: int) -> dict:
+    """SINGLE-board sibling of read_cached_telemetry: one filament, one small
+    FLAG_SINGLE frame (0x3A single form) instead of the paged all-board sweep.
+
+    Returns {fil: entry} (same shape as the bulk read, so callers can merge the
+    two interchangeably) or {} if the filament has no board on this controller,
+    or the read failed. Use for a single-filament poll (wait_for_current); NEVER
+    loop it over many boards -- that's what the bulk read exists for."""
+    cid0, ch, mux, _ = filament_to_board(int(fil))
+    if cid0 != controller or ch is None:
+        return {}
+    if not _single_read_is_trusted(link, controller):
+        # Old firmware: the single read cannot say "I could not read this", so use
+        # the paged read, which can. Costs the round-trips this path exists to
+        # avoid -- correctness first; the speed returns when the RP2350 is flashed.
+        return {int(fil): v for f, v in read_cached_telemetry(link, controller).items()
+                if f == int(fil)}
+    ft, flags, payload = build_payload("CH_GET_CACHED_CURRENTS",
+                                       {"channel": ch, "mux_port": mux})
+    try:
+        resp = link.request(ft, payload, flags=flags, timeout=1.5)
+    except Exception:
+        return {}
+    dec = resp.get("decoded") if isinstance(resp, dict) else None
+    if not isinstance(dec, dict) or "mode" not in dec:
+        return {}
+    return {int(fil): _cached_entry(int(fil), dec.get("mode", 0),
+                                    dec.get("measured_mA", 0), dec.get("target_mA", 0))}
 
 
 # ---- PUSHED telemetry (firmware -> host, no request) -------------------------
@@ -799,7 +921,36 @@ def set_scan_telemetry(link: "ControllerLink", controller: int, enable: bool) ->
 def read_pushed_telemetry(link: "ControllerLink", controller: int) -> dict:
     """Per-FILAMENT snapshot assembled from the firmware-PUSHED EVENT_TELEMETRY
     frames already RECEIVED (no request). Pages stream in order, so applying every
-    received page's entries (oldest->newest) leaves the newest value per board."""
+    received page's entries (oldest->newest) leaves the newest value per board.
+
+    CAUTION: an EVENT_TELEMETRY entry is (channel, port, bus_mV, current_mA) with NO
+    validity flag -- unlike the 0x3A reads, whose mode byte carries stale/unavailable
+    (see _cached_entry). So the firmware cannot currently tell us a pushed value is
+    bad: a failed read arrives as 0 mA, and the cached branch can push a STALE current
+    as if it were live. Treat pushed currents as ADVISORY (they drive the 20 fps live
+    view only) -- never verify a command against them; use wait_for_current, which
+    goes through 0x3A and does get the flags.
+
+    TELEMETRY_INVALID_MIN below is the agreed-on sentinel range (see cross-session thread with
+    rp2350bfilamentcontroller-39): a per-entry flag byte would change the entry stride,
+    and a version skew there misparses the WHOLE page instead of one value, so 0xFFFF
+    was chosen instead. Guarding for it now is a no-op until/unless that firmware side
+    lands -- it costs nothing and means we don't have to move both ends together."""
+    # Sentinel RANGE, not a single value: 0xFFF0..0xFFFF all mean "no valid
+    # reading", with the low bits carrying the REASON (firmware 78fabb7,
+    # uart_protocol.md 16.4):
+    #   0xFFFF board absent (probed, no answer)   0xFFFE measurement too old
+    #   0xFFFD unavailable (channel not ready)    0xFFFC not measured by this mode
+    # 0xFFFC is the one to be careful with if this ever stops collapsing them:
+    # in CACHED mode bus_mV is 0xFFFC on EVERY entry, because the CC cache holds
+    # a current and nothing else. Reading that as "absent" would report every
+    # board missing throughout a scan. Accepting the whole range here
+    # first is what makes that extension safe -- firmware only ever emits
+    # 0xFFFF today, so this is a no-op now, but once it starts emitting the
+    # distinct values an `== 0xFFFF` check would MISS them and render 65534 mA
+    # as a real current. Widening before they narrow, never the reverse.
+    # Anything in this range is ~65 A, ~20x past what these boards can draw.
+    TELEMETRY_INVALID_MIN = 0xFFF0
     board: dict[tuple, tuple] = {}
     try:
         events = link.client.events()
@@ -816,8 +967,25 @@ def read_pushed_telemetry(link: "ControllerLink", controller: int) -> dict:
         fil = MAPPING.filament_for_board(controller, ch, mux)
         if fil is None:
             continue
-        out[fil] = {"index": fil, "present": True, "bus_mV": mv,
-                    "current_mA": mA, "pushed": True}
+        # present was hardcoded True here: "a board that appeared in a pushed frame
+        # exists". It doesn't follow -- the firmware pages EVERY masked board, including
+        # ones it failed to read, so an absent board was being reported present with a
+        # 0 mA reading. Fall back to the same None-means-no-reading convention the 0x3A
+        # path uses, so a consumer can't tell the two paths apart.
+        #
+        # CONFLATION, on purpose: the sentinel cannot separate "absent" from "present
+        # but stale" -- this entry shape has no flag field, which is the whole reason
+        # for the sentinel. So `present` here means "confirmed present THIS sample",
+        # not "plugged in", and a live board with one stale sample does dip it. That
+        # only moves the status-line count; state is no longer inferred from an
+        # untrusted sample (app.js pollTelemetry passes state:null for a null
+        # current), so it can't flicker a board to STOP the way it used to.
+        # bus_mV is 0xFFFF for EVERY board in cached telemetry mode (the CC cache
+        # holds no voltage), so it is None throughout a scan by design, not a fault.
+        valid = mA < TELEMETRY_INVALID_MIN
+        out[fil] = {"index": fil, "present": valid,
+                    "bus_mV": mv if mv < TELEMETRY_INVALID_MIN else None,
+                    "current_mA": mA if valid else None, "pushed": True}
     return out
 
 SHV_EMIT_CHUNK = 64    # emission entries per frame (64*4+3 = 259 B). Bigger chunks
@@ -1171,6 +1339,19 @@ class ControllerLink:
             self._running = True
             self._poll_thread = threading.Thread(target=self._poll, daemon=True)
             self._poll_thread.start()
+        # Forget any cached firmware-capability probe for this controller: a
+        # reconnect is exactly what a reflash looks like from here, and the probe
+        # result is a property of the FIRMWARE, not of the host. Without this a
+        # backend that probed an old firmware stays on the slow (paged) path for
+        # its whole lifetime even after the RP2350 is flashed -- conservative, but
+        # it silently never gives the fast path back. VERIFIED 2026-09-16: the
+        # probe did cache False against pre-5bff25c firmware and needed a restart.
+        for _cid, _lnk in list(CONTROLLERS.items()):
+            if _lnk is self:
+                _SINGLE_0X3A_TRUSTED.pop(_cid - 1, None)
+                break
+        else:                                  # not registered yet (startup): clear all
+            _SINGLE_0X3A_TRUSTED.clear()
         self._read_identity(host)
 
     def _read_identity(self, host: str) -> None:
@@ -1925,9 +2106,18 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     currents = currents or {}
     if filaments is None:
         fils = MAPPING.filaments(controller)
+        not_this_controller: list[int] = []
     else:
-        fils = [int(f) for f in filaments
-                if filament_to_board(int(f))[0] == controller]
+        requested = [int(f) for f in filaments]
+        fils = [f for f in requested if filament_to_board(f)[0] == controller]
+        # Filaments this call was asked for but that MAPPING says belong to a
+        # DIFFERENT controller (or no controller at all) -- expected/normal
+        # when the caller is broadcasting one filaments= list across every
+        # connected controller (the top-level /api/filament-prep handler does
+        # exactly that), so this alone isn't an error. It only becomes one if
+        # NO controller ends up claiming a requested filament -- the top-level
+        # handler reconciles that across all `results`, see "excluded" there.
+        not_this_controller = [f for f in requested if f not in fils]
     # BATCHED, not per-filament. A per-filament flood (~48 CH_SET_POWER_STATE frames
     # back-to-back) overwhelmed the RP2350's UART+I2C and tripped its 2 s watchdog
     # ("Stop all" -> RP2350 reset). Instead send ONE MASKED frame per (channel,
@@ -1937,14 +2127,21 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # to reset. Grouped by current so Idle/Active with per-filament targets still
     # batch per channel where the target matches. Response layout (per handler):
     # [status, mask[8], applied[8], failed[8], state, ...] -> applied[] at raw[9:17].
+    # unslotted: filament_to_board() matched this controller but has no channel
+    # (past slot 63, or a skipped channel) -- a real, reportable exclusion, not
+    # a "belongs elsewhere" case like not_this_controller above.
+    unslotted: list[int] = []
     if not fils:
-        return {"controller": controller, "ok": True, "applied": 0, "failed": [], "state": int(state)}
+        return {"controller": controller, "ok": True, "applied": 0, "failed": [],
+                "state": int(state), "touched": [], "not_this_controller": not_this_controller,
+                "unslotted": unslotted}
     groups: dict = {}   # (channel, arg) -> OR'd mask byte for that channel
     members: dict = {}  # (channel, arg) -> [filament]
     for f in fils:
         _, ch, pos, _ = filament_to_board(f)
         if ch is None:            # unslotted/overflow filament (past slot 63, or a
-            continue              # skipped channel) -> has no power slot to address
+            unslotted.append(f)   # skipped channel) -> has no power slot to address
+            continue
         v = currents.get(str(f), currents.get(f, default_arg))
         arg = int(v if v is not None else default_arg)   # tolerate an explicit null
         groups[(ch, arg)] = groups.get((ch, arg), 0) | (1 << pos)
@@ -1977,8 +2174,9 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
                 applied += 1
             else:
                 failed.append(int(f))
-    return {"controller": controller, "ok": not failed, "applied": applied,
-            "total": len(fils), "failed": failed, "state": int(state)}
+    return {"controller": controller, "ok": not failed and not unslotted, "applied": applied,
+            "total": len(fils), "failed": failed, "state": int(state),
+            "touched": fils, "not_this_controller": not_this_controller, "unslotted": unslotted}
 
 
 def hv_grid_set(link: "ControllerLink", controller: int, filaments,
@@ -1991,21 +2189,36 @@ def hv_grid_set(link: "ControllerLink", controller: int, filaments,
     HvSetMultiChannel (0x15) — one frame per touched channel, not one per
     filament. `force`=True uses writeMode=2 (bypasses firmware fault/verify
     checks) — same semantics as the GUI's Force checkbox."""
+    # Exclusion bookkeeping, mirroring prep_filaments: a requested filament that
+    # never reaches the wire must be NAMED, not dropped. This path used to return
+    # ok:True having sent nothing -- so hv_grid_set(f, on=False) on an unmapped or
+    # offline filament reported success while the grid switch stayed ON. On an HV
+    # path a success-shaped no-op is the dangerous direction.
+    not_this_controller: list[int] = []
     if filaments is None:
         fils = MAPPING.filaments(controller)
     else:
-        fils = [int(f) for f in filaments
-                if filament_to_board(int(f))[0] == controller]
-    if not fils:
-        return {"controller": controller, "ok": True, "applied": [], "failed": []}
+        fils = []
+        for f in filaments:
+            f = int(f)
+            if filament_to_board(f)[0] == controller:
+                fils.append(f)
+            else:
+                not_this_controller.append(f)
     by_ch: dict[int, list[int]] = {}
+    unslotted: list[int] = []
+    touched: list[int] = []
     for f in fils:
         _, ch, pos, _ = filament_to_board(f)
         if ch is None:                    # unslotted/overflow -> no board to address
+            unslotted.append(f)
             continue
         by_ch.setdefault(ch, []).append(pos)
+        touched.append(f)
     if not by_ch:
-        return {"controller": controller, "ok": True, "applied": [], "failed": []}
+        return {"controller": controller, "ok": not unslotted, "applied": [], "failed": [],
+                "touched": [], "not_this_controller": not_this_controller,
+                "unslotted": unslotted}
     ft, flags, payload = build_payload("HV_GET_ALL_BYTES", {})
     cur = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
     cur_raw = cur.get("raw") if isinstance(cur, dict) else None
@@ -2023,14 +2236,110 @@ def hv_grid_set(link: "ControllerLink", controller: int, filaments,
     })
     resp = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
     raw = resp.get("raw") if isinstance(resp, dict) else None
+    # Response: status, appliedMask, verifiedMask, failedMask, desired[8], feedback[8]
+    # (firmware handleHvSetMultiChannel_). appliedMask is per-CHANNEL, so on its own
+    # it can only say "this channel's byte was written" -- it cannot tell you whether
+    # YOUR bit within that byte actually landed. feedback[] is the 74HC165 READ-BACK,
+    # i.e. what is physically on the hardware now, and it is per-bit. Comparing the
+    # intended bit against feedback is the strongest confirmation this interface
+    # offers and is stronger than any status byte -- especially with force=True,
+    # which bypasses the firmware's own verify step entirely.
     applied_mask = raw[1] if raw and len(raw) >= 2 else 0
-    applied, failed = [], []
-    for f in fils:
-        _, ch, _pos, _ = filament_to_board(f)
-        if ch is None:
+    feedback = list(raw[12:20]) if raw and len(raw) >= 20 else None
+    applied, failed, suspect = [], [], []
+    for f in touched:
+        _, ch, pos, _ = filament_to_board(f)
+        if not (applied_mask & (1 << ch)):
+            failed.append(f)
             continue
-        (applied if applied_mask & (1 << ch) else failed).append(f)
-    return {"controller": controller, "ok": not failed, "applied": applied, "failed": failed}
+        if feedback is not None and bool(feedback[ch] & (1 << pos)) != bool(on):
+            suspect.append(f)      # disagrees on THIS read -- confirm before failing it
+            continue
+        applied.append(f)
+
+    # CONFIRM BEFORE ACCUSING. With force=True (writeMode>=2, the GUI's default)
+    # the firmware returns a SINGLE UNCONFIRMED 165 sample: hvSetChannelByte does
+    # one hvFeedback_.readChannel() and returns immediately, skipping the mismatch
+    # re-read that writeMode 0/1 get. HvController::verify()'s confirm-and-reread
+    # (and its rereads/unstable counters) is a DIFFERENT path this traffic never
+    # enters -- so those counters stay flat here and prove nothing.
+    #
+    # The 165 read is the weak link on this hardware (one shared MISO through a
+    # 151, long cable, first bit sampled with no clock edge of its own), so a lone
+    # disagreement is more likely a bad SAMPLE than a bit that didn't land.
+    # Re-read once and only fail bits that disagree BOTH times; a bit that flips
+    # between the two reads is reported as `unstable` -- that is the marginal
+    # read-back signal, and it is not the same claim as "the write failed".
+    # The confirming read MUST be 0x14 HV_REFRESH_FEEDBACK, never 0x13
+    # HV_GET_ALL_BYTES. 0x13 does not touch the hardware -- hvGetAllBytes() just
+    # copies hvState_.channels[].feedback out of the cache, so re-reading with it
+    # compares a value against ITSELF: `unstable` could never fire and every
+    # suspicion would be "confirmed" on the strength of nothing. That failure is
+    # invisible in testing (clean runs stay clean; it only shows up as
+    # over-confident mismatches you have no reason to distrust). 0x14 with
+    # mask=0xFF really re-reads all 8 channels and returns them in one frame.
+    mismatched, unstable = [], []
+    if suspect:
+        fb2 = None
+        # 0x14 ALSO silently returns cache while the PIO owns the shift pins
+        # (hvRefreshFeedback: a bit-bang read would move S0/S1/S2 out from under
+        # the PIO and break the pulses -- correct, but undetectable in the
+        # response). During an armed/running schedule the "fresh" read is
+        # therefore the same no-op as 0x13, so don't attempt it: an unconfirmable
+        # suspicion is UNKNOWN, not proven-failed.
+        try:
+            st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+            pio_busy = bool(st) and st.get("state") == 2
+        except Exception:
+            pio_busy = True          # can't establish it's safe -> assume it isn't
+        if not pio_busy:
+            try:
+                again = link.request(HV_REFRESH_FEEDBACK, bytes([0xFF]), flags=0, timeout=2.0)
+                araw = again.get("raw") if isinstance(again, dict) else None
+                if araw and len(araw) >= 9 and araw[0] == 0x00:
+                    fb2 = list(araw[1:9])
+            except Exception:
+                fb2 = None
+        for f in suspect:
+            _, ch, pos, _ = filament_to_board(f)
+            if fb2 is None:
+                # Could not obtain a trustworthy second read. Report UNKNOWN
+                # rather than asserting the write failed -- claiming a failure we
+                # did not establish is the same over-claim as claiming success.
+                unstable.append(f)
+            elif bool(fb2[ch] & (1 << pos)) != bool(on):
+                mismatched.append(f)          # both reads agree: the bit did not land
+            else:
+                unstable.append(f)            # reads disagree with each other
+    # `unstable` counts against ok: the bit's state is UNKNOWN, and "unknown"
+    # must not read as "did what you asked" -- that is the same failure-as-a-
+    # legal-value mistake this whole audit was about, and an HV grid bit is the
+    # last place to make it. It stays a SEPARATE field from mismatched/failed so
+    # a caller can tell "we could not confirm" from "it definitely did not land"
+    # and decide its own tolerance.
+    out = {"controller": controller,
+           "ok": not failed and not mismatched and not unstable and not unslotted,
+           "applied": applied, "failed": failed,
+           "touched": touched, "not_this_controller": not_this_controller,
+           "unslotted": unslotted}
+    if mismatched:
+        out["mismatched"] = mismatched
+        out["error"] = (f"grid read-back disagrees for {mismatched} on BOTH reads — the "
+                        f"channel write was accepted but the 165 feedback does not show "
+                        f"the requested state")
+    if unstable:
+        # Deliberately does NOT fail the call: two reads that disagree with each
+        # other say the READ is marginal, not that the write didn't land. Claiming
+        # a failure here would be the same "value where an absence belongs" mistake
+        # in the opposite direction.
+        out["unstable"] = unstable
+        out["warning"] = (f"165 read-back unstable for {unstable} — two reads disagreed "
+                          f"with each other; treat the state of these bits as unknown, "
+                          f"not as failed")
+    if feedback is None:
+        # Don't silently claim verification we didn't do.
+        out["verified"] = False
+    return out
 
 
 def set_ocp_threshold_batch(link: "ControllerLink", controller: int, filaments,
@@ -2040,16 +2349,28 @@ def set_ocp_threshold_batch(link: "ControllerLink", controller: int, filaments,
     only in firmware — no masked/batch form exists like CH_SET_POWER_STATE
     — so this loops one frame per filament, same pattern as prep_filaments.
     `filaments`=None -> every populated board this controller owns."""
+    # Same exclusion bookkeeping as prep_filaments / hv_grid_set. This matters
+    # more here than almost anywhere else: OCP is a PROTECTION setting, so a
+    # silently-skipped board means a script believes it lowered a trip point on
+    # a board it never addressed.
+    not_this_controller: list[int] = []
     if filaments is None:
         fils = MAPPING.filaments(controller)
     else:
-        fils = [int(f) for f in filaments
-                if filament_to_board(int(f))[0] == controller]
-    applied, failed = [], []
+        fils = []
+        for f in filaments:
+            f = int(f)
+            if filament_to_board(f)[0] == controller:
+                fils.append(f)
+            else:
+                not_this_controller.append(f)
+    applied, failed, unslotted, touched = [], [], [], []
     for f in fils:
         _, ch, pos, _ = filament_to_board(f)
         if ch is None:
+            unslotted.append(f)
             continue
+        touched.append(f)
         ft, flags, payload = build_payload("CH_SET_TPS_OCP_THRESHOLD", {
             "channel": ch, "mux_port": pos, "threshold_mA": threshold_ma,
         })
@@ -2058,7 +2379,9 @@ def set_ocp_threshold_batch(link: "ControllerLink", controller: int, filaments,
             (applied if _status_ok(resp) else failed).append(f)
         except Exception:
             failed.append(f)
-    return {"controller": controller, "ok": not failed, "applied": applied, "failed": failed}
+    return {"controller": controller, "ok": not failed and not unslotted,
+            "applied": applied, "failed": failed, "touched": touched,
+            "not_this_controller": not_this_controller, "unslotted": unslotted}
 
 
 def do_scan() -> list[dict[str, Any]]:
@@ -2140,6 +2463,19 @@ class CtHandler(BaseHTTPRequestHandler):
             # Real per-filament telemetry for the ring: batch INA219 (V/I) per
             # connected controller, merged by the board map. Plus the live firing
             # filament from ShvGetStatus (no batch power-state read exists).
+            #
+            # ?live=1 forces the LIVE INA219 sweep (read_telemetry) instead of the
+            # CC-loop cached read. The cached read is the default because it needs
+            # ~1 round-trip instead of ~4-5 and is safe to poll mid-run, but it
+            # carries NO bus voltage (the CC cache holds a current and nothing
+            # else) -- so bus_mV is 0/cached there and the only way to get a real
+            # voltage is this sweep. Making cached the default silently broke
+            # read_filament_voltage(), which returned None for every filament
+            # because every entry came back cached:True; read_telemetry() was left
+            # with no callers at all. Still refused while a run is firing, where
+            # the I2C sweep would stall pulses -- that case falls back to cached
+            # and is flagged, rather than pretending a voltage exists.
+            want_live = self._query().get("live") in ("1", "true", "yes")
             rows: dict[int, dict] = {}
             firing = []
             run_state = {}
@@ -2173,7 +2509,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 # (a separate, slower-cadence poll) is still the source of truth
                 # for physical presence.
                 try:
-                    rows.update(read_cached_telemetry(link, cid - 1))
+                    if want_live and not running:
+                        rows.update(read_telemetry(link, cid - 1))
+                    else:
+                        rows.update(read_cached_telemetry(link, cid - 1))
                 except Exception:
                     pass
             # Feed the run recorder so an end-of-run report can confirm each active
@@ -2570,7 +2909,29 @@ class CtHandler(BaseHTTPRequestHandler):
             # controllers merged into one dict — matches ct_simple_control's
             # filament-index-first API. Confirms idle_one/active_one actually
             # landed at the commanded target; safe to poll even mid-run.
+            #
+            # ?filament=N (optional) switches to the SINGLE-board firmware command
+            # (0x3A FLAG_SINGLE) — a different command, not a filtered bulk read:
+            # one small frame, only the owning controller touched. Same response
+            # shape either way, so a caller can use one code path for both. Omit
+            # it (or ask for several) and you get the paged bulk sweep.
+            q = self._query()
+            one = q.get("filament")
             out = {}
+            if one is not None and str(one).strip() != "":
+                fil = int(one)
+                cid0, _ch, _mux, _ = filament_to_board(fil)
+                if cid0 is None:
+                    return self._json({"ok": False, "filaments": {},
+                                       "error": f"filament {fil} has no board"})
+                link = CONTROLLERS.get(cid0 + 1)
+                if not link or not link.client.connected:
+                    return self._json({"ok": False, "filaments": {},
+                                       "error": f"controller {cid0 + 1} not connected"})
+                out = read_cached_telemetry_one(link, cid0, fil)
+                return self._json({"ok": bool(out), "filaments": out,
+                                   "single": True,
+                                   **({} if out else {"error": "read failed"})})
             for cid, link in CONTROLLERS.items():
                 if not link.client.connected:
                     continue
@@ -2929,8 +3290,23 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 failed = [int(f) for r in results.values() for f in (r.get("failed") or [])]
                 applied = sum(int(r.get("applied") or 0) for r in results.values())
-                self._json({"ok": all(r.get("ok") for r in results.values()), "results": results,
-                            "failed": failed, "applied": applied})
+                # Reconcile the ORIGINAL request against what every connected
+                # controller actually claimed (prep_filaments()'s "touched"). A
+                # filament can legitimately be "not_this_controller" for controller
+                # A while being claimed by controller B -- that's normal, not an
+                # error. It's only a real, reportable exclusion if NO connected
+                # controller ends up touching it: its home controller isn't
+                # connected, or MAPPING has no slot for it at all. Silently
+                # shrinking "total"/"applied" with no trace of this was the actual
+                # bug being fixed here -- a caller could request N filaments, have
+                # fewer than N actually attempted, and still see ok:true with no
+                # indication anything was skipped.
+                touched = {int(f) for r in results.values() for f in (r.get("touched") or [])}
+                excluded = ([int(f) for f in filaments if int(f) not in touched]
+                            if filaments is not None else [])
+                self._json({"ok": all(r.get("ok") for r in results.values()) and not excluded,
+                            "results": results, "failed": failed, "applied": applied,
+                            "excluded": excluded})
             elif path == "/api/ocp-threshold":
                 # Per-board TPS55289 IOUT_LIMIT (steady-state OCP threshold, mA)
                 # for a batch of filaments across BOTH connected controllers.
@@ -2953,8 +3329,16 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 failed = [int(f) for r in results.values() for f in (r.get("failed") or [])]
                 applied = [int(f) for r in results.values() for f in (r.get("applied") or [])]
-                self._json({"ok": all(r.get("ok") for r in results.values()), "results": results,
-                            "failed": failed, "applied": applied})
+                # See /api/hv-grid for why this reconciliation exists. OCP is a
+                # protection setting, so "asked for, never written, reported ok"
+                # is the worst of the three places this pattern appeared.
+                excluded = []
+                if filaments is not None:
+                    touched = {int(f) for r in results.values() for f in (r.get("touched") or [])}
+                    excluded = [int(f) for f in filaments if int(f) not in touched]
+                self._json({"ok": all(r.get("ok") for r in results.values()) and not excluded,
+                            "results": results, "failed": failed, "applied": applied,
+                            "excluded": excluded})
             elif path == "/api/ocp-startup":
                 # Global per-controller two-stage OCP floor (CH_STARTUP_OCP,
                 # 0x37) — NOT per-board. STARTUP rides the cold inrush on
@@ -3008,8 +3392,25 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 applied = [f for r in results.values() for f in (r.get("applied") or [])]
                 failed = [f for r in results.values() for f in (r.get("failed") or [])]
-                self._json({"ok": all(r.get("ok") for r in results.values()), "results": results,
-                            "applied": applied, "failed": failed})
+                mismatched = [f for r in results.values() for f in (r.get("mismatched") or [])]
+                # Reconcile what was ASKED FOR against what any controller actually
+                # touched -- same treatment /api/filament-prep already has. Without
+                # it a filament belonging to a DISCONNECTED controller is dropped by
+                # every loop iteration and the call returns ok:True having done
+                # nothing. On an HV-off request that reads as "grid is clear" when
+                # it isn't. Only meaningful when the caller named filaments; None
+                # means "every populated board", which excludes nothing by
+                # definition.
+                excluded = []
+                if filaments is not None:
+                    touched = {f for r in results.values() for f in (r.get("touched") or [])}
+                    excluded = [int(f) for f in filaments if int(f) not in touched]
+                out = {"ok": all(r.get("ok") for r in results.values()) and not excluded,
+                       "results": results, "applied": applied, "failed": failed,
+                       "excluded": excluded}
+                if mismatched:
+                    out["mismatched"] = mismatched
+                self._json(out)
             elif path == "/api/calibration/save":
                 # Persist an emission-current calibration to the host disk (JSON +
                 # flat CSV). body: {name, params, curves:{filament:[{heatA,mA,peak}]}}.

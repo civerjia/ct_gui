@@ -165,7 +165,7 @@ from ct_simple_control import CTClient
 ct = CTClient("localhost", port=8770, client_id="my-script")
 
 # Connect controller 1 to the ESP32 if the GUI hasn't already
-if not ct.status()["controllers"]["1"]["connected"]:
+if not ct.status().get("controllers", {}).get("1", {}).get("connected"):
     r = ct.connect(1, "192.168.50.173")   # the ESP32's own IP
     if not r["ok"]:
         print(f"connect failed: {r['error']}")
@@ -275,7 +275,7 @@ multi-step sequence to prevent the GUI from interfering mid-way:
 with ct.lease(ttl=60, note="auto scan"):
     # GUI write buttons are blocked while this block runs
     ct.shv_arm(1)
-    result = ct.fire_single_pulse(filament=0, ...)
+    result = ct.fire_single_pulse(filament=0, num_pulses=1, width_us=1000)
 # lease released — GUI resumes full control
 ```
 
@@ -358,7 +358,7 @@ print(s)
 # {"controllers": {"1": {"connected": True, "host": "192.168.50.173", ...},
 #                   "2": {"connected": False, "host": None, ...}},
 #  "master": 1, "lock": {"held": False, ...}, "you": "ct_simple_control"}
-if not s["controllers"]["1"]["connected"]:
+if not s.get("controllers", {}).get("1", {}).get("connected"):
     ct.connect(1, "192.168.50.173")
 ```
 
@@ -470,22 +470,41 @@ to you. You never need to translate anything yourself.
 
 **`set_filament_order(order)`** — Define the swap.
 
+**Entries are SYMMETRIC: `{5: 8}` swaps the pair, it does not remap one
+way.** Writing `{5: 8}` also routes logical 8 → physical 5. This is a true
+exchange of two filaments, which is what a miswired pair actually is.
+
 ```python
-# filament 5 is physically wired where the hardware calls filament 8:
+# filaments 5 and 8 are wired into each other's positions:
 ct.set_filament_order({5: 8})
 
 ct.active_one(5, current_ma=2900)      # actually commands physical filament 8
+ct.active_one(8, current_ma=2900)      # ...and this one commands physical 5
 ct.read_filament_current(5)            # actually reads physical filament 8,
                                         # returned to you keyed as "filament 5"
 ct.fire_single_pulse(filament=5)       # fires physical filament 8
 ```
 
+If only ONE of the two is really misplaced, this is the wrong tool — you
+would be silently remapping a second filament that was fine, and on the HV
+path that means energising a board you didn't name. Fix the active-list
+[mapping](#active-list-mapping) instead; that's the layer that describes
+which physical board a filament index means.
+
+Because pairs are symmetric, an inconsistent mapping is rejected rather
+than half-applied — `{5: 8, 8: 3}` asks 8 to be both 5's partner and 3's:
+
+```python
+ct.set_filament_order({5: 8, 8: 3})   # raises ValueError
+```
+
 `order` can also be a list where `order[i]` is the physical index for
-logical filament `i`:
+logical filament `i`. The same symmetry applies — the list below defines
+the 5↔8 swap, both directions, not a one-way move:
 
 ```python
 order = list(range(96))
-order[5] = 8   # only this one entry differs from identity
+order[5] = 8   # pairs 5 with 8; 8 is routed back to 5 automatically
 ct.set_filament_order(order)
 ```
 
@@ -498,7 +517,7 @@ ct.set_filament_order(None)
 **`get_filament_order()`** — Read the current swap (`{}` = identity, no swap).
 
 ```python
-print(ct.get_filament_order())   # {5: 8}
+print(ct.get_filament_order())   # {5: 8, 8: 5} — pairs are symmetric
 ```
 
 **What's covered**: every filament-taking method — `stop_one`/`sleep_one`/
@@ -552,7 +571,7 @@ a long-running loop.
 ```python
 import time
 ct.acquire_lease(ttl=30)
-for i in range(100):
+for i in range(96):          # filaments are 0-95
     ct.active_one(i, 2900)
     time.sleep(1)
     ct.renew_lease(ttl=30)   # keep the lease alive for the next iteration
@@ -635,8 +654,8 @@ state, **VOLTAGE** — a fixed-voltage hold for bench/calibration use, see
 | Targets | every populated board, or a list | exactly one filament |
 | Wire format | RP2350's masked multi-board frame (one frame per channel group) | RP2350's dedicated single-board frame |
 | Endpoint | `/api/filament-prep` | `/api/filament-state` |
-| Soft per-board failure | returned in `"failed": [...]`, batch call still succeeds overall | returned as `{"ok": False, ...}`, no exception |
-| Dead filament in the target set | silently skipped | `stop_one`/etc. return `{"ok": False, "dead": True, ...}` immediately, no exception |
+| Soft per-board failure | returned in `"failed": [...]`, **and the batch `"ok"` goes `False`** | returned as `{"ok": False, ...}`, no exception |
+| Dead filament in the target set | skipped, and listed in `"dead_skipped": [...]` | `stop_one`/etc. return `{"ok": False, "dead": True, ...}` immediately, no exception |
 
 Passing `filaments=[5]` to a `*_all` method technically works (it's a
 1-element batch), but it still goes through the masked multi-board wire
@@ -686,7 +705,7 @@ ct.idle_one(5, current_ma=1500)
 r = ct.idle_one(5, current_ma=1500, verify=True, timeout_s=5.0)
 print(r["heating"])
 # {"ok": True, "filament": 5, "target_ma": 1500.0, "measured_ma": 1487.0,
-#  "elapsed_s": 1.4, "present": True, "cc_mode": 1}
+#  "measured_valid": True, "elapsed_s": 1.4, "present": True, "cc_mode": 1}
 if not r["heating"]["ok"]:
     print(f"WARNING: filament 5 only reached {r['heating']['measured_ma']} mA "
           f"of {r['heating']['target_ma']} mA target — board absent or faulted?")
@@ -734,8 +753,13 @@ check `["ok"]` yourself.
 status = ct.wait_for_current(5, target_ma=1500, tolerance_ma=150, timeout_s=5.0)
 print(status)
 # {"ok": bool, "filament": 5, "target_ma": 1500.0, "measured_ma": ...,
-#  "elapsed_s": ..., "present": bool, "cc_mode": int}
+#  "measured_valid": bool, "elapsed_s": ..., "present": bool, "cc_mode": int}
 ```
+
+`measured_valid` is `False` when the board never returned a live measurement
+(the RP2350 flags its cached current as stale). `measured_ma` is then `0.0`
+filler, and `ok` is forced `False` — so a stale reading can't masquerade as a
+real 0 mA and make `stop_one(verify=True)` report a success it never saw.
 
 A typical single-filament cycle with real feedback at each step — nothing
 here raises, so a bad filament just gets logged and skipped instead of
@@ -901,7 +925,7 @@ don't loop this to poll many boards).
 r = ct.get_ocp_threshold_one(5)
 print(r)   # {"ok": True, "filament": 5, "controller": 1, "channel": 0,
            #  "mux_port": 0, "enabled": True, "threshold_ma": 3200}
-if not r["enabled"]:
+if r.get("ok") and not r["enabled"]:   # no "enabled" key on a failed read
     print("OCP protection is currently OFF for filament 5")
 ```
 
@@ -996,6 +1020,13 @@ board goes to 0 regardless of which filaments are marked dead.
 Use it as an emergency "kill everything now": before walking away from the
 bench, after an unexpected fault, or whenever you want a known-clean
 starting point before re-arming.
+
+**It also DISARMS the schedule engine.** The call POSTs `/api/disarm`,
+which sends `SHV_DISARM` to every connected controller — so calling it
+during an armed or running schedule kills that run, not just the grid
+outputs. That is what you want from an emergency stop, but it means this
+is not a "clear the grid and carry on" operation. `session()` teardown
+uses it for exactly this reason.
 
 ```python
 ct.hv_grid_clear_all()
@@ -1154,23 +1185,49 @@ firmware side, so it's safe to poll even while a schedule is running).
 Use them to confirm `idle_one()`/`active_one()` actually landed at the
 current you commanded, or to check a filament's state before firing it.
 
-**`read_filament_currents(filaments=None)`** — Bulk read of every
-populated filament's measured heating current.
+> **Which of these two do I want?** They are not a currents/voltages pair —
+> they are two different firmware commands with different costs, and the names
+> now say so. Prefer the capability-led names; the old ones still work.
+>
+> | need | call | voltage? | safe while a schedule fires? |
+> |---|---|---|---|
+> | a current, cheaply | `read_filament_current_cached()` | no — always `None` | **yes** (no I2C) |
+> | a voltage, or a live V+I pair | `read_filament_vi_live()` | yes | **no** (does an I2C mux sweep) |
+>
+> `read_filament_currents()` and `read_filament_voltages()` are kept as aliases
+> for the two above, so existing scripts are unchanged. The old names implied a
+> symmetry that does not exist: the cached read has no voltage and never will,
+> because there is no voltage field in its firmware response.
+
+**`read_filament_current_cached(filaments=None)`** (alias:
+`read_filament_currents`) — Measured heating current for
+one filament or many, same call. **Current only**, and safe to poll mid-run.
 
 ```python
-all_currents = ct.read_filament_currents()
+all_currents = ct.read_filament_currents()          # every populated filament
 for fil, c in all_currents.items():
     print(f"fil {fil}: {c['current_mA']} mA (target {c['target_mA']} mA, "
           f"present={c['present']})")
 
-# Or filter to just a few:
-subset = ct.read_filament_currents([0, 1, 2])
+subset = ct.read_filament_currents([0, 1, 2])       # a few
+one    = ct.read_filament_currents(5)               # one — bare int is fine
+one    = ct.read_filament_currents([5])             # identical to the above
 ```
+
+**Single and bulk are different firmware commands, not one read filtered two
+ways.** Ask for exactly one filament and it goes out as a single small frame
+(`CH_GET_CACHED_CURRENTS` `FLAG_SINGLE`) to only that filament's controller —
+that's what makes a per-filament poll cheap. Ask for several (or all) and you
+get the paged bulk sweep across every used channel, because looping the
+single read over many boards would flood the one shared bridge link. The
+return shape is identical either way, so you never branch on which one ran.
 
 Each entry: `{"current_mA", "target_mA", "present", "cc_mode"}`.
 `cc_mode`: `0`=voltage, `1`=current (Idle/Active regulating), `2`/`3`=fault.
-`present` is inferred from whether the CC loop is actively regulating that
-board — not a live I2C presence scan (see
+`current_mA` is `None` — not `0` — when the board's cached reading isn't a
+live measurement yet; guard it with `is not None` rather than treating it as
+0 mA. `present` is inferred from whether the CC loop is actively regulating
+that board — not a live I2C presence scan (see
 [`present_filaments()`](#connection) for that).
 
 **`read_filament_current(filament)`** — Convenience wrapper for one
@@ -1197,14 +1254,18 @@ ct.active_one(5, current_ma=2900)
 
 ### Filament board voltage
 
-**`read_filament_voltages(filaments=None)`** — Bulk read of every populated
-filament's measured board voltage (mV) **and** current (mA) together.
+**`read_filament_vi_live(filaments=None)`** (alias: `read_filament_voltages`)
+— Bulk read of every populated
+filament's measured board voltage (mV) **and** current (mA) together. **The only
+source of a voltage**, and **not** safe to poll while a schedule is firing.
 Unlike `read_filament_currents()` above (CC-loop cached current, no I2C,
-always safe to poll), this is a real INA219 **I2C sweep** — the backend
-skips it automatically while a schedule is firing (I2C would stall pulses)
-and falls back to the cached current for that window: mid-run, entries
-come back with `"bus_mV": 0` and `"cached": True` — voltage genuinely
-isn't available then; call again once the run completes.
+always safe to poll), this is a real INA219 **I2C sweep** — it requests
+`/api/telemetry?live=1`, because the plain telemetry read is the no-I2C
+cached one and carries **no bus voltage at all**. The backend refuses the
+sweep while a schedule is firing (I2C would stall pulses) and falls back to
+the cached read for that window: mid-run, entries come back with
+`"bus_mV": 0` and `"cached": True` — voltage genuinely isn't available
+then; call again once the run completes.
 
 ```python
 v = ct.read_filament_voltages()
@@ -1212,6 +1273,27 @@ for fil, row in v.items():
     print(f"fil {fil}: {row['bus_mV']} mV, {row['current_mA']} mA "
           f"(present={row['present']}, cached={row.get('cached', False)})")
 ```
+
+**Reading one filament's V and I together** — take both from a single
+`read_filament_vi_live()` entry. It accepts a bare int:
+
+```python
+d = ct.read_filament_vi_live(7)[7]
+# {"index": 7, "present": True, "bus_mV": 1048.0, "current_mA": 1073.0,
+#  "target_mA": None, "cc_mode": None, "source": "live", "valid": True}
+if d["valid"]:
+    print(f"R = {d['bus_mV'] / d['current_mA']:.3f} ohm")
+```
+
+⚠️ **Do not build a V/I pair by calling `read_filament_voltage()` and
+`read_filament_current()` together.** They deliberately read different
+sources — the voltage from the live INA219 (the only command that has one),
+the current from the CC-loop cache — so you get two numbers from two commands
+sampled at two different instants. While a filament's resistance is still
+moving with temperature that is a real difference, not jitter: measured 92 mA
+apart mid-ramp, against 1–7 mA once settled. One `read_filament_vi_live()`
+entry gives you both from one INA219 conversion, so `bus_mV / current_mA` is a
+meaningful resistance.
 
 **`read_filament_voltage(filament)`** — Convenience wrapper for one
 filament. Returns `None` (not `0.0`) if the filament isn't present, or if
@@ -1522,7 +1604,9 @@ ct.fire_single_pulse(filament=50, controller=2) # explicit override
 section right below for the full explanation and examples of each.
 
 **`timeout_s`** (default `15.0`) — how long, in seconds, the Python call
-itself polls before giving up and raising `CTTimeoutError`. This is a
+itself polls before giving up and returning
+`{"ok": False, "timeout": True, ...}` (it does **not** raise — see the
+exceptions table). This is a
 **client-side** poll timeout, separate from `total_ms` (the firmware's own
 schedule timeout). Set it comfortably above `total_ms / 1000` so the
 firmware gets to report COMPLETE/FAULT before Python gives up waiting.
@@ -1670,7 +1754,7 @@ print("armed — waiting for external SyncIn edge")
 deadline = time.monotonic() + 30.0
 while time.monotonic() < deadline:
     st = ct.shv_status(1)
-    if st["state"] == 3:      # COMPLETE
+    if st.get("state") == 3:  # COMPLETE (shv_status returns {} on a failed read)
         print("fired:", ct.shv_pulse_log(1))
         break
     if st["state"] == 4:      # FAULT
@@ -1728,7 +1812,7 @@ ct.simulate_sync(count=1, controller=1)
 deadline = time.monotonic() + 10
 while time.monotonic() < deadline:
     st = ct.shv_status(1)
-    if st["state"] in (3, 4):   # 3=complete, 4=fault
+    if st.get("state") in (3, 4):   # 3=complete, 4=fault ({} on a failed read)
         print("done:", st)
         break
     time.sleep(0.05)
@@ -1776,8 +1860,9 @@ process:
   RP2350 faults the **whole schedule** (`shv_status()["stopReason"]` comes
   back `"inter-pulse timeout"`) — a late trigger isn't skipped or ignored,
   the run just stops. The 3000 ms default here is workable for a real
-  trigger source; the library's own default of 30000 ms (30 s, see
-  `fire_single_pulse`) is sized instead for slow *manual* bench triggers.
+  trigger source; the 30000 ms (30 s) default of `shv_set_config`'s **`total_ms`** is sized
+  instead for slow *manual* bench triggers. (`fire_single_pulse`'s own
+  `inter_pulse_ms` default is 3000, same as here — not 30000.)
 - **`max_on_ms`** — checked **once, at `shv_arm()` time**, against every
   entry already in the table: if *any* entry's `width_us` exceeds it,
   `arm()` itself is **rejected** (`reject` code `WidthTooLarge`, `2`) and
@@ -2048,7 +2133,7 @@ print(ct.describe(ct.fire_single_pulse(5, num_pulses=3)))
 # "Fired 3 pulse(s), schedule complete (stop reason: complete), 3 total pulses done, elapsed 118 ms."
 
 print(ct.describe({"ok": False, "error": "controller not connected"}))
-# "Failed: controller not connected."
+# "Failed: controller not connected"   (no trailing period on this one)
 ```
 
 ### Exceptions
@@ -2059,9 +2144,10 @@ Every method returns `{"ok": bool, "error": str, ...}` — check `"ok"`.
 
 | Class | Raised by | When |
 |---|---|---|
-| `CTLeaseError` | `acquire_lease()` / `with ct.lease():` | Another client already holds the write lock. **The one deliberate exception** — see below. |
+| `CTLeaseError` | `acquire_lease()` / `with ct.lease():` | Another client already holds the write lock. **The one deliberate exception on the hardware path** — see below. |
 | `CTError` | nothing, by default | Base class, kept for compatibility. Not raised by any method here. |
 | `CTConnectionError` | nothing, by default | Kept for compatibility. A connection failure now comes back as `{"ok": False, "connection_error": True, "error": ...}` instead of raising. |
+| `ValueError` | `set_filament_order()` | Raised on a conflicting swap map (e.g. `{5: 8, 8: 3}`), because pairs are symmetric and the request is contradictory. Validate the dict you build if it comes from user input. |
 | `CTTimeoutError` | nothing, by default | Kept for compatibility. `fire_single_pulse`'s poll timeout now comes back as `{"ok": False, "timeout": True, ...}` instead of raising. |
 
 ```python

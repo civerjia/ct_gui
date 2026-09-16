@@ -781,7 +781,15 @@ async function pollTelemetry() {
   const present = tele.filter((t) => t.present).length;
   const rows = tele.map((t) => {
     const f = filaments[t.index]; if (!f) return null;
-    return { index: t.index, state: inferState(f, t.current_mA, t.present), bus_mV: t.bus_mV, current_mA: t.current_mA };
+    // current_mA === null means the backend had no trustworthy reading for this
+    // board (stale cache, unreadable, or absent — see backend _cached_entry /
+    // read_pushed_telemetry). ingestTelemetry already refuses to draw a null
+    // current, but state was still being re-derived FROM that null, so an ACTIVE
+    // board with one untrusted sample flickered to STOP. Pass state:null instead
+    // and ingestTelemetry keeps the last known state — don't infer from a value
+    // we didn't measure. Firing rows below still override to ACTIVE regardless.
+    const state = t.current_mA == null ? null : inferState(f, t.current_mA, t.present);
+    return { index: t.index, state, bus_mV: t.bus_mV, current_mA: t.current_mA };
   }).filter(Boolean);
   // the firmware-reported firing filament(s) are authoritative ACTIVE
   const firing = data.firing || [];

@@ -707,26 +707,43 @@ class CTClient:
     # translate anything yourself.
 
     def set_filament_order(self, order) -> None:
-        """Define the logical->physical filament swap.
+        """Define a set of one-to-one logical<->physical filament SWAPS.
 
-        order: dict {logical: physical}, or a list where order[i] is the
-        physical index for logical filament i (only entries that actually
-        differ from identity need to be included, in either form). Pass
-        None or {} to clear back to identity (no swap).
+        order: dict {a: b}, or a list where order[i] is the paired index for
+        logical filament i (only entries that differ from identity need to
+        be included, in either form). Each pair is symmetric and applied
+        automatically both ways — {5: 8} sets BOTH "5 -> physical 8" and
+        "8 -> physical 5"; you never need to write both directions yourself.
+        Pass None or {} to clear back to identity (no swap).
 
-        Example — filament 5 is physically wired where the hardware/backend
-        calls filament 8:
+        Raises ValueError if the input isn't a valid one-to-one mapping —
+        e.g. the same filament given two different partners — since a
+        filament can only be swapped with exactly one other.
+
+        Example — filaments 5 and 8 are physically swapped on the backplane:
             ct.set_filament_order({5: 8})
             ct.active_one(5, 2900)         # actually commands physical filament 8
+            ct.active_one(8, 2900)         # actually commands physical filament 5
             ct.read_filament_current(5)    # actually reads physical filament 8,
                                             # returned to you keyed as "filament 5"
         """
         if not order:
             self.filament_order = {}
-        elif isinstance(order, dict):
-            self.filament_order = {int(k): int(v) for k, v in order.items() if int(v) != int(k)}
+            return
+        if isinstance(order, dict):
+            pairs = {int(k): int(v) for k, v in order.items() if int(v) != int(k)}
         else:
-            self.filament_order = {i: int(v) for i, v in enumerate(order) if int(v) != i}
+            pairs = {i: int(v) for i, v in enumerate(order) if int(v) != i}
+        swapped: dict[int, int] = {}
+        for a, b in pairs.items():
+            for x, y in ((a, b), (b, a)):
+                if x in swapped and swapped[x] != y:
+                    raise ValueError(
+                        f"set_filament_order: conflicting swap for filament {x} "
+                        f"({swapped[x]} vs {y}) — each filament can only be "
+                        f"paired with exactly one other, in one-to-one swaps")
+                swapped[x] = y
+        self.filament_order = swapped
 
     def get_filament_order(self) -> dict:
         """The current logical->physical swap (empty dict = identity, no swap)."""
@@ -775,9 +792,19 @@ class CTClient:
 
     def _prep(self, state: int, filaments=None,
               currents: dict | None = None, arg: int = 0) -> dict:
+        # Logical indices this call actually asked for that the dead mask
+        # drops BEFORE anything is sent — _live()'s filtering is invisible
+        # to the caller otherwise. A filament silently vanishing here (e.g.
+        # because a filament_order swap happens to route a DEAD logical
+        # index onto an otherwise-fine physical board) looked exactly like
+        # a backend bug until this was surfaced -- see the "why was 25
+        # skipped" investigation this traced back to set_dead().
+        requested = [int(f) for f in filaments] if filaments is not None else list(range(96))
+        dead_skipped = [f for f in requested if f in self.dead]
         live = self._live(filaments)
         if live is not None and len(live) == 0:
-            return {"ok": True, "applied": 0, "failed": [], "skipped_dead": True}
+            return {"ok": True, "applied": 0, "failed": [], "skipped_dead": True,
+                    "dead_skipped": dead_skipped}
         body: dict = {"state": state, "arg": arg}
         if live is not None:
             body["filaments"] = live
@@ -786,7 +813,17 @@ class CTClient:
             # the survivors' keys to physical for the wire
             alive = {int(k): v for k, v in currents.items() if int(k) not in self.dead}
             body["currents"] = {str(self._phys(k)): int(v) for k, v in alive.items()}
-        return self._relog_response(self._post("/api/filament-prep", body, timeout=20.0))
+        # "excluded" (top level) + "touched"/"not_this_controller"/"unslotted"
+        # (per-controller, inside "results") are filament-index lists too --
+        # re-key them back to logical the same as applied/failed, or a swap
+        # would leak physical numbers into what's supposed to be an all-
+        # logical response.
+        r = self._relog_response(
+            self._post("/api/filament-prep", body, timeout=20.0),
+            keys=("applied", "failed", "excluded", "touched", "not_this_controller", "unslotted"))
+        if dead_skipped:
+            r["dead_skipped"] = dead_skipped
+        return r
 
     def stop_all(self, filaments=None) -> dict:
         """STOP a BATCH of filaments (all populated boards, or `filaments`),
@@ -923,6 +960,14 @@ class CTClient:
 
         Returns: {"ok": bool,          # reached target within tolerance
                   "filament": int, "target_ma": float, "measured_ma": float,
+                  "measured_valid": bool,   # False = NO source could give a
+                                            # live measurement; measured_ma is
+                                            # 0.0 filler and "ok" is False
+                  "measured_from": "cached" | "ina219",  # which source answered.
+                                            # The CC cache stops being maintained
+                                            # once the loop isn't regulating (i.e.
+                                            # after stop/sleep), so a 0 mA target
+                                            # is normally confirmed via ina219
                   "elapsed_s": float, "present": bool, "cc_mode": int}
                   cc_mode: 0=voltage 1=current(regulating) 2/3=fault.
         """
@@ -930,12 +975,47 @@ class CTClient:
         deadline = start + timeout_s
         data: dict = {}
         while True:
-            data = self.read_filament_currents([filament]).get(int(filament), {})
-            measured = float(data.get("current_mA", 0))
-            ok = abs(measured - target_ma) <= tolerance_ma
+            data = self.read_filament_current_cached(filament).get(int(filament), {})
+            # current_mA is None (key PRESENT, value None) when the RP2350's
+            # cached reading isn't a live measurement yet -- so .get(...,0)
+            # never fires and float(None) would raise. None also must not
+            # count as a measured 0, or stop_one(verify=True) (target 0,
+            # tolerance 50) would report success off a missing reading.
+            raw = data.get("current_mA")
+            valid = raw is not None
+            source = "cached"
+            if not valid:
+                # The CC cache has no live measurement. That is NORMAL and
+                # permanent for a stop/sleep/standby target: once the loop is no
+                # longer regulating the port it stops maintaining a current, so
+                # polling the cache alone can never confirm 0 mA and this call
+                # would burn its full timeout and report "did NOT reach" for a
+                # filament that stopped correctly (measured on hardware: 8.7 s to
+                # a wrong answer). The live INA219 read CAN still see it. Fall
+                # back to it -- it costs an I2C sweep, but only on the iteration
+                # where the cache has nothing, and a stop confirms on the first
+                # one. Skipped automatically mid-run: the backend refuses the
+                # sweep while a schedule fires and answers cached (cached=True),
+                # which we do not accept as a measurement.
+                live = self.read_filament_vi_live([filament]).get(int(filament), {})
+                # `present` is NOT optional here. The INA sweep reports a board it
+                # could not find as 0 mA with present=False, so accepting any
+                # non-None value re-opens the exact false-success this method
+                # exists to close -- an absent board "confirmed" at 0 mA. That
+                # regression was introduced by this very fallback and caught in
+                # test; the guard is the only thing separating "measured 0" from
+                # "nothing there to measure".
+                if live and not live.get("cached") and live.get("present"):
+                    lraw = live.get("current_mA")
+                    if lraw is not None:
+                        raw, valid, source = lraw, True, "ina219"
+            measured = float(raw) if valid else 0.0
+            ok = valid and abs(measured - target_ma) <= tolerance_ma
             if ok or time.monotonic() >= deadline:
                 return {"ok": ok, "filament": int(filament), "target_ma": float(target_ma),
-                        "measured_ma": measured, "elapsed_s": time.monotonic() - start,
+                        "measured_ma": measured, "measured_valid": valid,
+                        "measured_from": source,
+                        "elapsed_s": time.monotonic() - start,
                         "present": bool(data.get("present", False)),
                         "cc_mode": data.get("cc_mode", 0)}
             time.sleep(poll_interval_s)
@@ -1088,7 +1168,7 @@ class CTClient:
         deadline = start + timeout_s
         data: dict = {}
         while True:
-            data = self.read_filament_currents([filament]).get(int(filament), {})
+            data = self.read_filament_current_cached(filament).get(int(filament), {})
             cc_mode = int(data.get("cc_mode", -1))
             ok = cc_mode == 0
             if ok or time.monotonic() >= deadline:
@@ -1165,13 +1245,24 @@ class CTClient:
         has no board mapping.
         """
         r = self.set_ocp_threshold_all(filaments=[filament], threshold_ma=threshold_ma)
-        if int(filament) in (r.get("failed") or []):
-            r = {**r, "ok": False}
+        # Confirm POSITIVELY that this filament was applied, rather than merely
+        # checking it isn't in `failed`. A filament that was silently skipped --
+        # unslotted, or on a controller that isn't connected -- appears in NEITHER
+        # list, so the old absence-of-failure test returned ok:True for a
+        # protection threshold that was never written.
+        if int(filament) not in [int(x) for x in (r.get("applied") or [])]:
+            reason = ("filament is dead-masked" if self._is_dead(filament)
+                      else "no board mapping, or its controller is not connected")
+            r = {**r, "ok": False,
+                 "error": r.get("error") or
+                          f"OCP threshold NOT written for filament {int(filament)} ({reason})"}
         return r
 
     def set_ocp_threshold_all(self,
                               filaments=None,      # None = every populated
-                                                    # board (minus dead mask)
+                                                    # board. NOT dead-filtered --
+                                                    # OCP is protection, see
+                                                    # set_ocp_threshold_one
                               threshold_ma: int = 0) -> dict:  # per-board OCP
                                                                 # trip current
         """Set the TPS55289 steady-state OCP trip current (mA) for a BATCH
@@ -1183,7 +1274,10 @@ class CTClient:
         body: dict = {"threshold_ma": int(threshold_ma)}
         if filaments is not None:
             body["filaments"] = self._phys_list(filaments)
-        return self._relog_response(self._post("/api/ocp-threshold", body, timeout=30.0))
+        return self._relog_response(self._post("/api/ocp-threshold", body, timeout=30.0),
+                                    keys=("applied", "failed", "excluded", "touched",
+                                            "not_this_controller", "unslotted",
+                                            "mismatched", "unstable"))
 
     def get_ocp_startup(self, controller: int = 1) -> dict:
         """Read the global per-controller two-stage OCP floor.
@@ -1234,7 +1328,9 @@ class CTClient:
             return self._dead_result(filament)
         r = self._post("/api/hv-grid", {"filaments": [self._phys(filament)],
                                         "on": bool(on), "force": bool(force)})
-        return self._relog_response(r)
+        return self._relog_response(r, keys=("applied", "failed", "excluded", "touched",
+                                            "not_this_controller", "unslotted",
+                                            "mismatched", "unstable"))
 
     def hv_grid_set_all(self,
                         filaments=None,     # None = every populated board
@@ -1251,13 +1347,28 @@ class CTClient:
 
         Returns {"ok", "results": {controller: {...}}, "applied": [...], "failed": [...]}.
         """
+        # dead_skipped is computed on the LOGICAL indices BEFORE _live() translates,
+        # so it reads back in YOUR numbering. Without it, hv_grid_off_all([5]) with
+        # 5 dead-masked returned a bare ok:True while the grid switch stayed ON --
+        # a success-shaped no-op on an HV path.
+        requested = None if filaments is None else [int(f) for f in filaments]
+        dead_skipped = [] if requested is None else [f for f in requested if f in self.dead]
         live = self._live(filaments)   # already translated to physical
         if live is not None and len(live) == 0:
-            return {"ok": True, "applied": [], "failed": [], "skipped_dead": True}
+            # ok:False -- the caller named filaments and NONE were commanded.
+            return {"ok": False, "applied": [], "failed": [], "skipped_dead": True,
+                    "dead_skipped": dead_skipped, "requested": requested,
+                    "error": "every requested filament is dead-masked — nothing sent"}
         body: dict = {"on": bool(on), "force": bool(force)}
         if live is not None:
             body["filaments"] = live
-        return self._relog_response(self._post("/api/hv-grid", body, timeout=20.0))
+        r = self._relog_response(self._post("/api/hv-grid", body, timeout=20.0),
+                                 keys=("applied", "failed", "excluded", "touched",
+                                            "not_this_controller", "unslotted",
+                                            "mismatched", "unstable"))
+        if dead_skipped:
+            r = {**r, "dead_skipped": dead_skipped}
+        return r
 
     def hv_grid_off_all(self, filaments=None, force: bool = True) -> dict:
         """Convenience: turn OFF the HV isolation switch for all (or listed)
@@ -1469,18 +1580,134 @@ class CTClient:
     # even mid-run) — use them to confirm idle_one()/active_one() actually
     # landed at the current you commanded.
 
-    def read_filament_currents(self, filaments=None) -> dict:
-        """Bulk read of every populated filament's measured heating current.
+    # ══ FILAMENT READS — WHICH ONE DO I WANT? ════════════════════════════════
+    #
+    #   I want to...                          | use
+    #   --------------------------------------+-------------------------------
+    #   check a filament reached its commanded | read_filament_current_cached()
+    #   current, or watch currents WHILE a     |   (cheap, no I2C, run-safe)
+    #   schedule is firing                     |
+    #   --------------------------------------+-------------------------------
+    #   know a filament's VOLTAGE, or get a    | read_filament_vi_live()
+    #   matched V+I pair (e.g. to compute      |   (real I2C read; do NOT call
+    #   resistance)                            |    while a schedule fires)
+    #   --------------------------------------+-------------------------------
+    #   ...just one filament, both values      | read_filament_vi_live(f)[f]
+    #   --------------------------------------+-------------------------------
+    #   ...just one filament, one number       | read_filament_current(f) /
+    #                                          | read_filament_voltage(f)
+    #
+    # THE TRAP THIS TABLE EXISTS TO PREVENT: the cached read has NO voltage --
+    # not "0 V", none at all, because the firmware command behind it carries no
+    # voltage field. And the two single-value helpers read DIFFERENT sources, so
+    # pairing them gives you V and I sampled by different commands at different
+    # instants (measured 92 mA apart on a warming filament). For a pair, always
+    # take BOTH from one read_filament_vi_live() entry.
+    #
+    # ── One shape, one failure convention ────────────────────────────────────
+    # Every reader below takes `int | list | None` (None = all), returns
+    # {filament: entry} with the SAME keys regardless of source, and encodes
+    # "no reading" as None -- never as 0. A value this layer did not get from
+    # hardware is absent, not zero; that rule is the one every bug in this file
+    # has come down to.
 
-        filaments: optional list to filter the result to just these indices.
+    _ENTRY_KEYS = ("index", "present", "bus_mV", "current_mA", "target_mA",
+                   "cc_mode", "source", "valid", "unavailable", "cached")
+
+    @staticmethod
+    def _want_filaments(filaments):
+        """`int | list | None` -> `list[int] | None`. Accepting a bare int used
+        to work on one reader and raise TypeError on its sibling."""
+        if filaments is None:
+            return None
+        if isinstance(filaments, (int, float)) and not isinstance(filaments, bool):
+            return [int(filaments)]
+        return [int(f) for f in filaments]
+
+    @staticmethod
+    def _entry(raw: dict, logical: int, source: str) -> dict:
+        """Normalise one backend entry to the common shape.
+
+        Fields the source cannot supply are None, not 0 -- the live read has no
+        target_mA/cc_mode, the cached read has no bus_mV (its firmware command
+        carries no voltage at all). `valid` says whether a usable measurement
+        came back; a board that isn't present never reports numbers, because the
+        INA sweep reports a board it cannot find as a tidy 0 mA."""
+        present = bool(raw.get("present"))
+        # Cached: current_mA is already None when stale/unavailable. Live: it is
+        # 0 for an absent board, which is exactly the fabricated value this
+        # normalisation exists to remove.
+        mA = raw.get("current_mA")
+        mV = raw.get("bus_mV")
+        if not present:
+            mA = mV = None
+        valid = mA is not None or mV is not None
+        return {"index": logical, "present": present,
+                "bus_mV": float(mV) if mV is not None else None,
+                "current_mA": float(mA) if mA is not None else None,
+                "target_mA": (float(raw["target_mA"])
+                              if raw.get("target_mA") is not None else None),
+                "cc_mode": raw.get("cc_mode"),
+                "source": source, "valid": valid,
+                # Always present on BOTH sources, so a caller never has to know
+                # which one answered to know which keys exist. `cached` is not
+                # redundant with source=="cached": the LIVE read falls back to
+                # cached data while a schedule is firing (the I2C sweep would
+                # stall pulses), so source=="live" with cached=True means "you
+                # asked for a live read and did not get one".
+                "unavailable": bool(raw.get("unavailable", not present)),
+                "cached": bool(raw.get("cached", source == "cached"))}
+
+    def read_filament_current_cached(self, filaments=None) -> dict:
+        """USE THIS TO: confirm filaments reached their commanded current, and
+        to watch heating current while a schedule is firing.
+
+        CURRENT ONLY, from the CC loop's cache. SAFE while a schedule fires.
+
+        No voltage: the firmware command behind this returns currents and
+        nothing else, so `bus_mV` is always None here — use read_filament_vi_live()
+        if you need a voltage. No I2C either, which is the point: this is the
+        read you can poll at speed, and the only one that is safe to call while
+        a schedule is firing (the live read does a mux select and would stall
+        pulses).
+
+        Read ONE filament or MANY with the same call.
+
+        filaments:
+            None          -> every populated filament (bulk/paged sweep)
+            5             -> just filament 5   (SINGLE-board command)
+            [5]           -> same as 5         (SINGLE-board command)
+            [0, 1, 2]     -> those three       (bulk sweep, filtered)
+
+        Single and bulk are DIFFERENT firmware commands, not the same read
+        filtered two ways: one filament goes out as a single small frame to
+        only that filament's controller (0x3A FLAG_SINGLE), which is what
+        makes a per-filament poll like wait_for_current() cheap. Asking for
+        several always uses the paged bulk sweep — looping the single read
+        over many boards would flood the shared bridge link. The returned
+        shape is identical either way, so you never branch on which ran.
+
         Not auto-filtered by the dead mask — this is a read, and you may
         still want to see a dead filament's last-known current.
 
         Returns {filament_index: {"current_mA", "target_mA", "present",
         "cc_mode"}}. cc_mode: 0=voltage, 1=current (Idle/Active), 2/3=fault.
+        current_mA is None when the board's cached reading isn't a live
+        measurement — guard with `is not None`, don't treat it as 0 mA.
         Returns {} on failure (never raises).
+
+        NO VOLTAGE HERE. The underlying firmware command returns currents and
+        nothing else — there is no bus-voltage field in its response — so
+        `bus_mV` comes back None rather than a made-up number. Use
+        read_filament_voltages() for a voltage; the live INA219 read is the only
+        source that has one.
         """
-        r = self._get("/api/filament-currents")
+        want = self._want_filaments(filaments)
+
+        if want is not None and len(want) == 1:
+            r = self._get(f"/api/filament-currents?filament={self._phys(want[0])}")
+        else:
+            r = self._get("/api/filament-currents")
         # The backend replies keyed by PHYSICAL filament index (it has no
         # concept of the client-side swap) — re-key to LOGICAL so the
         # result always matches YOUR numbering, then filter on that. Also
@@ -1490,24 +1717,45 @@ class CTClient:
         out = {}
         for k, v in raw.items():
             logical = self._logical(k)
-            if isinstance(v, dict) and "index" in v:
-                v = {**v, "index": logical}
-            out[logical] = v
-        if filaments is not None:
-            want = {int(f) for f in filaments}
-            out = {k: v for k, v in out.items() if k in want}
+            out[logical] = self._entry(v, logical, "cached") if isinstance(v, dict) else v
+        if want is not None:
+            keep = set(want)
+            out = {k: v for k, v in out.items() if k in keep}
         return out
 
-    def read_filament_current(self, filament: int) -> float:
-        """Measured heating current (mA) for ONE filament. Returns 0.0 if
-        the filament isn't present/regulated by the CC loop, OR if the
-        read itself failed — this can't distinguish the two cases; use
-        read_filament_currents() directly if you need to tell them apart."""
-        data = self.read_filament_currents([filament])
-        return float(data.get(int(filament), {}).get("current_mA", 0))
+    def read_filament_current(self, filament: int) -> float | None:
+        """USE THIS TO: read one filament's heating current as a plain number,
+        when you don't need to know WHY a read came back empty.
 
-    def read_filament_voltages(self, filaments=None) -> dict:
-        """Bulk read of every populated filament's measured board voltage
+        Measured heating current (mA) for ONE filament. Returns **None** (not
+        0.0) if the filament isn't present/regulated by the CC loop, OR if the
+        read itself failed — arithmetic on the result then raises loudly
+        instead of silently continuing with a fabricated zero. This still
+        can't distinguish those two cases; use
+        read_filament_current_cached() directly if you need to tell them apart.
+
+        Reads the CC-loop CACHE. If you also want the voltage, do NOT pair this
+        with read_filament_voltage() -- that one reads live INA219, so the two
+        come from different commands at different instants. Use
+        read_filament_vi_live(filament) for a matched pair -- it takes both
+        from one conversion."""
+        raw = self.read_filament_current_cached(filament).get(int(filament), {}).get("current_mA")
+        return float(raw) if raw is not None else None
+
+    def read_filament_vi_live(self, filaments=None) -> dict:
+        """USE THIS TO: measure board voltage, or get matched V+I pairs (e.g.
+        to compute resistance). NOT for polling during a run -- it does real
+        I2C and would stall pulses; use read_filament_current_cached() there.
+
+        VOLTAGE AND CURRENT, live from the INA219. NOT safe mid-run.
+
+        This is the only source of a board voltage — the cached read has none.
+        It does a real I2C mux sweep, so the backend refuses it while a schedule
+        is firing (it would stall pulses) and answers from the cache instead;
+        those entries come back "cached": True with no usable voltage. For a
+        current you can poll safely at any time, use read_filament_current_cached().
+
+        Bulk read of every populated filament's measured board voltage
         (mV) AND current (mA) together. Unlike read_filament_currents()
         (CC-loop CACHED currents, no I2C, safe mid-run), this is a real
         INA219 I2C sweep — the backend SKIPS it automatically while a
@@ -1522,28 +1770,56 @@ class CTClient:
         Returns {filament_index: {"bus_mV", "current_mA", "present",
         "cached"}}. Returns {} on failure (never raises).
         """
-        r = self._get("/api/telemetry")
+        # ?live=1 is REQUIRED for a voltage: /api/telemetry defaults to the
+        # no-I2C cached read, which carries no bus_mV at all (every entry comes
+        # back bus_mV=0, cached=True). Without this flag every filament here
+        # reads 0 mV and read_filament_voltage() returns None for all of them.
+        want = self._want_filaments(filaments)
+        r = self._get("/api/telemetry?live=1")
         raw = {int(row["index"]): row for row in (r.get("telemetry") or [])
               if isinstance(row, dict) and "index" in row}
         out = {}
         for k, v in raw.items():
             logical = self._logical(k)
-            out[logical] = {**v, "index": logical}
-        if filaments is not None:
-            want = {int(f) for f in filaments}
-            out = {k: v for k, v in out.items() if k in want}
+            out[logical] = self._entry(v, logical, "live")
+        if want is not None:
+            keep = set(want)
+            out = {k: v for k, v in out.items() if k in keep}
         return out
 
     def read_filament_voltage(self, filament: int) -> float | None:
-        """Measured board voltage (mV) for ONE filament. Returns None if
+        """USE THIS TO: read one filament's board voltage as a plain number.
+        If you also want its current, use read_filament_vi_live(filament)
+        instead — it takes both from one conversion.
+
+        Measured board voltage (mV) for ONE filament. Returns None if
         the filament isn't present, or if voltage isn't available right
-        now (mid-run — see read_filament_voltages()) — distinct from 0.0,
-        which is a real (if unusual) reading. Use read_filament_voltages()
-        directly if you need present/cached separated from a genuine 0 mV."""
-        data = self.read_filament_voltages([filament]).get(int(filament), {})
+        now (mid-run — see read_filament_vi_live()) — distinct from 0.0,
+        which is a real (if unusual) reading. Use read_filament_vi_live()
+        directly if you need present/cached separated from a genuine 0 mV.
+
+        If you also want the current, use read_filament_vi_live(filament) rather than pairing
+        this with read_filament_current(): that one reads the CC-loop cache, so
+        the two values would come from different commands at different
+        instants."""
+        data = self.read_filament_vi_live([filament]).get(int(filament), {})
         if not data.get("present") or data.get("cached"):
             return None
         return float(data.get("bus_mV", 0))
+
+    def read_filament_currents(self, filaments=None) -> dict:
+        """Deprecated alias for read_filament_current_cached().
+
+        Same behaviour, clearer name. Cached CC-loop CURRENT ONLY (no voltage
+        exists in that firmware response), no I2C, safe to poll mid-run."""
+        return self.read_filament_current_cached(filaments)
+
+    def read_filament_voltages(self, filaments=None) -> dict:
+        """Deprecated alias for read_filament_vi_live().
+
+        Same behaviour, clearer name. LIVE INA219 read of voltage AND current;
+        does I2C, so it is NOT safe to poll while a schedule is firing."""
+        return self.read_filament_vi_live(filaments)
 
     # ── HV enable / disable ───────────────────────────────────────────────────
 
@@ -1570,6 +1846,53 @@ class CTClient:
     # building blocks for advanced/custom sequences only — see the warning
     # on that section before reaching for them.
 
+    def _phys_plan(self, plan: dict) -> tuple[dict, list]:
+        """Translate a schedule plan's filament indices LOGICAL -> PHYSICAL and
+        drop dead-masked entries. Returns (translated_plan, dead_skipped).
+
+        This is the ONE place a plan crosses the logical/physical boundary. It
+        used to be nowhere: download()/verify_schedule() put plan indices on the
+        wire raw while every other filament-taking method went through _phys(),
+        so with a swap active `active_one(5)` heated physical 8 while a plan
+        naming 5 scheduled physical 5 -- the schedule fired a different, unheated
+        filament than the one just pre-heated. fire_single_pulse compensated by
+        pre-translating its own plan; that compensation is now REMOVED (it would
+        translate twice here, and a symmetric swap would map straight back to the
+        original). Build plans in LOGICAL indices; this converts them.
+
+        Dead entries are dropped rather than sent, matching _live()/_prep(), and
+        reported so the drop is never silent."""
+        dead_skipped: list[int] = []
+        out = dict(plan)
+        for key in ("emission", "heating"):
+            rows = plan.get(key)
+            if not isinstance(rows, list):
+                continue
+            kept = []
+            for row in rows:
+                if not isinstance(row, dict) or "filament" not in row:
+                    kept.append(row)
+                    continue
+                f = int(row["filament"])
+                if f in self.dead:
+                    if f not in dead_skipped:
+                        dead_skipped.append(f)
+                    continue
+                kept.append({**row, "filament": self._phys(f)})
+            out[key] = kept
+        cur = plan.get("currents")
+        if isinstance(cur, dict):
+            kept_cur = {}
+            for k, v in cur.items():
+                f = int(k)
+                if f in self.dead:
+                    if f not in dead_skipped:
+                        dead_skipped.append(f)
+                    continue
+                kept_cur[self._phys(f)] = v
+            out["currents"] = kept_cur
+        return out, sorted(dead_skipped)
+
     def download(self, plan: dict,       # {"config", "emission", "heating"?,
                                           # "currents"?} -- see the shape below
                 timeout: float = 30.0) -> dict:  # generous default; a full
@@ -1589,9 +1912,22 @@ class CTClient:
         actually owns, so this is safe even when only one controller is
         involved. Downloads to both connected controllers if both are up.
 
-        Returns {"ok", "results": [...]} — one result dict per controller.
+        Plan filament indices are LOGICAL (your numbering) — they are translated
+        through filament_order and dead-filtered on the way out by _phys_plan().
+        Any dead-masked entry is dropped and reported back as "dead_skipped";
+        if that would leave nothing to fire, the download is refused outright
+        rather than writing an empty emission table.
+
+        Returns {"ok", "results": [...]} — one result dict per controller, plus
+        "dead_skipped": [...] whenever the dead mask removed something.
         """
-        r = self._post("/api/download", {"plan": plan}, timeout=timeout)
+        wire_plan, dead_skipped = self._phys_plan(plan)
+        if isinstance(plan.get("emission"), list) and plan["emission"] and not wire_plan["emission"]:
+            return {"ok": False, "results": [], "dead_skipped": dead_skipped,
+                    "error": "every emission entry is dead-masked — nothing to download"}
+        r = self._post("/api/download", {"plan": wire_plan}, timeout=timeout)
+        if dead_skipped:
+            r = {**r, "dead_skipped": dead_skipped}
         # Keep fire_single_pulse(reuse=True)'s per-controller cache honest even
         # when download() is called directly (bypassing fire_single_pulse): a
         # successful write updates what we believe is on that controller now;
@@ -1619,9 +1955,15 @@ class CTClient:
         download() and before arming, to catch a corrupted/partial transfer
         before firing anything.
 
+        Takes the SAME logical-index plan you gave download() — it is translated
+        identically here (_phys_plan), so the CRC compared against the hardware
+        is computed over the bytes that were actually written. Passing a plan
+        that download() dead-filtered is fine: this filters it the same way.
+
         Returns {"ok", "results": {controller: {"match": bool, ...}}}.
         """
-        return self._post("/api/verify-schedule", {"plan": plan}, timeout=10.0)
+        wire_plan, _dead = self._phys_plan(plan)
+        return self._post("/api/verify-schedule", {"plan": wire_plan}, timeout=10.0)
 
     # ── SHV schedule — low-level ──────────────────────────────────────────────
     # RAW single-op building blocks, useful for advanced/custom sequences (e.g.
@@ -1646,6 +1988,7 @@ class CTClient:
     #                              rejecting it, so keep this one <= 255
     #                              yourself.
 
+    _U8_MAX = 255          # numPulses is a single byte on the wire
     _U16_MAX = 65535
     _U32_MAX = 4294967295
 
@@ -1666,14 +2009,16 @@ class CTClient:
 
     def shv_set_entry(self, controller: int, filament: int,
                       num_pulses: int = 1,   # pulses in this entry's burst;
-                                              # ⚠ uint8 on the wire (0-255),
-                                              # silently truncated via &0xFF,
-                                              # NOT rejected — keep it <=255
+                                              # uint8 on the wire (0-255),
+                                              # REJECTED here if out of range
+                                              # (the backend encodes it &0xFF,
+                                              # so 300 would silently become 44)
                       width_us: int = 1000) -> dict:  # pulse width (µs);
                                                        # uint16, 0-65535,
                                                        # rejected here if out
                                                        # of range
-        err = self._range_error("width_us", int(width_us), self._U16_MAX)
+        err = (self._range_error("num_pulses", int(num_pulses), self._U8_MAX)
+               or self._range_error("width_us", int(width_us), self._U16_MAX))
         if err:
             return {"ok": False, "error": err}
         return self._shv(controller, {
@@ -2035,7 +2380,8 @@ class CTClient:
 
         # max_on_ms/width_us are uint16 fields (0-65535), inter_pulse_ms/
         # total_ms are uint32 — see the wire-format note above shv_set_config.
-        err = (self._range_error("max_on_ms", int(max_on_ms), self._U16_MAX)
+        err = (self._range_error("num_pulses", int(num_pulses), self._U8_MAX)
+               or self._range_error("max_on_ms", int(max_on_ms), self._U16_MAX)
                or self._range_error("width_us", int(width_us), self._U16_MAX)
                or self._range_error("inter_pulse_ms", int(inter_pulse_ms), self._U32_MAX)
                or self._range_error("total_ms", int(total_ms), self._U32_MAX))
@@ -2050,11 +2396,14 @@ class CTClient:
         plan = {
             "config": {"interPulseMs": int(inter_pulse_ms), "maxOnMs": int(max_on_ms),
                       "totalMs": int(total_ms), "triggerEdge": 0},
-            # PHYSICAL filament goes on the wire — shv_pulse_log() re-keys
-            # fired records back to LOGICAL, so the "fired"/"records" filter
-            # below (which compares against the original logical `filament`)
-            # still works correctly.
-            "emission": [{"filament": self._phys(filament), "numPulses": int(num_pulses),
+            # LOGICAL filament here — download()/verify_schedule() translate to
+            # physical via _phys_plan(). This used to call _phys() itself, back
+            # when download() sent plans raw; doing both would translate twice
+            # (a symmetric swap maps straight back to the original). Keep the
+            # plan logical so _last_plan's reuse comparison is logical too, and
+            # so shv_pulse_log()'s re-keying to logical still lines up with the
+            # "fired"/"records" filter below.
+            "emission": [{"filament": int(filament), "numPulses": int(num_pulses),
                          "widthUs": int(width_us)}],
             "heating": [],
         }
@@ -2356,6 +2705,39 @@ class CTClient:
         except Exception as exc:   # a formatting bug here should never break a log line
             return f"(describe() failed: {exc}) {result}"
 
+    def _describe_skips(self, r: dict) -> str:
+        """The clause naming filaments that were DROPPED rather than commanded.
+
+        Without this, describe() reported "Applied to 2 filament(s)." for a call
+        that was asked for three -- the dead_skipped/excluded keys were sitting
+        right there in the dict and never surfaced. A summary line that silently
+        omits what it skipped is the same defect the keys were added to fix, one
+        layer up. Returns "" when nothing was dropped, so callers can append it
+        unconditionally."""
+        parts = []
+        dead = r.get("dead_skipped") or []
+        if dead:
+            parts.append(f"{len(dead)} dead-skipped: {dead}")
+        exc = r.get("excluded") or []
+        if exc:
+            parts.append(f"{len(exc)} excluded (no board / controller offline): {exc}")
+        uns = r.get("unslotted") or []
+        if uns:
+            parts.append(f"{len(uns)} unslotted: {uns}")
+        # Not a skip -- these WERE commanded, but the 74HC165 read-back disagrees
+        # with what was asked for, so the bit did not land. Surfaced here because
+        # it forces ok:False and would otherwise be invisible in the summary line.
+        mis = r.get("mismatched") or []
+        if mis:
+            parts.append(f"{len(mis)} read-back MISMATCH (did not land): {mis}")
+        # Distinct from mismatched: two reads disagreed with each OTHER, so the
+        # bit's state is unknown rather than known-bad. Named differently on
+        # purpose -- "unknown" and "failed" are different things to act on.
+        unst = r.get("unstable") or []
+        if unst:
+            parts.append(f"{len(unst)} UNCONFIRMED (165 read unstable, state unknown): {unst}")
+        return (", " + ", ".join(parts)) if parts else ""
+
     def _describe_heating(self, h: dict) -> str:
         """One clause describing a verify=True sub-result -- either
         wait_for_current()'s shape ("measured_ma") or
@@ -2482,19 +2864,25 @@ class CTClient:
         # {"ok","applied": int, "failed": [...]}
         if "applied" in r and "failed" in r and isinstance(r.get("applied"), int):
             if r.get("skipped_dead"):
-                return "No live filaments in the requested set (all dead-masked) — nothing sent."
+                dead = r.get("dead_skipped") or []
+                which = f" ({dead})" if dead else ""
+                return f"No live filaments in the requested set (all dead-masked{which}) — nothing sent."
             failed = r.get("failed") or []
             fail_txt = f", {len(failed)} failed: {failed}" if failed else ""
-            return f"Applied to {r.get('applied')} filament(s){fail_txt}."
+            return f"Applied to {r.get('applied')} filament(s){fail_txt}{self._describe_skips(r)}."
 
         # hv_grid_set()/hv_grid_set_all()/set_ocp_threshold_all(): "applied" is a
         # list of filaments here, not a count
         if "applied" in r and "failed" in r:
+            if r.get("skipped_dead"):
+                dead = r.get("dead_skipped") or []
+                which = f" ({dead})" if dead else ""
+                return f"Nothing sent — every requested filament is dead-masked{which}."
             applied = r.get("applied")
             n = len(applied) if isinstance(applied, list) else applied
             failed = r.get("failed") or []
             fail_txt = f", {len(failed)} failed: {failed}" if failed else ""
-            return f"Applied to {n} filament(s){fail_txt}."
+            return f"Applied to {n} filament(s){fail_txt}{self._describe_skips(r)}."
 
         # stop_one/sleep_one/standby_one/idle_one/active_one/voltage_one() via
         # _state_one(): {"ok","filament","state": 1-6,"arg", ...}
