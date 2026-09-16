@@ -48,6 +48,9 @@ from net_protocol import (
     adc_ring_window,
     adc_ring_window_data,
     adc_pulse_arm,
+    adc_pulse_diag,
+    adc_ready_arm,
+    adc_ready_disarm,
     adc_pulse_disarm,
     primary_local_ip,
     EspCmdClient,
@@ -1621,6 +1624,65 @@ _DETECTOR_USERS: dict[str, set[str]] = {}
 _DETECTOR_LOCK = threading.Lock()
 
 
+def _adc_window_autoarm(host: str, n: int) -> dict[str, Any]:
+    """adc_window, arming the high-speed ADC first if it isn't already running.
+
+    adc_window summarises a window of an ALREADY-RUNNING sample stream; it is not
+    a one-shot read, because the STM32's ADC only converts while armed (TIM1 +
+    circular DMA). So a plain click on the GUI's ADC card used to fail with a
+    bare 409 and leave the operator to know, from nowhere, that they had to arm
+    something first. One click should just work.
+
+    If the arm doesn't take, say so specifically: "accepted the arm but is not
+    converting" is a different fault from "could not arm" and from "not armed",
+    and the card is where someone will actually read it."""
+    r = stm32_adc_window(host, n)
+    if r.get("ok") or "not streaming" not in str(r.get("error", "")):
+        return r                                   # worked, or failed for another reason
+    arm = adc_pulse_arm(host, 1000000)
+    if not arm.get("ok"):
+        return {"ok": False, "auto_arm": "failed",
+                "error": f"ADC was not streaming and arming it failed: "
+                         f"{arm.get('error') or arm.get('message') or arm}"}
+    time.sleep(0.25)
+    if not _detector_is_converting(host):
+        return {"ok": False, "auto_arm": "accepted-but-not-converting",
+                "error": "ADC was not streaming; the STM32 ACCEPTED the arm but is "
+                         "still not converting (detector_continuous_active=false, "
+                         "sample count not advancing). The arm command is returning "
+                         "OK without starting the ADC — this is upstream of the "
+                         "summary and needs the STM32 side."}
+    r = stm32_adc_window(host, n)
+    if isinstance(r, dict):
+        r["auto_armed"] = True
+    return r
+
+
+def _detector_is_converting(host: str) -> bool:
+    """Is the STM32 ADC actually producing samples right now?
+
+    Asks the hardware instead of trusting bookkeeping. detector_continuous_active
+    plus a rising sample count is the real answer; hs_adc_state is NOT (CONFIG
+    sets it to 1 and ARM to 2, and the ADC can be running in either). Returns
+    False when it cannot tell -- an unanswerable probe must not read as "yes"."""
+    try:
+        a = adc_pulse_diag(host)
+        if not a.get("ok"):
+            return False
+        s0 = ((a.get("stm32") or {}).get("samples_seen"))
+        if s0 is None:
+            return False
+        time.sleep(0.12)
+        b = adc_pulse_diag(host)
+        st = (b.get("stm32") or {})
+        if st.get("detector_continuous_active") is not True:
+            return False
+        s1 = st.get("samples_seen")
+        return s1 is not None and s1 > s0
+    except Exception:
+        return False
+
+
 def detector_arm(host: str, rate_hz: int, user: str) -> dict[str, Any]:
     """Arm the shared STM32 pulse detector for `user` ('stream'/'record').
     Only the first user actually arms the hardware; a later joiner shares
@@ -1628,15 +1690,24 @@ def detector_arm(host: str, rate_hz: int, user: str) -> dict[str, Any]:
     ADC, one rate) and `shared`/`other_users` is set so the GUI can say so."""
     with _DETECTOR_LOCK:
         users = _DETECTOR_USERS.setdefault(host, set())
-        if not users:
-            r = adc_pulse_arm(host, rate_hz)
-            if not r.get("ok"):
-                return r
+        # The refcount is a BELIEF about the hardware, not the hardware. It goes
+        # stale whenever something disarms outside this bookkeeping (the relay's
+        # own disarm, an STM32 reboot, a crash), and then this returned
+        # {"ok": True, "shared": True, "other_users": []} -- claiming to share an
+        # arm with nobody, having armed nothing. Every downstream "measured 0
+        # pulses" after that was unattributable. So: only skip the real arm when
+        # the hardware itself says it is converting.
+        if users and _detector_is_converting(host):
+            others = users - {user}
             users.add(user)
-            return {"ok": True}
-        others = users - {user}
+            return {"ok": True, "shared": True, "other_users": sorted(others)}
+        if users:
+            users.clear()          # stale bookkeeping; re-arm for real
+        r = adc_pulse_arm(host, rate_hz)
+        if not r.get("ok"):
+            return r
         users.add(user)
-        return {"ok": True, "shared": True, "other_users": sorted(others)}
+        return {"ok": True}
 
 
 def detector_disarm(host: str, user: str) -> dict[str, Any]:
@@ -2735,7 +2806,10 @@ class CtHandler(BaseHTTPRequestHandler):
             # ground truth read straight off the STM32, not from any host cache.
             host, err = self._master_host()
             n = int(self._query().get("n", "1000"))
-            self._json({"ok": False, "error": err} if err else stm32_adc_window(host, n))
+            if err:
+                self._json({"ok": False, "error": err})
+            else:
+                self._json(_adc_window_autoarm(host, n))
         elif path == "/api/stm32/hv-status":
             # Proxy to `/stm32/hv_status` — the ACTUAL HV enable GPIO levels
             # (emission_on/focus_on read from the pin, not the commanded state)
@@ -3593,6 +3667,20 @@ class CtHandler(BaseHTTPRequestHandler):
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(detector_arm(host, int(body.get("rate", 1000000)), "stream"))
+            elif path == "/api/adc/ready-arm":
+                # Arm the pulse-envelope RELAY (and the STM32 detector inside it).
+                # Distinct from /api/adc/pulse-arm, which arms only the detector:
+                # without the relay, PA4 never moves and nothing gets measured.
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                self._json(adc_ready_arm(host, int(body.get("rate", 1000000)),
+                                         int(body.get("n_samples", 2000))))
+            elif path == "/api/adc/ready-disarm":
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                self._json(adc_ready_disarm(host))
             elif path == "/api/adc/pulse-disarm":
                 # Release Stream's claim on the shared detector arm — see
                 # detector_disarm: only actually disarms if Record isn't
@@ -3690,6 +3778,12 @@ class CtHandler(BaseHTTPRequestHandler):
                              "expect_v": round(expect_v, 1), "method": method}
                 if not ok:
                     out["error"] = r.get("error") or "DS3502 write failed"
+                    # Carry the REASON through, don't flatten it into a generic
+                    # failure. "no_device" means the pot is absent -- a caller
+                    # must not retry that, and must not read it as "the write
+                    # failed", which is what it looked like before this.
+                    if r.get("reason"):
+                        out["reason"] = r["reason"]
                 self._json(out)
             elif path == "/api/hv/set-i":
                 # Linear emission-current set: ma=target mA (0–85.7).
@@ -3708,6 +3802,8 @@ class CtHandler(BaseHTTPRequestHandler):
                               "expect_ma": round(wiper / 127 * _EM_I_FULL_MA, 2)}
                 if not ok:
                     out2["error"] = r.get("error") or "DS3502 write failed"
+                    if r.get("reason"):
+                        out2["reason"] = r["reason"]     # see set-v above
                 self._json(out2)
             elif path == "/api/stm32/hv-enable":
                 # Proxy to `/stm32/hv_enable` — toggles the HV enable GPIO for

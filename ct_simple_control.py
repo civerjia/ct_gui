@@ -680,7 +680,7 @@ class CTClient:
         """
         if not self.dead and not self.filament_order and filaments is None:
             return None
-        base = list(filaments) if filaments is not None else list(range(96))
+        base = list(filaments) if filaments is not None else list(range(self.FILAMENT_COUNT))
         survivors = [f for f in base if f not in self.dead]   # dead-check on LOGICAL indices
         return self._phys_list(survivors)                      # then translate to physical
 
@@ -706,48 +706,98 @@ class CTClient:
     # to the PHYSICAL (actually-wired) filament underneath. You never need to
     # translate anything yourself.
 
+    FILAMENT_COUNT = 96      # logical filaments 0..95
+
+    @classmethod
+    def identity_order(cls) -> list[int]:
+        """The no-swap order: [0, 1, 2, ..., 95]. Start from this, change the
+        entries you need, and pass the whole list to set_filament_order()."""
+        return list(range(cls.FILAMENT_COUNT))
+
     def set_filament_order(self, order) -> None:
-        """Define a set of one-to-one logical<->physical filament SWAPS.
+        """Define the logical->physical filament mapping EXPLICITLY.
 
-        order: dict {a: b}, or a list where order[i] is the paired index for
-        logical filament i (only entries that differ from identity need to
-        be included, in either form). Each pair is symmetric and applied
-        automatically both ways — {5: 8} sets BOTH "5 -> physical 8" and
-        "8 -> physical 5"; you never need to write both directions yourself.
-        Pass None or {} to clear back to identity (no swap).
+        order: a sequence of exactly 96 integers, where order[i] is the
+        PHYSICAL filament that your logical filament i refers to. Pass None
+        or an empty sequence to clear back to identity (no remapping).
 
-        Raises ValueError if the input isn't a valid one-to-one mapping —
-        e.g. the same filament given two different partners — since a
-        filament can only be swapped with exactly one other.
+        The whole table is stated, not a diff. The previous "only list what
+        differs" forms are gone on purpose: a partial mapping cannot be
+        checked for validity, because the entries you left out are exactly
+        the ones a conflict would hide. Writing all 96 makes the mapping
+        checkable, and it is checked -- see below.
 
-        Example — filaments 5 and 8 are physically swapped on the backplane:
-            ct.set_filament_order({5: 8})
-            ct.active_one(5, 2900)         # actually commands physical filament 8
-            ct.active_one(8, 2900)         # actually commands physical filament 5
-            ct.read_filament_current(5)    # actually reads physical filament 8,
-                                            # returned to you keyed as "filament 5"
+        MUST BE ONE-TO-ONE. Every filament 0..95 has to appear exactly once,
+        so the mapping is a true permutation and is reversible: this client
+        translates your indices to physical ones on the way out and back to
+        yours on the way in, and that round trip only works if no two logical
+        filaments claim the same physical board. Raises ValueError naming the
+        offending entries otherwise -- a length that isn't 96, a value outside
+        0..95, or any duplicate.
+
+        Example -- filaments 5 and 8 are physically swapped on the backplane:
+            order = CTClient.identity_order()
+            order[5], order[8] = 8, 5        # state BOTH directions yourself
+            ct.set_filament_order(order)
+
+            ct.active_one(5, 2900)           # commands physical filament 8
+            ct.read_filament_current(5)      # reads physical filament 8,
+                                              # returned keyed as "filament 5"
+
+        Note you now write both directions explicitly. The old dict form
+        applied {5: 8} in both directions for you; that convenience is what
+        made a partial table ambiguous, so the table says what it means now.
         """
-        if not order:
+        n = self.FILAMENT_COUNT
+        if order is None or (hasattr(order, "__len__") and len(order) == 0):
             self.filament_order = {}
             return
         if isinstance(order, dict):
-            pairs = {int(k): int(v) for k, v in order.items() if int(v) != int(k)}
-        else:
-            pairs = {i: int(v) for i, v in enumerate(order) if int(v) != i}
-        swapped: dict[int, int] = {}
-        for a, b in pairs.items():
-            for x, y in ((a, b), (b, a)):
-                if x in swapped and swapped[x] != y:
-                    raise ValueError(
-                        f"set_filament_order: conflicting swap for filament {x} "
-                        f"({swapped[x]} vs {y}) — each filament can only be "
-                        f"paired with exactly one other, in one-to-one swaps")
-                swapped[x] = y
-        self.filament_order = swapped
+            raise ValueError(
+                "set_filament_order: pass an explicit sequence of "
+                f"{n} indices, not a dict. Start from CTClient.identity_order() "
+                "and assign the entries you need (both directions of a swap). "
+                "A partial mapping can't be validated, which is why it's no "
+                "longer accepted; pass None or [] to clear back to identity.")
+        try:
+            seq = [int(v) for v in order]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"set_filament_order: order must be a sequence "
+                             f"of {n} integers ({exc})") from None
+        if len(seq) != n:
+            raise ValueError(
+                f"set_filament_order: expected exactly {n} entries "
+                f"(one per filament 0..{n - 1}), got {len(seq)}")
+        bad = [(i, v) for i, v in enumerate(seq) if not (0 <= v < n)]
+        if bad:
+            raise ValueError(
+                f"set_filament_order: value(s) outside 0..{n - 1}: "
+                + ", ".join(f"order[{i}]={v}" for i, v in bad[:8])
+                + (f" (and {len(bad) - 8} more)" if len(bad) > 8 else ""))
+        seen: dict[int, int] = {}
+        dupes: list[str] = []
+        for i, v in enumerate(seq):
+            if v in seen:
+                dupes.append(f"physical {v} claimed by both logical {seen[v]} and {i}")
+            else:
+                seen[v] = i
+            
+        if dupes:
+            raise ValueError(
+                "set_filament_order: mapping is not one-to-one — "
+                + "; ".join(dupes[:6])
+                + (f" (and {len(dupes) - 6} more)" if len(dupes) > 6 else "")
+                + ". Every filament 0..%d must appear exactly once, or "
+                  "translating results back to your numbering is ambiguous." % (n - 1))
+        # Store only the entries that actually differ: _phys/_logical short-
+        # circuit on an empty table, so identity stays free.
+        self.filament_order = {i: v for i, v in enumerate(seq) if v != i}
 
-    def get_filament_order(self) -> dict:
-        """The current logical->physical swap (empty dict = identity, no swap)."""
-        return dict(self.filament_order)
+    def get_filament_order(self) -> list[int]:
+        """The current mapping as an explicit 96-entry list, order[i] = the
+        physical filament logical i refers to. Identity when no remapping is
+        set, so this always round-trips through set_filament_order()."""
+        return [self.filament_order.get(i, i) for i in range(self.FILAMENT_COUNT)]
 
     def _phys(self, filament: int) -> int:
         """Logical -> physical filament index (identity if no swap is set)."""
@@ -963,13 +1013,30 @@ class CTClient:
                   "measured_valid": bool,   # False = NO source could give a
                                             # live measurement; measured_ma is
                                             # 0.0 filler and "ok" is False
-                  "measured_from": "cached" | "ina219",  # which source answered.
+                  "measured_from": "cached" | "ina219" | "power_state",
+                                            # which evidence answered. See the
+                                            # note below on "power_state".
                                             # The CC cache stops being maintained
                                             # once the loop isn't regulating (i.e.
                                             # after stop/sleep), so a 0 mA target
                                             # is normally confirmed via ina219
                   "elapsed_s": float, "present": bool, "cc_mode": int}
                   cc_mode: 0=voltage 1=current(regulating) 2/3=fault.
+        A ~0 mA TARGET IS CONFIRMED BY POWER STATE, NOT BY CURRENT, and it has
+        to be: stopping a board drops its rail, so the INA presence probe stops
+        answering for it and no current reading exists any more. Waiting for a
+        measured 0 would therefore never succeed. Such a result carries
+        measured_from="power_state" and measured_valid=False -- it is a
+        confirmation, explicitly not a reading, and describe() says so.
+
+        Known limit, and why it is the acceptable direction: once the rail is
+        down this cannot tell a real stopped board from a board that was never
+        there (read_board_status reports STOP for both, and the only probe that
+        distinguishes them is slow and leaves boards at SLEEP). So stop_one() on
+        an absent filament reports success. The dangerous direction -- calling a
+        still-heating board stopped -- cannot happen: the state comes from the
+        firmware's own per-board read, and a board being driven reports
+        IDLE/ACTIVE, not STOP. Verified on hardware.
         """
         start = time.monotonic()
         deadline = start + timeout_s
@@ -997,6 +1064,41 @@ class CTClient:
                 # one. Skipped automatically mid-run: the backend refuses the
                 # sweep while a schedule fires and answers cached (cached=True),
                 # which we do not accept as a measurement.
+                # A STOPPED board cannot be confirmed by CURRENT at all, and
+                # that is structural, not a flake. Stopping removes the board's
+                # rail, so the live INA presence probe reports present=False --
+                # indistinguishable from a board that was never there, which is
+                # exactly why the `present` guard below exists. Result: a
+                # stop/sleep/standby verification could never succeed; measured
+                # here, stop_one(verify=True) burned its full timeout and said
+                # "did NOT reach 0.0 mA" for a filament that had stopped
+                # correctly. (One earlier run passed only because the rail had
+                # not collapsed yet -- timing luck, not confirmation.)
+                #
+                # For a ~0 mA target the honest instrument is the board's own
+                # power state: if the CC loop is no longer driving it and the
+                # board reports a non-heating state, it is not heating. That is
+                # reported as measured_from="power_state" with
+                # measured_valid=False, so it can never be mistaken for a
+                # measured zero -- confirmation, but explicitly not a reading.
+                if abs(float(target_ma)) <= tolerance_ma:
+                    st = self.read_board_status(filament)
+                    if st.get("ok") and st.get("state") in (STOP, SLEEP, STANDBY):
+                        return {"ok": True, "filament": int(filament),
+                                "target_ma": float(target_ma), "measured_ma": 0.0,
+                                "measured_valid": False, "measured_from": "power_state",
+                                # NOT "state_name": that key is read_board_status's
+                                # shape and describe() matches it first, which made a
+                                # standalone wait_for_current result render as a board
+                                # status line instead of a heating one.
+                                "power_state": st.get("state_name"),
+                                "elapsed_s": time.monotonic() - start,
+                                "present": bool(data.get("present", False)),
+                                "cc_mode": data.get("cc_mode", 0),
+                                "note": (f"not heating — board reports "
+                                         f"{st.get('state_name')}; no current reading is "
+                                         f"available once the rail is down, so this is "
+                                         f"confirmed by power state, not measured")}
                 live = self.read_filament_vi_live([filament]).get(int(filament), {})
                 # `present` is NOT optional here. The INA sweep reports a board it
                 # could not find as 0 mA with present=False, so accepting any
@@ -2234,6 +2336,11 @@ class CTClient:
                                 # default because it has a real, documented
                                 # safety gap (see the docstring) — opt in only
                                 # when you understand it.
+        measure: bool = False,   # ALSO measure the HV current of each
+                                  # pulse on the STM32 detector -- see
+                                  # "measure" in the docstring
+        rate_hz: int = 1000000,  # detector ADC sample rate; only used
+                                  # when measure=True
     ) -> dict:
         """Download a one-entry schedule, arm it, fire, and verify.
 
@@ -2364,7 +2471,135 @@ class CTClient:
         Returns:
             {"ok": bool, "fired": int, "records": [...], "status": {...},
              "error": str}   # "error" present only when "ok" is False
+
+
+        measure=True -- ALSO measure the current of every pulse
+        ------------------------------------------------------
+        Firing and measuring are two different subsystems: the RP2350
+        decides WHEN HV fires, and a pulse detector on the STM32 measures
+        how much current actually flowed. This flag runs both as one
+        operation, which is almost always what you want -- a fired pulse
+        you did not measure tells you very little.
+
+            r = ct.fire_single_pulse(5, num_pulses=3, width_us=1000,
+                                     measure=True)
+            if r["ok"]:
+                for e in r["measured"]:
+                    print(e["peak_ma"], "mA peak,", e["plateau_ma"], "mA plateau")
+
+        It arms the detector, notes where the event stream is, fires,
+        collects exactly the events this fire produced, and releases the
+        detector again -- including if the fire raises or times out.
+
+        With measure=True the result gains:
+            "measured": [ ... ]   one event per pulse, each with peak_ma /
+                                  plateau_ma / bg_ma (see pulse_events_ma)
+            "ref_mv":    float    the live reference reading actually used
+        and "ok" becomes stricter: it is True only if the fire succeeded AND
+        every fired pulse produced a measured event. A fire that "worked"
+        while the detector saw nothing -- link down, detector not really
+        armed, events dropped -- reports ok=False rather than letting a
+        silent measurement gap look like success.
+
+        Requires the STM32 link to be up; there is exactly ONE detector and
+        it lives on the master controller. If it cannot be armed, nothing is
+        fired at all and the error says so, so measure=True never leaves you
+        guessing whether HV went out.
         """
+        if not measure:
+            return self._fire_core(
+                filament, num_pulses=num_pulses, width_us=width_us,
+                inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                total_ms=total_ms, controller=controller, trigger=trigger,
+                timeout_s=timeout_s, verify=verify, reuse=reuse)
+
+        # Arm BEFORE firing -- a detector armed afterwards has already missed
+        # the pulses. If it can't arm we fire nothing: silently firing HV that
+        # nobody is measuring is the opposite of what measure=True asked for.
+        #
+        # This arms the RELAY, not just the detector. The STM32 times each pulse
+        # from the real envelope on its PA4 pin, and PA4 only moves while the
+        # ESP32 is mirroring the RP2350's pulse signal onto it. pulse_arm() alone
+        # arms the detector and leaves the relay off, so the detector sits there
+        # sampling and never sees a pulse start: measured on hardware, a 3-pulse
+        # fire came back "0 of 3 measured" while the RP2350 fired correctly and
+        # the STM32 took 7.2M samples. With the relay armed the same fire gives
+        # 3 events whose measured widths (1009/1002/1000 us) match the commanded
+        # 1000 us. See pulse_arm()'s note for the detector-only form.
+        arm = self.ready_arm(rate_hz)
+        if not arm.get("ok"):
+            return {"ok": False, "fired": 0, "records": [], "status": {},
+                    "measured": [], "ref_mv": None,
+                    "error": f"detector arm failed, nothing fired: {arm.get('error')}"}
+        try:
+            # "Huge since" returns no events but a true current cursor, so we
+            # collect only what THIS fire produces and never a stale backlog.
+            since = self.pulse_events(2_000_000_000).get("last_id", 0)
+            fired = self._fire_core(
+                filament, num_pulses=num_pulses, width_us=width_us,
+                inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                total_ms=total_ms, controller=controller, trigger=trigger,
+                timeout_s=timeout_s, verify=verify, reuse=reuse)
+            measured, ref_mv = self._collect_pulse_events(since, int(num_pulses))
+            out = {**fired, "measured": measured, "ref_mv": ref_mv,
+                   "ok": bool(fired.get("ok")) and len(measured) >= int(num_pulses)}
+            if not out["ok"] and fired.get("ok") and not out.get("error"):
+                out["error"] = (f"fired {fired.get('fired')} pulse(s) but the detector "
+                                f"reported {len(measured)} of {num_pulses} — measurement "
+                                f"incomplete, so the result is not trustworthy")
+            return out
+        finally:
+            self.ready_disarm()
+
+    def _collect_pulse_events(self, since: int, want: int,
+                              grace_s: float = 3.0) -> tuple[list, float | None]:
+        """Collect `want` detector events newer than `since`. The detector is
+        real-time, so these normally arrive immediately after the fire returns;
+        the grace period is for a delayed/dropped event, not expected lag.
+        Returns whatever it got -- the CALLER decides that a short count is a
+        failure, so this can't quietly paper over one."""
+        measured: list = []
+        ref_mv = None
+        deadline = time.monotonic() + grace_s
+        cursor = since
+        while len(measured) < want and time.monotonic() < deadline:
+            ev = self.pulse_events_ma(cursor)
+            if ev.get("ok"):
+                ref_mv = ev.get("ref_mv", ref_mv)
+                if ev.get("events"):
+                    measured.extend(ev["events"])
+                    cursor = ev["events"][-1]["id"]
+            if len(measured) < want:
+                time.sleep(0.05)
+        return measured, ref_mv
+
+    def _fire_core(
+        self,
+        filament: int,
+        num_pulses: int = 1,
+        width_us: int = 1000,
+        inter_pulse_ms: int = 3000,
+        max_on_ms: int = 40,
+        total_ms: int = 15000,       # RP2350 FIRMWARE's own schedule timeout (ms)
+                                      # — see docstring, "total_ms vs timeout_s"
+        controller: int | None = None,   # None = auto-infer from `filament` via
+                                          # the active-list mapping — see docstring,
+                                          # "why controller exists at all"
+        trigger: str = "sim",
+        timeout_s: float = 15.0,     # PYTHON CLIENT's polling timeout (seconds)
+                                      # — see docstring, "total_ms vs timeout_s"
+        verify: bool = True,
+        reuse: bool = False,   # skip re-download if unchanged since your last
+                                # call — see docstring, "reuse — skipping the
+                                # download when nothing changed"; OFF by
+                                # default because it has a real, documented
+                                # safety gap (see the docstring) — opt in only
+                                # when you understand it.
+    ) -> dict:
+        """Fire one schedule entry and wait for it. The body of
+        fire_single_pulse() -- see that method for the full contract;
+        this exists only so the public method can wrap it with the
+        detector arm/correlate step without duplicating any of it."""
         if self._is_dead(filament):
             return self._dead_result(filament, {"fired": 0, "records": [], "status": {}})
 
@@ -2394,8 +2629,19 @@ class CTClient:
                                        # reuse is about to skip the download.
 
         plan = {
-            "config": {"interPulseMs": int(inter_pulse_ms), "maxOnMs": int(max_on_ms),
-                      "totalMs": int(total_ms), "triggerEdge": 0},
+            # With trigger="sim" THIS CLIENT drives both the trigger and the
+            # watchdog that fires if a trigger is late. Setting them to the same
+            # value makes the simulated edge race its own deadline: measured on
+            # hardware, inter_pulse_ms=300 lost that race on every attempt (2, 3
+            # and 4 pulses all faulted with stopReason=inter-pulse timeout after
+            # exactly one pulse) while 200 and 500 passed every time. The spacing
+            # is the physically meaningful number, so keep the sim at what the
+            # caller asked for and give the WATCHDOG room instead. An external
+            # trigger is the caller's to time, so it keeps the value as given.
+            "config": {"interPulseMs": (int(inter_pulse_ms) * 2 + 100
+                                        if trigger == "sim" else int(inter_pulse_ms)),
+                       "maxOnMs": int(max_on_ms),
+                       "totalMs": int(total_ms), "triggerEdge": 0},
             # LOGICAL filament here — download()/verify_schedule() translate to
             # physical via _phys_plan(). This used to call _phys() itself, back
             # when download() sent plans raw; doing both would translate twice
@@ -2465,8 +2711,9 @@ class CTClient:
             if state == SHV_FAULT:
                 return {"ok": False,
                         "error": f"SHV fault on controller {controller}: "
-                                f"filament {st.get('faultFilament')}, "
-                                f"reason {st.get('stopReason')}",
+                                f"filament {st.get('faultFilament')}, reason "
+                                f"{self._SHV_STOP_REASON_NAMES.get(st.get('stopReason'), st.get('stopReason'))}"
+                                f" ({st.get('stopReason')})",
                         "fired": 0, "records": [], "status": st}
             if state == SHV_COMPLETE:
                 logs = self.shv_pulse_log(controller)
@@ -2500,6 +2747,23 @@ class CTClient:
     # Safe to run this script alongside an open GUI tab; just don't assume
     # you got the rate_hz you asked for if something else armed it first.
 
+    def ready_arm(self, rate_hz: int = 1000000, n_samples: int = 2000) -> dict:
+        """Arm the pulse-envelope RELAY plus the STM32 detector inside it.
+
+        This is the one you want when you intend to MEASURE fired pulses, and it
+        is what fire_single_pulse(measure=True) uses. The STM32 times each pulse
+        from the real edge on its PA4 pin; that pin is driven by the ESP32
+        mirroring the RP2350's own pulse-envelope output. Arm only the detector
+        (pulse_arm) and PA4 never moves, so a fire measures nothing at all --
+        the detector reports zero events while everything else looks healthy.
+        """
+        return self._post("/api/adc/ready-arm",
+                          {"rate": int(rate_hz), "n_samples": int(n_samples)})
+
+    def ready_disarm(self) -> dict:
+        """Stop relaying pulse envelopes and release the STM32 CS claim."""
+        return self._post("/api/adc/ready-disarm", {})
+
     def pulse_arm(self, rate_hz: int = 1000000) -> dict:
         """Arm the STM32 per-pulse current detector. Nothing is measured
         until pulses actually fire -- this just gets the STM32's ADC
@@ -2519,9 +2783,29 @@ class CTClient:
         return self._post("/api/adc/pulse-disarm", {}, timeout=5.0)
 
     def pulse_events(self, since: int = 0) -> dict:
-        """Poll new STM32-measured pulse events with id > `since`. Each
-        event: {"id", "t_us", "on_us", "peak", "plateau", "bg",
-        "bg_sigma4", "integral", "recv_ms"} -- peak/plateau/bg are RAW ADC
+        """Poll new STM32-measured pulse events with id > `since`.
+
+        Each event:
+            "id"        monotonic event id (use as the next `since`)
+            "t_us"      STM32 timestamp of the pulse start
+            "on_us"     MEASURED pulse width, from the real envelope on the
+                        STM32's PA4 pin -- not the commanded width. Compare it
+                        against what you asked for; they should agree closely.
+            "peak"      highest sample inside the pulse
+            "plateau"   mean over the pulse window [rise, fall)
+            "bg"        rolling background BEFORE the pulse
+            "post_bg"   mean AFTER the pulse: the STM32 waits ~50 us for the
+                        signal to settle, then averages ~50 us. **None when it
+                        was not measured** -- either the window is configured
+                        to 0 samples, or the next pulse arrived before even one
+                        sample could be taken. None, not 0: 0 is a perfectly
+                        legal post-pulse current and the two must not look
+                        alike. Guard with `is not None`.
+            "bg_sigma4" 4x the background sigma
+            "integral"  summed samples over the pulse
+            "recv_ms"   host receive time
+
+        peak/plateau/bg/post_bg are RAW ADC
         counts, not mA; convert with pulse_ma()/pulse_events_ma() below,
         never by hand (the correct conversion needs a LIVE reference
         reading, not a fixed constant -- see pulse_ma's docstring).
@@ -2579,13 +2863,18 @@ class CTClient:
 
     def pulse_events_ma(self, since: int = 0) -> dict:
         """Like pulse_events(), but every event also gets peak_ma/
-        plateau_ma/bg_ma fields, converted with ONE live ADS1115
+        plateau_ma/bg_ma/post_bg_ma fields, converted with ONE live ADS1115
         reference reading shared across the whole batch — cheaper and
         more internally consistent than calling pulse_ma() per-event
         (each of which would otherwise fetch its own live reading).
         Returns {"ok", "events": [...], "last_id", "ref_mv": <the reading
         actually used, or None if that read failed and the ~1.2V fallback
-        was used instead>}."""
+        was used instead>}.
+
+        A field that was not measured stays None and gets NO _ma companion --
+        post_bg_ma is simply absent on such an event, rather than carrying a
+        converted stand-in. Check `"post_bg_ma" in event`, or guard on
+        `event["post_bg"] is not None`."""
         r = self.pulse_events(since)
         if not r.get("ok"):
             return r
@@ -2596,7 +2885,10 @@ class CTClient:
         # this method entirely.
         resolved_ref_mv = ref_mv if ref_mv is not None else 1200.0
         for e in r.get("events", []):
-            for key in ("peak", "plateau", "bg"):
+            # post_bg included: it is a current reading like the others. The
+            # `is not None` guard below is what keeps "not measured" (null)
+            # from being converted into a plausible mA value.
+            for key in ("peak", "plateau", "bg", "post_bg"):
                 if e.get(key) is not None:
                     e[f"{key}_ma"] = round(self.pulse_ma(e[key], resolved_ref_mv), 3)
         r["ref_mv"] = ref_mv
@@ -2607,74 +2899,42 @@ class CTClient:
         filament: int,
         num_pulses: int = 1,
         width_us: int = 1000,
-        rate_hz: int = 1000000,       # STM32 ADC sample rate for the detector
-        inter_pulse_ms: int = 3000,   # passed through to fire_single_pulse
-        max_on_ms: int = 40,          # passed through to fire_single_pulse
-        total_ms: int = 15000,        # passed through to fire_single_pulse
-        controller: int | None = None,   # passed through to fire_single_pulse
-        trigger: str = "sim",         # passed through to fire_single_pulse
-        timeout_s: float = 15.0,      # passed through to fire_single_pulse
-        verify: bool = True,          # passed through to fire_single_pulse
-        reuse: bool = False,          # passed through to fire_single_pulse
+        rate_hz: int = 1000000,
+        inter_pulse_ms: int = 3000,
+        max_on_ms: int = 40,
+        total_ms: int = 15000,
+        controller: int | None = None,
+        trigger: str = "sim",
+        timeout_s: float = 15.0,
+        verify: bool = True,
+        reuse: bool = False,
     ) -> dict:
-        """Fire `num_pulses` on `filament` (via fire_single_pulse — the
-        precise, PIO-timed schedule-engine path; see its own docstring for
-        every one of the parameters above besides `rate_hz`) AND correlate
-        the STM32 detector's measured current for exactly those pulses, in
-        one call.
+        """Fire and measure, returning the two halves separately.
 
-        Arms the detector first (pulse_arm), records the current
-        pulse_events cursor, fires, then polls pulse_events until it has
-        seen `num_pulses` new events or a short grace period elapses (the
-        detector reacts in real time, so this is normally near-instant
-        after fire_single_pulse returns — the grace period exists only to
-        catch a dropped/delayed event, not because measurement is
-        expected to lag). Always releases this script's claim on the
-        detector arm on the way out (see pulse_disarm's docstring — that
-        may not be the same thing as actually disarming the hardware, if
-        the GUI is also using it).
+        Identical work to fire_single_pulse(..., measure=True) -- which is
+        now the recommended call, since firing and measuring belong to the
+        same operation and keeping them in one function stops anyone firing
+        HV they forgot to measure. This wrapper differs only in SHAPE: it
+        nests the fire result under "fired" instead of merging it, which is
+        handy when you want to log the two halves apart.
 
-        Returns {"ok", "fired": <fire_single_pulse's own result dict>,
-        "measured": [<pulse_events_ma() events for just this fire, each
-        with peak_ma/plateau_ma/bg_ma>], "ref_mv": <the live reference
-        reading actually used>}. "ok" is True only if BOTH the fire
-        succeeded AND every fired pulse got a matching measured event — a
-        fire that "succeeds" with zero/partial measured events (detector
-        wasn't really armed, STM32 link dropped mid-run, ...) is reported
-        as ok=False so a silent measurement gap can't look like success."""
-        arm = self.pulse_arm(rate_hz)
-        if not arm.get("ok"):
-            return {"ok": False, "error": f"pulse arm failed: {arm.get('error')}",
-                    "fired": {}, "measured": [], "ref_mv": None}
-        try:
-            # Same "huge since" trick pulse_events() documents: zero events
-            # back, but a true current cursor to fire from.
-            since = self.pulse_events(2_000_000_000).get("last_id", 0)
+            {"ok":       both fired AND every pulse measured,
+             "fired":    the full fire_single_pulse result dict,
+             "measured": [one event per pulse, peak_ma/plateau_ma/bg_ma],
+             "ref_mv":   the live reference reading actually used}
 
-            fired = self.fire_single_pulse(
-                filament, num_pulses=num_pulses, width_us=width_us,
-                inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
-                total_ms=total_ms, controller=controller, trigger=trigger,
-                timeout_s=timeout_s, verify=verify, reuse=reuse)
-
-            measured: list = []
-            ref_mv = None
-            deadline = time.monotonic() + 3.0   # generous grace past a real-time detector
-            while len(measured) < num_pulses and time.monotonic() < deadline:
-                ev = self.pulse_events_ma(since)
-                if ev.get("ok") and ev.get("events"):
-                    measured.extend(ev["events"])
-                    ref_mv = ev.get("ref_mv", ref_mv)
-                    since = ev["events"][-1]["id"]
-                elif ev.get("ok"):
-                    ref_mv = ev.get("ref_mv", ref_mv)
-                if len(measured) < num_pulses:
-                    time.sleep(0.05)
-
-            return {"ok": bool(fired.get("ok")) and len(measured) >= num_pulses,
-                    "fired": fired, "measured": measured, "ref_mv": ref_mv}
-        finally:
-            self.pulse_disarm()
+        See fire_single_pulse's "measure=True" section for the arming and
+        correlation rules, and why a partial measurement reports ok=False.
+        """
+        r = self.fire_single_pulse(
+            filament, num_pulses=num_pulses, width_us=width_us,
+            inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+            total_ms=total_ms, controller=controller, trigger=trigger,
+            timeout_s=timeout_s, verify=verify, reuse=reuse,
+            measure=True, rate_hz=rate_hz)
+        fired = {k: v for k, v in r.items() if k not in ("measured", "ref_mv")}
+        return {"ok": bool(r.get("ok")), "fired": fired,
+                "measured": r.get("measured") or [], "ref_mv": r.get("ref_mv")}
 
     # ── Human-readable result decoding ────────────────────────────────────────
     # Every method above returns a plain dict -- convenient for scripting, but
@@ -2746,8 +3006,18 @@ class CTClient:
         if not isinstance(h, dict):
             return ""
         if "measured_ma" in h:
+            # Never say "reached N mA" for something that was not measured. A
+            # stop is confirmed from the board's POWER STATE (no current reading
+            # exists once the rail is down -- see wait_for_current), and
+            # reporting that as a measured zero would be claiming evidence we
+            # do not have, in the summary line people actually read.
+            if h.get("measured_from") == "power_state":
+                return (f"not heating — board reports {h.get('power_state')} "
+                        f"(confirmed by power state, not measured) "
+                        f"in {h.get('elapsed_s', 0):.1f}s")
             verb = "reached" if h.get("ok") else "did NOT reach"
-            return (f"{verb} {h.get('measured_ma')} mA "
+            src = f" [{h['measured_from']}]" if h.get("measured_from") else ""
+            return (f"{verb} {h.get('measured_ma')} mA{src} "
                     f"(target {h.get('target_ma')} mA) in {h.get('elapsed_s', 0):.1f}s")
         if "cc_mode" in h:
             verb = "entered voltage-regulation mode" if h.get("ok") else "did NOT enter voltage mode"
@@ -2761,17 +3031,25 @@ class CTClient:
         if r.get("dead"):
             return f"Filament {r.get('filament')} is marked dead — no command sent."
 
-        # measure_pulse_current(): {"ok","fired","measured","ref_mv"} --
-        # check BEFORE fire_single_pulse's shape below since both have a
-        # "fired" key (this one's is a nested dict, not an int).
+        # Fire+measure results, in EITHER shape. fire_single_pulse(measure=True)
+        # merges the fire in, so "fired" is a pulse COUNT and "error" is at the
+        # top level; measure_pulse_current() nests the whole fire result under
+        # "fired" instead. Both are checked BEFORE fire_single_pulse's own shape
+        # below, since all three carry a "fired" key. Reading an int "fired" as
+        # a dict is how this branch used to report "unknown error" while the
+        # actual reason was sitting right there in r["error"].
         if "measured" in r and "fired" in r:
-            fired = r.get("fired") or {}
-            if not fired.get("ok"):
-                return f"measure_pulse_current: fire failed — {fired.get('error', 'unknown error')}"
+            nested = r["fired"] if isinstance(r.get("fired"), dict) else None
+            fire_ok = nested.get("ok") if nested is not None else (r.get("fired") or 0) > 0
+            why = (nested or r).get("error") or r.get("error")
+            label = "measure_pulse_current" if nested is not None else "fire_single_pulse(measure=True)"
+            if not fire_ok:
+                return f"{label}: fire failed — {why or 'unknown error'}"
             n = len(r.get("measured") or [])
             if not ok:
-                return (f"measure_pulse_current: fired but only {n} pulse(s) measured "
-                        f"(detector gap?) — ref {r.get('ref_mv')} mV")
+                return (f"{label}: fired but only {n} pulse(s) measured "
+                        f"(detector gap?){' — ' + why if why else ''} "
+                        f"— ref {r.get('ref_mv')} mV")
             mas = [e.get("peak_ma") for e in r["measured"] if e.get("peak_ma") is not None]
             peaks = ", ".join(f"{m:.2f}" for m in mas) if mas else "?"
             return f"Measured {n} pulse(s), peak mA: {peaks} (ref {r.get('ref_mv')} mV)"
@@ -2910,5 +3188,10 @@ class CTClient:
             extra = {k: v for k, v in r.items() if k != "ok"}
             return f"OK ({extra})." if extra else "OK."
         if ok is False:
+            # "no_device" is not a failure to retry -- the chip the command
+            # needs is not on the bus. Saying "Failed: ..." for it sends the
+            # reader looking for a fault in something that is simply absent.
+            if r.get("reason") == "no_device":
+                return f"Chip not present: {r.get('error', 'the required chip is absent')}"
             return f"Failed: {r.get('error', 'unknown error')}"
         return str(r)

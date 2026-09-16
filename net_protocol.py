@@ -1659,12 +1659,44 @@ def fetch_stm32_status(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> 
         return {"ever_seen": False, "age_ms": 0, "error": str(exc)}
 
 
+def _post_result(status: int, text: str) -> dict[str, Any]:
+    """Standard result for a plain-text POST to the ESP32 bridge.
+
+    On failure the reason goes in "error" -- the key every caller actually
+    checks -- and not only in "message". This dict used to be hand-built at
+    14 separate call sites and every one of them set "message" alone, so a
+    failed call surfaced as a bare ok:False while the device's own
+    explanation ("hsadc_config failed (UART)", "ds3502_set failed") was
+    dropped on the floor. Each site had to REMEMBER to report the reason;
+    none did. Building it in one place is what stops the next one forgetting.
+    """
+    ok = status == 200
+    out = {"ok": ok, "status": status, "message": text.strip()}
+    if not ok:
+        out["error"] = f"HTTP {status}: {text.strip() or '(no detail)'}"
+    return out
+
+
 def _stm32_get_json(host: str, path: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
     try:
         status, body, _ = _http_get(f"http://{host}:{BRIDGE_HTTP_PORT}{path}", timeout)
         if status != 200:
             return {"ok": False, "error": f"HTTP {status}: {body.decode('utf-8','replace').strip()}"}
         return json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # urllib RAISES on 4xx/5xx, so the branch above never runs for them and
+        # str(exc) is only "HTTP Error 409: Conflict" -- the device's own
+        # explanation is sitting in the response body and was being thrown away.
+        # That cost real debugging time: the ESP32 replies "adc_window rejected
+        # (ADC not streaming? arm HSADC first)", which says exactly what to do,
+        # and the user saw a bare status name instead.
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        return {"ok": False, "status": exc.code,
+                "error": f"HTTP {exc.code}: {detail}" if detail else str(exc)}
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError,
             json.JSONDecodeError) as exc:
         return {"ok": False, "error": str(exc)}
@@ -1678,8 +1710,19 @@ def _stm32_post(host: str, path: str, fields: dict[str, str],
             body = json.loads(text)
         except json.JSONDecodeError:
             body = {}
-        return {"ok": status == 200 and body.get("ok", status == 200), "status": status,
-                **body, "message": text.strip()}
+        ok = status == 200 and body.get("ok", status == 200)
+        out = {"ok": ok, "status": status, **body, "message": text.strip()}
+        # On failure carry the REASON in "error", the key every caller checks.
+        # This used to set only "message", so a failed POST came back as a bare
+        # ok:False with no explanation -- e.g. enable_emission() reported failure
+        # while the ESP32 had said exactly why ("hv enable failed (UART)"). The
+        # GET sibling (_stm32_get_json) always set "error"; this one never did,
+        # so the two halves of the same module disagreed about how a failure is
+        # reported. Don't clobber an "error" the device itself supplied.
+        if not ok and not out.get("error"):
+            detail = text.strip() or f"HTTP {status}"
+            out["error"] = f"HTTP {status}: {detail}" if status != 200 else detail
+        return out
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -1782,12 +1825,12 @@ def sync_post_config(host: str, fields: dict[str, str],
 
 def sync_post_fire(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
     status, text = _http_post_form(f"http://{host}:{BRIDGE_HTTP_PORT}/sync/fire", {}, timeout)
-    return {"ok": status == 200, "status": status, "message": text.strip()}
+    return _post_result(status, text)
 
 
 def sync_post_abort(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
     status, text = _http_post_form(f"http://{host}:{BRIDGE_HTTP_PORT}/sync/abort", {}, timeout)
-    return {"ok": status == 200, "status": status, "message": text.strip()}
+    return _post_result(status, text)
 
 
 def sync_post_burst(host: str, count: int, rate_hz: int,
@@ -1816,7 +1859,7 @@ def sync_get_burst_status(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) 
 
 def sync_post_burst_stop(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
     status, text = _http_post_form(f"http://{host}:{BRIDGE_HTTP_PORT}/sync/burst/stop", {}, timeout)
-    return {"ok": status == 200, "status": status, "message": text.strip()}
+    return _post_result(status, text)
 
 
 def sync_post_capture(host: str, fields: dict[str, str],
@@ -1898,7 +1941,7 @@ def adc_post_stream_start(host: str, dest_host: str, dest_port: int,
         timeout = max(timeout, (n_samples / rate_hz) + 1.5)
     try:
         status, text = _http_post_form(url, fields, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -1907,7 +1950,7 @@ def adc_post_stream_stop(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -
     url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/stream/stop"
     try:
         status, text = _http_post_form(url, {}, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -2289,7 +2332,7 @@ def adc_capture_arm(host: str, pre: int, post: int,
             fields["timeout_ms"] = str(int(timeout_ms))
     try:
         status, text = _http_post_form(url, fields, http_timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -2367,7 +2410,7 @@ def adc_ring_start(host: str, rate_hz: int,
     url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ring/start?rate_hz={int(rate_hz)}"
     try:
         status, text = _http_post_form(url, {}, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -2376,7 +2419,7 @@ def adc_ring_stop(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[
     url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ring/stop"
     try:
         status, text = _http_post_form(url, {}, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -2403,7 +2446,7 @@ def adc_ring_tap_start(host: str, dest_ip: str, port: int, decim: int = 1,
            f"?host={dest_ip}&port={int(port)}&decim={int(decim)}")
     try:
         status, text = _http_post_form(url, {}, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -2412,9 +2455,45 @@ def adc_ring_tap_stop(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> d
     url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ring/tap_stop"
     try:
         status, text = _http_post_form(url, {}, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def adc_pulse_diag(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
+    """STM32 pulse-detector diagnostics + ESP32-side RX counters. Used to ask the
+    hardware whether the ADC is actually converting, rather than trusting any
+    bookkeeping about whether something armed it."""
+    return _stm32_get_json(host, "/pulse_diag", timeout)
+
+
+def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
+                  timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
+    """Arm the RP2350->STM32 pulse-envelope relay AND (inside it) the STM32
+    detector. This is what makes a fired pulse actually get MEASURED: the
+    detector times each pulse from the real envelope on PA4, which only moves
+    while the relay is mirroring GPIO39 -> GPIO34. adc_pulse_arm() alone arms the
+    detector but not the relay, so PA4 never moves and a fire yields 0 events."""
+    url = (f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ready_arm"
+           f"?rate_hz={int(rate_hz)}&n_samples={int(n_samples)}")
+    try:
+        status, text = _http_post_form(url, {}, timeout)
+        return _post_result(status, text)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def adc_ready_disarm(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
+    url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ready_disarm"
+    try:
+        status, text = _http_post_form(url, {}, timeout)
+        return _post_result(status, text)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def adc_ready_status(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
+    return _stm32_get_json(host, "/adc/ready_status", timeout)
 
 
 def adc_pulse_arm(host: str, rate_hz: int = 1000000,
@@ -2425,7 +2504,7 @@ def adc_pulse_arm(host: str, rate_hz: int = 1000000,
     url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/pulse_arm?rate_hz={int(rate_hz)}"
     try:
         status, text = _http_post_form(url, {}, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -2434,7 +2513,7 @@ def adc_pulse_disarm(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> di
     url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/pulse_disarm"
     try:
         status, text = _http_post_form(url, {}, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -2683,6 +2762,6 @@ def adc_capture_clear(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> d
     url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/capture/clear"
     try:
         status, text = _http_post_form(url, {}, timeout)
-        return {"ok": status == 200, "status": status, "message": text.strip()}
+        return _post_result(status, text)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
         return {"ok": False, "error": str(exc)}

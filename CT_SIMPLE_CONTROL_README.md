@@ -468,15 +468,16 @@ the physical one right before talking to hardware, and translates any
 filament-indexed data in the *response* back to logical before handing it
 to you. You never need to translate anything yourself.
 
-**`set_filament_order(order)`** — Define the swap.
+**`set_filament_order(order)`** — Define the mapping, explicitly.
 
-**Entries are SYMMETRIC: `{5: 8}` swaps the pair, it does not remap one
-way.** Writing `{5: 8}` also routes logical 8 → physical 5. This is a true
-exchange of two filaments, which is what a miswired pair actually is.
+`order` is a sequence of **exactly 96** integers: `order[i]` is the physical
+filament that your logical filament `i` refers to. The whole table is stated,
+not a diff.
 
 ```python
-# filaments 5 and 8 are wired into each other's positions:
-ct.set_filament_order({5: 8})
+order = CTClient.identity_order()     # [0, 1, 2, ..., 95]
+order[5], order[8] = 8, 5             # state BOTH directions yourself
+ct.set_filament_order(order)
 
 ct.active_one(5, current_ma=2900)      # actually commands physical filament 8
 ct.active_one(8, current_ma=2900)      # ...and this one commands physical 5
@@ -485,40 +486,51 @@ ct.read_filament_current(5)            # actually reads physical filament 8,
 ct.fire_single_pulse(filament=5)       # fires physical filament 8
 ```
 
-If only ONE of the two is really misplaced, this is the wrong tool — you
-would be silently remapping a second filament that was fine, and on the HV
-path that means energising a board you didn't name. Fix the active-list
-[mapping](#active-list-mapping) instead; that's the layer that describes
-which physical board a filament index means.
-
-Because pairs are symmetric, an inconsistent mapping is rejected rather
-than half-applied — `{5: 8, 8: 3}` asks 8 to be both 5's partner and 3's:
+**It must be one-to-one, and that is checked.** Every filament `0..95` has to
+appear exactly once. The mapping has to be reversible: this client translates
+your indices to physical ones on the way out and back to yours on the way in,
+and that round trip is only unambiguous if no two logical filaments claim the
+same physical board. A `ValueError` names the offending entries:
 
 ```python
-ct.set_filament_order({5: 8, 8: 3})   # raises ValueError
+bad = CTClient.identity_order()
+bad[5] = 8                     # one-way: physical 8 now claimed by 5 AND by 8
+ct.set_filament_order(bad)
+# ValueError: mapping is not one-to-one — physical 8 claimed by both
+#             logical 5 and 8. Every filament 0..95 must appear exactly once...
 ```
 
-`order` can also be a list where `order[i]` is the physical index for
-logical filament `i`. The same symmetry applies — the list below defines
-the 5↔8 swap, both directions, not a one-way move:
+Wrong length, a value outside `0..95`, and duplicates are each rejected with
+the specific entries listed. Any permutation is legal, not just pairwise
+swaps — a 3-cycle (`1→2→3→1`) is one-to-one and accepted.
 
-```python
-order = list(range(96))
-order[5] = 8   # pairs 5 with 8; 8 is routed back to 5 automatically
-ct.set_filament_order(order)
-```
+> **Partial mappings are no longer accepted.** The old dict form (`{5: 8}`,
+> applied in both directions for you) is rejected with a message pointing at
+> the list form. That convenience is exactly what made a table uncheckable:
+> the entries you left out are the ones a conflict would hide. Passing a dict
+> now raises; passing `None` or `[]` still clears to identity.
 
-Pass `None` (or `{}`) to clear back to identity (no swap):
+If only ONE of the two filaments is really misplaced, this is the wrong tool —
+you would be remapping a second filament that was fine, and on the HV path
+that means energising a board you didn't name. Fix the active-list
+[mapping](#active-list-mapping) instead; that's the layer that describes which
+physical board a filament index means.
+
+Pass `None` (or `[]`, or `{}`) to clear back to identity:
 
 ```python
 ct.set_filament_order(None)
 ```
 
-**`get_filament_order()`** — Read the current swap (`{}` = identity, no swap).
+**`get_filament_order()`** — the current mapping as an explicit 96-entry list.
 
 ```python
-print(ct.get_filament_order())   # {5: 8, 8: 5} — pairs are symmetric
+print(ct.get_filament_order())   # [0, 1, 2, 3, 4, 8, 6, 7, 5, 9, ...]
 ```
+
+It always round-trips: whatever this returns is accepted by
+`set_filament_order()` unchanged, and it is the identity list when no
+remapping is set.
 
 **What's covered**: every filament-taking method — `stop_one`/`sleep_one`/
 `standby_one`/`idle_one`/`active_one`/`voltage_one`, `stop_all`/`sleep_all`/
@@ -969,6 +981,15 @@ board manually) or clearing a switch stuck in the wrong state.
 `force=True` (the default) uses writeMode=2 — it bypasses the firmware's
 fault/verify checks, matching the GUI's Force checkbox. Set `force=False`
 to require the firmware's own verify pass instead (writeMode=1).
+
+> ⚠️ **This is the CONTINUOUS DC path, and it is an alternative to pulsing —
+> not a step before it.** Closing this switch leaves HV routed to the board
+> until you open it again. `fire_single_pulse` drives the *same* switch as a
+> brief scheduled pulse and must own it for the duration, so the grid has to be
+> **off** when you pulse. Either route DC with `hv_grid_set` and read the
+> steady-state current, or leave the grid off and fire a pulse — never both on
+> the same filament. `fire_single_pulse` refuses (and fires nothing) if the
+> target's grid switch is already closed.
 
 **As with every batch call, dead-masked filaments are always excluded** —
 `hv_grid_set` returns `{"ok": False, "dead": True, ...}` immediately if the
@@ -2018,6 +2039,81 @@ timing) once armed. There is exactly **one** detector, on the master —
 none of these methods take a `controller` argument, unlike every
 board/HV method above.
 
+#### The normal way: `fire_single_pulse(..., measure=True)`
+
+**Don't fire and measure as two steps.** Firing and measuring are separate
+subsystems but a single operation: a pulse you fired without measuring tells
+you almost nothing, and arming the detector *after* firing has already missed
+it. One flag runs the whole flow:
+
+> ⚠️ **Do NOT call `hv_grid_set(f, on=True)` before pulsing.** That is the
+> *continuous DC* path — it closes the filament's grid switch and leaves HV
+> routed to it. `fire_single_pulse` drives that same switch as a brief pulse,
+> and the schedule must own it. The two are **alternatives, not steps**: pulse
+> with the grid off, or route DC with `hv_grid_set` and don't pulse. The client
+> now refuses to fire a filament whose grid is already closed, and fires
+> nothing when it does.
+
+```python
+from ct_simple_control import CTClient
+
+ct = CTClient("192.168.8.214")
+with ct.lease(ttl=120, note="pulse measurement"):
+    ct.idle_one(5, current_ma=1500, verify=True)      # get the filament hot
+    # grid stays OFF — the schedule owns the switch for the duration of the pulse
+
+    r = ct.fire_single_pulse(5, num_pulses=3, width_us=1000, measure=True)
+
+    print(ct.describe(r))
+    # Measured 3 pulse(s), peak mA: 5.83, 5.79, 5.85 (ref 1227.4 mV)
+
+    if r["ok"]:
+        for e in r["measured"]:
+            # post_bg_ma is ABSENT (not zero) when the post-pulse window
+            # wasn't measured — so read it with .get(), not e["post_bg_ma"]
+            print(f"{e['on_us']} us  peak {e['peak_ma']:.2f} mA  "
+                  f"post {e.get('post_bg_ma', 'not measured')}  "
+                  f"plateau {e['plateau_ma']:.2f} mA "
+                  f"background {e['bg_ma']:.2f} mA")
+    else:
+        print("not trustworthy:", r.get("error"))
+
+    ct.stop_one(5, verify=True)
+```
+
+That call arms the detector, notes where the event stream is, fires, collects
+exactly the events *this* fire produced, and releases the detector — including
+if the fire fails or times out.
+
+**What `measure=True` adds to the result**
+
+| key | meaning |
+|---|---|
+| `measured` | one event per pulse: `on_us`, `peak_ma`, `plateau_ma`, `bg_ma`, `post_bg_ma`, `id` |
+| `ref_mv` | the live reference reading actually used for the mA conversion |
+| `ok` | stricter — True only if the fire succeeded **and** every fired pulse produced a measured event |
+
+That stricter `ok` is the point. A fire that "worked" while the detector saw
+nothing — link down, detector not really armed, events dropped — reports
+`ok=False` rather than letting a silent measurement gap look like success. And
+if the detector cannot be armed at all, **nothing is fired**: `measure=True`
+never leaves you guessing whether HV went out.
+
+Requires the STM32 link to be up. If it isn't, you get the refusal, with the
+reason:
+
+```python
+r = ct.fire_single_pulse(5, num_pulses=1, measure=True)
+# {"ok": False, "fired": 0, "measured": [], "ref_mv": None,
+#  "error": "detector arm failed, nothing fired: HTTP 502: hsadc_config failed (UART)"}
+```
+
+#### The pieces, if you need them separately
+
+Everything below is what `measure=True` does for you. Reach for it only when
+you need to measure pulses this client didn't fire (an external trigger
+source, or the GUI firing), or to hold one arm across many fires.
+
 **Shared with the GUI**: `pulse_arm()`/`pulse_disarm()` hit the *same*
 backend endpoints as the GUI's "Stream" button and "Record measurement"
 card, which the backend reference-counts — arming here while a GUI tab
@@ -2038,8 +2134,27 @@ ct.pulse_disarm()
 ```
 
 **`pulse_events(since=0)`** — Poll new measured events (`id > since`).
-Each event: `{"id", "t_us", "on_us", "peak", "plateau", "bg",
-"bg_sigma4", "integral", "recv_ms"}` — `peak`/`plateau`/`bg` are **raw
+
+| field | meaning |
+|---|---|
+| `id` | monotonic event id — pass it back as the next `since` |
+| `t_us` | STM32 timestamp of the pulse start |
+| `on_us` | **measured** pulse width, from the real envelope on the STM32's PA4 pin — not the width you commanded. Compare the two; they should agree closely |
+| `peak` | highest sample inside the pulse |
+| `plateau` | mean over the pulse window `[rise, fall)` |
+| `bg` | rolling background **before** the pulse |
+| `post_bg` | mean **after** the pulse — the STM32 waits ~50 µs to settle, then averages ~50 µs. **`None` when not measured** (see below) |
+| `bg_sigma4` | 4× the background σ |
+| `integral` | summed samples over the pulse |
+| `recv_ms` | host receive time |
+
+> ⚠️ **`post_bg` is `None`, not `0`, when it wasn't measured.** That happens
+> when the post-pulse window is configured to 0 samples, or when the next pulse
+> arrives before even one sample could be taken. `0` is a perfectly legal
+> post-pulse current, so the two must not look alike — guard with
+> `is not None`, never `if e["post_bg"]:`.
+
+`peak`/`plateau`/`bg`/`post_bg` are **raw
 ADC counts**, not mA; convert with `pulse_ma()`/`pulse_events_ma()`
 below, never by hand. Persist the returned `last_id` and pass it back as
 `since` to get only the delta next time. Pass a deliberately huge
@@ -2066,7 +2181,7 @@ fine for one-off conversions, but fetch it once and reuse it for a batch
 instead (see `pulse_events_ma()`).
 
 **`pulse_events_ma(since=0)`** — Like `pulse_events()`, but every event
-also gets `peak_ma`/`plateau_ma`/`bg_ma` fields, converted with ONE live
+also gets `peak_ma`/`plateau_ma`/`bg_ma`/`post_bg_ma` fields, converted with ONE live
 reference reading shared across the whole batch. Returns `{"ok",
 "events": [...], "last_id", "ref_mv"}`.
 
@@ -2081,23 +2196,11 @@ for e in r["events"]:
 ct.pulse_disarm()
 ```
 
-**`measure_pulse_current(filament, num_pulses=1, width_us=1000, rate_hz=1000000, **fire_single_pulse_kwargs)`**
-— The convenience wrapper for the whole workflow above: arms the
-detector, fires `num_pulses` on `filament` via `fire_single_pulse` (the
-precise, PIO-timed schedule-engine path — see its own docstring for
-every parameter besides `rate_hz`), correlates the detector's measured
-events for exactly those pulses (polling with a short grace period past
-when the fire completes — the detector reacts in real time, so this is
-normally near-instant), and always releases its own claim on the
-detector arm afterward.
-
-Returns `{"ok", "fired": <fire_single_pulse's own result>, "measured":
-[<pulse_events_ma() events for just this fire>], "ref_mv"}`. `"ok"` is
-True only if BOTH the fire succeeded AND every fired pulse got a
-matching measured event — a fire that "succeeds" with zero/partial
-measured events (detector wasn't really armed, STM32 link dropped
-mid-run) comes back `ok=False`, so a silent measurement gap can't look
-like success.
+**`measure_pulse_current(filament, num_pulses=1, width_us=1000, rate_hz=1000000, ...)`**
+— Identical work to `fire_single_pulse(..., measure=True)`, which is the
+recommended call. This differs only in **shape**: it nests the fire result
+under `"fired"` instead of merging it, which is handy when you want to log the
+two halves apart.
 
 ```python
 r = ct.measure_pulse_current(filament=5, num_pulses=3, width_us=1000)
@@ -2106,6 +2209,10 @@ print(ct.describe(r))
 if not r["ok"]:
     print("fire or measurement failed:", r["fired"].get("error"))
 ```
+
+Returns `{"ok", "fired": <the full fire_single_pulse result>, "measured": [...],
+"ref_mv"}`. Same arming, correlation and strict-`ok` rules as `measure=True`;
+it takes the same `fire_single_pulse` parameters.
 
 ### Human-readable results
 
@@ -2147,7 +2254,7 @@ Every method returns `{"ok": bool, "error": str, ...}` — check `"ok"`.
 | `CTLeaseError` | `acquire_lease()` / `with ct.lease():` | Another client already holds the write lock. **The one deliberate exception on the hardware path** — see below. |
 | `CTError` | nothing, by default | Base class, kept for compatibility. Not raised by any method here. |
 | `CTConnectionError` | nothing, by default | Kept for compatibility. A connection failure now comes back as `{"ok": False, "connection_error": True, "error": ...}` instead of raising. |
-| `ValueError` | `set_filament_order()` | Raised on a conflicting swap map (e.g. `{5: 8, 8: 3}`), because pairs are symmetric and the request is contradictory. Validate the dict you build if it comes from user input. |
+| `ValueError` | `set_filament_order()` | Raised when the 96-entry order isn't a valid one-to-one mapping — wrong length, a value outside `0..95`, or duplicates — and when a dict is passed instead of the explicit list. The message names the offending entries. Validate input you build from user data. |
 | `CTTimeoutError` | nothing, by default | Kept for compatibility. `fire_single_pulse`'s poll timeout now comes back as `{"ok": False, "timeout": True, ...}` instead of raising. |
 
 ```python

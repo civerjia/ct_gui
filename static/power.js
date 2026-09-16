@@ -1207,8 +1207,13 @@ function wireHv() {
     refreshHv();
   };
   // Non-pulse ADC summary: STM32 sums N samples on-chip over the window and returns
-  // mean/min/max/rms/std over UART (ground truth, no SPI, no pulse). Tries first; if
-  // the ADC isn't streaming it arms the detector (pulse-arm @ 1 MSPS) and retries.
+  // mean/min/max/rms/std over UART (ground truth, no SPI, no pulse).
+  //
+  // The arm-if-idle retry lives in the BACKEND now (/api/stm32/adc-window arms
+  // the detector and retries once). It used to be here as well, and both layers
+  // firing meant one click produced two abort->config->arm rounds at the STM32 —
+  // each arm starts with an abort, so the second round tore down what the first
+  // had just set up. One click, one arm.
   // Emission current from raw ADC count — tests.js's peakToMa() is THE
   // conversion (imported, not re-derived here); affine, so mean/min/max
   // map directly and pk-pk/σ scale by the slope (the DC offset cancels in
@@ -1220,13 +1225,7 @@ function wireHv() {
     const st = $p('adcWinStatus');
     const measure = async () => { try { return await (await fetch(`/api/stm32/adc-window?n=${n}`)).json(); } catch (e) { return { ok: false, error: String(e) }; } };
     st.textContent = 'measuring…';
-    let j = await measure();
-    if (!j.ok) {                       // ADC likely idle — arm the detector, retry
-      st.textContent = 'arming ADC…';
-      await postJ('/api/adc/pulse-arm', { controller: masterId(), rate: 1000000 });
-      await sleep(200);
-      j = await measure();
-    }
+    const j = await measure();         // backend arms the ADC itself if it's idle
     if (!j.ok) { st.textContent = `ADC summary failed: ${j.error || 'is the ADC/STM32 up?'}`; return; }
     const meanMa = peakToMa(j.mean), minMa = peakToMa(j.min), maxMa = peakToMa(j.max);
     const ppMa = j.pp * EMI_MA_PER_COUNT, stdMa = j.std * EMI_MA_PER_COUNT;
