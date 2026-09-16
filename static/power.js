@@ -304,48 +304,95 @@ function selectRect(sel, anchor, cur, rowKey, colKey, isRowEnabled) {
   for (let r = r0; r <= r1; r++) { if (!isRowEnabled(r)) continue; for (let c = c0; c <= c1; c++) sel.add(`${r}.${c}`); }
 }
 
+// Tile DOM nodes, keyed by "channel.mux_port" -- created ONCE and updated in
+// place on every subsequent render, never destroyed/recreated. This poll runs
+// at 10 Hz; the previous version did grid.innerHTML='' + rebuild-from-scratch
+// on every single call, which meant a click's mousedown/mouseup (routinely
+// 50-150+ ms apart) had a real chance of straddling a rebuild -- the element
+// under the cursor got swapped out mid-click and the browser drops the click
+// entirely. That was the "selection often just doesn't work" bug. channel/
+// mux_port are the tile's permanent identity (never change for a given grid
+// position), so the click listener captures them once at creation and stays
+// correct across every future content update.
+const boardTiles = new Map();
+// Builds one tile's fixed inner DOM structure ONCE (called only from the
+// !tile branch below). Every sub-element referenced here is stored on the
+// tile itself (tile._parts) so later renders update text/className in place
+// -- see the innerHTML comment above renderBoardGrid() for why this has to
+// go all the way down, not just at the outer tile level.
+function buildTileParts(tile) {
+  const hv = document.createElement('span'); hv.className = 'hv-badge'; hv.textContent = 'HV';
+  const title = document.createElement('span'); title.className = 'tile-title';
+  const dots = document.createElement('span'); dots.className = 'tile-dots';
+  const dotP = document.createElement('span'); dotP.className = 'dot';
+  const dotI = document.createElement('span'); dotI.className = 'dot';
+  const dotT = document.createElement('span'); dotT.className = 'dot';
+  const dotF = document.createElement('span'); dotF.className = 'dot';
+  dots.append(dotP, dotI, dotT, dotF);
+  const measure = document.createElement('span'); measure.className = 'tile-measure';
+  const dash = document.createElement('span'); dash.textContent = '—';
+  const vSpan = document.createElement('span');
+  const iSpan = document.createElement('span');
+  measure.append(dash, vSpan, iSpan);
+  tile.append(hv, title, dots, measure);
+  tile._parts = { hv, title, dotP, dotI, dotT, dotF, dash, vSpan, iSpan };
+}
+
 function renderBoardGrid() {
   const grid = $p('bmGrid'); if (!grid) return;
-  grid.innerHTML = '';
   let present = 0, tps = 0, iso = 0, fault = 0;
+  // valid=false means that field's read failed (e.g. a board design with
+  // the HV-current chip removed) -- the value itself is meaningless, so
+  // render "unknown" (dashed/hatched), never a confident-looking off.
+  const setDot = (el, on, ch, fa, valid = true) => {
+    el.className = 'dot ' + (!valid ? 'unknown' : fa ? 'fault' : on ? 'on' : 'off');
+    el.textContent = valid ? ch : '?';
+  };
   for (const b of boardCache) {
     if (b.present) present++; if (b.tps_enabled) tps++; if (b.iso_enabled) iso++; if (b.tps_fault) fault++;
-    const tile = document.createElement('div');
-    const cls = b.tps_fault ? 'fault' : b.present ? 'present' : 'absent';
     const k = bKey(b);
+    let tile = boardTiles.get(k);
+    if (!tile) {
+      tile = document.createElement('div');
+      const channel = b.channel, mux_port = b.mux_port;   // fixed identity, captured once
+      tile.addEventListener('click', (e) => {
+        if (!chEnabled(channel)) return;                  // masked-off channel: non-selectable
+        if (e.shiftKey) {
+          // Rectangular block from the anchor (boardPrimary) to this cell —
+          // selects every enabled board in channels [r0..r1] × ports [c0..c1].
+          selectRect(boardSel, boardPrimary, { channel, mux_port }, 'channel', 'mux_port', chEnabled);
+          renderBoardGrid();                               // anchor stays put so the block can be re-dragged
+        } else if (e.ctrlKey || e.metaKey) {
+          if (boardSel.has(k)) boardSel.delete(k); else boardSel.add(k);
+          boardPrimary = { channel, mux_port };   // move anchor for the next shift-block
+          renderBoardGrid();
+        } else {
+          boardSel.clear(); boardSel.add(k); boardPrimary = { channel, mux_port };
+          renderBoardGrid(); renderOneBoard(); readTpsRegs(); readStartupOcp();   // read OCP/delay/slew + startup OCP
+        }
+      });
+      buildTileParts(tile);
+      boardTiles.set(k, tile);
+      grid.appendChild(tile);
+    }
+    const cls = b.tps_fault ? 'fault' : b.present ? 'present' : 'absent';
     tile.className = 'status-tile ' + cls + (boardSel.has(k) ? ' selected' : '')
       + (chEnabled(b.channel) ? '' : ' masked')
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');
-    // valid=false means that field's read failed (e.g. a board design with
-    // the HV-current chip removed) -- the value itself is meaningless, so
-    // render "unknown" (dashed/hatched), never a confident-looking off.
-    const dot = (on, ch, fa, valid = true) =>
-      `<span class="dot ${!valid ? 'unknown' : fa ? 'fault' : on ? 'on' : 'off'}">${valid ? ch : '?'}</span>`;
+    const p = tile._parts;
     const hvValid = b.hv_overcurrent_valid;
-    const hv = `<span class="hv-badge ${!hvValid ? 'unknown' : b.hv_overcurrent ? 'on' : 'off'}" title="HV current ${!hvValid ? 'unavailable (chip not present)' : b.hv_overcurrent ? 'sensed (>1 mA)' : 'none'}">HV</span>`;
-    tile.innerHTML = hv
-      + `<span class="tile-title">${b.label}</span>`
-      + `<span class="tile-dots">${dot(b.present, 'P')}${dot(b.iso_enabled, 'I', false, b.iso_enabled_valid)}${dot(b.tps_enabled, 'T', b.tps_fault, b.tps_enabled_valid)}${dot(b.tps_fault, 'F', b.tps_fault, b.tps_fault_valid)}</span>`
-      + `<span class="tile-measure">${b.present
-          ? `<span>${(b.bus_mV / 1000).toFixed(2)} V</span><span>${b.current_mA} mA</span>`
-          : '<span>—</span>'}</span>`;
-    tile.addEventListener('click', (e) => {
-      if (!chEnabled(b.channel)) return;                 // masked-off channel: non-selectable
-      if (e.shiftKey) {
-        // Rectangular block from the anchor (boardPrimary) to this cell —
-        // selects every enabled board in channels [r0..r1] × ports [c0..c1].
-        selectRect(boardSel, boardPrimary, { channel: b.channel, mux_port: b.mux_port }, 'channel', 'mux_port', chEnabled);
-        renderBoardGrid();                               // anchor stays put so the block can be re-dragged
-      } else if (e.ctrlKey || e.metaKey) {
-        if (boardSel.has(k)) boardSel.delete(k); else boardSel.add(k);
-        boardPrimary = { channel: b.channel, mux_port: b.mux_port };   // move anchor for the next shift-block
-        renderBoardGrid();
-      } else {
-        boardSel.clear(); boardSel.add(k); boardPrimary = { channel: b.channel, mux_port: b.mux_port };
-        renderBoardGrid(); renderOneBoard(); readTpsRegs(); readStartupOcp();   // read OCP/delay/slew + startup OCP
-      }
-    });
-    grid.appendChild(tile);
+    p.hv.className = 'hv-badge ' + (!hvValid ? 'unknown' : b.hv_overcurrent ? 'on' : 'off');
+    p.hv.title = `HV current ${!hvValid ? 'unavailable (chip not present)' : b.hv_overcurrent ? 'sensed (>1 mA)' : 'none'}`;
+    p.title.textContent = b.label;
+    setDot(p.dotP, b.present, 'P');
+    setDot(p.dotI, b.iso_enabled, 'I', false, b.iso_enabled_valid);
+    setDot(p.dotT, b.tps_enabled, 'T', b.tps_fault, b.tps_enabled_valid);
+    setDot(p.dotF, b.tps_fault, 'F', b.tps_fault, b.tps_fault_valid);
+    p.dash.hidden = b.present; p.vSpan.hidden = !b.present; p.iSpan.hidden = !b.present;
+    if (b.present) {
+      p.vSpan.textContent = (b.bus_mV / 1000).toFixed(2) + ' V';
+      p.iSpan.textContent = b.current_mA + ' mA';
+    }
   }
   $p('bmSelSummary').textContent = `${boardSel.size} selected · ${present}P ${tps}T ${iso}I ${fault}F`;
 }
@@ -633,18 +680,26 @@ function wireBoards() {
     bmMsg(j.ok === false ? (j.error || 'set mask failed') : 'channel mask set');
   };
   const run = async (p) => { const j = await p; bmMsg(j.ok ? 'ok' : (j.error || 'failed')); refreshBoards(true); };
+  // Read INA specifically wants the LIVE read it just triggered to actually
+  // show up: refreshBoards(true) merges only the zero-I2C CACHED-current path
+  // (0x3A), which is often empty/invalid for a board not in CC-loop Current
+  // mode (see current_mA_valid) -- so a successful "ok" response was silently
+  // followed by a refresh that could show nothing for the exact board just
+  // read. refreshBoards(false) does its own live INA219 sweep (0x24), the
+  // same data source "Read INA" itself used, so the result is never thrown away.
+  const runLive = async (p) => { const j = await p; bmMsg(j.ok ? 'ok' : (j.error || 'failed')); refreshBoards(false); };
   $p('bmIsoOn').onclick = () => run(powerCmd('CH_SET_ISO_ENABLE', { ...batchExtra(), enable: true }));
   $p('bmIsoOff').onclick = () => run(powerCmd('CH_SET_ISO_ENABLE', { ...batchExtra(), enable: false }));
   $p('bmTpsOn').onclick = () => run(powerCmd('CH_SET_TPS_ENABLE', { ...batchExtra(), enable: true }));
   $p('bmTpsOff').onclick = () => run(powerCmd('CH_SET_TPS_ENABLE', { ...batchExtra(), enable: false }));
-  $p('bmReadIna').onclick = () => run(powerCmd('CH_GET_INA219', { ...batchExtra(), page_start: 0, max_entries: 64 }));
+  $p('bmReadIna').onclick = () => runLive(powerCmd('CH_GET_INA219', { ...batchExtra(), page_start: 0, max_entries: 64 }));
   $p('bmSetV').onclick = () => run(powerCmd('CH_SET_TPS_VOLTAGE', { ...batchExtra(), millivolts: Math.min(V_MAX_MV, +$p('bmTpsMv').value), enable_after_set: true }));
   $p('bmSetOcp').onclick = () => run(powerCmd('CH_SET_TPS_OCP_THRESHOLD', { ...batchExtra(), threshold_mA: Math.min(OCP_MAX_MA, +$p('bmOcp').value) }));
   $p('bmOneIsoOn').onclick = () => run(powerCmd('CH_SET_ISO_ENABLE', { ...single(), enable: true }));
   $p('bmOneIsoOff').onclick = () => run(powerCmd('CH_SET_ISO_ENABLE', { ...single(), enable: false }));
   $p('bmOneTpsOn').onclick = () => run(powerCmd('CH_SET_TPS_ENABLE', { ...single(), enable: true }));
   $p('bmOneTpsOff').onclick = () => run(powerCmd('CH_SET_TPS_ENABLE', { ...single(), enable: false }));
-  $p('bmOneReadIna').onclick = () => run(powerCmd('CH_GET_INA219', single()));
+  $p('bmOneReadIna').onclick = () => runLive(powerCmd('CH_GET_INA219', single()));
   $p('bmOneSetOcp').onclick = async () => { await run(powerCmd('CH_SET_TPS_OCP_THRESHOLD', { ...single(), threshold_mA: Math.min(OCP_MAX_MA, +$p('bmOneOcp').value) })); readTpsRegs(); };
   // Power state (CH_SET_POWER_STATE 0x35) — routed via /api/cmd (firmware-ahead
   // of build_command_payload). Idle/Active carry mA; Voltage carries mV.
