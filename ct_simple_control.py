@@ -175,6 +175,13 @@ Dependencies: pip install requests
 import math
 import time
 from contextlib import contextmanager
+from typing import NewType
+
+# FID: the canonical 0..95 filament id the backend and firmware agree on.
+# A NewType, not a plain alias: passing a USER_INDEX where a Fid is required is
+# then a type error a checker catches, instead of a wrong-but-legal int that
+# only shows up as a filament that mysteriously did not fire. Zero runtime cost.
+Fid = NewType("Fid", int)
 
 import requests
 
@@ -230,6 +237,29 @@ class CTClient:
     exception of acquire_lease()/lease().
     """
 
+    # ── Filament index spaces ────────────────────────────────────────────
+    # THREE spaces exist, and only two words used to name them -- with
+    # "physical" meaning both #2 and #1 depending on the sentence, which is
+    # how a dead filament once got blamed on the backend (see _dead_result).
+    # Each space now has exactly one name, and they are deliberately NOT
+    # symmetrical-looking: misreading one for the other has to be visible.
+    #
+    #   1. SITE       (controller, channel, position) -- where the wire
+    #                 physically is. Authority: the harness. Also `slot`
+    #                 (0-63), the firmware's power-slot index.
+    #   2. FID        0..95 canonical filament id. Authority: the backend's
+    #                 MAPPING and the firmware active-list. NEVER "physical".
+    #   3. USER_INDEX 0..95 what the SCRIPT calls it, after filament_order.
+    #                 Authority: this client only. NEVER "logical".
+    #
+    # Crossings go through exactly two functions -- _fid_of() outbound and
+    # _user_index_of() inbound. `filament_order` must not be touched anywhere
+    # else; that is mechanically checkable and the point of the rule.
+    #
+    # Public API takes and returns USER_INDEX (plain ints), because that is
+    # what scripts already pass. Conversion happens at the boundary, and
+    # everything past it carries Fid.
+
     def __init__(
         self,
         host: str = "localhost",      # backend.py's address — SAME machine:
@@ -273,8 +303,9 @@ class CTClient:
         # Dead mask — filaments blocked from all heating and HV pulse operations.
         # Set once with set_dead(); automatically applied to every batch call.
         self.dead: set[int] = set()
-        # Software-level logical->physical filament swap — see set_filament_order().
+        # Software-level USER_INDEX -> FID swap — see set_filament_order().
         self.filament_order: dict[int, int] = {}
+        self._order_rev: dict[int, int] = {}     # FID -> USER_INDEX, see _user_index_of
         # Auto-retry for TRANSIENT failures only — see _is_transient() below.
         # Does NOT retry deterministic rejections (dead filament, bad state,
         # lease held, arm rejected) since retrying those just wastes time;
@@ -452,7 +483,7 @@ class CTClient:
         return list(r.get("present") or [])
 
     # ── active-list mapping (filament <-> power slot) ─────────────────────────
-    # Which global filament (0-95) sits at which physical power slot — the
+    # Which global filament (0-95) sits at which power slot — the
     # host-owned "active-list" model. Every filament is assigned to controller
     # 1, 2, or unassigned; within a controller, filaments pack into power
     # slots (channel*8+position) in ascending filament order. This mapping is
@@ -527,19 +558,18 @@ class CTClient:
         return self._post("/api/mapping", body, timeout=15.0)
 
     def filament_to_board(self, filament: int) -> dict | None:
-        """Forward lookup: global filament index (0-95) -> physical board
-        location. Returns None if the filament is unassigned or overflowed
+        """Forward lookup: global filament index (0-95) -> SITE (controller/channel/position). Returns None if the filament is unassigned or overflowed
         past the usable slots (can't fire — see get_mapping()'s "overflow").
 
         Returns {"controller": 1|2, "channel": 0-7, "position": 0-7, "slot": 0-63}.
         """
         # get_mapping() reflects the BACKEND's hardware active-list, which
         # knows nothing about the client-side filament-order swap — look up
-        # the PHYSICAL index (what the backend actually calls this filament).
-        physical = self._phys(filament)
+        # the FID -- what the backend actually calls this filament.
+        fid = self._fid_of(filament)
         m = self.get_mapping().get("mapping") or {}
         for row in m.get("filaments") or []:
-            if row.get("filament") == physical:
+            if row.get("filament") == fid:
                 if row.get("controller") is None or row.get("slot") is None:
                     return None
                 return {"controller": row["controller"] + 1, "channel": row["channel"],
@@ -551,7 +581,7 @@ class CTClient:
                                              # convention elsewhere; 1-based)
                           channel: int,     # 0-7
                           position: int) -> int | None:  # 0-7 (aka "mux_port")
-        """Reverse lookup: physical board location -> global filament index.
+        """Reverse lookup: SITE (controller/channel/position) -> global filament index.
 
         controller: 1 or 2. channel/position: 0-7. Returns None if that
         slot is unassigned.
@@ -560,9 +590,9 @@ class CTClient:
         for row in m.get("filaments") or []:
             if (row.get("controller") == controller - 1 and row.get("channel") == channel
                 and row.get("position") == position):
-                physical = row.get("filament")
-                # translate back so you always see YOUR (logical) numbering
-                return self._logical(physical) if physical is not None else None
+                fid = row.get("filament")
+                # translate back so you always see YOUR (USER_INDEX) numbering
+                return self._user_index_of(fid) if fid is not None else None
         return None
 
     # ── lease ─────────────────────────────────────────────────────────────────
@@ -672,18 +702,18 @@ class CTClient:
 
     def _live(self, filaments=None) -> list[int] | None:
         """Return the filament list with dead filaments removed and the
-        filament-order swap applied (logical -> physical).
+        filament-order swap applied (USER_INDEX -> FID).
 
         If no dead mask/swap is set and filaments is None, returns None so
         the backend applies the command to all populated boards (most
         efficient) — a pure permutation swap doesn't change the SET of
         "every filament", so this shortcut stays valid even with a swap set.
         """
-        if not self.dead and not self.filament_order and filaments is None:
+        if not self.dead and not self._swap_active and filaments is None:
             return None
         base = list(filaments) if filaments is not None else list(range(self.FILAMENT_COUNT))
-        survivors = [f for f in base if f not in self.dead]   # dead-check on LOGICAL indices
-        return self._phys_list(survivors)                      # then translate to physical
+        survivors = [f for f in base if f not in self.dead]   # dead mask is in USER_INDEX space
+        return self._fids_of(survivors)                      # then cross to FID
 
     def _is_dead(self, filament: int) -> bool:
         """True if filament is in the dead mask."""
@@ -702,12 +732,12 @@ class CTClient:
     # active-list mapping (see get_mapping()/set_mapping() for that). Use this
     # to correct for boards being physically wired in a different order than
     # you'd naturally number them: after set_filament_order(), you keep using
-    # YOUR OWN (logical) numbering everywhere — dead mask, single-filament
+    # YOUR OWN (USER_INDEX) numbering everywhere — dead mask, single-filament
     # calls, batch calls, reads — and every one of them transparently talks
-    # to the PHYSICAL (actually-wired) filament underneath. You never need to
+    # to the FID (actually-wired filament) underneath. You never need to
     # translate anything yourself.
 
-    FILAMENT_COUNT = 96      # logical filaments 0..95
+    FILAMENT_COUNT = 96      # USER_INDEX filaments 0..95
 
     @classmethod
     def identity_order(cls) -> list[int]:
@@ -716,10 +746,10 @@ class CTClient:
         return list(range(cls.FILAMENT_COUNT))
 
     def set_filament_order(self, order) -> None:
-        """Define the logical->physical filament mapping EXPLICITLY.
+        """Define the USER_INDEX -> FID mapping EXPLICITLY.
 
         order: a sequence of exactly 96 integers, where order[i] is the
-        PHYSICAL filament that your logical filament i refers to. Pass None
+        FID that your USER_INDEX i refers to. Pass None
         or an empty sequence to clear back to identity (no remapping).
 
         The whole table is stated, not a diff. The previous "only list what
@@ -730,9 +760,9 @@ class CTClient:
 
         MUST BE ONE-TO-ONE. Every filament 0..95 has to appear exactly once,
         so the mapping is a true permutation and is reversible: this client
-        translates your indices to physical ones on the way out and back to
-        yours on the way in, and that round trip only works if no two logical
-        filaments claim the same physical board. Raises ValueError naming the
+        crosses your indices to FIDs on the way out and back to
+        yours on the way in, and that round trip only works if no two USER_INDEX
+        values claim the same FID. Raises ValueError naming the
         offending entries otherwise -- a length that isn't 96, a value outside
         0..95, or any duplicate.
 
@@ -741,8 +771,8 @@ class CTClient:
             order[5], order[8] = 8, 5        # state BOTH directions yourself
             ct.set_filament_order(order)
 
-            ct.active_one(5, 2900)           # commands physical filament 8
-            ct.read_filament_current(5)      # reads physical filament 8,
+            ct.active_one(5, 2900)           # commands FID 8
+            ct.read_filament_current(5)      # reads FID 8,
                                               # returned keyed as "filament 5"
 
         Note you now write both directions explicitly. The old dict form
@@ -752,6 +782,7 @@ class CTClient:
         n = self.FILAMENT_COUNT
         if order is None or (hasattr(order, "__len__") and len(order) == 0):
             self.filament_order = {}
+            self._order_rev = {}
             return
         if isinstance(order, dict):
             raise ValueError(
@@ -779,7 +810,7 @@ class CTClient:
         dupes: list[str] = []
         for i, v in enumerate(seq):
             if v in seen:
-                dupes.append(f"physical {v} claimed by both logical {seen[v]} and {i}")
+                dupes.append(f"FID {v} claimed by both USER_INDEX {seen[v]} and {i}")
             else:
                 seen[v] = i
             
@@ -790,64 +821,78 @@ class CTClient:
                 + (f" (and {len(dupes) - 6} more)" if len(dupes) > 6 else "")
                 + ". Every filament 0..%d must appear exactly once, or "
                   "translating results back to your numbering is ambiguous." % (n - 1))
-        # Store only the entries that actually differ: _phys/_logical short-
+        # Store only the entries that actually differ: _fid_of/_user_index_of short-
         # circuit on an empty table, so identity stays free.
         self.filament_order = {i: v for i, v in enumerate(seq) if v != i}
+        # Built here, not on lookup: set_filament_order() already proved the
+        # mapping is a permutation, so the inverse is well-defined and total.
+        self._order_rev = {v: k for k, v in self.filament_order.items()}
 
     def get_filament_order(self) -> list[int]:
         """The current mapping as an explicit 96-entry list, order[i] = the
-        physical filament logical i refers to. Identity when no remapping is
+        FID that USER_INDEX i refers to. Identity when no remapping is
         set, so this always round-trips through set_filament_order()."""
         return [self.filament_order.get(i, i) for i in range(self.FILAMENT_COUNT)]
 
-    def _phys(self, filament: int) -> int:
-        """Logical -> physical filament index (identity if no swap is set)."""
-        return self.filament_order.get(int(filament), int(filament)) if self.filament_order else int(filament)
+    @property
+    def _swap_active(self) -> bool:
+        """Whether any USER_INDEX differs from its FID. Exists so that the only
+        places `filament_order` itself is read are the two crossing functions
+        and its own setter/getter -- which makes the boundary rule something a
+        grep can check, not just a convention."""
+        return bool(self.filament_order)
 
-    def _phys_list(self, filaments) -> list[int]:
-        """Translate a list of logical filament indices to physical ones."""
-        return [self._phys(f) for f in filaments]
+    def _fid_of(self, filament: int) -> Fid:
+        """USER_INDEX -> FID. The only outbound crossing (identity with no swap)."""
+        f = int(filament)
+        return Fid(self.filament_order.get(f, f) if self.filament_order else f)
 
-    def _phys_keys(self, d: dict) -> dict:
-        """Translate a {filament: value} dict's KEYS from logical to physical."""
-        return {self._phys(k): v for k, v in d.items()}
+    def _fids_of(self, filaments) -> list[Fid]:
+        """Translate a list of USER_INDEX values to FIDs."""
+        return [self._fid_of(f) for f in filaments]
 
-    def _logical(self, physical: int) -> int:
-        """Physical -> logical filament index (reverse of _phys) — used to
-        re-key read results so you always see YOUR OWN numbering back."""
-        if not self.filament_order:
-            return physical
-        for k, v in self.filament_order.items():
-            if v == physical:
-                return k
-        return physical
+    def _fid_keys(self, d: dict) -> dict:
+        """Translate a {filament: value} dict's KEYS from USER_INDEX to FID."""
+        return {self._fid_of(k): v for k, v in d.items()}
 
-    def _relog_response(self, r: dict, keys=("applied", "failed")) -> dict:
-        """Re-key filament-index LISTS in a batch response from physical
-        back to logical — both at the top level and inside any
+    def _user_index_of(self, fid: int) -> int:
+        """FID -> USER_INDEX. The only inbound crossing — re-keys read results
+        so a script always sees its OWN numbering back.
+
+        Uses a reverse map built once in set_filament_order(): this runs per
+        filament inside result loops, and the linear scan it replaces was
+        O(len(order)) on every single lookup.
+        """
+        if not self._order_rev:
+            return int(fid)
+        return self._order_rev.get(int(fid), int(fid))
+
+    def _reindex_response(self, r: dict, keys=("applied", "failed")) -> dict:
+        """Re-key filament-index LISTS in a batch response from FID
+        back to USER_INDEX — both at the top level and inside any
         per-controller "results" sub-dict. Only touches keys whose value is
         actually a list (some responses use "applied" as a plain COUNT, not
         a list of indices — those are left untouched). Every batch method
         that returns filament-index lists runs its response through this."""
         for k in keys:
             if isinstance(r.get(k), list):
-                r[k] = [self._logical(f) for f in r[k]]
+                r[k] = [self._user_index_of(f) for f in r[k]]
         for row in (r.get("results") or {}).values():
             if isinstance(row, dict):
                 for k in keys:
                     if isinstance(row.get(k), list):
-                        row[k] = [self._logical(f) for f in row[k]]
+                        row[k] = [self._user_index_of(f) for f in row[k]]
         return r
 
     # ── power state ───────────────────────────────────────────────────────────
 
     def _prep(self, state: int, filaments=None,
               currents: dict | None = None, arg: int = 0) -> dict:
-        # Logical indices this call actually asked for that the dead mask
+        # USER_INDEX values this call actually asked for that the dead mask
         # drops BEFORE anything is sent — _live()'s filtering is invisible
         # to the caller otherwise. A filament silently vanishing here (e.g.
-        # because a filament_order swap happens to route a DEAD logical
-        # index onto an otherwise-fine physical board) looked exactly like
+        # because a filament_order swap happens to route a DEAD USER_INDEX
+        # onto an otherwise-fine FID) looked exactly like
         # a backend bug until this was surfaced -- see the "why was 25
         # skipped" investigation this traced back to set_dead().
         requested = [int(f) for f in filaments] if filaments is not None else list(range(96))
@@ -860,16 +905,16 @@ class CTClient:
         if live is not None:
             body["filaments"] = live
         if currents:
-            # strip dead filaments (checked on LOGICAL keys), then translate
-            # the survivors' keys to physical for the wire
+            # strip dead filaments (checked on USER_INDEX keys), then cross
+            # the survivors' keys to FID for the wire
             alive = {int(k): v for k, v in currents.items() if int(k) not in self.dead}
-            body["currents"] = {str(self._phys(k)): int(v) for k, v in alive.items()}
+            body["currents"] = {str(self._fid_of(k)): int(v) for k, v in alive.items()}
         # "excluded" (top level) + "touched"/"not_this_controller"/"unslotted"
         # (per-controller, inside "results") are filament-index lists too --
-        # re-key them back to logical the same as applied/failed, or a swap
-        # would leak physical numbers into what's supposed to be an all-
-        # logical response.
-        r = self._relog_response(
+        # re-key them back to USER_INDEX the same as applied/failed, or a swap
+        # would leak FIDs into what is supposed to be an all-USER_INDEX
+        # response.
+        r = self._reindex_response(
             self._post("/api/filament-prep", body, timeout=20.0),
             keys=("applied", "failed", "excluded", "touched", "not_this_controller", "unslotted"))
         if dead_skipped:
@@ -976,15 +1021,15 @@ class CTClient:
     # back as {"ok": False, "error": "...", ...} — check "ok" yourself.
 
     def _state_one(self, filament: int, state: int, arg: int, op: str) -> dict:
-        if self._is_dead(filament):   # dead-check on the LOGICAL index, as the caller sees it
+        if self._is_dead(filament):   # dead mask is USER_INDEX, which is what the caller passed
             return self._dead_result(filament)
         r = self._post("/api/filament-state",
-                       {"filament": self._phys(filament), "state": state, "arg": int(arg)})
+                       {"filament": self._fid_of(filament), "state": state, "arg": int(arg)})
         # The board-didn't-ACK soft failure carries no "error" message on the
         # wire — fill one in so a printed/logged result is never just "None".
         if not r.get("ok") and not r.get("error"):
             r["error"] = "board did not ACK (absent, unseated, or faulted?)"
-        r["filament"] = int(filament)   # always echo back YOUR (logical) number, not the physical one
+        r["filament"] = int(filament)   # always echo back YOUR (USER_INDEX) number, not the FID
         return r
 
     def wait_for_current(self, filament: int,
@@ -1296,11 +1341,11 @@ class CTClient:
         "fault": 0/1/2, "fault_name": "none"/"open"/"OCP/SCP"}.
         Never raises — check "ok".
         """
-        r = self._get(f"/api/filament-status?filament={self._phys(filament)}")
+        r = self._get(f"/api/filament-status?filament={self._fid_of(filament)}")
         if r.get("ok"):
             r["state_name"] = _STATE_NAMES.get(r.get("state"))
             r["fault_name"] = _FAULT_NAMES.get(r.get("fault"))
-        r["filament"] = int(filament)   # always echo back YOUR (logical) number
+        r["filament"] = int(filament)   # always echo back YOUR (USER_INDEX) number
         return r
 
     # ── OCP protection ─────────────────────────────────────────────────────────
@@ -1334,8 +1379,8 @@ class CTClient:
         in that case, not a real 0 mA trip point). Returns
         {"ok": False, "error": ...} if the filament has no board mapping.
         """
-        r = self._get(f"/api/ocp-threshold?filament={self._phys(filament)}")
-        r["filament"] = int(filament)   # always echo back YOUR (logical) number
+        r = self._get(f"/api/ocp-threshold?filament={self._fid_of(filament)}")
+        r["filament"] = int(filament)   # always echo back YOUR (USER_INDEX) number
         return r
 
     def set_ocp_threshold_one(self, filament: int, threshold_ma: int) -> dict:
@@ -1376,8 +1421,8 @@ class CTClient:
         """
         body: dict = {"threshold_ma": int(threshold_ma)}
         if filaments is not None:
-            body["filaments"] = self._phys_list(filaments)
-        return self._relog_response(self._post("/api/ocp-threshold", body, timeout=30.0),
+            body["filaments"] = self._fids_of(filaments)
+        return self._reindex_response(self._post("/api/ocp-threshold", body, timeout=30.0),
                                     keys=("applied", "failed", "excluded", "touched",
                                             "not_this_controller", "unslotted",
                                             "mismatched", "unstable"))
@@ -1429,9 +1474,9 @@ class CTClient:
         """
         if self._is_dead(filament):
             return self._dead_result(filament)
-        r = self._post("/api/hv-grid", {"filaments": [self._phys(filament)],
+        r = self._post("/api/hv-grid", {"filaments": [self._fid_of(filament)],
                                         "on": bool(on), "force": bool(force)})
-        return self._relog_response(r, keys=("applied", "failed", "excluded", "touched",
+        return self._reindex_response(r, keys=("applied", "failed", "excluded", "touched",
                                             "not_this_controller", "unslotted",
                                             "mismatched", "unstable"))
 
@@ -1450,13 +1495,13 @@ class CTClient:
 
         Returns {"ok", "results": {controller: {...}}, "applied": [...], "failed": [...]}.
         """
-        # dead_skipped is computed on the LOGICAL indices BEFORE _live() translates,
+        # dead_skipped is computed on USER_INDEX BEFORE _live() crosses to FID,
         # so it reads back in YOUR numbering. Without it, hv_grid_off_all([5]) with
         # 5 dead-masked returned a bare ok:True while the grid switch stayed ON --
         # a success-shaped no-op on an HV path.
         requested = None if filaments is None else [int(f) for f in filaments]
         dead_skipped = [] if requested is None else [f for f in requested if f in self.dead]
-        live = self._live(filaments)   # already translated to physical
+        live = self._live(filaments)   # already crossed to FID
         if live is not None and len(live) == 0:
             # ok:False -- the caller named filaments and NONE were commanded.
             return {"ok": False, "applied": [], "failed": [], "skipped_dead": True,
@@ -1465,7 +1510,7 @@ class CTClient:
         body: dict = {"on": bool(on), "force": bool(force)}
         if live is not None:
             body["filaments"] = live
-        r = self._relog_response(self._post("/api/hv-grid", body, timeout=20.0),
+        r = self._reindex_response(self._post("/api/hv-grid", body, timeout=20.0),
                                  keys=("applied", "failed", "excluded", "touched",
                                             "not_this_controller", "unslotted",
                                             "mismatched", "unstable"))
@@ -1486,10 +1531,10 @@ class CTClient:
         sense line (a mismatch flags a stuck/dead switch).
         """
         r = self._get(f"/api/hv-grid-status?controller={controller}")
-        # Backend replies keyed by PHYSICAL filament (as a string) — re-key
-        # to LOGICAL so this always matches YOUR numbering.
+        # Backend replies keyed by FID (as a string) -- re-key to
+        # USER_INDEX so this always matches YOUR numbering.
         if isinstance(r.get("filaments"), dict):
-            r["filaments"] = {str(self._logical(int(k))): v
+            r["filaments"] = {str(self._user_index_of(int(k))): v
                               for k, v in r["filaments"].items()}
         return r
 
@@ -1528,11 +1573,11 @@ class CTClient:
 
         Returns {"ok", "board": 0|1, "mismatch": 0|1, "mismatchCount": int,
         "faultedSlots": [raw slot ints, 8*channel+position],
-        "faultedFilaments": [global filament indices, your logical numbering]}.
+        "faultedFilaments": [global filament indices, your USER_INDEX numbering]}.
         """
         r = self._shv(controller, {"op": "fault_policy"})
         if r.get("ok") and "faultedFilaments" in r:
-            r["faultedFilaments"] = [self._logical(f) for f in r["faultedFilaments"]]
+            r["faultedFilaments"] = [self._user_index_of(f) for f in r["faultedFilaments"]]
         return r
 
     def set_fault_policy(self, controller: int = 1,
@@ -1552,7 +1597,7 @@ class CTClient:
             body["mismatch"] = int(mismatch)
         r = self._shv(controller, body)
         if r.get("ok") and "faultedFilaments" in r:
-            r["faultedFilaments"] = [self._logical(f) for f in r["faultedFilaments"]]
+            r["faultedFilaments"] = [self._user_index_of(f) for f in r["faultedFilaments"]]
         return r
 
     def get_trigger_delay(self, controller: int = 1) -> dict:
@@ -1728,7 +1773,7 @@ class CTClient:
         return [int(f) for f in filaments]
 
     @staticmethod
-    def _entry(raw: dict, logical: int, source: str) -> dict:
+    def _entry(raw: dict, user_index: int, source: str) -> dict:
         """Normalise one backend entry to the common shape.
 
         Fields the source cannot supply are None, not 0 -- the live read has no
@@ -1745,7 +1790,7 @@ class CTClient:
         if not present:
             mA = mV = None
         valid = mA is not None or mV is not None
-        return {"index": logical, "present": present,
+        return {"index": user_index, "present": present,
                 "bus_mV": float(mV) if mV is not None else None,
                 "current_mA": float(mA) if mA is not None else None,
                 "target_mA": (float(raw["target_mA"])
@@ -1808,19 +1853,19 @@ class CTClient:
         want = self._want_filaments(filaments)
 
         if want is not None and len(want) == 1:
-            r = self._get(f"/api/filament-currents?filament={self._phys(want[0])}")
+            r = self._get(f"/api/filament-currents?filament={self._fid_of(want[0])}")
         else:
             r = self._get("/api/filament-currents")
-        # The backend replies keyed by PHYSICAL filament index (it has no
-        # concept of the client-side swap) — re-key to LOGICAL so the
+        # The backend replies keyed by FID (it has no
+        # concept of the client-side swap) -- re-key to USER_INDEX so the
         # result always matches YOUR numbering, then filter on that. Also
         # fix up the "index" field INSIDE each entry (a raw copy of the key,
-        # left as physical by the backend) so it agrees with the outer key.
+        # left as FID by the backend) so it agrees with the outer key.
         raw = {int(k): v for k, v in (r.get("filaments") or {}).items()}
         out = {}
         for k, v in raw.items():
-            logical = self._logical(k)
-            out[logical] = self._entry(v, logical, "cached") if isinstance(v, dict) else v
+            user_index = self._user_index_of(k)
+            out[user_index] = self._entry(v, user_index, "cached") if isinstance(v, dict) else v
         if want is not None:
             keep = set(want)
             out = {k: v for k, v in out.items() if k in keep}
@@ -1883,8 +1928,8 @@ class CTClient:
               if isinstance(row, dict) and "index" in row}
         out = {}
         for k, v in raw.items():
-            logical = self._logical(k)
-            out[logical] = self._entry(v, logical, "live")
+            user_index = self._user_index_of(k)
+            out[user_index] = self._entry(v, user_index, "live")
         if want is not None:
             keep = set(want)
             out = {k: v for k, v in out.items() if k in keep}
@@ -1949,19 +1994,19 @@ class CTClient:
     # building blocks for advanced/custom sequences only — see the warning
     # on that section before reaching for them.
 
-    def _phys_plan(self, plan: dict) -> tuple[dict, list]:
-        """Translate a schedule plan's filament indices LOGICAL -> PHYSICAL and
+    def _plan_to_fids(self, plan: dict) -> tuple[dict, list]:
+        """Translate a schedule plan's filament indices USER_INDEX -> FID and
         drop dead-masked entries. Returns (translated_plan, dead_skipped).
 
-        This is the ONE place a plan crosses the logical/physical boundary. It
+        This is the ONE place a plan crosses the USER_INDEX/FID boundary. It
         used to be nowhere: download()/verify_schedule() put plan indices on the
-        wire raw while every other filament-taking method went through _phys(),
-        so with a swap active `active_one(5)` heated physical 8 while a plan
-        naming 5 scheduled physical 5 -- the schedule fired a different, unheated
+        wire raw while every other filament-taking method went through _fid_of(),
+        so with a swap active `active_one(5)` heated FID 8 while a plan
+        naming 5 scheduled FID 5 -- the schedule fired a different, unheated
         filament than the one just pre-heated. fire_single_pulse compensated by
         pre-translating its own plan; that compensation is now REMOVED (it would
         translate twice here, and a symmetric swap would map straight back to the
-        original). Build plans in LOGICAL indices; this converts them.
+        original). Build plans in USER_INDEX; this crosses them to FID.
 
         Dead entries are dropped rather than sent, matching _live()/_prep(), and
         reported so the drop is never silent."""
@@ -1981,7 +2026,7 @@ class CTClient:
                     if f not in dead_skipped:
                         dead_skipped.append(f)
                     continue
-                kept.append({**row, "filament": self._phys(f)})
+                kept.append({**row, "filament": self._fid_of(f)})
             out[key] = kept
         cur = plan.get("currents")
         if isinstance(cur, dict):
@@ -1992,7 +2037,7 @@ class CTClient:
                     if f not in dead_skipped:
                         dead_skipped.append(f)
                     continue
-                kept_cur[self._phys(f)] = v
+                kept_cur[self._fid_of(f)] = v
             out["currents"] = kept_cur
         return out, sorted(dead_skipped)
 
@@ -2015,8 +2060,8 @@ class CTClient:
         actually owns, so this is safe even when only one controller is
         involved. Downloads to both connected controllers if both are up.
 
-        Plan filament indices are LOGICAL (your numbering) — they are translated
-        through filament_order and dead-filtered on the way out by _phys_plan().
+        Plan filament indices are USER_INDEX (your numbering) -- they are crossed
+        through filament_order and dead-filtered on the way out by _plan_to_fids().
         Any dead-masked entry is dropped and reported back as "dead_skipped";
         if that would leave nothing to fire, the download is refused outright
         rather than writing an empty emission table.
@@ -2024,7 +2069,7 @@ class CTClient:
         Returns {"ok", "results": [...]} — one result dict per controller, plus
         "dead_skipped": [...] whenever the dead mask removed something.
         """
-        wire_plan, dead_skipped = self._phys_plan(plan)
+        wire_plan, dead_skipped = self._plan_to_fids(plan)
         if isinstance(plan.get("emission"), list) and plan["emission"] and not wire_plan["emission"]:
             return {"ok": False, "results": [], "dead_skipped": dead_skipped,
                     "error": "every emission entry is dead-masked — nothing to download"}
@@ -2058,14 +2103,14 @@ class CTClient:
         download() and before arming, to catch a corrupted/partial transfer
         before firing anything.
 
-        Takes the SAME logical-index plan you gave download() — it is translated
-        identically here (_phys_plan), so the CRC compared against the hardware
+        Takes the SAME USER_INDEX plan you gave download() -- it is crossed
+        identically here (_plan_to_fids), so the CRC compared against the hardware
         is computed over the bytes that were actually written. Passing a plan
         that download() dead-filtered is fine: this filters it the same way.
 
         Returns {"ok", "results": {controller: {"match": bool, ...}}}.
         """
-        wire_plan, _dead = self._phys_plan(plan)
+        wire_plan, _dead = self._plan_to_fids(plan)
         return self._post("/api/verify-schedule", {"plan": wire_plan}, timeout=10.0)
 
     # ── SHV schedule — low-level ──────────────────────────────────────────────
@@ -2126,7 +2171,7 @@ class CTClient:
             return {"ok": False, "error": err}
         return self._shv(controller, {
             "op": "set_entries",
-            "entries": [{"filament": self._phys(filament),
+            "entries": [{"filament": self._fid_of(filament),
                          "numPulses": int(num_pulses),
                          "width": int(width_us)}],
         })
@@ -2226,11 +2271,11 @@ class CTClient:
         """SHV status: {state, filamentIndex, totalPulsesDone, elapsedMs, …}.
         Returns {} on failure (never raises)."""
         st = self._shv(controller, {"op": "status"}).get("status") or {}
-        # filamentIndex/faultFilament come back as PHYSICAL (0xFF/255 = none)
-        # — re-key to LOGICAL so they match YOUR numbering.
+        # filamentIndex/faultFilament come back as FID (0xFF/255 = none)
+        # -- re-key to USER_INDEX so they match YOUR numbering.
         for key in ("filamentIndex", "faultFilament"):
             if key in st and st[key] not in (None, 0xFF, 255):
-                st[key] = self._logical(st[key])
+                st[key] = self._user_index_of(st[key])
         return st
 
     def shv_pulse_log(self,
@@ -2244,7 +2289,7 @@ class CTClient:
                                          "start": int(start)}).get("records") or []
         for rec in records:
             if "filament" in rec:
-                rec["filament"] = self._logical(rec["filament"])
+                rec["filament"] = self._user_index_of(rec["filament"])
         return records
 
     # ── SyncIn simulate (ESP32-generated trigger pulses) ──────────────────────
@@ -2664,12 +2709,12 @@ class CTClient:
                                         if trigger == "sim" else int(inter_pulse_ms)),
                        "maxOnMs": int(max_on_ms),
                        "totalMs": int(total_ms), "triggerEdge": 0},
-            # LOGICAL filament here — download()/verify_schedule() translate to
-            # physical via _phys_plan(). This used to call _phys() itself, back
+            # USER_INDEX here -- download()/verify_schedule() cross to FID
+            # via _plan_to_fids(). This used to call _fid_of() itself, back
             # when download() sent plans raw; doing both would translate twice
             # (a symmetric swap maps straight back to the original). Keep the
-            # plan logical so _last_plan's reuse comparison is logical too, and
-            # so shv_pulse_log()'s re-keying to logical still lines up with the
+            # plan in USER_INDEX so _last_plan's reuse comparison is too, and
+            # so shv_pulse_log()'s re-keying still lines up with the
             # "fired"/"records" filter below.
             "emission": [{"filament": int(filament), "numPulses": int(num_pulses),
                          "widthUs": int(width_us)}],

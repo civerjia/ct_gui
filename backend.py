@@ -15,6 +15,7 @@ STM32 = the device's HTTP /stm32 status (age_ms).
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import logging.handlers
@@ -1257,6 +1258,96 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CALIB_DIR = Path(__file__).resolve().parent / "calibration"   # emission-current calibration records
+STATE_DIR = Path(__file__).resolve().parent / "state"         # operator decisions that must outlive a restart
+
+
+# ── Dead filaments ───────────────────────────────────────────────────────────
+# "dead" means THIS FILAMENT MUST NOT BE ENERGISED. The board it sits on may be
+# perfectly fine; the filament is the thing that is faulty. It is an operator
+# decision, never an inference -- in particular it is NOT presence: a board
+# going offline and coming back says nothing about whether its filament is
+# usable, so nothing here ever clears an entry automatically.
+#
+# It lives here rather than in the client for two reasons, and the second is
+# the real one:
+#   1. a client-side set dies with the script, so the next script energises a
+#      filament someone already determined was bad;
+#   2. a client-side set is only enforced by clients that bother to. The GUI, a
+#      curl, someone else's script -- all could energise a dead filament, and
+#      backend.py would carry it out. Storage here is convenience; ENFORCEMENT
+#      here is the point.
+#
+# Stored in FID space (the canonical 0..95 the firmware agrees on), never in a
+# client's own numbering: a faulty filament is faulty regardless of any
+# per-script remapping, and a set stored in one script's numbering would mean
+# something different to the next. Clients cross at their own boundary.
+DEAD_STATE_PATH = STATE_DIR / "dead_fids.json"
+_DEAD_LOCK = threading.Lock()
+# fid -> {"reason": str, "by": str, "at": iso8601}. Provenance is not decoration:
+# an entry that can never expire and blocks energising needs to say why, or in
+# three months nobody knows why 55 is off and nobody dares clear it.
+DEAD_FIDS: dict[int, dict] = {}
+
+# Which FIDs the last successful download actually put in each controller's
+# emission table. /api/arm needs it: marking a filament dead AFTER a download
+# must not leave a loaded table that would still fire it, and the backend has no
+# other way to know what the table contains (SHV_GET_TABLE_INFO returns counts,
+# not entries). Deliberately NOT persisted -- it describes what is in the
+# firmware's RAM right now, and a backend restart is no evidence about that.
+LOADED_EMIT_FIDS: dict[int, set[int]] = {}
+
+
+def _dead_load() -> None:
+    global DEAD_FIDS
+    try:
+        raw = json.loads(DEAD_STATE_PATH.read_text())
+        entries = raw.get("dead") if isinstance(raw, dict) else None
+        if isinstance(entries, dict):
+            DEAD_FIDS = {int(k): dict(v) for k, v in entries.items()
+                         if 0 <= int(k) < FILAMENT_COUNT}
+            log.info("dead filaments: loaded %d from %s", len(DEAD_FIDS), DEAD_STATE_PATH.name)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        # Do NOT start with an empty mask on a parse error: that would silently
+        # re-enable every filament someone disabled. Refuse to start instead.
+        raise SystemExit(f"dead filament state at {DEAD_STATE_PATH} is unreadable "
+                         f"({e}). Fix or move the file; refusing to start with an "
+                         f"empty mask, which would re-enable disabled filaments.")
+
+
+def _dead_save() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = DEAD_STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"dead": {str(k): v for k, v in sorted(DEAD_FIDS.items())}}, indent=2))
+    tmp.replace(DEAD_STATE_PATH)   # atomic: a crash mid-write must not truncate the mask
+
+
+# PowerState values that put power ON the filament, so the ones a dead filament
+# must be refused. STOP(1)/SLEEP(2) leave the output off; STANDBY(3) enables it
+# at the firmware's 0.8 V floor, so it is NOT a no-power state and is included.
+#
+# STOP and SLEEP are deliberately ALWAYS allowed, even for a dead filament:
+# refusing them would make it impossible to turn a faulty filament OFF, which
+# inverts the whole point. Enforcement blocks energising, never de-energising.
+ENERGISING_STATES = frozenset({3, 4, 5, 6})   # STANDBY, IDLE, ACTIVE, VOLTAGE
+
+
+def dead_fids() -> set[int]:
+    with _DEAD_LOCK:
+        return set(DEAD_FIDS)
+
+
+def split_dead(fids) -> tuple[list[int], list[int]]:
+    """Partition an iterable of FIDs into (alive, dead), preserving order."""
+    d = dead_fids()
+    alive, dead = [], []
+    for f in fids:
+        (dead if int(f) in d else alive).append(int(f))
+    return alive, dead
+
+
+_dead_load()
 
 
 def _hv_lut_path(chan: str) -> Path:
@@ -2143,6 +2234,15 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     # emission table — full global list (entry carries global filament 0-95)
     reqs.append((SHV_CLEAR_TABLE, b"", 0)); labels.append("emit_clear"); cur_fil.append(None)
     emit = plan.get("emission") or []
+    # Dead filaments never make it into the table. Filtered (not rejected) to
+    # match every other batch path, but NAMED in the result: a schedule is a
+    # committed artifact and an entry quietly vanishing from it is how you end
+    # up believing a filament was scanned when it never fired.
+    emit_dead = sorted({int(e["filament"]) for e in emit if int(e["filament"]) in dead_fids()})
+    if emit_dead:
+        emit = [e for e in emit if int(e["filament"]) not in dead_fids()]
+        log.warning("download_to_controller: dropped dead filaments %s from the "
+                    "emission table (controller=%d)", emit_dead, controller)
     ent = bytearray()
     for e in emit:
         ent += bytes([int(e["filament"]) & 0xFF, int(e["numPulses"]) & 0xFF]) + _u16(int(e["widthUs"]))
@@ -2232,10 +2332,21 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
           f"({per_frame:.0f} ms/frame) | currents {cur_n}f (+{cur_skipped} cached) · emit {emit_frames}f · heat {hn // SHV_HEAT_CHUNK + 1}f"
           + (f" · {len(fails)} FAILED: {fails[:6]}" if fails else ""), flush=True)
 
-    return {"controller": controller, "ok": ok, "emit": n, "heat": hn,
-            "frames": total, "curSent": cur_n, "curCached": cur_skipped,
-            "fails": len(fails), "failLabels": fails[:12],
-            "timing": {"total": total_ms}}
+    # Record what is now in this controller's table, so /api/arm can re-check it
+    # against the dead mask as it stands AT ARM TIME, not at download time.
+    # Only on success: a failed download leaves the table in an unknown state, and
+    # claiming to know its contents would be worse than admitting we do not.
+    if ok:
+        LOADED_EMIT_FIDS[controller] = {int(e["filament"]) for e in emit}
+    else:
+        LOADED_EMIT_FIDS.pop(controller, None)
+    out = {"controller": controller, "ok": ok, "emit": n, "heat": hn,
+           "frames": total, "curSent": cur_n, "curCached": cur_skipped,
+           "fails": len(fails), "failLabels": fails[:12],
+           "timing": {"total": total_ms}}
+    if emit_dead:
+        out["dead_skipped"] = emit_dead
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2248,9 +2359,16 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
                    filaments=None, currents=None, default_arg: int = 0,
                    channels=DEFAULT_CHANNELS) -> dict:
     """Apply CH_SET_POWER_STATE to a set of this controller's filaments. `filaments`
-    is a logical 0-95 list (only this controller's are touched); None = every
-    populated board the controller owns. `currents` maps filament→mA for the
-    Idle/Active arg (falls back to default_arg)."""
+    is a FID 0-95 list (only this controller's are touched); None = every
+    populated board the controller owns. `currents` maps FID→mA for the
+    Idle/Active arg (falls back to default_arg).
+
+    Dead filaments are dropped here and returned in "dead_skipped". This is the
+    enforcement point for the whole batch path BECAUSE it is where `None`
+    expands to every populated board -- filtering in the endpoint instead would
+    cover an explicit list and silently miss the broadcast case, which is the
+    one that touches everything.
+    """
     currents = currents or {}
     if filaments is None:
         fils = MAPPING.filaments(controller)
@@ -2266,6 +2384,15 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         # NO controller ends up claiming a requested filament -- the top-level
         # handler reconciles that across all `results`, see "excluded" there.
         not_this_controller = [f for f in requested if f not in fils]
+    # Dead filaments out, AFTER the None expansion above so the broadcast case
+    # is covered too. Only for states that energise: a dead filament must still
+    # be STOPpable (see ENERGISING_STATES).
+    dead_skipped: list[int] = []
+    if state in ENERGISING_STATES:
+        fils, dead_skipped = split_dead(fils)
+        if dead_skipped:
+            log.warning("prep_filaments: refused to energise dead filaments %s "
+                        "(state=%d, controller=%d)", dead_skipped, state, controller)
     # BATCHED, not per-filament. A per-filament flood (~48 CH_SET_POWER_STATE frames
     # back-to-back) overwhelmed the RP2350's UART+I2C and tripped its 2 s watchdog
     # ("Stop all" -> RP2350 reset). Instead send ONE MASKED frame per (channel,
@@ -2282,7 +2409,7 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     if not fils:
         return {"controller": controller, "ok": True, "applied": 0, "failed": [],
                 "state": int(state), "touched": [], "not_this_controller": not_this_controller,
-                "unslotted": unslotted}
+                "unslotted": unslotted, "dead_skipped": dead_skipped}
     groups: dict = {}   # (channel, arg) -> OR'd mask byte for that channel
     members: dict = {}  # (channel, arg) -> [filament]
     for f in fils:
@@ -2324,7 +2451,8 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
                 failed.append(int(f))
     return {"controller": controller, "ok": not failed and not unslotted, "applied": applied,
             "total": len(fils), "failed": failed, "state": int(state),
-            "touched": fils, "not_this_controller": not_this_controller, "unslotted": unslotted}
+            "touched": fils, "not_this_controller": not_this_controller,
+            "unslotted": unslotted, "dead_skipped": dead_skipped}
 
 
 def hv_grid_set(link: "ControllerLink", controller: int, filaments,
@@ -2353,6 +2481,17 @@ def hv_grid_set(link: "ControllerLink", controller: int, filaments,
                 fils.append(f)
             else:
                 not_this_controller.append(f)
+    # Dead filaments out before any bit is set -- but only when turning the grid
+    # ON. Turning it OFF must always be allowed: refusing that would leave a
+    # faulty filament's HV switch closed with no way to open it, which is the
+    # exact opposite of what marking it dead is for. Same rule as
+    # ENERGISING_STATES on the power-state path.
+    dead_skipped: list[int] = []
+    if on:
+        fils, dead_skipped = split_dead(fils)
+        if dead_skipped:
+            log.warning("hv_grid_set: refused to route HV to dead filaments %s "
+                        "(controller=%d)", dead_skipped, controller)
     by_ch: dict[int, list[int]] = {}
     unslotted: list[int] = []
     touched: list[int] = []
@@ -2366,7 +2505,7 @@ def hv_grid_set(link: "ControllerLink", controller: int, filaments,
     if not by_ch:
         return {"controller": controller, "ok": not unslotted, "applied": [], "failed": [],
                 "touched": [], "not_this_controller": not_this_controller,
-                "unslotted": unslotted}
+                "unslotted": unslotted, "dead_skipped": dead_skipped}
     ft, flags, payload = build_payload("HV_GET_ALL_BYTES", {})
     cur = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
     cur_raw = cur.get("raw") if isinstance(cur, dict) else None
@@ -2487,6 +2626,8 @@ def hv_grid_set(link: "ControllerLink", controller: int, filaments,
     if feedback is None:
         # Don't silently claim verification we didn't do.
         out["verified"] = False
+    if dead_skipped:
+        out["dead_skipped"] = dead_skipped
     return out
 
 
@@ -2575,6 +2716,14 @@ class CtHandler(BaseHTTPRequestHandler):
         elif path == "/api/lock":
             # Who (if anyone) currently holds the exclusive-write lease.
             self._json({"ok": True, "lock": _lease_snapshot(), "you": self._client()})
+        elif path == "/api/dead-fids":
+            # Filaments that must not be energised, in FID space, with the
+            # provenance of each decision. See the DEAD_FIDS comment.
+            with _DEAD_LOCK:
+                entries = {str(k): dict(v) for k, v in sorted(DEAD_FIDS.items())}
+            self._json({"ok": True, "space": "fid", "count": len(entries),
+                        "dead": entries, "path": str(DEAD_STATE_PATH)})
+
         elif path == "/api/clients":
             # Everyone that has called this API recently — so a program can see
             # it is not alone on the bench before it starts driving hardware.
@@ -3349,6 +3498,21 @@ class CtHandler(BaseHTTPRequestHandler):
                 # per trigger cycle.
                 repeats = int(body.get("repeats", 1))
                 payload = _u16(max(1, repeats))
+                # A filament marked dead AFTER the table was downloaded would
+                # still fire: download-time filtering cannot see a decision made
+                # later, and nothing else re-validates the loaded table. Refuse
+                # the arm outright rather than filter -- there is no way to
+                # remove one entry from a table that is already in firmware RAM,
+                # so the only honest options are "refuse" and "fire it anyway".
+                stale = {cid: sorted(fids & dead_fids())
+                         for cid, fids in LOADED_EMIT_FIDS.items() if fids & dead_fids()}
+                if stale:
+                    log.warning("arm refused: loaded table contains dead filaments %s", stale)
+                    return self._json(
+                        {"ok": False, "error": "loaded schedule contains filaments marked dead "
+                                               "since it was downloaded — re-download first",
+                         "dead_in_table": {str(k + 1): v for k, v in stale.items()}},
+                        HTTPStatus.OK)
                 results = {}
                 for cid, link in CONTROLLERS.items():
                     if not link.client.connected:
@@ -3388,6 +3552,17 @@ class CtHandler(BaseHTTPRequestHandler):
                 if state < 1 or state > 6:
                     return self._json({"ok": False, "error": "bad state"}, HTTPStatus.OK)
                 arg = int(body.get("arg", 0))
+                # Enforcement, not just bookkeeping: ct_simple_control filters its
+                # own dead mask before calling, but the GUI, a curl, or anyone
+                # else's script does not -- and this backend would happily carry
+                # the command out. Shape matches the client's contract
+                # ({"ok": False, "dead": True}) so both layers look the same.
+                if state in ENERGISING_STATES and filament in dead_fids():
+                    with _DEAD_LOCK:
+                        why = dict(DEAD_FIDS.get(filament) or {})
+                    return self._json({"ok": False, "dead": True, "filament": filament,
+                                       "error": f"filament {filament} is marked dead", "marked": why},
+                                      HTTPStatus.OK)
                 cid0, ch, pos, _ = filament_to_board(filament)
                 if cid0 is None or ch is None:
                     return self._json({"ok": False, "error": f"filament {filament} has no board"}, HTTPStatus.OK)
@@ -3525,9 +3700,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 # force=true bypasses firmware fault/verify checks — same
                 # semantics as the GUI's Force checkbox; use when the switch
                 # feedback is unreliable or the filament is known-shorted.
-                # Callers are expected to pre-filter dead filaments out of
-                # `filaments` before calling (ct_simple_control does this via
-                # its client-side dead mask).
+                # Dead filaments are enforced in hv_grid_set() itself, not left
+                # to callers: clients that filter (ct_simple_control) just never
+                # reach it, and clients that do not (the GUI, a curl) are stopped
+                # there rather than energising a filament someone disabled.
                 on = bool(body.get("on"))
                 force = bool(body.get("force", True))
                 filaments = body.get("filaments")   # None = all populated boards
@@ -3638,6 +3814,63 @@ class CtHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         out[str(cid)] = {"tca9554_error": str(exc)}
                 self._json({"ok": bool(out), "controllers": out})
+            elif path == "/api/dead-fids":
+                # Mark filaments as must-not-energise, or clear them. FID space.
+                # body: {op: "set"|"add"|"remove", fids: [...], reason: str}
+                #
+                # Clearing is deliberately as explicit as marking: nothing in this
+                # backend ever clears an entry on its own (see DEAD_FIDS), so the
+                # only way a filament comes back is a person saying so here.
+                op = str(body.get("op", "add")).lower()
+                if op not in ("set", "add", "remove"):
+                    return self._json({"ok": False, "error": "op must be set|add|remove"},
+                                      HTTPStatus.OK)
+                raw_fids = body.get("fids")
+                if not isinstance(raw_fids, list):
+                    return self._json({"ok": False, "error": "fids must be a list"},
+                                      HTTPStatus.OK)
+                try:
+                    fids = [int(f) for f in raw_fids]
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "fids must be integers"},
+                                      HTTPStatus.OK)
+                bad = [f for f in fids if not 0 <= f < FILAMENT_COUNT]
+                if bad:
+                    # Reject the whole call rather than applying the valid part: a
+                    # half-applied safety mask is worse than a refused one, because
+                    # the caller believes all of it landed.
+                    return self._json({"ok": False, "error": f"fids outside 0..{FILAMENT_COUNT - 1}: {bad}"},
+                                      HTTPStatus.OK)
+                reason = str(body.get("reason", "")).strip()
+                if op in ("set", "add") and not reason:
+                    return self._json({"ok": False, "error":
+                                       "reason is required when marking a filament dead "
+                                       "-- an entry nothing can clear automatically has to "
+                                       "say why, or nobody will dare clear it later"},
+                                      HTTPStatus.OK)
+                entry = {"reason": reason, "by": self._client(),
+                         "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+                with _DEAD_LOCK:
+                    before = set(DEAD_FIDS)
+                    if op == "set":
+                        DEAD_FIDS.clear()
+                        for f in fids:
+                            DEAD_FIDS[f] = dict(entry)
+                    elif op == "add":
+                        for f in fids:
+                            DEAD_FIDS.setdefault(f, dict(entry))   # keep the ORIGINAL provenance
+                    else:
+                        for f in fids:
+                            DEAD_FIDS.pop(f, None)
+                    after = set(DEAD_FIDS)
+                    _dead_save()
+                added, removed = sorted(after - before), sorted(before - after)
+                if added or removed:
+                    log.warning("dead filaments changed by %s: +%s -%s (reason=%r) -> now %s",
+                                self._client(), added, removed, reason, sorted(after))
+                return self._json({"ok": True, "space": "fid", "added": added,
+                                   "removed": removed, "dead": sorted(after)}, HTTPStatus.OK)
+
             elif path == "/api/channel-mask":
                 # Set the channel enable mask. The HOST poll set (SCAN_MASK) is the
                 # real lever — board_snapshot reads INA219 V/I only for these
