@@ -127,6 +127,16 @@ def build_payload(command: str, b: dict):
         return 0x22, FLAG_SINGLE, bytes([ch, mux]) + _u16(int(b["millivolts"])) + bytes([1 if b.get("enable_after_set", True) else 0])
     if command == "CH_SET_TPS_OCP_THRESHOLD":  # 0x28: ch,mux,mA16 (direct IOUT_LIMIT)
         return 0x28, FLAG_SINGLE, bytes([ch, mux]) + _u16(int(b["threshold_mA"]))
+    if command == "CH_GET_TPS_STATUS":       # 0x23 mask form: mask[8] -> status +
+        # seven per-board bitmaps. Payload 57 bytes:
+        #   status@0, targeted@1, present@9, enabled@17, fault@25,
+        #   hv_oc@33, valid@41, struggling@49   (8 bytes each after status)
+        # struggling is the one that matters here: set after 3 consecutive
+        # failed revives, cleared the instant the output comes back. It is the
+        # only signal that distinguishes a SHORT, which never sets the CC mode's
+        # fault bits (see wait_for_current).
+        mask = bytes((int(x) & 0xFF) for x in list(b.get("board_mask", [0xFF] * 8))[:8])
+        return 0x23, 0, mask + bytes(8 - len(mask))
     if command == "CH_GET_INA219":           # 0x24: ch,mux -> status,ch,mux,present,busMv16,mA16
         return 0x24, FLAG_SINGLE, bytes([ch, mux])
     if command == "CH_GET_CACHED_CURRENTS":  # 0x3A single form: ch,mux ->
@@ -1345,6 +1355,50 @@ def _dead_save() -> None:
 # inverts the whole point. Enforcement blocks energising, never de-energising.
 ENERGISING_STATES = frozenset({3, 4, 5, 6})   # STANDBY, IDLE, ACTIVE, VOLTAGE
 
+# ── The ACTIVE ladder guard ──────────────────────────────────────────────────
+# Jumping straight to ACTIVE (firing current) is NOT ALLOWED: it damages the
+# filament, and a filament that fails inside the vacuum cannot be repaired.
+# The ladder is STOP -> SLEEP -> STANDBY -> IDLE -> (settle) -> ACTIVE.
+#
+# Measured here 2026-09-17 on ch1.8, commanding ACTIVE 2900 mA from cold: 740 mV
+# / 2067 mA of inrush, then the output COLLAPSED to 0 mV / 0 mA for ~10 s before
+# the firmware's guardian revived it. That is the hazard, visible on a simulated
+# load; on a real filament it is not something to find out empirically.
+#
+# Enforced here rather than left to callers for the same reason as the dead mask:
+# the client that filters is not the only client. A bare curl or the GUI would
+# otherwise put full firing current on a cold filament and this backend would
+# carry it out.
+POWER_STATE_ACTIVE = 5
+POWER_STATE_IDLE = 4
+# fid -> (state, monotonic when it was commanded). The backend is the ONLY
+# writer to the bridge (single-client TCP), so what it last commanded is what
+# the hardware has -- except across a reconnect, where the board may have been
+# reflashed and reset to STOP. Cleared there, and an UNKNOWN state refuses
+# ACTIVE rather than allowing it: not knowing must not read as permission.
+LAST_POWER_STATE: dict[int, tuple[int, float]] = {}
+
+
+def note_power_state(fids, state: int) -> None:
+    now = time.monotonic()
+    for f in fids:
+        LAST_POWER_STATE[int(f)] = (int(state), now)
+
+
+def ladder_blocks_active(fid: int) -> str | None:
+    """None if ACTIVE is allowed for this filament, else why not."""
+    known = LAST_POWER_STATE.get(int(fid))
+    if known is None:
+        return ("power state unknown to this backend (no state commanded since "
+                "connect, or the controller reconnected) — run the ladder "
+                "STOP→SLEEP→STANDBY→IDLE first")
+    st, when = known
+    if st in (POWER_STATE_IDLE, POWER_STATE_ACTIVE):
+        return None
+    return (f"currently at power state {st}; ACTIVE may only be entered from "
+            f"IDLE(4) — going straight to firing current damages the filament, "
+            f"and in vacuum that is unrepairable")
+
 
 def dead_fids() -> set[int]:
     with _DEAD_LOCK:
@@ -2034,6 +2088,10 @@ def invalidate_currents_cache(controller: int | None = None) -> None:
             d.clear()
         else:
             d.pop(controller, None)
+    # Power-state beliefs too: a reconnect may be to a board that was reflashed
+    # and is back at STOP, so keeping them would let the ACTIVE guard wave
+    # through a filament it thinks is at IDLE. Unknown refuses; wrong does not.
+    LAST_POWER_STATE.clear()
 
 # ---- Scan simulation --------------------------------------------------------
 # Auto-generate the whole sync-pulse train, PACED over the scan duration, in a
@@ -2421,6 +2479,29 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         if dead_skipped:
             log.warning("prep_filaments: refused to energise dead filaments %s "
                         "(state=%d, controller=%d)", dead_skipped, state, controller)
+    # ACTIVE only from IDLE — see the ladder guard. Filtered, not rejected, so a
+    # batch ladder that legitimately walks most boards up is not blocked by one
+    # straggler; the blocked ones are NAMED so it cannot pass silently.
+    # A LIST of FIDs, like dead_skipped and failed -- not a dict keyed by a
+    # stringified index. JSON turns dict keys into strings, and every other
+    # filament-list field here is a plain int list that the client re-keys from
+    # FID to its own numbering; a dict would have skipped that translation and
+    # reported FIDs to a script using a swap. Reasons go alongside, for humans.
+    ladder_blocked: list[int] = []
+    ladder_reasons: dict[str, str] = {}
+    if int(state) == POWER_STATE_ACTIVE:
+        allowed = []
+        for f in fils:
+            why = ladder_blocks_active(f)
+            if why is None:
+                allowed.append(f)
+            else:
+                ladder_blocked.append(int(f))
+                ladder_reasons[str(int(f))] = why
+        fils = allowed
+        if ladder_blocked:
+            log.warning("prep_filaments: refused ACTIVE for %s (not at IDLE) "
+                        "controller=%d", ladder_blocked, controller)
     # BATCHED, not per-filament. A per-filament flood (~48 CH_SET_POWER_STATE frames
     # back-to-back) overwhelmed the RP2350's UART+I2C and tripped its 2 s watchdog
     # ("Stop all" -> RP2350 reset). Instead send ONE MASKED frame per (channel,
@@ -2437,7 +2518,8 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     if not fils:
         return {"controller": controller, "ok": True, "applied": 0, "failed": [],
                 "state": int(state), "touched": [], "not_this_controller": not_this_controller,
-                "unslotted": unslotted, "dead_skipped": dead_skipped}
+                "unslotted": unslotted, "dead_skipped": dead_skipped,
+                "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons}
     groups: dict = {}   # (channel, arg) -> OR'd mask byte for that channel
     members: dict = {}  # (channel, arg) -> [filament]
     for f in fils:
@@ -2467,6 +2549,7 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         except Exception as exc:
             results.append({"ok": False, "error": str(exc)})
     applied, failed = 0, []
+    landed: list[int] = []
     for key, r in zip(keys, results):
         ch, _arg = key
         raw = r.get("raw") if isinstance(r, dict) else None
@@ -2475,12 +2558,18 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
             _, _fch, fpos, _ = filament_to_board(f)
             if appl & (1 << fpos):
                 applied += 1
+                landed.append(int(f))
             else:
                 failed.append(int(f))
+    # Record only what the firmware CONFIRMED it applied. Recording the intent
+    # would let a failed write leave the backend believing a filament is at
+    # IDLE, which is exactly the belief the ACTIVE guard depends on.
+    note_power_state(landed, state)
     return {"controller": controller, "ok": not failed and not unslotted, "applied": applied,
             "total": len(fils), "failed": failed, "state": int(state),
             "touched": fils, "not_this_controller": not_this_controller,
-            "unslotted": unslotted, "dead_skipped": dead_skipped}
+            "unslotted": unslotted, "dead_skipped": dead_skipped,
+            "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons}
 
 
 def hv_grid_set(link: "ControllerLink", controller: int, filaments,
@@ -3608,6 +3697,16 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "dead": True, "filament": filament,
                                        "error": f"filament {filament} is marked dead", "marked": why},
                                       HTTPStatus.OK)
+                # ACTIVE only from IDLE — see the ladder guard. Refused, not
+                # filtered: a single-filament call has nothing to fall back to.
+                if state == POWER_STATE_ACTIVE:
+                    why = ladder_blocks_active(filament)
+                    if why:
+                        log.warning("filament-state: refused ACTIVE for %d — %s", filament, why)
+                        return self._json({"ok": False, "ladder_blocked": True,
+                                           "filament": filament, "error":
+                                           f"filament {filament} may not go to ACTIVE: {why}"},
+                                          HTTPStatus.OK)
                 cid0, ch, pos, _ = filament_to_board(filament)
                 if cid0 is None or ch is None:
                     return self._json({"ok": False, "error": f"filament {filament} has no board"}, HTTPStatus.OK)
@@ -3630,6 +3729,8 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
                 raw = resp.get("raw") if isinstance(resp, dict) else None
                 applied = bool(raw and len(raw) >= 4 and raw[3] == 1)
+                if applied:
+                    note_power_state([filament], state)
                 self._json({"ok": _status_ok(resp) and applied, "filament": filament,
                             "controller": cid, "channel": ch, "mux_port": pos,
                             "state": state, "arg": arg})

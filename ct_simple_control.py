@@ -639,6 +639,39 @@ class CTClient:
         return self._post("/api/lock", {"action": "acquire", "ttl": ttl})
 
     @contextmanager
+    def energised(self, *filaments: int, verify: bool = True):
+        """Context manager: whatever happens inside, these filaments get STOPped
+        on the way out — normal return, exception, or Ctrl-C.
+
+        Use this around ANY code that heats a filament. Relying on a STOP at the
+        end of the script is not enough: a bug anywhere in between skips it and
+        leaves the filament at full power indefinitely. That is not
+        hypothetical — a diagnostic here raised AttributeError one line before
+        its stop_one() and left a filament ramping to 2.9 A at 10.5 V for
+        several minutes before anyone noticed.
+
+            with ct.energised(7):
+                ct.active_one(7, 2900, verify=True)
+                ...                      # a crash here still stops filament 7
+
+        What this does NOT cover: the process being killed outright (SIGKILL),
+        or the machine dying. Only the backend can protect against that, since
+        it outlives the script — there is no such watchdog yet, and the lease
+        (which does self-expire) only gates writes, it de-energises nothing.
+        """
+        try:
+            yield self
+        finally:
+            # Deliberately not conditional on success, and each filament is
+            # attempted even if an earlier one errors: the whole point is that
+            # this path runs when something has already gone wrong.
+            for f in filaments:
+                try:
+                    self.stop_one(int(f), verify=verify)
+                except Exception:
+                    pass
+
+    @contextmanager
     def lease(self, ttl: float = 60.0, note: str = ""):
         """Context manager: acquire lease on enter, release on exit.
 
@@ -971,7 +1004,8 @@ class CTClient:
             return int(fid)
         return self._order_rev.get(int(fid), int(fid))
 
-    def _reindex_response(self, r: dict, keys=("applied", "failed")) -> dict:
+    def _reindex_response(self, r: dict,
+                          keys=("applied", "failed", "ladder_blocked")) -> dict:
         """Re-key filament-index LISTS in a batch response from FID
         back to USER_INDEX — both at the top level and inside any
         per-controller "results" sub-dict. Only touches keys whose value is
@@ -1174,7 +1208,12 @@ class CTClient:
                                             # once the loop isn't regulating (i.e.
                                             # after stop/sleep), so a 0 mA target
                                             # is normally confirmed via ina219
-                  "elapsed_s": float, "present": bool, "cc_mode": int}
+                  "elapsed_s": float, "present": bool, "cc_mode": int,
+                  "faulted": bool}   # True = gave up EARLY because the CC
+                                     # loop reported this channel faulted,
+                                     # with "error" naming it. Distinct from
+                                     # ok=False after a full timeout, which
+                                     # means it was still trying.
                   cc_mode: 0=voltage 1=current(regulating) 2/3=fault.
         A ~0 mA TARGET IS CONFIRMED BY POWER STATE, NOT BY CURRENT, and it has
         to be: stopping a board drops its rail, so the INA presence probe stops
@@ -1266,6 +1305,39 @@ class CTClient:
                     if lraw is not None:
                         raw, valid, source = lraw, True, "ina219"
             measured = float(raw) if valid else 0.0
+            # The CC loop's OWN verdict, when it has one. cc_mode 2/3 means the
+            # firmware faulted this channel -- it is not going to arrive, and
+            # continuing to poll just burns the timeout and then reports a
+            # generic "did not reach target" that reads identically to a
+            # thermally slow filament or an unreachable setpoint.
+            #
+            # This covers an OPEN filament and a genuine OCP trip. It does NOT
+            # cover a SHORT, and that is not an oversight here but a property of
+            # the firmware: mode 2/3 is only ever set behind a
+            # `feedbackMv >= 2000` guard, and a shorted output cannot reach 2 V
+            # -- that is what shorted means. A short therefore sits in mode 1
+            # indefinitely while the guardian keeps reviving the collapsed
+            # output. Measured on this bench by the RP2350 session: a shorted
+            # board commanded Idle 1200 mA held mode 1, measMv 0, measMa 1-2 for
+            # minutes. So never read "mode 1 and current not rising" as healthy
+            # -- see the struggling[] check below, which is what catches it.
+            #
+            # There is also still no positive "arrived" signal, so ok= below
+            # compares a POLLED sample against the target. That comparison
+            # belongs in the loop, not here: a trip between two polls is
+            # invisible to this host. Requested on the RP2350 side (they hold
+            # tpsCcConverged_/tpsCcCapped_ internally, unreported).
+            cc_mode = data.get("cc_mode")
+            if cc_mode in (2, 3) and abs(float(target_ma)) > tolerance_ma:
+                return {"ok": False, "filament": int(filament),
+                        "target_ma": float(target_ma), "measured_ma": measured,
+                        "measured_valid": valid, "measured_from": source,
+                        "elapsed_s": time.monotonic() - start,
+                        "present": bool(data.get("present", False)),
+                        "cc_mode": cc_mode, "faulted": True,
+                        "error": f"CC loop reports this channel FAULTED (cc_mode "
+                                 f"{cc_mode}: 2=open filament, 3=OCP/SCP) — it is "
+                                 f"not ramping toward {target_ma} mA."}
             ok = valid and abs(measured - target_ma) <= tolerance_ma
             if ok or time.monotonic() >= deadline:
                 return {"ok": ok, "filament": int(filament), "target_ma": float(target_ma),
@@ -1273,7 +1345,7 @@ class CTClient:
                         "measured_from": source,
                         "elapsed_s": time.monotonic() - start,
                         "present": bool(data.get("present", False)),
-                        "cc_mode": data.get("cc_mode", 0)}
+                        "cc_mode": data.get("cc_mode", 0), "faulted": False}
             time.sleep(poll_interval_s)
 
     def stop_one(self, filament: int,
@@ -1356,20 +1428,48 @@ class CTClient:
                    current_ma: float,             # target ACTIVE (firing) current
                                                    # in mA -- the real operating
                                                    # current, e.g. 2900
+                                                   # REQUIRES the filament to be
+                                                   # at IDLE already -- see below
                    verify: bool = False,          # poll real measured current
                                                    # after commanding -- see below
                    tolerance_ma: float = 150.0,   # only used if verify=True --
                                                    # passed straight to
                                                    # wait_for_current()
                    timeout_s: float = 5.0) -> dict:  # only used if verify=True
-        """Promote a single filament to ACTIVE at `current_ma` mA. Returns
-        {"ok": False, "dead": True, ...} if the filament is dead — does
-        not raise.
+        """Promote a single filament to ACTIVE at `current_ma` mA.
+
+        The filament MUST already be at IDLE. Going straight to ACTIVE is not
+        allowed: full firing current into a cold filament damages it, and a
+        filament that fails inside the vacuum cannot be repaired. Measured on a
+        simulated load, ACTIVE from cold collapsed the output to 0 V for ~10 s
+        before the firmware revived it — that is the mechanism, and it is not
+        something to confirm on a real filament.
+
+        Walk the ladder instead, and let IDLE SETTLE before promoting (its
+        voltage keeps climbing for ~15 s from cold; ACTIVE from a settled IDLE
+        takes ~3 s, from an unsettled one it starts far lower and takes longer):
+
+            ct.sleep_one(f); ct.standby_one(f)
+            ct.idle_one(f, 1500, verify=True, timeout_s=30)
+            ...                                  # let it settle
+            ct.active_one(f, 2900, verify=True)
+
+        Returns {"ok": False, "ladder_blocked": True, "error": ...} if the
+        filament is not at IDLE, or if this backend does not KNOW its state
+        (after a reconnect — unknown refuses rather than allows). Returns
+        {"ok": False, "dead": True, ...} if the filament is dead. Never raises.
 
         verify=True: same real-current feedback as idle_one(verify=True),
         merged under result["heating"].
         """
+        # The backend enforces the ladder; this mirrors it so the reason is
+        # clear without a round trip, and so a script gets the same answer
+        # whether or not the backend is reachable. ACTIVE may only be entered
+        # from IDLE: going straight to firing current damages the filament, and
+        # in vacuum that damage is unrepairable.
         r = self._state_one(filament, ACTIVE, int(current_ma), "active_one")
+        if r.get("ladder_blocked"):
+            return r
         if verify and not r.get("dead"):
             r = {**r, "heating": self.wait_for_current(filament, current_ma,
                                                        tolerance_ma, timeout_s)}
