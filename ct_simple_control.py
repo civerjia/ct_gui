@@ -1491,18 +1491,38 @@ class CTClient:
         return r
 
     def standby_one(self, filament: int,
-                    verify: bool = False,      # confirm current drops to ~0 mA
-                                                # afterward (real feedback, see docstring)
+                    verify: bool = False,      # confirm the board reports STANDBY
+                                                # and report what it actually draws
                     timeout_s: float = 5.0) -> dict:  # only used if verify=True
         """STANDBY a single filament. Returns {"ok": False, "dead": True, ...}
         if the filament is dead — does not raise.
 
-        verify=True: same real-current feedback as stop_one(verify=True).
+        verify=True confirms the board reports STANDBY and reports the current
+        it is actually drawing, under result["standby"].
+
+        It does NOT check the current against a target, because STANDBY has no
+        current target: it holds the firmware's 0.8 V floor, and what flows is
+        whatever the filament's resistance allows. Measured on a cold filament
+        here: 2.1 A of inrush, decaying to ~885 mA steady by ~5 s at 0.78 V.
+        This used to verify against a target of 0 mA and report "reached, 0.0 mA"
+        while about 2 A was flowing — true only in the sense that it confirmed
+        the STATE, and actively misleading about the current. Read
+        result["standby"]["current_mA"], and wait ~5 s before calling a STANDBY
+        current abnormal.
         """
         r = self._state_one(filament, STANDBY, 0, "standby_one")
         if verify and not r.get("dead"):
-            r = {**r, "heating": self.wait_for_current(filament, 0, tolerance_ma=50,
-                                                       timeout_s=timeout_s)}
+            st = self.read_board_status(filament)
+            live = (self.read_filament_vi_live(filament).get(int(filament)) or {})
+            in_standby = st.get("ok") and st.get("state") == STANDBY
+            r = {**r, "standby": {
+                "ok": bool(in_standby),
+                "state": st.get("state"),
+                "current_mA": live.get("current_mA"),
+                "bus_mV": live.get("bus_mV"),
+                "note": ("STANDBY has no current target — this is what it draws, "
+                         "not a pass/fail. Inrush decays for ~5 s."),
+            }}
         return r
 
     def idle_one(self, filament: int,

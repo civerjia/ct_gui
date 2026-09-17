@@ -1442,19 +1442,37 @@ def note_power_state(fids, state: int) -> None:
         LAST_POWER_STATE[int(f)] = (int(state), now)
 
 
-def ladder_blocks_active(fid: int) -> str | None:
-    """None if ACTIVE is allowed for this filament, else why not."""
+def ladder_blocks_active(fid: int, arrival: str | None = None,
+                         arrival_known: bool = False) -> str | None:
+    """None if ACTIVE is allowed for this filament, else why not.
+
+    `arrival` is the CC loop's own verdict from 0x3A, when the caller has it.
+    Being COMMANDED to IDLE is not the same as having REACHED it: a shorted
+    board accepts the IDLE write (the write lands, the output never comes up),
+    so state alone let ACTIVE through on a filament that never warmed. That was
+    observed on the shorted CH2.8 -- IDLE reported cannot_start and ACTIVE was
+    then permitted. Requiring `settled` closes it; the whole point of promoting
+    from IDLE is that the filament is actually warm.
+    """
     known = LAST_POWER_STATE.get(int(fid))
     if known is None:
         return ("power state unknown to this backend (no state commanded since "
                 "connect, or the controller reconnected) — run the ladder "
                 "STOP→SLEEP→STANDBY→IDLE first")
     st, when = known
-    if st in (POWER_STATE_IDLE, POWER_STATE_ACTIVE):
+    if st == POWER_STATE_ACTIVE:
+        return None          # re-commanding a new target while already ACTIVE
+    if st != POWER_STATE_IDLE:
+        return (f"currently at power state {st}; ACTIVE may only be entered from "
+                f"IDLE(4) — going straight to firing current damages the filament, "
+                f"and in vacuum that is unrepairable")
+    if not arrival_known:
+        return None          # older firmware reports no arrival: state-only check
+    if arrival == "settled":
         return None
-    return (f"currently at power state {st}; ACTIVE may only be entered from "
-            f"IDLE(4) — going straight to firing current damages the filament, "
-            f"and in vacuum that is unrepairable")
+    return (f"commanded to IDLE but the CC loop reports '{arrival}', not settled "
+            f"— the filament has not actually reached idle current, and promoting "
+            f"an unwarmed filament to firing current is what this guard prevents")
 
 
 def dead_fids() -> set[int]:
@@ -2563,9 +2581,20 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
             ladder_blocked.extend(under)
             fils = [f for f in fils if int(f) not in set(under)]
     if int(state) == POWER_STATE_ACTIVE:
+        # ONE paged bulk 0x3A for every board, not a per-filament loop -- see
+        # read_cached_telemetry's docstring.
+        arrivals: dict[int, str | None] = {}
+        arrivals_known = False
+        try:
+            bulk = read_cached_telemetry(link, controller) or {}
+            arrivals = {int(k): (v or {}).get("arrival") for k, v in bulk.items()}
+            arrivals_known = bool(bulk)
+        except Exception:
+            pass
         allowed = []
         for f in fils:
-            why = ladder_blocks_active(f)
+            why = ladder_blocks_active(
+                f, arrivals.get(int(f)), arrivals_known and int(f) in arrivals)
             if why is None:
                 allowed.append(f)
             else:
@@ -3828,7 +3857,19 @@ class CtHandler(BaseHTTPRequestHandler):
                                        f"must not lower the current"},
                                       HTTPStatus.OK)
                 if state == POWER_STATE_ACTIVE:
-                    why = ladder_blocks_active(filament)
+                    # One cheap single-board 0x3A (the CC cache, no I2C) so the
+                    # guard tests where the filament IS, not only what it was told.
+                    arr, arr_known = None, False
+                    _c0, _ch, _p, _ = filament_to_board(filament)
+                    _lk = CONTROLLERS.get((_c0 + 1) if _c0 is not None else 0)
+                    if _lk and _lk.client.connected:
+                        try:
+                            ent = read_cached_telemetry_one(_lk, _c0, filament).get(filament)
+                            if ent and "arrival" in ent:
+                                arr, arr_known = ent.get("arrival"), True
+                        except Exception:
+                            pass   # unreadable -> fall back to the state-only check
+                    why = ladder_blocks_active(filament, arr, arr_known)
                     if why:
                         log.warning("filament-state: refused ACTIVE for %d — %s", filament, why)
                         return self._json({"ok": False, "ladder_blocked": True,
