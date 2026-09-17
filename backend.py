@@ -1398,6 +1398,43 @@ POWER_STATE_IDLE = 4
 # ACTIVE rather than allowing it: not knowing must not read as permission.
 LAST_POWER_STATE: dict[int, tuple[int, float]] = {}
 
+# ── ACTIVE current floor ─────────────────────────────────────────────────────
+# ACTIVE below the IDLE operating current is refused. The firmware clamps IDLE
+# at 2 A but deliberately does NOT clamp ACTIVE, so this is the only guard on
+# that direction, and the RP2350 side asked for it to live here.
+#
+# 1500 mA is the IDLE operating current this bench runs at, per the user. It is
+# not a constant read out of the firmware -- there is none -- so if the idle
+# operating point changes, change this with it.
+ACTIVE_FLOOR_MA = 1500
+
+# Schedules may not select Voltage mode: ShvHeatSetEntries rejects state 6 with
+# BadArgument and refuses the whole batch. Caught here first so the caller is
+# told WHICH entry is wrong instead of getting a batch-level reject. Direct
+# board control (CH_SET_POWER_STATE via /api/cmd) may still use Voltage -- it is
+# a bench/calibration mode, and only SCHEDULES are restricted.
+POWER_STATE_VOLTAGE = 6
+
+
+def check_heating_plan(heating) -> list[str]:
+    """Reasons this heating plan must not be downloaded, empty if it is fine."""
+    problems: list[str] = []
+    for n, h in enumerate(heating or []):
+        try:
+            st = int(h.get("state"))
+            fil = int(h.get("filament"))
+            arg = int(h.get("arg", h.get("milliamps", 0)))
+        except (TypeError, ValueError):
+            problems.append(f"heating[{n}]: unreadable state/filament/arg: {h!r}")
+            continue
+        if st == POWER_STATE_VOLTAGE:
+            problems.append(f"heating[{n}] (filament {fil}): Voltage mode is not "
+                            f"allowed in a schedule — the firmware rejects it")
+        if st == POWER_STATE_ACTIVE and arg < ACTIVE_FLOOR_MA:
+            problems.append(f"heating[{n}] (filament {fil}): ACTIVE {arg} mA is "
+                            f"below the {ACTIVE_FLOOR_MA} mA floor")
+    return problems
+
 
 def note_power_state(fids, state: int) -> None:
     now = time.monotonic()
@@ -2509,6 +2546,22 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # reported FIDs to a script using a swap. Reasons go alongside, for humans.
     ladder_blocked: list[int] = []
     ladder_reasons: dict[str, str] = {}
+    # ACTIVE floor applies to the batch path too. `currents` can carry a
+    # per-filament override, so check the value each filament would actually
+    # get, not just the batch default -- otherwise one override slips under it.
+    if int(state) == POWER_STATE_ACTIVE:
+        under = []
+        for f in fils:
+            ma = int(currents.get(f, currents.get(str(f), default_arg)) or 0)
+            if ma < ACTIVE_FLOOR_MA:
+                under.append(int(f))
+                ladder_reasons[str(int(f))] = (f"ACTIVE {ma} mA is below the "
+                                               f"{ACTIVE_FLOOR_MA} mA floor")
+        if under:
+            log.warning("prep_filaments: refused ACTIVE below %d mA for %s",
+                        ACTIVE_FLOOR_MA, under)
+            ladder_blocked.extend(under)
+            fils = [f for f in fils if int(f) not in set(under)]
     if int(state) == POWER_STATE_ACTIVE:
         allowed = []
         for f in fils:
@@ -3625,6 +3678,15 @@ class CtHandler(BaseHTTPRequestHandler):
             elif path == "/api/download":
                 # Download the bound schedule + config to every connected controller.
                 plan = body.get("plan") or {}
+                # Refuse the WHOLE download, not just the bad entries: a schedule
+                # is a committed artifact, and silently dropping or altering a
+                # heating delta changes what will actually run while the operator
+                # believes they downloaded what they built.
+                bad = check_heating_plan(plan.get("heating"))
+                if bad:
+                    return self._json({"ok": False, "error":
+                                       "heating plan refused: " + "; ".join(bad[:8]),
+                                       "problems": bad}, HTTPStatus.OK)
                 channels = body.get("channels") or DEFAULT_CHANNELS
                 # Download to each connected controller SEQUENTIALLY. Parallel transfers
                 # to both bridges contend on the host's single WiFi uplink and drop each
@@ -3757,6 +3819,14 @@ class CtHandler(BaseHTTPRequestHandler):
                                       HTTPStatus.OK)
                 # ACTIVE only from IDLE — see the ladder guard. Refused, not
                 # filtered: a single-filament call has nothing to fall back to.
+                if state == POWER_STATE_ACTIVE and arg < ACTIVE_FLOOR_MA:
+                    return self._json({"ok": False, "below_active_floor": True,
+                                       "filament": filament, "error":
+                                       f"ACTIVE {arg} mA is below the "
+                                       f"{ACTIVE_FLOOR_MA} mA floor (the idle "
+                                       f"operating current) — promoting to ACTIVE "
+                                       f"must not lower the current"},
+                                      HTTPStatus.OK)
                 if state == POWER_STATE_ACTIVE:
                     why = ladder_blocks_active(filament)
                     if why:

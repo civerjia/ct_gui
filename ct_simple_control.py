@@ -744,6 +744,13 @@ class CTClient:
         self._refresh_dead()
         return frozenset(self._dead_cache)
 
+    # Consecutive mode 2/3 reads before a fault is believed. A startup-inrush
+    # OCP that recovers on the next revive can flash the fault bits, so one
+    # sighting is not a verdict. At the default 0.1 s poll interval this is a
+    # ~0.3 s window -- long enough to ride out a transient, short enough that a
+    # real fault still ends the wait immediately rather than at timeout.
+    _FAULT_CONFIRM_READS = 3
+
     def _refresh_dead(self, force: bool = False) -> None:
         now = time.monotonic()
         if not force and self._dead_fetched_at and (now - self._dead_fetched_at) < self._DEAD_TTL_S:
@@ -1239,6 +1246,7 @@ class CTClient:
         # a repaired load forever -- refuse, never drive, never clear, refuse.
         # The delay gives the firmware a revive pass to clear it.
         last_struggle_check = start
+        fault_streak = 0            # consecutive mode 2/3 reads; see below
         deadline = start + timeout_s
         data: dict = {}
         while True:
@@ -1403,8 +1411,19 @@ class CTClient:
                                          "the fault bits and its arrival stays "
                                          "'ramping', so nothing else here catches "
                                          "it. Check the load before retrying."}
+            # A fault must be CONFIRMED before it ends the wait. A board that
+            # trips OCP on the startup inrush and comes up on the next revive is
+            # a NORMAL outcome, not a failure -- and it can flash FaultOcp while
+            # that is happening. Returning on the first sighting would report a
+            # hard fault for a board that recovered a moment later, which is the
+            # same single-sample mistake as trusting one current reading.
+            #
+            # `struggling` is the firmware's own confirmed version of this (3
+            # consecutive failed revives) and needs no debounce here; the mode
+            # bits are instantaneous, so they do.
             cc_mode = data.get("cc_mode")
-            if cc_mode in (2, 3) and abs(float(target_ma)) > tolerance_ma:
+            fault_streak = fault_streak + 1 if cc_mode in (2, 3) else 0
+            if fault_streak >= self._FAULT_CONFIRM_READS and abs(float(target_ma)) > tolerance_ma:
                 return {"ok": False, "filament": int(filament),
                         "target_ma": float(target_ma), "measured_ma": measured,
                         "measured_valid": valid, "measured_from": source,
@@ -1412,8 +1431,10 @@ class CTClient:
                         "present": bool(data.get("present", False)),
                         "cc_mode": cc_mode, "faulted": True,
                         "error": f"CC loop reports this channel FAULTED (cc_mode "
-                                 f"{cc_mode}: 2=open filament, 3=OCP/SCP) — it is "
-                                 f"not ramping toward {target_ma} mA."}
+                                 f"{cc_mode}: 2=open filament, 3=OCP/SCP) on "
+                                 f"{fault_streak} consecutive reads — not a "
+                                 f"transient startup trip, which recovers on the "
+                                 f"next revive. Not ramping toward {target_ma} mA."}
             # The polled comparison is now only a FALLBACK, for firmware that
             # does not report arrival. When arrival IS reported it is
             # authoritative: "ramping" means the loop says it has not arrived,
