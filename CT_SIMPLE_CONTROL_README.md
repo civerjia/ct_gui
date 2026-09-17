@@ -171,16 +171,24 @@ if not ct.status().get("controllers", {}).get("1", {}).get("connected"):
         print(f"connect failed: {r['error']}")
 
 # ── Dead filaments ───────────────────────────────────────────────────────
-# A "dead" filament is one you've marked as physically damaged, missing, or
-# otherwise not to be touched — e.g. a burnt-out emitter, an unseated board,
-# or a known-bad HV switch. Once marked, EVERY batch call below (stop_all,
+# A "dead" filament is one that MUST NOT BE ENERGISED — e.g. a burnt-out
+# emitter or a known-bad HV switch. The board it sits on may be perfectly
+# fine; the filament is the faulty part.
+#
+# It lives in the BACKEND, so it outlives your script and applies to every
+# client — the GUI and a bare curl are stopped by it too, not just scripts
+# that remember to filter. Nothing clears an entry automatically, and in
+# particular not a board dropping out of presence: presence is about the
+# board, this is about the filament. Repaired one? remove_dead() — it is
+# meant to be changeable, just rarely changed.
+# Once marked, EVERY batch call below (stop_all,
 # sleep_all, standby_all, idle_all, active_all, hv_grid_set_all, ...)
 # silently skips it — you never have to remember to exclude it yourself.
 # Any call that targets ONE specific filament (active_one, idle_one,
 # fire_single_pulse, hv_grid_set, ...) returns {"ok": False, "dead": True}
 # immediately instead — it does NOT raise (see "Error handling" above) — so
 # a script iterating every filament in a loop just skips it and moves on.
-ct.set_dead([6, 26, 73])   # or: ct.set_dead(set(range(96)) - set(ct.present_filaments()))
+ct.set_dead([6, 26, 73], reason="burnt emitters, 2026-09 bench")
 
 # with ct.session(): guarantees HV/heating gets torn down on exit even if
 # something below raises unexpectedly — see "Error handling" above.
@@ -372,7 +380,13 @@ actually plugged in instead of hand-maintaining a list:
 
 ```python
 present = set(ct.present_filaments())
-ct.set_dead(set(range(96)) - present)   # everything NOT physically present is dead
+# Everything not physically present, marked as do-not-energise. NOTE this is
+# YOU deciding to disable those slots, not an automatic link: the entries
+# persist and will NOT clear themselves when a board is re-seated, because
+# dead is about the filament and presence is about the board. Re-seated a
+# board? remove_dead() those indices.
+ct.set_dead(set(range(96)) - present,
+            reason="no board present at scan time")
 print(f"{len(present)}/96 filaments present; dead mask: {sorted(ct.dead)[:10]}...")
 ```
 
@@ -542,12 +556,12 @@ remapping is set.
 `read_filament_voltage`/`read_filament_voltages`,
 `filament_to_board`/`board_to_filament`, `fire_single_pulse`, and the
 low-level `shv_set_entry`/`shv_status`/`shv_pulse_log`. The dead mask
-(`set_dead`/`add_dead`/`remove_dead`) always operates in **your own logical
+(`set_dead`/`add_dead`/`remove_dead`) always operates in **your own USER_INDEX
 numbering**, independent of any swap.
 
 ```python
 ct.set_filament_order({5: 8})
-ct.set_dead([6])   # blocks LOGICAL filament 6, unaffected by the 5->8 swap
+ct.set_dead([6], reason="...")   # blocks YOUR filament 6; stored as its FID
 
 # Verify the round-trip:
 board = ct.filament_to_board(5)              # physical 8's board location
@@ -645,9 +659,11 @@ dead filament — they do NOT raise (see
 [Error handling](#error-handling--read-this-first)).
 
 ```python
-ct.set_dead([3, 7, 12, 55])   # replace the entire dead mask
-ct.add_dead(20, 21)            # add individual filaments
-ct.remove_dead(7)              # un-block a filament
+ct.set_dead([3, 7, 12, 55], reason="burnt emitters")  # replace the whole mask
+ct.add_dead(20, 21, reason="HV switch stuck closed")  # add individual ones
+ct.remove_dead(7)                                     # repaired — un-block it
+ct.dead                        # frozenset of YOUR indices (backend-held)
+ct.dead_details()              # ... with {reason, by, at} for each
 print(ct.dead)                 # {3, 12, 20, 21, 55}
 ```
 
@@ -997,7 +1013,7 @@ target is dead (never raises), and `hv_grid_set_all` / `hv_grid_off_all`
 silently strip dead filaments from the batch before sending the request.
 
 ```python
-ct.set_dead([3, 7, 12])   # these are physically damaged / removed boards
+ct.set_dead([3, 7, 12], reason="damaged emitters")   # must not be energised
 
 # Toggle ONE filament's switch ON (returns {"ok": False, "dead": True} if
 # filament 3 is dead — never raises)
@@ -2517,7 +2533,7 @@ ct = CTClient("localhost", port=8770, client_id="preheat-script")
 # Known-bad boards on this bench — silently skipped by every batch call,
 # and every single-filament call below returns {"ok": False, "dead": True}
 # for these instead of doing anything.
-ct.set_dead([6, 26, 73])
+ct.set_dead([6, 26, 73], reason="burnt emitters")
 
 IDLE_CURRENTS  = {i: 1500 for i in range(48)}  # mA per filament — typical idle hold
 ACTIVE_CURRENT = 2900                           # mA for the firing filament

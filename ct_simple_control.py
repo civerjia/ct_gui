@@ -302,7 +302,9 @@ class CTClient:
         })
         # Dead mask — filaments blocked from all heating and HV pulse operations.
         # Set once with set_dead(); automatically applied to every batch call.
-        self.dead: set[int] = set()
+        self._dead_cache: set[int] = set()   # USER_INDEX; see the `dead` property
+        self._dead_fetched_at = 0.0
+        self._dead_stale = False
         # Software-level USER_INDEX -> FID swap — see set_filament_order().
         self.filament_order: dict[int, int] = {}
         self._order_rev: dict[int, int] = {}     # FID -> USER_INDEX, see _user_index_of
@@ -686,27 +688,105 @@ class CTClient:
                         pass
 
     # ── dead mask ─────────────────────────────────────────────────────────────
+    # The mask lives in the BACKEND now, not here. It used to die with the
+    # script, so the next run had to re-declare every entry -- and, worse, it
+    # was only honoured by clients that filtered, while backend.py would carry
+    # out an energise command for a dead filament from anywhere else.
+    #
+    # It changes rarely and is read constantly, so it is cached for
+    # _DEAD_TTL_S and refreshed on every write. A stale cache here is safe by
+    # construction: the backend enforces the mask itself, so the worst a stale
+    # read does is send a request the backend then refuses and reports.
 
-    def set_dead(self, filaments) -> None:
+    _DEAD_TTL_S = 5.0
+
+    @property
+    def dead(self) -> frozenset[int]:
+        """Filaments that must not be energised, in YOUR numbering (USER_INDEX).
+
+        A frozenset, deliberately: `ct.dead.add(5)` used to appear to work and
+        would now silently fail to reach the backend, so it raises instead.
+        Use add_dead()/remove_dead()/set_dead().
+        """
+        self._refresh_dead()
+        return frozenset(self._dead_cache)
+
+    def _refresh_dead(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and self._dead_fetched_at and (now - self._dead_fetched_at) < self._DEAD_TTL_S:
+            return
+        r = self._get("/api/dead-fids", timeout=5.0)
+        if not r.get("ok"):
+            # Keep the last known mask. Falling back to an EMPTY set would read
+            # as "nothing is dead" and let this client happily target a filament
+            # someone disabled -- a failed read must not become a permissive
+            # answer. The backend still enforces regardless of what we think.
+            self._dead_stale = True
+            return
+        # The backend stores FIDs; translate into this script's numbering so
+        # `ct.dead` matches the indices the caller passes everywhere else.
+        self._dead_cache = {self._user_index_of(int(f)) for f in (r.get("dead") or {})}
+        self._dead_fetched_at = now
+        self._dead_stale = False
+
+    def _write_dead(self, op: str, filaments, reason: str | None) -> dict:
+        fids = [int(self._fid_of(f)) for f in filaments]
+        body = {"op": op, "fids": fids}
+        if op != "remove":
+            # Not fabricated when absent: the backend requires a non-empty
+            # reason because an entry nothing clears automatically has to say
+            # why, and inventing a plausible cause here would be worse than
+            # recording that nobody wrote one down.
+            body["reason"] = reason or f"(no reason recorded — set by {self.client_id})"
+        r = self._post("/api/dead-fids", body, timeout=10.0)
+        self._refresh_dead(force=True)
+        return r
+
+    def set_dead(self, filaments, reason: str | None = None) -> dict:
         """Replace the dead mask with the given filament indices (0–95).
 
-        Dead filaments are silently skipped in every batch power-state call.
-        Any SINGLE-filament call (active_one, idle_one, fire_single_pulse,
-        hv_grid_set, ...) returns {"ok": False, "dead": True, ...}
-        immediately if targeted at one — it does NOT raise.
+        "Dead" means THIS FILAMENT MUST NOT BE ENERGISED. The board it sits on
+        may be perfectly fine -- the filament is the faulty part. It is your
+        decision, never something inferred: nothing clears an entry on its own,
+        and in particular not a board dropping out of presence (presence is
+        about the board, this is about the filament).
+
+        Dead filaments are skipped in every batch power-state call and listed
+        in "dead_skipped". Any SINGLE-filament call (active_one, idle_one,
+        fire_single_pulse, hv_grid_set, ...) returns
+        {"ok": False, "dead": True, ...} -- it does NOT raise.
+
+        Enforcement is in the backend, so this survives the script exiting and
+        applies to every client, not just this one. Repaired a filament? Call
+        remove_dead() -- it is meant to be changeable, just rarely changed.
+
+        `reason` is recorded with who and when. Pass a real one: these entries
+        outlive the session, and "why is 55 disabled" is the question nobody
+        can answer later without it.
 
         Example:
-            ct.set_dead([3, 7, 12, 55])
+            ct.set_dead([3, 7, 12, 55], reason="burnt emitters, 2026-09 bench")
         """
-        self.dead = {int(f) for f in filaments}
+        return self._write_dead("set", filaments, reason)
 
-    def add_dead(self, *filaments: int) -> None:
-        """Add filaments to the dead mask."""
-        self.dead.update(int(f) for f in filaments)
+    def add_dead(self, *filaments: int, reason: str | None = None) -> dict:
+        """Add filaments to the dead mask. Existing entries keep their original
+        provenance rather than being overwritten with this call's reason."""
+        return self._write_dead("add", filaments, reason)
 
-    def remove_dead(self, *filaments: int) -> None:
-        """Remove filaments from the dead mask."""
-        self.dead.difference_update(filaments)
+    def remove_dead(self, *filaments: int) -> dict:
+        """Un-block filaments -- the repaired-it path. No reason needed: the
+        record of why it was blocked goes away with the entry."""
+        return self._write_dead("remove", filaments, None)
+
+    def dead_details(self) -> dict:
+        """The dead mask with provenance: {USER_INDEX: {reason, by, at}}."""
+        r = self._get("/api/dead-fids", timeout=5.0)
+        if not r.get("ok"):
+            return r
+        return {"ok": True, "dead": {self._user_index_of(int(f)): v
+                                     for f, v in (r.get("dead") or {}).items()},
+                "stale": False}
 
     def _live(self, filaments=None) -> list[int] | None:
         """Return the filament list with dead filaments removed and the
@@ -720,8 +800,17 @@ class CTClient:
         if not self.dead and not self._swap_active and filaments is None:
             return None
         base = list(filaments) if filaments is not None else list(range(self.FILAMENT_COUNT))
-        survivors = [f for f in base if f not in self.dead]   # dead mask is in USER_INDEX space
+        dead = self.dead   # bound once: `self.dead` is a property, and inside a
+                           # comprehension it would be re-evaluated per element
+        survivors = [f for f in base if f not in dead]   # dead mask is in USER_INDEX space
         return self._fids_of(survivors)                      # then cross to FID
+
+    # PowerState values that put power ON the filament (STANDBY enables the
+    # output at the firmware's 0.8 V floor, so it counts). Mirrors the backend's
+    # ENERGISING_STATES -- the two must agree, or the client refuses something
+    # the backend would have allowed, which is how a dead filament ends up
+    # impossible to turn OFF.
+    _ENERGISING_STATES = frozenset({STANDBY, IDLE, ACTIVE, VOLTAGE})
 
     def _is_dead(self, filament: int) -> bool:
         """True if filament is in the dead mask."""
@@ -791,6 +880,7 @@ class CTClient:
         if order is None or (hasattr(order, "__len__") and len(order) == 0):
             self.filament_order = {}
             self._order_rev = {}
+            self._dead_fetched_at = 0.0   # same reason as below
             return
         if isinstance(order, dict):
             raise ValueError(
@@ -835,6 +925,12 @@ class CTClient:
         # Built here, not on lookup: set_filament_order() already proved the
         # mapping is a permutation, so the inverse is well-defined and total.
         self._order_rev = {v: k for k, v in self.filament_order.items()}
+        # The dead cache holds USER_INDEX values translated under the PREVIOUS
+        # order, so it now names the wrong filaments. Drop it rather than
+        # translate: re-fetching costs one request, and a mask that quietly
+        # points at the wrong indices is the failure this whole naming pass
+        # exists to prevent.
+        self._dead_fetched_at = 0.0
 
     def get_filament_order(self) -> list[int]:
         """The current mapping as an explicit 96-entry list, order[i] = the
@@ -904,7 +1000,8 @@ class CTClient:
         # a backend bug until this was surfaced -- see the "why was 25
         # skipped" investigation this traced back to set_dead().
         requested = [int(f) for f in filaments] if filaments is not None else list(range(96))
-        dead_skipped = [f for f in requested if f in self.dead]
+        dead = self.dead   # bound once — property, see _live()
+        dead_skipped = [f for f in requested if f in dead]
         live = self._live(filaments)
         if live is not None and len(live) == 0:
             return {"ok": True, "applied": 0, "failed": [], "skipped_dead": True,
@@ -915,7 +1012,7 @@ class CTClient:
         if currents:
             # strip dead filaments (checked on USER_INDEX keys), then cross
             # the survivors' keys to FID for the wire
-            alive = {int(k): v for k, v in currents.items() if int(k) not in self.dead}
+            alive = {int(k): v for k, v in currents.items() if int(k) not in dead}
             body["currents"] = {str(self._fid_of(k)): int(v) for k, v in alive.items()}
         # "excluded" (top level) + "touched"/"not_this_controller"/"unslotted"
         # (per-controller, inside "results") are filament-index lists too --
@@ -1029,7 +1126,10 @@ class CTClient:
     # back as {"ok": False, "error": "...", ...} — check "ok" yourself.
 
     def _state_one(self, filament: int, state: int, arg: int, op: str) -> dict:
-        if self._is_dead(filament):   # dead mask is USER_INDEX, which is what the caller passed
+        # Block energising, never de-energising: STOP/SLEEP on a dead filament
+        # must go through, or marking one dead would leave it with no way to be
+        # turned off -- the opposite of the point. Same rule as the backend's.
+        if state in self._ENERGISING_STATES and self._is_dead(filament):
             return self._dead_result(filament)
         r = self._post("/api/filament-state",
                        {"filament": self._fid_of(filament), "state": state, "arg": int(arg)})
@@ -1480,7 +1580,10 @@ class CTClient:
 
         Returns {"ok", "applied": [filament] or [], "failed": [...]}.
         """
-        if self._is_dead(filament):
+        # on=False is de-energising -- allowed for a dead filament, same reason
+        # as STOP above. Refusing it would leave a faulty filament's grid switch
+        # closed with no way to open it.
+        if on and self._is_dead(filament):
             return self._dead_result(filament)
         r = self._post("/api/hv-grid", {"filaments": [self._fid_of(filament)],
                                         "on": bool(on), "force": bool(force)})
@@ -1508,7 +1611,8 @@ class CTClient:
         # 5 dead-masked returned a bare ok:True while the grid switch stayed ON --
         # a success-shaped no-op on an HV path.
         requested = None if filaments is None else [int(f) for f in filaments]
-        dead_skipped = [] if requested is None else [f for f in requested if f in self.dead]
+        dead = self.dead   # bound once — property, see _live()
+        dead_skipped = [] if requested is None else [f for f in requested if f in dead]
         live = self._live(filaments)   # already crossed to FID
         if live is not None and len(live) == 0:
             # ok:False -- the caller named filaments and NONE were commanded.
@@ -2055,6 +2159,7 @@ class CTClient:
         Dead entries are dropped rather than sent, matching _live()/_prep(), and
         reported so the drop is never silent."""
         dead_skipped: list[int] = []
+        dead = self.dead   # bound once — property, see _live()
         out = dict(plan)
         for key in ("emission", "heating"):
             rows = plan.get(key)
@@ -2066,7 +2171,7 @@ class CTClient:
                     kept.append(row)
                     continue
                 f = int(row["filament"])
-                if f in self.dead:
+                if f in dead:
                     if f not in dead_skipped:
                         dead_skipped.append(f)
                     continue
@@ -2077,7 +2182,7 @@ class CTClient:
             kept_cur = {}
             for k, v in cur.items():
                 f = int(k)
-                if f in self.dead:
+                if f in dead:
                     if f not in dead_skipped:
                         dead_skipped.append(f)
                     continue
