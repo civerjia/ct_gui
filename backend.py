@@ -15,6 +15,7 @@ STM32 = the device's HTTP /stm32 status (age_ms).
 
 from __future__ import annotations
 
+import copy
 import datetime
 import json
 import logging
@@ -1295,6 +1296,18 @@ DEAD_FIDS: dict[int, dict] = {}
 # not entries). Deliberately NOT persisted -- it describes what is in the
 # firmware's RAM right now, and a backend restart is no evidence about that.
 LOADED_EMIT_FIDS: dict[int, set[int]] = {}
+# The wire plan last downloaded to each controller, and the table CRC the
+# hardware reported for it. Held here rather than in the client so a SECOND
+# script run can skip a re-download it does not need -- previously every fresh
+# process started with an empty cache and paid for the download again.
+#
+# Same non-persistence rule as LOADED_EMIT_FIDS: this describes what is in
+# firmware RAM right now. It is a fast-path HINT only -- reuse still confirms
+# against the live CRC before skipping, because another actor's same-shaped
+# schedule must not slip past, and a reflash empties the table without telling
+# anyone here.
+LOADED_PLAN: dict[int, dict] = {}
+LOADED_CRC: dict[int, int] = {}
 
 
 def _dead_load() -> None:
@@ -2011,6 +2024,16 @@ def invalidate_currents_cache(controller: int | None = None) -> None:
             _DL_CURRENTS_CACHE.clear()
         else:
             _DL_CURRENTS_CACHE.pop(controller, None)
+    # The loaded-table hints go with it. A reconnect may be to a freshly
+    # reflashed board whose table is empty, and a hint that outlives the table
+    # it describes is exactly how a run skips a download it needed. Callers
+    # re-confirm against the live CRC anyway; this keeps the hint from being
+    # confidently wrong in the first place.
+    for d in (LOADED_PLAN, LOADED_CRC, LOADED_EMIT_FIDS):
+        if controller is None:
+            d.clear()
+        else:
+            d.pop(controller, None)
 
 # ---- Scan simulation --------------------------------------------------------
 # Auto-generate the whole sync-pulse train, PACED over the scan duration, in a
@@ -2338,8 +2361,13 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     # claiming to know its contents would be worse than admitting we do not.
     if ok:
         LOADED_EMIT_FIDS[controller] = {int(e["filament"]) for e in emit}
+        LOADED_PLAN[controller] = copy.deepcopy(plan)
     else:
         LOADED_EMIT_FIDS.pop(controller, None)
+        LOADED_PLAN.pop(controller, None)
+    # The CRC belongs to the table we just wrote, and we have not read it yet --
+    # drop any previous one rather than let a stale CRC vouch for new content.
+    LOADED_CRC.pop(controller, None)
     out = {"controller": controller, "ok": ok, "emit": n, "heat": hn,
            "frames": total, "curSent": cur_n, "curCached": cur_skipped,
            "fails": len(fails), "failLabels": fails[:12],
@@ -2716,6 +2744,16 @@ class CtHandler(BaseHTTPRequestHandler):
         elif path == "/api/lock":
             # Who (if anyone) currently holds the exclusive-write lease.
             self._json({"ok": True, "lock": _lease_snapshot(), "you": self._client()})
+        elif path == "/api/loaded-schedule":
+            # What the backend believes is in each controller's table, so a new
+            # script run can decide whether it needs to download. A HINT: the
+            # caller still confirms against the live CRC before trusting it.
+            self._json({"ok": True, "space": "fid",
+                        "loaded": {str(cid + 1): {"plan": LOADED_PLAN.get(cid),
+                                                  "crc": LOADED_CRC.get(cid),
+                                                  "emit_fids": sorted(LOADED_EMIT_FIDS.get(cid, ()))}
+                                   for cid in sorted(set(LOADED_PLAN) | set(LOADED_EMIT_FIDS))}})
+
         elif path == "/api/dead-fids":
             # Filaments that must not be energised, in FID space, with the
             # provenance of each decision. See the DEAD_FIDS comment.
@@ -3483,6 +3521,13 @@ class CtHandler(BaseHTTPRequestHandler):
                             "emitExpected": emit_expected, "heatExpected": heat_expected,
                             "match": emit == emit_expected and heat == heat_expected,
                         }
+                        # Remember the CRC only when the table actually matches
+                        # this plan: caching it on a mismatch would later let a
+                        # reuse check "confirm" a table that was never right.
+                        if crc is not None and results[str(cid)]["match"]:
+                            LOADED_CRC[controller] = int(crc)
+                        else:
+                            LOADED_CRC.pop(controller, None)
                     except Exception as exc:
                         results[str(cid)] = {"ok": False, "error": str(exc)}
                 if not results:

@@ -328,6 +328,14 @@ class CTClient:
         # content verification, not just "we think nothing changed."
         self._last_plan: dict[int, dict] = {}
         self._last_crc: dict[int, int] = {}
+        # Whether this run has asked the backend what is already loaded. The
+        # backend outlives the script, so a FRESH process can reuse a table a
+        # previous run downloaded -- before this, every new process started
+        # blank and paid for the download again even though the hardware
+        # already held exactly the right table. Fetched once, lazily: the
+        # answer only changes when WE download, and this client is the one
+        # doing that.
+        self._loaded_fetched = False
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
     # Never raise. Any failure — connection refused, timeout, HTTP error, bad
@@ -1994,6 +2002,42 @@ class CTClient:
     # building blocks for advanced/custom sequences only — see the warning
     # on that section before reaching for them.
 
+    def _adopt_loaded_schedule(self) -> None:
+        """Seed the reuse pre-filter from the BACKEND's record of what is
+        already in each controller's table.
+
+        The backend keeps running between script runs, so it knows a table a
+        previous process downloaded. Without this, a fresh process reuses
+        nothing -- the second run of a script re-downloads a table the hardware
+        already holds, which is the cost this whole fast path exists to remove.
+
+        It only seeds the CHEAP pre-filter. The safety check is unchanged: the
+        live CRC is still re-read and compared before any download is skipped,
+        so an out-of-date hint costs one extra verify, never a wrong schedule.
+        Fetched once per run; a failure just leaves the pre-filter empty, which
+        degrades to the old always-download behaviour.
+        """
+        if self._loaded_fetched:
+            return
+        self._loaded_fetched = True
+        r = self._get("/api/loaded-schedule", timeout=5.0)
+        if not r.get("ok"):
+            return
+        for cid_s, row in (r.get("loaded") or {}).items():
+            try:
+                cid = int(cid_s)
+            except (TypeError, ValueError):
+                continue
+            plan, crc = row.get("plan"), row.get("crc")
+            # The backend stores the WIRE plan (FID space); the comparison in
+            # fire_single_pulse is against a wire plan too, so no crossing here.
+            # A row without a CRC is not usable as a pre-filter seed: the CRC is
+            # what the reuse check compares, and seeding a plan with no CRC
+            # would make `controller in self._last_crc` fail anyway.
+            if isinstance(plan, dict) and crc is not None:
+                self._last_plan[cid] = plan
+                self._last_crc[cid] = int(crc)
+
     def _plan_to_fids(self, plan: dict) -> tuple[dict, list]:
         """Translate a schedule plan's filament indices USER_INDEX -> FID and
         drop dead-masked entries. Returns (translated_plan, dead_skipped).
@@ -2091,7 +2135,14 @@ class CTClient:
             if cid is None:
                 continue
             if row.get("ok"):
-                self._last_plan[cid + 1] = plan
+                # The WIRE plan (FID space), not the USER_INDEX one we were
+                # handed. The hardware holds FIDs, the backend records FIDs, and
+                # the reuse check compares against what the hardware holds -- so
+                # caching the caller's own numbering here would mismatch the
+                # moment a filament_order swap is active, and would make two
+                # scripts with different orders but the SAME physical schedule
+                # each think the other's table was stale.
+                self._last_plan[cid + 1] = wire_plan
             else:
                 self._last_plan.pop(cid + 1, None)
             self._last_crc.pop(cid + 1, None)
@@ -2713,7 +2764,7 @@ class CTClient:
             # via _plan_to_fids(). This used to call _fid_of() itself, back
             # when download() sent plans raw; doing both would translate twice
             # (a symmetric swap maps straight back to the original). Keep the
-            # plan in USER_INDEX so _last_plan's reuse comparison is too, and
+            # plan in USER_INDEX; _last_plan holds the FID form and the reuse
             # so shv_pulse_log()'s re-keying still lines up with the
             # "fired"/"records" filter below.
             "emission": [{"filament": int(filament), "numPulses": int(num_pulses),
@@ -2722,7 +2773,25 @@ class CTClient:
         }
 
         skip_download = False
-        if reuse and self._last_plan.get(controller) == plan and controller in self._last_crc:
+        # Why this call did or did not re-download, reported in the result. The
+        # fast path is only useful if a caller can SEE it working: wall-clock
+        # time cannot distinguish "reused the table" from "the download happened
+        # to be cheap", and a silent fast path is one nobody can tell has
+        # regressed. Values: "downloaded:first-seen" | "downloaded:plan-changed"
+        # | "downloaded:crc-mismatch" | "reused:crc-confirmed" | "reuse-not-requested".
+        reuse_note = "reuse-not-requested"
+        if reuse:
+            self._adopt_loaded_schedule()
+        # Compare in FID space -- see the note in download(). _plan_to_fids also
+        # drops dead filaments, so what is compared is exactly what would be
+        # written, not what was asked for.
+        reuse_wire, _reuse_dead = self._plan_to_fids(plan) if reuse else ({}, [])
+        if reuse and self._last_plan.get(controller) != reuse_wire:
+            reuse_note = ("downloaded:first-seen" if controller not in self._last_plan
+                          else "downloaded:plan-changed")
+        elif reuse and controller not in self._last_crc:
+            reuse_note = "downloaded:no-crc-baseline"
+        if reuse and self._last_plan.get(controller) == reuse_wire and controller in self._last_crc:
             # Cheap local pre-filter passed (plan unchanged from what WE last
             # wrote) — now confirm against the ACTUAL hardware CRC, not just
             # entry count, so a different actor's same-size schedule can't
@@ -2732,6 +2801,9 @@ class CTClient:
             if (row.get("match") and row.get("crc") is not None
                     and row.get("crc") == self._last_crc.get(controller)):
                 skip_download = True   # content confirmed byte-identical — go straight to arm
+                reuse_note = "reused:crc-confirmed"
+            else:
+                reuse_note = "downloaded:crc-mismatch"
 
         if not skip_download:
             dl = self.download(plan)   # updates self._last_plan[controller]; clears any stale crc
@@ -2756,7 +2828,7 @@ class CTClient:
         if not arm_r.get("ok"):
             return {"ok": False, "error": f"arm rejected (code {arm_r.get('reject')}) — "
                                           "check active list and filament power states",
-                    "fired": 0, "records": [], "status": {}}
+                    "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
 
         if trigger == "sim":
             r = self._post("/api/sync/simulate", {
@@ -2781,18 +2853,18 @@ class CTClient:
                                 f"filament {st.get('faultFilament')}, reason "
                                 f"{self._SHV_STOP_REASON_NAMES.get(st.get('stopReason'), st.get('stopReason'))}"
                                 f" ({st.get('stopReason')})",
-                        "fired": 0, "records": [], "status": st}
+                        "fired": 0, "records": [], "status": st, "schedule": reuse_note}
             if state == SHV_COMPLETE:
                 logs = self.shv_pulse_log(controller)
                 fired = [r for r in logs if r.get("filament") == filament]
                 return {"ok": bool(fired), "fired": len(fired),
-                        "records": fired, "status": st}
+                        "records": fired, "status": st, "schedule": reuse_note}
             time.sleep(0.05)
 
         self.shv_disarm(controller)
         return {"ok": False, "timeout": True,
                 "error": f"timed out after {timeout_s} s (state={state})",
-                "fired": 0, "records": [], "status": {}}
+                "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
 
     # ── STM32 per-pulse HV CURRENT measurement ──────────────────────────────
     # Everything above (fire_single_pulse, hv_grid_set, ...) controls WHEN/
