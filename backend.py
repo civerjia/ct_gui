@@ -795,9 +795,28 @@ def _cached_entry(fil: int, raw_mode: int, current_mA, target_mA) -> dict:
     still updates from inferState() using this null -- that can still show a
     brief STOP for an ACTIVE board between measurements; pre-existing)."""
     CC_STALE, CC_UNAVAILABLE = 0x80, 0x40
-    cc_mode = raw_mode & ~(CC_STALE | CC_UNAVAILABLE) & 0xFF
+    # The mode byte is FOUR fields, not one value plus two flags:
+    #   bits 0-3  base mode (0 voltage, 1 current Idle/Active, 2 FaultOpen,
+    #             3 FaultOcp)
+    #   bits 4-5  ARRIVAL: 0x00 ramping, 0x10 settled, 0x20 capped
+    #   bit  6    unavailable, bit 7 stale
+    #
+    # Masking only bits 6-7 (as this did) folded the arrival bits into the base
+    # mode: a settled current-mode board read as 0x11 = 17 instead of 1, and a
+    # faulted-and-settled one as 0x12 = 18, so any `mode in (2, 3)` fault test
+    # silently stopped matching the moment the firmware started setting arrival.
+    # Mask each field explicitly.
+    CC_BASE_MASK, CC_ARRIVAL_MASK = 0x0F, 0x30
+    cc_mode = raw_mode & CC_BASE_MASK
+    arrival_bits = raw_mode & CC_ARRIVAL_MASK
+    # None, not "ramping", when the sample itself is not trustworthy: an
+    # unavailable board's zero bits would otherwise read as a real "still
+    # ramping" from a channel that answered nothing.
     unavailable = bool(raw_mode & CC_UNAVAILABLE)
     current_valid = not (raw_mode & CC_STALE) and not unavailable
+    arrival = None if unavailable else {
+        0x00: "ramping", 0x10: "settled", 0x20: "capped",
+    }.get(arrival_bits, f"unknown:0x{arrival_bits:02X}")
     # bus_mV is None, NOT 0. The 0x3A response has no voltage field at all --
     # status, channel, muxPort, mode, measMa, targetMa, and nothing else (measured
     # on the wire 2026-09-16). A 0 here was a number this host invented: it reads
@@ -807,6 +826,7 @@ def _cached_entry(fil: int, raw_mode: int, current_mA, target_mA) -> dict:
     # a value for it. Want a voltage -> 0x24 (read_telemetry / ?live=1); that is
     # the only command that carries one.
     return {"index": fil, "present": (cc_mode != 0) and not unavailable,
+            "arrival": arrival, "cc_mode_raw": int(raw_mode),
             "bus_mV": None,
             "current_mA": current_mA if current_valid else None,
             "target_mA": target_mA, "cc_mode": cc_mode,
@@ -2842,6 +2862,44 @@ class CtHandler(BaseHTTPRequestHandler):
                                                   "crc": LOADED_CRC.get(cid),
                                                   "emit_fids": sorted(LOADED_EMIT_FIDS.get(cid, ()))}
                                    for cid in sorted(set(LOADED_PLAN) | set(LOADED_EMIT_FIDS))}})
+
+        elif path == "/api/tps-struggling":
+            # Which filaments the firmware cannot get STARTED: struggling is set
+            # after 3 consecutive failed revives of a collapsed output and
+            # cleared the instant it comes back. This is the ONLY signal that
+            # catches a SHORT -- a shorted board never sets the CC mode's fault
+            # bits (those need feedbackMv >= 2000, which a short cannot reach)
+            # and its arrival bits stay "ramping" forever. Verified on a shorted
+            # CH2.8: struggling bit set ~6.5 s after commanding IDLE while
+            # mode stayed 1 and current stayed at 1 mA.
+            out: dict[str, Any] = {"ok": True, "struggling": {}}
+            for cid, link in CONTROLLERS.items():
+                if not link.client.connected:
+                    continue
+                try:
+                    ft, flags, payload = build_payload(
+                        "CH_GET_TPS_STATUS", {"board_mask": [0xFF] * 8})
+                    resp = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
+                    raw = resp.get("raw") if isinstance(resp, dict) else None
+                    if not raw or len(raw) < 57:
+                        # Short reply = older firmware without the mask. Absent,
+                        # not "nothing is struggling": reporting an empty list
+                        # would read as a clean bench.
+                        out["struggling"][str(cid)] = None
+                        continue
+                    mask = raw[49:57]
+                    fids = []
+                    for ch in range(8):
+                        for pos in range(8):
+                            if mask[ch] & (1 << pos):
+                                f = MAPPING.filament_for_board(cid - 1, ch, pos)
+                                if f is not None:
+                                    fids.append(int(f))
+                    out["struggling"][str(cid)] = sorted(fids)
+                except Exception as exc:
+                    out["struggling"][str(cid)] = None
+                    out.setdefault("errors", {})[str(cid)] = str(exc)
+            self._json(out)
 
         elif path == "/api/dead-fids":
             # Filaments that must not be energised, in FID space, with the

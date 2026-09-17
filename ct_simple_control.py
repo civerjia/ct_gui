@@ -1232,6 +1232,13 @@ class CTClient:
         IDLE/ACTIVE, not STOP. Verified on hardware.
         """
         start = time.monotonic()
+        # Deliberately `start`, not 0: the first struggling check happens 2 s in,
+        # not immediately. The bit LATCHES while the output stays down, so a
+        # filament that was struggling in an earlier run still reads struggling
+        # before this attempt has driven it at all. Checking at t=0 would refuse
+        # a repaired load forever -- refuse, never drive, never clear, refuse.
+        # The delay gives the firmware a revive pass to clear it.
+        last_struggle_check = start
         deadline = start + timeout_s
         data: dict = {}
         while True:
@@ -1327,6 +1334,75 @@ class CTClient:
             # belongs in the loop, not here: a trip between two polls is
             # invisible to this host. Requested on the RP2350 side (they hold
             # tpsCcConverged_/tpsCcCapped_ internally, unreported).
+            # ARRIVAL: the firmware's own answer, which is the whole point --
+            # comparing polled samples here was always the wrong place for the
+            # judgement. The loop sees every sample; this host sees one every
+            # 50-100 ms across a shared link, and (measured) polling live INA
+            # reads to watch a ramp slows the ramp by ~20%.
+            #
+            #   settled -> it arrived. Believe it over any comparison here.
+            #   capped  -> pinned at the voltage cap, target NOT reached. This
+            #              answers what a timeout could not: "cannot arrive at
+            #              this cap", not "still on its way". Stop; waiting
+            #              longer cannot help unless the load or cap changes.
+            arrival = data.get("arrival")
+            if arrival == "settled" and abs(float(target_ma)) > tolerance_ma:
+                return {"ok": True, "filament": int(filament),
+                        "target_ma": float(target_ma), "measured_ma": measured,
+                        "measured_valid": valid, "measured_from": source,
+                        "elapsed_s": time.monotonic() - start,
+                        "present": bool(data.get("present", False)),
+                        "cc_mode": data.get("cc_mode"), "arrival": arrival,
+                        "faulted": False}
+            if arrival == "capped" and abs(float(target_ma)) > tolerance_ma:
+                return {"ok": False, "filament": int(filament),
+                        "target_ma": float(target_ma), "measured_ma": measured,
+                        "measured_valid": valid, "measured_from": source,
+                        "elapsed_s": time.monotonic() - start,
+                        "present": bool(data.get("present", False)),
+                        "cc_mode": data.get("cc_mode"), "arrival": arrival,
+                        "faulted": False, "capped": True,
+                        "error": f"CC loop is CAPPED — pinned at the voltage cap "
+                                 f"with {target_ma} mA unreached (holding "
+                                 f"{measured} mA). Not a fault and not slow: "
+                                 f"unreachable at this cap. Raise the cap or "
+                                 f"change the load; waiting will not help."}
+            # CANNOT START -- the only signal that catches a SHORT. A short
+            # never sets the fault bits (they need feedbackMv >= 2000, which a
+            # short cannot reach) and its arrival bits read "ramping" forever,
+            # so on a shorted board every check above says "still on its way"
+            # and this would burn the full timeout. Measured on CH2.8: arrival
+            # "ramping", mode 1, 1 mA, struggling set ~6.5 s in.
+            #
+            # Checked on a slow cadence of its own: it is a TPS register read,
+            # not something to poll at the loop rate, and the bit needs a few
+            # seconds of failed revives to appear anyway.
+            if (abs(float(target_ma)) > tolerance_ma
+                    and time.monotonic() - last_struggle_check >= 2.0):
+                last_struggle_check = time.monotonic()
+                sr = self._get("/api/tps-struggling", timeout=5.0)
+                rows = (sr.get("struggling") or {}) if sr.get("ok") else {}
+                fid = int(self._fid_of(filament))
+                for _cid, fids in rows.items():
+                    # None = old firmware with no mask. Absent, not empty: it
+                    # must not read as "nothing is struggling".
+                    if fids and fid in fids:
+                        return {"ok": False, "filament": int(filament),
+                                "target_ma": float(target_ma),
+                                "measured_ma": measured, "measured_valid": valid,
+                                "measured_from": source,
+                                "elapsed_s": time.monotonic() - start,
+                                "present": bool(data.get("present", False)),
+                                "cc_mode": data.get("cc_mode"),
+                                "arrival": data.get("arrival"),
+                                "faulted": False, "cannot_start": True,
+                                "error": "the firmware cannot get this output "
+                                         "started (TPS 'struggling': 3+ failed "
+                                         "revives of a collapsed output). A SHORT "
+                                         "looks exactly like this — it never sets "
+                                         "the fault bits and its arrival stays "
+                                         "'ramping', so nothing else here catches "
+                                         "it. Check the load before retrying."}
             cc_mode = data.get("cc_mode")
             if cc_mode in (2, 3) and abs(float(target_ma)) > tolerance_ma:
                 return {"ok": False, "filament": int(filament),
@@ -1338,14 +1414,27 @@ class CTClient:
                         "error": f"CC loop reports this channel FAULTED (cc_mode "
                                  f"{cc_mode}: 2=open filament, 3=OCP/SCP) — it is "
                                  f"not ramping toward {target_ma} mA."}
-            ok = valid and abs(measured - target_ma) <= tolerance_ma
+            # The polled comparison is now only a FALLBACK, for firmware that
+            # does not report arrival. When arrival IS reported it is
+            # authoritative: "ramping" means the loop says it has not arrived,
+            # and a host-side sample that happens to land inside the tolerance
+            # band must not override that. Measured: commanding IDLE 1500 on a
+            # cold filament, the inrush passes DOWN through 1569 mA within
+            # 0.4 s, so the comparison declared success while the loop was
+            # still ramping -- the exact false success this arrival bit exists
+            # to remove.
+            if arrival is not None:
+                ok = False          # settled/capped already returned above
+            else:
+                ok = valid and abs(measured - target_ma) <= tolerance_ma
             if ok or time.monotonic() >= deadline:
                 return {"ok": ok, "filament": int(filament), "target_ma": float(target_ma),
                         "measured_ma": measured, "measured_valid": valid,
                         "measured_from": source,
                         "elapsed_s": time.monotonic() - start,
                         "present": bool(data.get("present", False)),
-                        "cc_mode": data.get("cc_mode", 0), "faulted": False}
+                        "cc_mode": data.get("cc_mode", 0),
+                        "arrival": data.get("arrival"), "faulted": False}
             time.sleep(poll_interval_s)
 
     def stop_one(self, filament: int,
@@ -2008,6 +2097,11 @@ class CTClient:
                 "target_mA": (float(raw["target_mA"])
                               if raw.get("target_mA") is not None else None),
                 "cc_mode": raw.get("cc_mode"),
+                # The CC loop's OWN verdict on whether it got there:
+                # "ramping" | "settled" | "capped" | None (not trustworthy).
+                # Only the 0x3A cached source carries it.
+                "arrival": raw.get("arrival"),
+                "cc_mode_raw": raw.get("cc_mode_raw"),   # undecoded byte, for diagnosis
                 "source": source, "valid": valid,
                 # Always present on BOTH sources, so a caller never has to know
                 # which one answered to know which keys exist. `cached` is not
