@@ -698,8 +698,99 @@ instead of reusing the batch response shape for a batch of one.
 nothing about whether the filament actually got there.** A board can be
 absent, faulted, or thermally slow, and the command would still return
 `ok: True`. Every `*_one` method below takes an optional `verify=True` to
-get REAL feedback: it polls the measured heating current afterward and
-merges the result under `result["heating"]`.
+get REAL feedback, merged under `result["heating"]`.
+
+#### What `verify=True` actually checks
+
+`verify` used to compare host-polled current against the target. That was the
+wrong place for the judgement and produced false successes: commanding
+`idle_one(f, 1500)` on a cold filament, the inrush passes **down** through
+1569 mA within 0.4 s, so the comparison declared arrival while the loop was
+still ramping. The CC loop sees every sample; this host sees one every
+50-100 ms across a shared link.
+
+The firmware now reports its own verdict, and `verify` uses that. Four outcomes,
+each meaning something different:
+
+| `result["heating"]` | meaning | what to do |
+|---|---|---|
+| `ok: True`, `arrival: "settled"` | the loop reports it arrived and is stable | proceed |
+| `cannot_start: True` | the firmware cannot bring the output up at all | **check the load — a SHORT looks exactly like this** |
+| `capped: True`, `arrival: "capped"` | pinned at the voltage cap with the target unreached | raise the cap or change the load; waiting cannot help |
+| `faulted: True` | open filament, or a real OCP, confirmed over consecutive reads | investigate the board |
+| `ok: False` with none of the above | still ramping when the timeout expired | give it longer — see the timings below |
+
+Three of those could not be told apart before: everything that was not success
+came back as a generic "did not reach target" after burning the full timeout.
+
+> ⚠️ **`cannot_start` is the only signal that catches a short.** A shorted board
+> never sets the fault bits — those need `feedbackMv >= 2000` and a short cannot
+> reach 2 V — and its arrival bits read `"ramping"` indefinitely. Measured on a
+> deliberately shorted board: mode 1, arrival `"ramping"`, 1 mA, for minutes.
+> It comes from the firmware's `struggling` flag (3 consecutive failed revives
+> of a collapsed output), which is checked from 2 s into the wait — the flag
+> latches while the output stays down, so checking at t=0 would refuse a
+> repaired load forever.
+
+> ⚠️ **A startup OCP that recovers is NORMAL and is not reported as a fault.**
+> A board can trip on the inrush and come up on the next revive; the fault bits
+> can flash while that happens. `faulted` requires three consecutive reads, so a
+> transient does not end the wait.
+
+#### Timings, and one trap that will cost you 20%
+
+Measured on a simulated filament load, so treat them as shape rather than spec:
+
+| | time |
+|---|---|
+| cold → IDLE 1500 mA settled | ~14 s |
+| settled IDLE → ACTIVE 2950 mA | ~3.0 s |
+| cold → ACTIVE directly | **refused — see below** |
+
+`idle_one`'s default `timeout_s=5.0` is **not enough for a cold start**. Pass
+`timeout_s=30`.
+
+> ⚠️ **Do not watch a ramp with live V/I reads.** `read_filament_vi_live` is a
+> live INA219 read over the same I2C the CC loop uses to rewrite its setpoint,
+> so polling it *slows the ramp you are measuring*. Measured on the same ramp:
+> 3.61 s while polling live at 4 Hz, 3.28 s polling the zero-I2C cache, **3.0 s
+> not polling at all** — a 20% observer effect. Use
+> `read_filament_current_cached`, or command, sleep, and read once.
+
+#### ACTIVE may only be entered from IDLE
+
+`active_one` is refused unless the filament is **already settled at IDLE**.
+Going straight to firing current damages the filament, and a filament that fails
+inside the vacuum cannot be repaired. Measured on a simulated load, ACTIVE from
+cold produced 2067 mA of inrush and then collapsed the output to 0 V for ~10 s
+before the firmware revived it.
+
+Refused with `{"ok": False, "ladder_blocked": True, "error": ...}` when the
+filament is not at IDLE, when it was *commanded* to IDLE but the loop reports it
+never got there, or when this backend does not KNOW its state (after a
+reconnect — unknown refuses rather than allows). The RP2350 firmware refuses the
+transition too, so this is a second line rather than the only one.
+
+ACTIVE below **1500 mA** (the idle operating current) is also refused, on the
+live paths and inside a downloaded schedule's heating deltas alike — promoting
+to ACTIVE must not lower the current. IDLE is separately clamped to 2 A by the
+firmware, and schedules may not use VOLTAGE mode at all.
+
+    ct.sleep_one(f); ct.standby_one(f)
+    ct.idle_one(f, 1500, verify=True, timeout_s=30)
+    ct.active_one(f, 2950, verify=True)
+
+Wrap anything that heats in `ct.energised()` so a crash cannot leave it on:
+
+```python
+with ct.energised(7):
+    ct.idle_one(7, 1500, verify=True, timeout_s=30)
+    ct.active_one(7, 2950, verify=True)
+    ...                      # an exception here still STOPs filament 7
+```
+
+It covers a normal return, an exception, and Ctrl-C. It does **not** cover the
+process being killed outright — nothing does yet.
 
 **`stop_one(filament, verify=False, timeout_s=5.0)`** /
 **`sleep_one(filament, verify=False, timeout_s=5.0)`** /
@@ -708,8 +799,15 @@ merges the result under `result["heating"]`.
 `{"ok": False, "dead": True, ...}` if the filament is dead, or
 `{"ok": False, "error": ...}` if it has no board mapping or the board
 simply didn't ACK (e.g. temporarily unseated) — always check `"ok"`.
-`verify=True` polls until the measured current drops to ~0 mA (confirms
-it actually stopped heating).
+For `stop_one`/`sleep_one`, `verify=True` polls until the measured current
+drops to ~0 mA (confirms it actually stopped heating).
+
+`standby_one(verify=True)` is different: STANDBY has **no current target** — it
+holds the firmware's 0.8 V floor and draws whatever the filament's resistance
+allows (measured: 2.1 A of inrush decaying to ~885 mA by ~5 s at 0.78 V). So it
+confirms the board actually reports STANDBY and reports the current as an
+observation, not a pass/fail, under `result["standby"]`. Wait ~5 s before
+calling a STANDBY current abnormal.
 
 ```python
 ct.stop_one(5)

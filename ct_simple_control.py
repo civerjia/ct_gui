@@ -2986,9 +2986,21 @@ class CTClient:
         arm = self.ready_arm(rate_hz, post_bg_gap_us=post_bg_gap_us,
                              post_bg_n_us=post_bg_n_us)
         if not arm.get("ok"):
+            hint = ""
+            if "already armed" in str(arm.get("error", "")):
+                st = self.ready_status()
+                hint = (" — the relay is already armed. The usual cause is a "
+                        "previous run that was KILLED between arming and its "
+                        "cleanup (the disarm is in a finally, so an exception is "
+                        "fine; SIGKILL is not). If nothing else is using it, "
+                        "clear it with ct.ready_disarm(). Not stolen "
+                        "automatically: the relay is a single global resource "
+                        "with no owner recorded, so another client could be "
+                        f"mid-run. Current: {st}")
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "measured": [], "ref_mv": None,
-                    "error": f"detector arm failed, nothing fired: {arm.get('error')}"}
+                    "error": f"detector arm failed, nothing fired: "
+                             f"{arm.get('error')}{hint}"}
         try:
             # "Huge since" returns no events but a true current cursor, so we
             # collect only what THIS fire produces and never a stale backlog.
@@ -3168,7 +3180,36 @@ class CTClient:
         if not arm_r.get("ok"):
             return {"ok": False, "error": f"arm rejected (code {arm_r.get('reject')}) — "
                                           "check active list and filament power states",
+                    "arm_reject": arm_r.get("reject"),
                     "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
+
+        # A SUCCESSFUL arm can still have silently dropped this filament. Under
+        # the CONTINUE fault policy, arm skips a filament that fails its safety
+        # gate (IsoOff -- the board's isolated 12 V rail is off), returns
+        # reject 0, and runs the rest. The envelope still fires for the counted
+        # trigger so the pulse index stays aligned, so the detector records a
+        # pulse and every other field looks like a normal shot -- while no HV
+        # ever reached the filament.
+        #
+        # Measured: filament 5 at STOP, arm reject 0, unsafeSlots 0x20 (slot 5),
+        # and a measured pulse event. That result was indistinguishable from a
+        # real one without this check. SLEEP (iso on) gives unsafeSlots 0.
+        st_after = self.shv_status(controller)
+        unsafe = st_after.get("unsafeSlots")
+        site = self.filament_to_board(filament)
+        slot = (site or {}).get("slot")
+        if unsafe and slot is not None and (unsafe >> int(slot)) & 1:
+            self.shv_disarm(controller)
+            return {"ok": False, "fired": 0, "records": [], "status": st_after,
+                    "schedule": reuse_note, "skipped_unsafe": True,
+                    "error": f"arm accepted the schedule but SKIPPED filament "
+                             f"{filament} (power slot {slot}) as unsafe — its "
+                             f"board's isolated 12 V rail is off, so no HV would "
+                             f"reach it. The run would still fire the envelope "
+                             f"for the counted trigger, so this would otherwise "
+                             f"look like a successful shot. Bring the rail up "
+                             f"(sleep_one({filament}) is enough — it enables iso "
+                             f"without heating current) and fire again."}
 
         if trigger == "sim":
             r = self._post("/api/sync/simulate", {
@@ -3259,6 +3300,12 @@ class CTClient:
             if us is not None:
                 body[key] = max(0, int(round(float(us) * rate_hz / 1_000_000)))
         return self._post("/api/adc/ready-arm", body)
+
+    def ready_status(self) -> dict:
+        """Whether the pulse-envelope relay is armed, and how many edges it has
+        relayed. Useful when an arm is refused as "already armed" -- there is no
+        owner recorded, so this is all there is to go on."""
+        return self._post("/api/adc/ready-status", {}, timeout=5.0)
 
     def ready_disarm(self) -> dict:
         """Stop relaying pulse envelopes and release the STM32 CS claim."""

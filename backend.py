@@ -55,6 +55,7 @@ from net_protocol import (
     adc_pulse_diag,
     adc_ready_arm,
     adc_ready_disarm,
+    adc_ready_status,
     adc_pulse_disarm,
     primary_local_ip,
     EspCmdClient,
@@ -1285,6 +1286,21 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         # when rbSaturated==0; otherwise treat it as a LOWER BOUND, not a
         # count.
         "rbSaturated": le32(39) if len(p) >= 43 else None,
+        # unsafeSlots (u64 bitmap of POWER SLOTS, not filaments): which
+        # scheduled slots arm() SKIPPED because they failed its safety gate
+        # (IsoOff — the board's isolated 12 V rail is not on). Only ever
+        # non-zero under the CONTINUE fault policy; STOP refuses the arm
+        # instead. None on firmware that does not report it — absent, not
+        # "nothing skipped", because those mean opposite things here.
+        #
+        # This is the ONLY way to tell a skipped filament from a fired one.
+        # arm returns reject 0, the run proceeds, and the envelope still
+        # fires for the counted trigger so the pulse index stays aligned —
+        # so a skipped filament looks like a successful shot from every
+        # other field. Check this before believing a pulse reached a
+        # filament.
+        "unsafeSlots": (int.from_bytes(p[43:51], "little")
+                        if len(p) >= 51 else None),
     }
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -4305,6 +4321,15 @@ class CtHandler(BaseHTTPRequestHandler):
                                          int(body.get("n_samples", 2000)),
                                          None if pbg is None else int(pbg),
                                          None if pbn is None else int(pbn)))
+            elif path == "/api/adc/ready-status":
+                # Armed / edges relayed. A POST only because everything in this
+                # chain is; it reads nothing but ESP32 state. Needed because an
+                # arm refused as "already armed" records no owner, so this is
+                # the only way to see what is holding it.
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                self._json(adc_ready_status(host))
             elif path == "/api/adc/ready-disarm":
                 host, err = self._master_host()
                 if err:
