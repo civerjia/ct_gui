@@ -2075,19 +2075,17 @@ so two identical runs both reporting 1 is not accumulation:
 | `rbSaturated` | times the 165 read-back FIFO was full when a pulse was accounted |
 | `unsafeSlots` | bitmap of power slots `arm` SKIPPED as unsafe. **Non-zero means those filaments did not fire even though the run looks normal** |
 
-> ⚠️ **`mismatches` equals the number of CHANNEL BOUNDARIES in the schedule, and
-> those are benign.** The channel select is applied in the trigger ISR — it has
-> to be, or the firmware risks missing the pre-shift window and losing a whole
-> pulse — so the 165 sample ~10 µs later finds the mux already moved to the next
-> entry's channel and reads `0x00`. **The pulse is correct; only its
-> verification is lost.** Measured: 0 crossings → 0, 3 → 3, 15 → 15, with every
-> pulse fired and measured.
+> ⚠️ **A non-zero `mismatches` is a real verify failure** — a pulse whose 165
+> read-back did not match the byte that was commanded. There is exactly ONE
+> read-back per pulse (post-ON, mid-pulse), so there is no second read to fall
+> back on.
 >
-> To tell a benign boundary artefact from a real failure, look at the pulse log:
-> the artefact carries `flags=0x01` with `read165=0x00` — a read-back of *zero*
-> rather than a wrong bit. A **non-zero** wrong read-back is a real verify
-> failure. (A schedule confined to one channel has no boundaries and so no
-> benign mismatches at all.)
+> It briefly meant something else: for one firmware revision a cross-channel
+> schedule reported one mismatch per channel boundary, because the channel
+> select moved before the read-back had been taken. That is fixed at the source,
+> and a cross-channel table now reads 0 (measured: 0 / 3 / 15 crossings, all 0).
+> If you ever see `mismatches` tracking the number of channel boundaries again,
+> that is the regression — not a property of crossing channels.
 
 **`shv_pulse_log(controller=1, start=0)`** — Fetch fired-pulse records
 after a run, to confirm what actually happened on the hardware.

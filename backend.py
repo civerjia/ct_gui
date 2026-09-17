@@ -1283,26 +1283,25 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         # through the 165 mid-pulse and compares). Per run, not cumulative:
         # arm() calls resetRuntime_(), so every arm starts from zero.
         #
-        # EXPECTED ON EVERY CHANNEL BOUNDARY, and it does not mean the pulse was
-        # wrong. The channel select (S0/S1/S2) is applied in the trigger ISR --
-        # it has to be, since applying it from the main loop risks missing the
-        # window before the next pre-shift and losing a whole PULSE. The cost is
-        # that the 165 sample ~10 us later finds the mux already moved to the
-        # next entry's channel and reads 0x00. The pulse itself is correct: the
-        # byte was pre-shifted into the 595 before the trigger and the board is
-        # chosen by the RCLK mask from the FIFO, neither of which the mux
-        # affects.
+        # A NON-ZERO VALUE IS A REAL VERIFY FAILURE. It briefly was not: for one
+        # firmware revision a cross-channel schedule reported exactly one
+        # mismatch per channel boundary, because the channel select was applied
+        # in the trigger ISR and the 165 sample ~10 us later found the mux
+        # already moved, reading 0x00. Fixed at the source (RP2350 32c70c9) --
+        # hv_shift now raises a PIO IRQ once the read-back has been pushed and
+        # the mux moves from that, so the verification actually happens. Measured
+        # here after the fix: 0 / 3 / 15 crossings all report 0 mismatches with
+        # pulse-log flags 0.
         #
-        # So on a cross-channel schedule, expect mismatches == the number of
-        # channel boundaries. Measured here: 0 crossings -> 0, 3 -> 3, 15 -> 15,
-        # with every pulse fired and measured (16/16 envelopes, on_us 1000-1002).
+        # Kept as a note because it is the shape to watch for, not because the
+        # behaviour is still here: if mismatches ever tracks the number of
+        # channel boundaries again, that is the regression, not a property of
+        # cross-channel schedules.
         #
-        # HOW TO TELL THE TWO APART: a boundary artefact carries flags=0x01 with
-        # read165=0x00 in the pulse log -- a "mismatch" whose read-back is ZERO
-        # rather than a wrong bit. A mismatch with a NON-zero wrong read-back is
-        # a real verify failure. The counter currently conflates "verify was
-        # impossible" with "verify failed"; the RP2350 side is proposing a
-        # distinct flag so boundary pulses stop counting here.
+        # There is exactly ONE read-back per pulse (post-ON, mid-pulse). The
+        # PostOnly / PrePost / PrePostLevel modes in the protocol belong to the
+        # legacy HvScheduleEngine, which is not ticked -- so there is no second
+        # read to fall back on, which is why the mux timing mattered at all.
         "mismatches": le32(35) if len(p) >= 39 else None,
         # rbSaturated (firmware 7528a75+): times the 165 read-back FIFO was
         # found full when a pulse was accounted. NOT independent of
