@@ -2341,6 +2341,12 @@ class CTClient:
                                   # "measure" in the docstring
         rate_hz: int = 1000000,  # detector ADC sample rate; only used
                                   # when measure=True
+        post_bg_gap_us: float | None = None,  # measure=True only: wait this long
+                                               # after the pulse ends before
+                                               # sampling the post-pulse level
+        post_bg_n_us: float | None = None,    # measure=True only: then average
+                                               # over this long. None = firmware
+                                               # default (50 us / 50 us)
     ) -> dict:
         """Download a one-entry schedule, arm it, fire, and verify.
 
@@ -2491,6 +2497,20 @@ class CTClient:
         collects exactly the events this fire produced, and releases the
         detector again -- including if the fire raises or times out.
 
+        POST-PULSE BACKGROUND. Each event's post_bg is measured by waiting
+        post_bg_gap_us after the envelope ends (for the analog front end to
+        settle) and then averaging over post_bg_n_us. Both default to the
+        firmware's 50 us / 50 us; pass your own when that doesn't fit this
+        board. If post_bg comes back looking like the tail of the pulse rather
+        than a settled level, the gap is too short. Setting post_bg_n_us=0
+        disables the measurement, and post_bg then reports None -- NOT 0, which
+        would be a legal post-pulse current.
+
+            r = ct.fire_single_pulse(5, num_pulses=3, width_us=1000,
+                                     measure=True,
+                                     post_bg_gap_us=200,   # let it settle longer
+                                     post_bg_n_us=100)
+
         With measure=True the result gains:
             "measured": [ ... ]   one event per pulse, each with peak_ma /
                                   plateau_ma / bg_ma (see pulse_events_ma)
@@ -2526,7 +2546,8 @@ class CTClient:
         # the STM32 took 7.2M samples. With the relay armed the same fire gives
         # 3 events whose measured widths (1009/1002/1000 us) match the commanded
         # 1000 us. See pulse_arm()'s note for the detector-only form.
-        arm = self.ready_arm(rate_hz)
+        arm = self.ready_arm(rate_hz, post_bg_gap_us=post_bg_gap_us,
+                             post_bg_n_us=post_bg_n_us)
         if not arm.get("ok"):
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "measured": [], "ref_mv": None,
@@ -2747,8 +2768,21 @@ class CTClient:
     # Safe to run this script alongside an open GUI tab; just don't assume
     # you got the rate_hz you asked for if something else armed it first.
 
-    def ready_arm(self, rate_hz: int = 1000000, n_samples: int = 2000) -> dict:
+    def ready_arm(self, rate_hz: int = 1000000, n_samples: int = 2000,
+                  post_bg_gap_us: float | None = None,
+                  post_bg_n_us: float | None = None) -> dict:
         """Arm the pulse-envelope RELAY plus the STM32 detector inside it.
+
+        post_bg_gap_us / post_bg_n_us tune the POST-PULSE background window: the
+        STM32 waits `gap` after the envelope ends for the signal to settle, then
+        averages `n` to produce each event's post_bg. Both are in MICROSECONDS
+        here (converted to samples at rate_hz on the way out). Leave them None
+        to use the firmware defaults (50 us / 50 us). The right gap depends on
+        how long this board's analog front end takes to settle -- if post_bg
+        still looks like the tail of the pulse rather than a settled level,
+        raise the gap. post_bg_n_us=0 turns the measurement off, and events then
+        report post_bg as None rather than 0.
+
 
         This is the one you want when you intend to MEASURE fired pulses, and it
         is what fire_single_pulse(measure=True) uses. The STM32 times each pulse
@@ -2757,8 +2791,16 @@ class CTClient:
         (pulse_arm) and PA4 never moves, so a fire measures nothing at all --
         the detector reports zero events while everything else looks healthy.
         """
-        return self._post("/api/adc/ready-arm",
-                          {"rate": int(rate_hz), "n_samples": int(n_samples)})
+        body: dict = {"rate": int(rate_hz), "n_samples": int(n_samples)}
+        # The wire wants SAMPLES; callers here think in microseconds like every
+        # other timing argument in this client, so convert at the boundary using
+        # the rate actually being armed. Omitted (not 0) when unspecified -- 0 is
+        # a real value on the wire meaning "do not measure the post-pulse
+        # background at all", so it must not double as "caller said nothing".
+        for key, us in (("post_bg_gap", post_bg_gap_us), ("post_bg_n", post_bg_n_us)):
+            if us is not None:
+                body[key] = max(0, int(round(float(us) * rate_hz / 1_000_000)))
+        return self._post("/api/adc/ready-arm", body)
 
     def ready_disarm(self) -> dict:
         """Stop relaying pulse envelopes and release the STM32 CS claim."""
@@ -2908,6 +2950,8 @@ class CTClient:
         timeout_s: float = 15.0,
         verify: bool = True,
         reuse: bool = False,
+        post_bg_gap_us: float | None = None,
+        post_bg_n_us: float | None = None,
     ) -> dict:
         """Fire and measure, returning the two halves separately.
 
@@ -2924,14 +2968,17 @@ class CTClient:
              "ref_mv":   the live reference reading actually used}
 
         See fire_single_pulse's "measure=True" section for the arming and
-        correlation rules, and why a partial measurement reports ok=False.
+        correlation rules, why a partial measurement reports ok=False, and what
+        post_bg_gap_us/post_bg_n_us do -- they are forwarded unchanged, so this
+        wrapper can do everything the call it wraps can.
         """
         r = self.fire_single_pulse(
             filament, num_pulses=num_pulses, width_us=width_us,
             inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
             total_ms=total_ms, controller=controller, trigger=trigger,
             timeout_s=timeout_s, verify=verify, reuse=reuse,
-            measure=True, rate_hz=rate_hz)
+            measure=True, rate_hz=rate_hz,
+            post_bg_gap_us=post_bg_gap_us, post_bg_n_us=post_bg_n_us)
         fired = {k: v for k, v in r.items() if k not in ("measured", "ref_mv")}
         return {"ok": bool(r.get("ok")), "fired": fired,
                 "measured": r.get("measured") or [], "ref_mv": r.get("ref_mv")}

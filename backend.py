@@ -16,6 +16,8 @@ STM32 = the device's HTTP /stm32 status (age_ms).
 from __future__ import annotations
 
 import json
+import logging
+import logging.handlers
 import os
 import threading
 import time
@@ -76,6 +78,28 @@ FLAG_SINGLE = 0x10  # kTargetIsSingleBoard
 
 def _u16(v: int) -> bytes:
     return int(v).to_bytes(2, "little")
+
+
+# ---------------------------------------------------------------------------
+# Logging. There was none: everything went to stdout and died with the terminal,
+# so a fault that happened overnight -- or a 40 kV arc that reset the STM32 while
+# nobody was watching -- left no record at all. File-backed now, with the console
+# output preserved so nothing that used to be visible stops being visible.
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+log = logging.getLogger("ct_gui")
+
+
+def _setup_logging() -> None:
+    LOG_DIR.mkdir(exist_ok=True)
+    log.setLevel(logging.INFO)
+    if log.handlers:
+        return
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_DIR / "backend.log", maxBytes=4_000_000, backupCount=5, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
+                                      "%Y-%m-%d %H:%M:%S"))
+    log.addHandler(fh)
+    log.propagate = False
 
 
 def build_payload(command: str, b: dict):
@@ -1328,6 +1352,8 @@ class ControllerLink:
         self.rp_rtt_ms: float | None = None
         self.stm: dict[str, Any] = {}
         self.bridge_name: str | None = None       # ESP32 AP SSID (MAC-derived identity)
+        self._last_stm_uptime: int | None = None  # for restart detection, see _note_stm_reset
+        self._stm_resets = 0
 
     def connect(self, host: str) -> None:
         with self._lock:
@@ -1418,6 +1444,7 @@ class ControllerLink:
                 except Exception:
                     if not reconnecting:
                         print(f"[{self.name}] bridge down, reconnecting to {host}…", flush=True)
+                    log.warning("%s: bridge down, reconnecting to %s", self.name, host)
                     reconnecting = True
                     time.sleep(1.0)
                     continue
@@ -1432,10 +1459,42 @@ class ControllerLink:
             host = self.host
             if host:
                 try:
-                    self.stm = fetch_stm32_status(host)
+                    stm = fetch_stm32_status(host)
+                    self._note_stm_reset(stm)
+                    self.stm = stm
                 except Exception as exc:
                     self.stm = {"ever_seen": False, "error": str(exc)}
             time.sleep(1.0)
+
+    def _note_stm_reset(self, stm: dict) -> None:
+        """Log every STM32 restart WITH ITS CAUSE, at the moment it happens.
+
+        uptime going backwards is the only evidence a restart occurred, and it is
+        gone a second later when the next poll overwrites it. The cause matters
+        more than the fact: a watchdog timeout, a brown-out and a real exception
+        are three different faults with three different fixes, and in the field
+        (40 kV arcing) nobody is watching a console when it happens."""
+        up = stm.get("stm_uptime_ms")
+        if up is None:
+            return
+        prev = self._last_stm_uptime
+        self._last_stm_uptime = up
+        if prev is None or up >= prev:
+            return
+        self._stm_resets += 1
+        cause = stm.get("reset_cause")
+        # "unknown" / None means the firmware did not report a cause. Logging a
+        # bare 0 or an empty string there would read as "no cause", which is a
+        # claim we were never given.
+        if not cause or cause == "unknown":
+            log.warning("%s: STM32 RESET #%d — cause NOT REPORTED by this firmware "
+                        "(uptime %s -> %s ms)", self.name, self._stm_resets, prev, up)
+            return
+        detail = ""
+        if stm.get("fault_pc") is not None:
+            detail = f" fault={stm.get('fault_type')} pc=0x{int(stm['fault_pc']):08X}"
+        log.warning("%s: STM32 RESET #%d — cause=%s%s (uptime %s -> %s ms)",
+                    self.name, self._stm_resets, cause, detail, prev, up)
 
     def status(self) -> dict[str, Any]:
         now = time.time()
@@ -1451,6 +1510,10 @@ class ControllerLink:
                 "ever_seen": bool(stm.get("ever_seen")),
                 "age_ms": stm.get("age_ms"),
                 "error": stm.get("error"),
+                "reset_cause": stm.get("reset_cause"),
+                "fault_type": stm.get("fault_type"),
+                "fault_pc": stm.get("fault_pc"),
+                "resets_observed": self._stm_resets,
             },
         }
 
@@ -3674,8 +3737,12 @@ class CtHandler(BaseHTTPRequestHandler):
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                pbg = body.get("post_bg_gap")
+                pbn = body.get("post_bg_n")
                 self._json(adc_ready_arm(host, int(body.get("rate", 1000000)),
-                                         int(body.get("n_samples", 2000))))
+                                         int(body.get("n_samples", 2000)),
+                                         None if pbg is None else int(pbg),
+                                         None if pbn is None else int(pbn)))
             elif path == "/api/adc/ready-disarm":
                 host, err = self._master_host()
                 if err:
@@ -4097,8 +4164,10 @@ def main() -> None:
     # this API. Set CT_GUI_HOST=127.0.0.1 to keep it to this machine.
     host = os.environ.get("CT_GUI_HOST", "0.0.0.0")
     port = int(os.environ.get("CT_GUI_PORT", "8770"))
+    _setup_logging()
+    log.info("=== backend start — listening on http://%s:%d ===", host, port)
     server = ThreadingHTTPServer((host, port), CtHandler)
-    print(f"CT GUI server listening on http://{host}:{port}")
+    print(f"CT GUI server listening on http://{host}:{port}  (log: {LOG_DIR}/backend.log)")
     if host == "0.0.0.0":
         lan = primary_local_ip()
         print(f"  open http://127.0.0.1:{port}" + (f" · shared API on http://{lan}:{port}" if lan else ""))
@@ -4109,6 +4178,10 @@ def main() -> None:
     finally:
         for c in CONTROLLERS.values():
             c.disconnect()
+        # A clean stop is itself worth recording: it is what tells you, later,
+        # that a gap in the log was an operator stopping the service and not a
+        # crash.
+        log.info("=== backend stop ===")
 
 
 if __name__ == "__main__":

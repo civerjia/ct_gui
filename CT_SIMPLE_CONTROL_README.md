@@ -2093,6 +2093,27 @@ if the fire fails or times out.
 | `ref_mv` | the live reference reading actually used for the mA conversion |
 | `ok` | stricter — True only if the fire succeeded **and** every fired pulse produced a measured event |
 
+**Tuning the post-pulse background** — `post_bg` is measured by waiting
+`post_bg_gap_us` after the envelope ends (so the analog front end can settle)
+and then averaging over `post_bg_n_us`. Both default to the firmware's
+50 µs / 50 µs; pass your own when that doesn't fit the board:
+
+```python
+r = ct.fire_single_pulse(25, num_pulses=3, width_us=1000, measure=True,
+                         post_bg_gap_us=200,    # let it settle longer
+                         post_bg_n_us=100)      # then average 100 µs
+```
+
+If `post_bg` comes back looking like the tail of the pulse rather than a
+settled level, the gap is too short. `post_bg_n_us=0` turns the measurement
+off, and `post_bg` then reports `None` — **not** `0`, which would be a legal
+post-pulse current.
+
+These are microseconds here and samples on the wire; the client converts using
+the `rate_hz` it is arming. They are sent on **every** arm, because the STM32
+loses them on reset — leaving that to a one-time setup would mean a reset
+silently reverts to "not measured" without the host noticing.
+
 That stricter `ok` is the point. A fire that "worked" while the detector saw
 nothing — link down, detector not really armed, events dropped — reports
 `ok=False` rather than letting a silent measurement gap look like success. And
@@ -2121,6 +2142,26 @@ already has Stream or Record running just **joins** that arm (your
 `rate_hz` is ignored if you weren't the first arm-er); disarming here
 only actually disarms the hardware once nothing else still wants it
 armed. Safe to run this script alongside an open GUI tab.
+
+**`ready_arm(rate_hz=1000000, n_samples=2000, post_bg_gap_us=None, post_bg_n_us=None)`**
+/ **`ready_disarm()`** — Arm/release the pulse-envelope **relay** *and* the STM32
+detector inside it. This is what `fire_single_pulse(measure=True)` uses, and
+what you want if you are arming by hand and intend to measure.
+
+> The relay is the part that makes measurement work at all. The STM32 times each
+> pulse from the real edge on its PA4 pin, and that pin only moves while the
+> ESP32 is mirroring the RP2350's pulse-envelope output onto it. Arm only the
+> detector (`pulse_arm` below) and PA4 never moves — the detector sits there
+> sampling and never sees a pulse start, so a fire measures **nothing** while
+> everything else looks healthy.
+
+```python
+ct.ready_arm(post_bg_gap_us=200, post_bg_n_us=100)   # relay + detector
+try:
+    ...                                              # fire from elsewhere
+finally:
+    ct.ready_disarm()
+```
 
 **`pulse_arm(rate_hz=1000000)`** / **`pulse_disarm()`** — Arm/release the
 detector. Arming doesn't measure anything by itself — it just gets the

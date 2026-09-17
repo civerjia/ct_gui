@@ -2468,6 +2468,7 @@ def adc_pulse_diag(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict
 
 
 def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
+                  post_bg_gap: int | None = None, post_bg_n: int | None = None,
                   timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
     """Arm the RP2350->STM32 pulse-envelope relay AND (inside it) the STM32
     detector. This is what makes a fired pulse actually get MEASURED: the
@@ -2476,6 +2477,12 @@ def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
     detector but not the relay, so PA4 never moves and a fire yields 0 events."""
     url = (f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ready_arm"
            f"?rate_hz={int(rate_hz)}&n_samples={int(n_samples)}")
+    # Omitted entirely rather than sent as 0: the ESP32 falls back to its own
+    # defaults for an absent param, and 0 means something different (post_bg_n=0
+    # is "do not measure"). Passing 0 to mean "unspecified" would silently turn
+    # the measurement off.
+    if post_bg_gap is not None: url += f"&post_bg_gap={int(post_bg_gap)}"
+    if post_bg_n   is not None: url += f"&post_bg_n={int(post_bg_n)}"
     try:
         status, text = _http_post_form(url, {}, timeout)
         return _post_result(status, text)
