@@ -1910,8 +1910,20 @@ class CTClient:
         - "mismatch": what to do on an HC165 shift-register read-back
           mismatch (0=stop, 1=continue).
 
-        Also reports which boards actually faulted during the current/most
-        recent run — the only record of that under a "continue" policy.
+        Also reports which boards have faulted — the only record of that under
+        a "continue" policy. NOTE it is CUMULATIVE: `arm` does not clear it, so
+        it answers "which filaments have ever faulted since this controller came
+        up", not "which faulted this run". (Verified: the list is identical
+        before and after a run with no faults.) The per-run counters --
+        mismatches/uncounted/underfed/triggerEdges -- ARE zeroed by arm, and
+        shv_status's `faultFilament` is the single filament that stopped the
+        current run. Three different questions.
+
+        With unpopulated slots on the bench you almost certainly want board=1:
+        the default stops the whole run at the first fault, and an empty slot
+        promoted to ACTIVE is an open circuit and faults by definition.
+        Measured on a 16-pulse scan with 14 empty slots: board=0 gave
+        done=2/16 (Fault), board=1 gave 16/16.
 
         Returns {"ok", "board": 0|1, "mismatch": 0|1, "mismatchCount": int,
         "faultedSlots": [raw slot ints, 8*channel+position],

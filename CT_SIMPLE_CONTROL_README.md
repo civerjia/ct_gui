@@ -1189,8 +1189,34 @@ ct.set_fault_policy(1, board=1, mismatch=0)   # continue past CC/OCP faults,
 r = ct.get_fault_policy(1)
 print(r)
 # {"ok": True, "board": 1, "mismatch": 0, "mismatchCount": 0,
-#  "faultedSlots": [...], "faultedFilaments": [...]}   # your logical numbering
+#  "faultedSlots": [...], "faultedFilaments": [...]}   # your USER_INDEX numbering
 ```
+
+> ⚠️ **On a bench with unpopulated slots you almost certainly want
+> `board=1`.** The default (`board=0`, stop) ends the whole run at the FIRST
+> filament that faults, and an empty slot promoted to ACTIVE faults by
+> definition — it is an open circuit. Measured on a 16-pulse scan with 14 empty
+> slots: `done=2/16`, `stopReason=5` (Fault), `faultFilament=3`. The same
+> schedule with `board=1` completed `16/16` and recorded the offenders in
+> `faultedFilaments`.
+>
+> This only bites when a heating delta promotes a filament **during** the run —
+> a schedule whose deltas all sit at trigger 0 never exposes it, which is why
+> a sliding-window plan can fail where a simpler one passes.
+>
+> An open circuit does not fault instantly: `FaultOpen` needs the output voltage
+> to climb past ~2 V with no current, so each board gets there at its own time
+> (measured on six empty slots at IDLE 1500 mA: two still healthy at 4 s, all
+> six faulted by 10 s). So a single snapshot showing only *some* slots faulted
+> is a timing artefact, not a difference between the slots.
+
+> ⚠️ **`faultedFilaments` is CUMULATIVE, not per-run.** `arm` does not clear it,
+> unlike `mismatches`/`uncounted`/`underfed`/`triggerEdges`, which it zeroes. A
+> clean run leaves the previous run's entries in place (verified: the list was
+> identical before and after a run with no faults), so it answers "which
+> filaments have ever faulted since the controller came up", not "which faulted
+> this run". `faultFilament` in `shv_status` is the single filament that stopped
+> the current run — a different question again.
 
 **`get_trigger_delay(controller=1)`** / **`set_trigger_delay(delay_us, controller=1)`**
 — A small, deliberate offset (µs, uint16, 0–65535) between the SyncIn
