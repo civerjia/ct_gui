@@ -172,6 +172,7 @@ Usage:
 Dependencies: pip install requests
 """
 
+import math
 import time
 from contextlib import contextmanager
 
@@ -2829,13 +2830,36 @@ class CTClient:
 
         Each event:
             "id"        monotonic event id (use as the next `since`)
-            "t_us"      STM32 timestamp of the pulse start
+            "t_us"      STM32 sample index at the pulse start (R). Free-running
+                        since boot, so it WRAPS every 2**32 samples -- about
+                        71.6 minutes at 1 MSPS. Differencing two of these
+                        across a wrap gives nonsense: order by "id", and use
+                        "recv_ms" for wall-clock.
             "on_us"     MEASURED pulse width, from the real envelope on the
                         STM32's PA4 pin -- not the commanded width. Compare it
                         against what you asked for; they should agree closely.
-            "peak"      highest sample inside the pulse
-            "plateau"   mean over the pulse window [rise, fall)
-            "bg"        rolling background BEFORE the pulse
+            "peak"      highest raw code inside the pulse. **None when not
+                        measured** (empty envelope), on firmware with the
+                        measure_flags capability. Older firmware reports the
+                        field's initial 0 there, which converts to a confident
+                        ~-32 mA -- so "empty_envelope" below, derived from
+                        on_us, stays the authoritative test and this null is
+                        the second layer.
+            "plateau"   mean raw code over [rise + plateau_margin, fall),
+                        margin = 0 here so it is the whole envelope. **None
+                        when not measured** (empty range), on firmware with the
+                        measure_flags capability. Older firmware reports "peak"
+                        instead, with no flag.
+                        Do NOT try to detect that by testing plateau == peak: a
+                        genuinely flat pulse has floor(mean) == max, so the test
+                        misfires on the CLEANEST data. With margin at 0 the
+                        empty case needs duration_samples <= 0 -- a zero-length
+                        envelope -- which a real pulse never produces.
+            "bg"        floor of the mean over the 20 samples BEFORE the
+                        rise. If the previous pulse ended fewer than 20 samples
+                        ago, this still holds samples from before THAT pulse --
+                        back-to-back firing quietly degrades bg, and with it
+                        integral and sigma.
             "post_bg"   mean AFTER the pulse: the STM32 waits ~50 us for the
                         signal to settle, then averages ~50 us. **None when it
                         was not measured** -- either the window is configured
@@ -2843,14 +2867,81 @@ class CTClient:
                         sample could be taken. None, not 0: 0 is a perfectly
                         legal post-pulse current and the two must not look
                         alike. Guard with `is not None`.
-            "bg_sigma4" 4x the background sigma
-            "integral"  summed samples over the pulse
+            "bg_sigma4" 4x the background sigma (sigma = bg_sigma4/4)
+            "integral"  background-subtracted sum over the pulse, in raw
+                        counts: round(Sigma(x) - (F-R)*Sigma_bg/n), using the
+                        EXACT background mean -- not the rounded "bg" above, so
+                        it does not carry that field's up-to-1-code error.
+                        SIGNED -- pure noise
+                        sums to about zero and a pulse dimmer than its own
+                        background is legitimately negative. Use
+                        pulse_events_ma()'s "integral_mams" rather than scaling
+                        it by hand -- the rate that conversion needs is
+                        "rate_hz" below, not the one you asked for.
+            "empty_envelope"  True when on_us == 0: a rise and a fall landed
+                        on the SAME sample, which is a PA4 glitch, not a pulse
+                        -- and the STM32 still commits a full, normal-looking
+                        event for it. In that event peak is its INITIAL value
+                        (0), integral is 0, and plateau is empty; none are
+                        measurements. peak_ma/plateau_ma/integral_mams are
+                        therefore omitted or None on such events (0 counts would
+                        otherwise convert to a confident ~-32 mA, and the
+                        integral to a legal 0.0 charge). bg and post_bg stay
+                        valid -- bg is snapshotted at the rise and post_bg is
+                        measured normally -- so those still convert.
+                        Discard these events, or keep them explicitly as
+                        glitches; do not average them in.
+            "rate_hz"   the rate this pulse was ACTUALLY sampled at, reported
+                        by the STM32 per event. Its timer runs at
+                        170 MHz / an integer divider, so the achieved rate
+                        rarely equals the requested one, and it can change
+                        between pulses. **None on firmware too old to report
+                        it.** on_us/integral and every sample-count parameter
+                        are in samples of THIS rate -- so with it None, they
+                        cannot be turned into time or charge at all.
             "recv_ms"   host receive time
 
         peak/plateau/bg/post_bg are RAW ADC
         counts, not mA; convert with pulse_ma()/pulse_events_ma() below,
         never by hand (the correct conversion needs a LIVE reference
         reading, not a fixed constant -- see pulse_ma's docstring).
+        pulse_events_ma() additionally adds, per event:
+            "integral_mams"  charge in mA*ms, = slope * integral / rate_hz.
+                        **None** when it could not be computed; see
+                        "integral_mams_unavailable" for which reason.
+            "integral_mams_unavailable"  present only when integral_mams is
+                        None, naming which fact was missing:
+                          "rate_unknown"  old firmware sent no sample rate, so
+                              there is nothing to divide by (assuming 1 MSPS
+                              would scale the answer by whatever the real rate
+                              turned out to be).
+                          "integral_clamped"  the STM32 reports the OLD
+                              clamp-at-zero integral, which is biased upward on
+                              weak pulses. Converting it would hand back a
+                              number that is wrong by an amount nothing in the
+                              data reveals. Flash both sides.
+                          "integral_form_unknown"  the STM32 never answered
+                              GET_INFO, so which of the two forms it sends is
+                              unknown -- distinct from knowing it is old.
+                          "empty_envelope"  on_us == 0, so integral is 0
+                              because nothing was integrated -- not because the
+                              charge was zero.
+                          "saturated"  integral hit INT32_MAX/INT32_MIN.
+            "integral_saturated"  True when integral hit 0xFFFFFFFF or
+                        duration hit 0xFFFF. The firmware clamps WITHOUT
+                        setting any flag, so a saturated reading cannot be
+                        told from a real one by value -- hence None above.
+            "integral_mams_sigma"  the scatter in that charge from background
+                        noise alone: sigma*sqrt(N) converted the same way.
+                        A charge smaller than its own sigma has NOT been
+                        distinguished from noise -- compare the two before
+                        believing a small value, and expect roughly a third of
+                        pure-noise pulses to land outside +/-1 sigma.
+                        **None when bg_sigma4 is 0** (flagged
+                        "background_flat"): a live front end always has some
+                        spread, so zero means the input is stuck or unpowered.
+                        Reporting 0 would make the |charge| > sigma test pass
+                        for anything -- the guard would silently stop guarding.
         Returns {"ok", "events": [...], "last_id": int}: persist `last_id`
         and pass it back as `since` on your next call to get only the
         delta. Pass an intentionally huge `since` (e.g. 2_000_000_000) to
@@ -2903,6 +2994,129 @@ class CTClient:
         v = raw * 3.3 / 4095 - 0.5 * (ref_mv / 1000.0)
         return 2 * v / self._PULSE_R_SENSE_OHM / self._PULSE_AMC3301_GAIN * 1000
 
+    # Saturation markers the STM32 reports instead of a value it cannot hold.
+    # integral is SIGNED, so both ends are markers, and both are REACHABLE: the
+    # integral accumulates over the STM32's internal u32 sample count, which is
+    # NOT bounded by duration_samples' u16 -- at full scale it hits INT32 in
+    # about 520k samples (~0.5 s at 1 MSPS).
+    _INTEGRAL_SAT_HI = 2_147_483_647     # INT32_MAX
+    _INTEGRAL_SAT_LO = -2_147_483_648    # INT32_MIN
+    # duration_samples is truncated to this on the way out, so the envelope was
+    # AT LEAST this long. It saturates independently of the integral: a pulse
+    # can have a perfectly good charge and an unusable width, so this must not
+    # invalidate integral_mams (which never uses the duration).
+    #
+    # The pre-signed firmware used 0xFFFFFFFF as ITS integral marker, which
+    # reads as -1 once parsed signed. That is deliberately NOT treated as
+    # saturation: -1 is an ordinary integral now that the clamp is gone (pure
+    # noise sums to about zero), and mixing the two firmware generations is
+    # ruled out by flashing both sides together.
+    _DURATION_SATURATED = 0xFFFF
+    def _add_charge(self, e: dict, ref_mv: float,
+                    integral_signed: bool | None = None) -> None:
+        """Add integral_mams (charge, mA*ms) and its scatter to one event.
+
+        integral is round(Sigma(sample - background)) over the pulse -- signed,
+        with no per-sample clamp -- so the conversion's large offset cancels and
+        charge is just slope * integral / rate.
+
+        A NEGATIVE integral is a legal result, not an error: with the clamp gone
+        pure noise sums to about zero, and a pulse dimmer than the background it
+        was measured against lands below it. Do not treat negatives as faults or
+        floor them at zero.
+
+        integral_mams_sigma comes with it: sigma*sqrt(N) worth of charge, the
+        scatter you would see from background noise alone over this pulse
+        length. A charge smaller than its own sigma has not been distinguished
+        from noise.
+        """
+        raw = e.get("integral")
+        dur = e.get("on_us")
+        # The rate comes from the EVENT, not from the rate we requested and not
+        # from a constant. The STM32 reports what its timer actually achieved
+        # (170 MHz / an integer divider, so rarely exactly the requested value),
+        # and it can change between pulses. null => firmware too old to say.
+        # Charge scales 1:1 with it, so an assumed rate is a wrong answer
+        # wearing the right units: no rate, no mAs.
+        rate = e.get("rate_hz")
+        if raw is None:
+            return
+        # Zero-length envelope: integral is 0 because nothing was integrated,
+        # not because the charge was zero. See the empty_envelope comment in
+        # pulse_events_ma().
+        if e.get("empty_envelope"):
+            e["integral_mams"] = None
+            e["integral_mams_unavailable"] = "empty_envelope"
+            return
+        # integral changed MEANING without changing shape: it used to be clamped
+        # at zero per sample, which biases weak pulses upward (measured: ~57% of
+        # a 976 us reading). Same offset, same width, no way to tell from the
+        # value -- so the STM32's capability bit decides, relayed by the ESP32.
+        # False => refuse rather than convert; None => it never answered, which
+        # is UNKNOWN and must not decay into an assumption either way.
+        if integral_signed is False:
+            e["integral_mams"] = None
+            e["integral_mams_unavailable"] = "integral_clamped"
+            return
+        if integral_signed is None:
+            e["integral_mams"] = None
+            e["integral_mams_unavailable"] = "integral_form_unknown"
+            return
+        if not rate:
+            e["integral_mams"] = None
+            e["integral_mams_unavailable"] = "rate_unknown"
+            return
+        if raw >= self._INTEGRAL_SAT_HI or raw <= self._INTEGRAL_SAT_LO:
+            # The STM32 clamps rather than wrapping, and reports no flag -- so a
+            # saturated reading is indistinguishable from a real one by value
+            # alone. None, not the clamped number.
+            e["integral_mams"] = None
+            e["integral_mams_unavailable"] = "saturated"
+            e["integral_saturated"] = True
+            return
+        e["integral_saturated"] = False
+        slope = self.pulse_ma(1, ref_mv) - self.pulse_ma(0, ref_mv)   # mA per count
+        # 9 decimals, not 6: a 1 ms pulse of a few mA is ~2e-4 mA*ms and its
+        # sigma ~1e-5, which 6 decimals would flatten to one significant digit
+        # and print as -0.0 for any small negative. Charge here spans several
+        # orders of magnitude, so keep the resolution and normalise negative
+        # zero away -- "-0.0 mA*ms" reads as a sign error rather than a number.
+        def _q(v: float) -> float:
+            r = round(v, 9)
+            return 0.0 if r == 0 else r
+        # rate is in Hz, so slope*integral/rate is mA*s; x1000 -> mA*ms, which
+        # is the scale these pulses actually live at (a 1 ms pulse of a few mA
+        # is ~0.2 mA*ms, vs 0.0002 mA*s -- four leading zeros of nothing).
+        e["integral_mams"] = _q(slope * raw * 1000.0 / rate)
+        # Random error, not bias: summing N samples of noise with sigma each
+        # gives a spread of about sigma*sqrt(N). (The old clamped integral
+        # needed a BIAS estimate instead -- it could only ever accumulate
+        # upward. Signed accumulation centres on zero, so what is left is
+        # scatter, and scatter is what tells you whether a small charge is
+        # real.) Compare |integral_mams| against this.
+        # sigma needs N, and a truncated duration is a LOWER BOUND on N, not N.
+        # Using 65535 there would understate the scatter on exactly the longest
+        # pulses -- the ones most likely to have accumulated a big integral. No
+        # N, no sigma.
+        sigma4 = e.get("bg_sigma4")
+        # sigma4 == 0 means the background window had ZERO spread. A live 12-bit
+        # front end always has some, so this says the input is stuck or
+        # unpowered -- not that the measurement is noise-free. It must not
+        # become a threshold: the documented test is |charge| > sigma, and with
+        # sigma 0 that passes for ANY charge, turning the one guard against
+        # over-reading a weak signal into a rubber stamp. Found on hardware with
+        # the analog front end unpowered (every sample 0, sigma4 0).
+        if sigma4 == 0:
+            e["background_flat"] = True
+            e["integral_mams_sigma"] = None
+        elif dur is not None and dur >= self._DURATION_SATURATED:
+            e["duration_saturated"] = True
+            e["integral_mams_sigma"] = None
+        elif sigma4 is not None and dur:
+            e["duration_saturated"] = False
+            e["integral_mams_sigma"] = _q(
+                slope * (sigma4 / 4.0) * math.sqrt(dur) * 1000.0 / rate)
+
     def pulse_events_ma(self, since: int = 0) -> dict:
         """Like pulse_events(), but every event also gets peak_ma/
         plateau_ma/bg_ma/post_bg_ma fields, converted with ONE live ADS1115
@@ -2927,12 +3141,23 @@ class CTClient:
         # this method entirely.
         resolved_ref_mv = ref_mv if ref_mv is not None else 1200.0
         for e in r.get("events", []):
-            # post_bg included: it is a current reading like the others. The
-            # `is not None` guard below is what keeps "not measured" (null)
-            # from being converted into a plausible mA value.
-            for key in ("peak", "plateau", "bg", "post_bg"):
+            # A zero-length envelope is a PA4 glitch, not a pulse: a rise and a
+            # fall landing on the same sample still commit a full event. In it,
+            # peak_adc is its INITIAL value (0), integral is 0 and plateau is
+            # empty -- none of them measurements. Converting 0 counts yields
+            # about -32 mA, a confident-looking current that was never measured,
+            # and integral would report a legal 0.0 charge. bg and post_bg ARE
+            # real (bg is snapshotted at the rise, post_bg measured normally),
+            # so they still convert.
+            empty = e.get("on_us") == 0
+            e["empty_envelope"] = empty
+            keys = ("bg", "post_bg") if empty else ("peak", "plateau", "bg", "post_bg")
+            # The `is not None` guard is what keeps "not measured" (null) from
+            # being converted into a plausible mA value.
+            for key in keys:
                 if e.get(key) is not None:
                     e[f"{key}_ma"] = round(self.pulse_ma(e[key], resolved_ref_mv), 3)
+            self._add_charge(e, resolved_ref_mv, r.get("integral_signed"))
         r["ref_mv"] = ref_mv
         return r
 

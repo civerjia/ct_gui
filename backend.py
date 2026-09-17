@@ -1821,18 +1821,32 @@ class MeasurementRecorder:
     def _pulse_loop(self, host: str) -> None:
         try:
             with open(self.pulse_path, "w") as f:
-                f.write("id,t_us,on_us,peak,plateau,bg,bg_sigma4,integral,recv_ms\n")
+                # rate_hz is part of the row, not the header: on_us and integral
+                # are SAMPLE COUNTS, so without the rate each sample was taken
+                # at, a saved recording cannot be turned back into time or
+                # charge. It can also change between pulses, so one value in a
+                # header comment would not be enough. Empty cell = the firmware
+                # did not report it (do not backfill 1e6 when reading these).
+                f.write("id,t_us,on_us,peak,plateau,bg,post_bg,bg_sigma4,integral,rate_hz,recv_ms\n")
                 since = 0
                 while not self._pulse_stop.is_set():
                     r = pulse_events_get(host, since)
                     if r.get("ok"):
                         evs = r.get("events") or []
                         for e in evs:
-                            f.write("{id},{t_us},{on_us},{peak},{plateau},{bg},{bg_sigma4},{integral},{recv_ms}\n".format(
+                            def _cell(v):
+                                # None -> empty cell, never 0: post_bg and
+                                # rate_hz are both legitimately absent, and 0 is
+                                # a real post-pulse current.
+                                return "" if v is None else v
+                            f.write("{id},{t_us},{on_us},{peak},{plateau},{bg},{post_bg},{bg_sigma4},{integral},{rate_hz},{recv_ms}\n".format(
                                 id=e.get("id", ""), t_us=e.get("t_us", ""), on_us=e.get("on_us", ""),
                                 peak=e.get("peak", ""), plateau=e.get("plateau", ""), bg=e.get("bg", ""),
+                                post_bg=_cell(e.get("post_bg")),
                                 bg_sigma4=e.get("bg_sigma4", ""),
-                                integral=e.get("integral", ""), recv_ms=e.get("recv_ms", "")))
+                                integral=e.get("integral", ""),
+                                rate_hz=_cell(e.get("rate_hz")),
+                                recv_ms=e.get("recv_ms", "")))
                             since = e.get("id", since)
                             self.pulse_count += 1
                         if evs:
