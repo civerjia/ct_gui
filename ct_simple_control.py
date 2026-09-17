@@ -3268,6 +3268,7 @@ class CTClient:
     # you got the rate_hz you asked for if something else armed it first.
 
     def ready_arm(self, rate_hz: int = 1000000, n_samples: int = 2000,
+                  ttl_ms: int | None = None,
                   post_bg_gap_us: float | None = None,
                   post_bg_n_us: float | None = None) -> dict:
         """Arm the pulse-envelope RELAY plus the STM32 detector inside it.
@@ -3291,6 +3292,11 @@ class CTClient:
         the detector reports zero events while everything else looks healthy.
         """
         body: dict = {"rate": int(rate_hz), "n_samples": int(n_samples)}
+        # Omitted (not 0) when unspecified: the ESP32 uses its own default, and
+        # ttl_ms=0 explicitly DISABLES the auto-disarm -- sending 0 to mean
+        # "unspecified" would remove the recovery this exists for.
+        if ttl_ms is not None:
+            body["ttl_ms"] = int(ttl_ms)
         # The wire wants SAMPLES; callers here think in microseconds like every
         # other timing argument in this client, so convert at the boundary using
         # the rate actually being armed. Omitted (not 0) when unspecified -- 0 is
@@ -3301,11 +3307,46 @@ class CTClient:
                 body[key] = max(0, int(round(float(us) * rate_hz / 1_000_000)))
         return self._post("/api/adc/ready-arm", body)
 
+    def recover(self, stop_heating: bool = False) -> dict:
+        """Clear state left behind by an operation that did not finish.
+
+        A killed script, a Ctrl-C, or a backend that exited before its cleanup
+        leaves the pulse-envelope relay armed, the STM32 CS claimed, or a
+        schedule armed — and every later run then fails with "already armed" or
+        an arm reject that reads like a hardware fault. `try/finally` and
+        energised() cannot help: they need the process to still be alive.
+
+        Returns {"ok", "was_stuck": bool, "found": {...}, "cleared": [...]}.
+        `found` is reported whether or not anything needed clearing, so a
+        recurring leak is visible instead of being quietly fixed each time.
+
+        Does NOT de-energise filaments unless stop_heating=True: heat is not
+        what gets a later run stuck, and stopping it could interrupt somebody
+        else's legitimate run. Energised filaments are listed either way.
+
+        The ESP32 also reclaims an abandoned arm on its own after a timeout
+        (60 s by default) — this is the immediate version of that, for when you
+        do not want to wait. ready_status()["ttl_expiries"] counts how many
+        arms the timeout has had to reclaim; non-zero means some caller's
+        cleanup is not running.
+        """
+        return self._post("/api/recover", {"stop_heating": bool(stop_heating)},
+                          timeout=30.0)
+
     def ready_status(self) -> dict:
         """Whether the pulse-envelope relay is armed, and how many edges it has
         relayed. Useful when an arm is refused as "already armed" -- there is no
         owner recorded, so this is all there is to go on."""
         return self._post("/api/adc/ready-status", {}, timeout=5.0)
+
+    def ready_renew(self) -> dict:
+        """Push the relay's auto-disarm deadline out by its TTL.
+
+        Only needed for a run that outlasts the TTL (60 s by default) — an
+        ordinary fire finishes well inside it. The timeout exists to reclaim an
+        ABANDONED arm, so renewing is the exception, not a keepalive you are
+        expected to run."""
+        return self._post("/api/adc/ready-renew", {}, timeout=5.0)
 
     def ready_disarm(self) -> dict:
         """Stop relaying pulse envelopes and release the STM32 CS claim."""

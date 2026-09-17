@@ -1671,9 +1671,32 @@ def _post_result(status: int, text: str) -> dict[str, Any]:
     none did. Building it in one place is what stops the next one forgetting.
     """
     ok = status == 200
-    out = {"ok": ok, "status": status, "message": text.strip()}
+    body = text.strip()
+    out = {"ok": ok, "status": status, "message": body}
     if not ok:
-        out["error"] = f"HTTP {status}: {text.strip() or '(no detail)'}"
+        out["error"] = f"HTTP {status}: {body or '(no detail)'}"
+        return out
+    # Some of these endpoints answer with JSON carrying their OWN ok/error, and
+    # deliberately use HTTP 200 for "the request succeeded and the answer is no"
+    # (same reasoning as sendNoDevice: a definite answer is not a transport
+    # failure). Basing ok purely on the status code then reported a refused
+    # operation as a success with the real answer stringified into "message" --
+    # observed on ready_renew when nothing was armed: {"ok": True, "message":
+    # '{"ok":false,"error":"not armed"}'}. Honour the embedded verdict.
+    if body.startswith("{"):
+        try:
+            inner = json.loads(body)
+        except ValueError:
+            return out
+        if isinstance(inner, dict):
+            if inner.get("ok") is False:
+                out["ok"] = False
+                out["error"] = str(inner.get("error") or "device reported ok:false")
+            # Merge the device's own fields up so callers do not have to parse
+            # "message" themselves. Never overwrite ok/status/message/error.
+            for k, v in inner.items():
+                if k not in ("ok", "status", "message", "error"):
+                    out.setdefault(k, v)
     return out
 
 
@@ -2469,6 +2492,7 @@ def adc_pulse_diag(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict
 
 def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
                   post_bg_gap: int | None = None, post_bg_n: int | None = None,
+                  ttl_ms: int | None = None,
                   timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
     """Arm the RP2350->STM32 pulse-envelope relay AND (inside it) the STM32
     detector. This is what makes a fired pulse actually get MEASURED: the
@@ -2483,6 +2507,21 @@ def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
     # the measurement off.
     if post_bg_gap is not None: url += f"&post_bg_gap={int(post_bg_gap)}"
     if post_bg_n   is not None: url += f"&post_bg_n={int(post_bg_n)}"
+    # Same omit-vs-zero rule: ttl_ms=0 explicitly DISABLES the auto-disarm, so
+    # sending 0 for "unspecified" would turn off the very recovery it is for.
+    if ttl_ms       is not None: url += f"&ttl_ms={int(ttl_ms)}"
+    try:
+        status, text = _http_post_form(url, {}, timeout)
+        return _post_result(status, text)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def adc_ready_renew(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
+    """Push the relay's auto-disarm deadline out by its TTL. For a run that
+    legitimately outlasts it; an ordinary fire finishes well inside the
+    default."""
+    url = f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ready_renew"
     try:
         status, text = _http_post_form(url, {}, timeout)
         return _post_result(status, text)

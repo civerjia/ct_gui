@@ -55,6 +55,7 @@ from net_protocol import (
     adc_pulse_diag,
     adc_ready_arm,
     adc_ready_disarm,
+    adc_ready_renew,
     adc_ready_status,
     adc_pulse_disarm,
     primary_local_ip,
@@ -4317,10 +4318,85 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 pbg = body.get("post_bg_gap")
                 pbn = body.get("post_bg_n")
+                ttl = body.get("ttl_ms")
                 self._json(adc_ready_arm(host, int(body.get("rate", 1000000)),
                                          int(body.get("n_samples", 2000)),
                                          None if pbg is None else int(pbg),
-                                         None if pbn is None else int(pbn)))
+                                         None if pbn is None else int(pbn),
+                                         None if ttl is None else int(ttl)))
+            elif path == "/api/recover":
+                # Clear state left behind by an operation that did not finish:
+                # a killed script, a backend that exited before its cleanup, a
+                # Ctrl-C. Those leave the pulse-envelope relay armed, the STM32
+                # CS claimed, or a schedule armed — and every later run then
+                # fails with "already armed" or an arm reject that looks like a
+                # hardware problem.
+                #
+                # Reports what it FOUND as well as what it cleared: "nothing was
+                # stuck" and "something was stuck and I fixed it" must not look
+                # the same, or a recurring leak stays invisible.
+                #
+                # Deliberately does NOT de-energise filaments by default. Those
+                # are the one piece of state where clearing could interrupt
+                # somebody's legitimate run, and heat is not what gets a later
+                # run stuck. Pass {"stop_heating": true} to include it; either
+                # way the energised filaments are reported.
+                host, err = self._master_host()
+                found: dict[str, Any] = {}
+                cleared: list[str] = []
+                if not err:
+                    try:
+                        st = adc_ready_status(host)
+                        found["ready_relay"] = st
+                        if st.get("armed"):
+                            adc_ready_disarm(host)
+                            cleared.append("ready_relay (was armed)")
+                    except Exception as exc:
+                        found["ready_relay"] = {"error": str(exc)}
+                else:
+                    found["ready_relay"] = {"error": err}
+                for cid, link in CONTROLLERS.items():
+                    if not link.client.connected:
+                        continue
+                    try:
+                        sh = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+                        found[f"schedule_{cid}"] = ({"state": sh.get("state"),
+                                                     "unsafeSlots": sh.get("unsafeSlots")}
+                                                    if sh else None)
+                        # state 1 = armed, 2 = running. Disarming a RUNNING
+                        # schedule is the one thing here that stops work in
+                        # progress, so it is reported distinctly.
+                        if sh and sh.get("state") in (1, 2):
+                            link.request(SHV_DISARM, b"", flags=0)
+                            cleared.append(f"schedule on controller {cid} "
+                                           f"(was {'running' if sh.get('state') == 2 else 'armed'})")
+                    except Exception as exc:
+                        found[f"schedule_{cid}"] = {"error": str(exc)}
+                # Energised filaments: always reported, only stopped on request.
+                hot: list[int] = []
+                for cid, link in CONTROLLERS.items():
+                    if not link.client.connected:
+                        continue
+                    try:
+                        for fil, ent in (read_cached_telemetry(link, cid - 1) or {}).items():
+                            if (ent or {}).get("present"):
+                                hot.append(int(fil))
+                    except Exception:
+                        pass
+                found["energised_filaments"] = sorted(hot)
+                if hot and bool(body.get("stop_heating")):
+                    for cid, link in CONTROLLERS.items():
+                        if link.client.connected:
+                            try:
+                                prep_filaments(link, cid - 1, 1, None)   # STOP
+                            except Exception:
+                                pass
+                    cleared.append(f"stopped {len(hot)} energised filament(s)")
+                if cleared:
+                    log.warning("recover by %s: cleared %s", self._client(), cleared)
+                self._json({"ok": True, "found": found, "cleared": cleared,
+                            "was_stuck": bool(cleared)})
+
             elif path == "/api/adc/ready-status":
                 # Armed / edges relayed. A POST only because everything in this
                 # chain is; it reads nothing but ESP32 state. Needed because an
@@ -4330,6 +4406,11 @@ class CtHandler(BaseHTTPRequestHandler):
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(adc_ready_status(host))
+            elif path == "/api/adc/ready-renew":
+                host, err = self._master_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                self._json(adc_ready_renew(host))
             elif path == "/api/adc/ready-disarm":
                 host, err = self._master_host()
                 if err:
