@@ -1278,6 +1278,31 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         "triggerEdges": le32(23) if len(p) >= 27 else None,
         "uncounted": le32(27) if len(p) >= 31 else None,
         "underfed": le32(31) if len(p) >= 35 else None,
+        # mismatches: pulses whose 165 READ-BACK did not equal the COMMANDED
+        # byte -- the per-pulse hardware verify (the PIO samples the 595 outputs
+        # through the 165 mid-pulse and compares). Per run, not cumulative:
+        # arm() calls resetRuntime_(), so every arm starts from zero.
+        #
+        # EXPECTED ON EVERY CHANNEL BOUNDARY, and it does not mean the pulse was
+        # wrong. The channel select (S0/S1/S2) is applied in the trigger ISR --
+        # it has to be, since applying it from the main loop risks missing the
+        # window before the next pre-shift and losing a whole PULSE. The cost is
+        # that the 165 sample ~10 us later finds the mux already moved to the
+        # next entry's channel and reads 0x00. The pulse itself is correct: the
+        # byte was pre-shifted into the 595 before the trigger and the board is
+        # chosen by the RCLK mask from the FIFO, neither of which the mux
+        # affects.
+        #
+        # So on a cross-channel schedule, expect mismatches == the number of
+        # channel boundaries. Measured here: 0 crossings -> 0, 3 -> 3, 15 -> 15,
+        # with every pulse fired and measured (16/16 envelopes, on_us 1000-1002).
+        #
+        # HOW TO TELL THE TWO APART: a boundary artefact carries flags=0x01 with
+        # read165=0x00 in the pulse log -- a "mismatch" whose read-back is ZERO
+        # rather than a wrong bit. A mismatch with a NON-zero wrong read-back is
+        # a real verify failure. The counter currently conflates "verify was
+        # impossible" with "verify failed"; the RP2350 side is proposing a
+        # distinct flag so boundary pulses stop counting here.
         "mismatches": le32(35) if len(p) >= 39 else None,
         # rbSaturated (firmware 7528a75+): times the 165 read-back FIFO was
         # found full when a pulse was accounted. NOT independent of

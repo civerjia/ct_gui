@@ -2063,6 +2063,32 @@ print(st)
 # state: 0=idle 1=armed 2=running 3=complete 4=fault
 ```
 
+Diagnostics worth reading after a run. All are **per run** — `arm` zeroes them,
+so two identical runs both reporting 1 is not accumulation:
+
+| field | meaning |
+|---|---|
+| `triggerEdges` | trigger edges the firmware counted |
+| `uncounted` | pulses the PIO fired but the edge-count ISR missed. **Exact only when `rbSaturated == 0`**, otherwise a lower bound |
+| `underfed` | triggers that arrived with nothing staged |
+| `mismatches` | pulses whose 165 read-back disagreed with the commanded byte — **see the warning below** |
+| `rbSaturated` | times the 165 read-back FIFO was full when a pulse was accounted |
+| `unsafeSlots` | bitmap of power slots `arm` SKIPPED as unsafe. **Non-zero means those filaments did not fire even though the run looks normal** |
+
+> ⚠️ **`mismatches` equals the number of CHANNEL BOUNDARIES in the schedule, and
+> those are benign.** The channel select is applied in the trigger ISR — it has
+> to be, or the firmware risks missing the pre-shift window and losing a whole
+> pulse — so the 165 sample ~10 µs later finds the mux already moved to the next
+> entry's channel and reads `0x00`. **The pulse is correct; only its
+> verification is lost.** Measured: 0 crossings → 0, 3 → 3, 15 → 15, with every
+> pulse fired and measured.
+>
+> To tell a benign boundary artefact from a real failure, look at the pulse log:
+> the artefact carries `flags=0x01` with `read165=0x00` — a read-back of *zero*
+> rather than a wrong bit. A **non-zero** wrong read-back is a real verify
+> failure. (A schedule confined to one channel has no boundaries and so no
+> benign mismatches at all.)
+
 **`shv_pulse_log(controller=1, start=0)`** — Fetch fired-pulse records
 after a run, to confirm what actually happened on the hardware.
 
