@@ -3206,6 +3206,33 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "space": "fid", "count": len(entries),
                         "dead": entries, "path": str(DEAD_STATE_PATH)})
 
+        elif path == "/api/thermal-history":
+            # How long each filament has been de-energised, so a measurement
+            # that is only meaningful on a COLD filament can check its own
+            # precondition instead of assuming it. A filament that was just run
+            # is still hot, and its resistance reads high for minutes after the
+            # power comes off -- see the client's measure_filament_resistance()
+            # / sweep_filament_impedance().
+            #
+            # Derived from LAST_POWER_STATE, which is what this backend last
+            # COMMANDED, so it carries that field's limits exactly: a filament
+            # with no entry is UNKNOWN, not cold (nothing has been commanded
+            # since connect, or a reconnect cleared it), and heat put in by
+            # something other than this backend is invisible here.
+            now = time.monotonic()
+            out = {}
+            for fid, (state, when) in sorted(LAST_POWER_STATE.items()):
+                energised = state in ENERGISING_STATES
+                out[str(fid)] = {
+                    "state": state, "energising": energised,
+                    "since_command_s": round(now - when, 1),
+                    # None while still energised: it is not cooling yet, and a 0
+                    # here would read as "just went cold" rather than "still on".
+                    "cold_for_s": None if energised else round(now - when, 1),
+                }
+            self._json({"ok": True, "space": "fid", "filaments": out,
+                        "note": "absent filament = unknown history, not cold"})
+
         elif path == "/api/clients":
             # Everyone that has called this API recently — so a program can see
             # it is not alone on the bench before it starts driving hardware.

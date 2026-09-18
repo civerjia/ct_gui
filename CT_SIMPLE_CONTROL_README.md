@@ -2785,6 +2785,114 @@ Returns `{"ok", "fired": <the full fire_single_pulse result>, "measured": [...],
 "ref_mv"}`. Same arming, correlation and strict-`ok` rules as `measure=True`;
 it takes the same `fire_single_pulse` parameters.
 
+### Test & measurement flows
+
+Ports of the GUI's "Calibration & Test" tab, runnable from a script instead of
+a browser tab that has to stay open. Only the two flows that need nothing but
+the INA219 exist so far — the other four need the DS3502s and ADS1115, which
+are not fitted on the lab board, so they could be written but not verified.
+
+**`measure_filament_resistance(filaments=None, settle_s=, short_ohm=, open_ma=,
+cool_s=, progress=)`** — STANDBY every filament, settle, read one V+I pair
+each, report `R = V/I` with a short/open verdict. The quick go/no-go screen.
+
+**`sweep_filament_impedance(filaments=None, start_mv=, end_mv=, step_mv=,
+dwell_s=, short_ohm=, cool_s=, hysteresis_tol=, save=, progress=)`** — per
+filament, step the voltage up in VOLTAGE mode, dwell at each step, and fit the
+V-I curve to `R(I) = a·I² + R₀`. Slow; saves curves and fits to the backend's
+`calibration/` directory.
+
+Both run inside `energised()`, so every filament is STOPped on the way out —
+including on an exception or Ctrl-C.
+
+#### Resistance is meaningless without a temperature
+
+A filament that ran recently is still hot, and hot tungsten reads a much higher
+resistance than cold. `R₀` is the fit's extrapolation to zero dissipated power,
+so it is the room-temperature resistance only if the sweep both **starts** at
+ambient and **stays in equilibrium** at every step. Neither condition shows up
+in the fit — both just move R₀. Measured on this bench's dummy load, three runs
+that all reported `verdict: ok`:
+
+| start | dwell | R₀ | return-point drift | residual |
+|---|---|---|---|---|
+| 60 s off | 1.5 s | 0.192 Ω | **+51.1%** | 18.3% |
+| straight after the previous sweep | 1.5 s | 0.473 Ω | **+16.8%** | 3.5% |
+| 90 s off | 6.0 s | 0.481 Ω | +4.8% | 4.9% |
+
+**R₀ swung 2.5× across runs that all succeeded**, and both variables do it:
+
+- *Start temperature.* Rows 1 and 2 differ only in that — 0.192 vs 0.473 Ω.
+- *Dwell too short.* Rows 1 and 3 both start cold. At 1.5 s the filament lags
+  the voltage, so the low-current points read colder than equilibrium and the
+  extrapolation is pulled **down** — toward a false SHORT. Row 3's 4.9%
+  residual says the `a·I²+R₀` model fits once each point has settled; row 1's
+  18.3% says it does not, and its R₀ is an artifact.
+
+The only outputs that separate the trustworthy run from the other two are the
+drift and the residual — R₀ alone looks equally authoritative in all three.
+Which is the practical procedure: **raise `dwell_s` until the drift falls
+inside tolerance**, then trust R₀. Two independent guards:
+
+- **`cool_s`** — de-energise and wait this long first, crediting time already
+  served (`cool_down()` does it standalone). There is deliberately **no default
+  value** anywhere: the right number is the thermal time constant of the real
+  filament in its vacuum envelope, which cannot be inferred from a bench dummy
+  load. Establishes the start condition; reported under `"thermal"`.
+- **The return point** — always taken. After the last step the sweep goes back
+  to `start_mv` and re-measures. Same temperature as it opened ⇒ same R. This
+  *tests* the premise instead of assuming it, and needs no prior knowledge of
+  the filament, so it works on any rig. Drift past `hysteresis_tol` (default 5%)
+  marks R₀ not-cold.
+
+Per filament: `r0_is_cold` is `True` / `False` / `None` (unverified) with a
+`cold_note`; run-level `r0_not_cold` lists every filament whose R₀ fitted but
+is not a cold resistance. A not-cold R₀ is still returned — it is a real
+measurement at an unknown temperature — but it is never labelled as cold, and
+`r0_is_cold` is saved into the calibration file next to R₀.
+
+`measure_filament_resistance()`'s R is **never** a cold resistance: 0.8 V into a
+real filament is ~0.7 W, so it is heating throughout the settle. That is fine
+for a short/open screen, where the thresholds are orders of magnitude from the
+drift, but do not record it as a filament's cold resistance.
+
+**`thermal_history(filaments=None)`** — how long each filament has been
+de-energised, from the backend (which outlives any one script, so it remembers
+what the *previous* script left hot). A filament missing from the result is
+**unknown, not cold** — a fresh backend or a controller reconnect erases the
+history. Needs backend `/api/thermal-history`; against an older backend the
+flows report the precondition as unverifiable rather than failing or, worse,
+assuming it held.
+
+#### Where these deliberately differ from the GUI
+
+Three of `fitR0()`'s outputs are unresolved fits wearing a number, and all
+three feed a `R₀ < short_ohm` comparison, so each one is a potential false
+SHORT:
+
+1. **Singular fit** (every point at the same current — an empty board pinned at
+   the voltage floor). GUI: `{R0: 0, a: 0}`. Here: `R0_ohm: None`.
+2. **Ill-conditioned fit.** Over a narrow current range `I` and `I³` are nearly
+   the same shape and the split between R₀ and `a` is not identifiable; R₀
+   usually lands negative, which trips the GUI's `R0 < 0` branch and pins it to
+   exactly 0. Observed on this bench: a load holding 0.99–1.11 A across an
+   0.88–1.46 V sweep, R = 0.89–1.31 Ω throughout, fitted as R₀ = 0 Ω →
+   reported SHORT. `collinearity` (0 … 1) was 0.9916 there vs ~0.85 for sweeps
+   that fit properly, so the threshold sits between them at 0.95.
+3. **Pinned R₀ = 0** from the surviving `R₀ < 0` branch is kept but flagged
+   `r0_pinned`, and never called a short.
+
+`fit_cold_resistance()` always returns a dict and never a bare number — R₀ is
+`None` whenever it could not be resolved, with `reason` saying which way. Where
+both resolve, it is bit-for-bit identical to the JS (verified across eight
+curves, including the `R₀ < 0` branch). It also reports `rms_residual_frac`, how
+well the model actually describes the load — reported, not gated on, since
+calibrating a threshold needs a population of real filaments.
+
+`tps_fault` is read with its `tps_fault_valid` twin: unreadable becomes `None`,
+not "no fault". The GUI's test 1 reads the raw bit, which silently turns every
+unreadable board into a passing one.
+
 ### Human-readable results
 
 Every method above returns a plain dict — convenient for scripting, but not

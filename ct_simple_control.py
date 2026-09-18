@@ -843,6 +843,21 @@ class CTClient:
         survivors = [f for f in base if f not in dead]   # dead mask is in USER_INDEX space
         return self._fids_of(survivors)                      # then cross to FID
 
+    def _live_user_indices(self, filaments=None) -> list[int]:
+        """Same dead-mask filtering as _live(), but the result stays in
+        USER_INDEX space instead of being crossed to FID.
+
+        _live() exists to build a wire payload, so it ends with _fids_of().
+        Anything that iterates the survivors and calls other client methods
+        with them (which all take USER_INDEX) needs this one instead -- using
+        _live()'s return as a loop variable silently applies the filament-order
+        swap twice.
+        """
+        base = ([int(f) for f in filaments] if filaments is not None
+                else list(range(self.FILAMENT_COUNT)))
+        dead = self.dead   # bound once -- property; see _live()
+        return [f for f in base if f not in dead]
+
     # PowerState values that put power ON the filament (STANDBY enables the
     # output at the firmware's 0.8 V floor, so it counts). Mirrors the backend's
     # ENERGISING_STATES -- the two must agree, or the client refuses something
@@ -933,6 +948,37 @@ class CTClient:
                      "warm_mV_per_s": 2800}
     SLEW_CEILINGS = {"below_mV_per_s": 2000, "above_mV_per_s": 5000,
                      "warm_mV_per_s": 5000}
+
+    # -- Test/measurement flow defaults. These mirror the GUI's Calibration &
+    #    Test tab input boxes one-for-one, so a run from here and a run from
+    #    the browser are the same measurement; see measure_filament_resistance()
+    #    and sweep_filament_impedance().
+    #    R thresholds are per-flow on purpose and NOT interchangeable: the
+    #    STANDBY test divides one V by one I at the 0.8 V floor, where the
+    #    numerator is a couple of hundred mV of slack; the sweep fits a line
+    #    through a whole V-I curve and resolves a genuinely smaller R.
+    _T1_SETTLE_S = 3.0        # hold at STANDBY before reading; thermal settle
+    _T1_SHORT_OHM = 0.05      # R below this (or a TPS fault) = SHORT
+    _T1_OPEN_MA = 10.0        # current below this at 0.8 V = OPEN
+    _T6_START_MV = 800        # the firmware's own voltage floor; below it the
+                              # regulator will not start, so a sweep cannot
+                              # begin lower no matter what is asked for
+    _T6_END_MV = 1500
+    _T6_STEP_MV = 100
+    _T6_DWELL_S = 1.5         # per step, for thermal equilibrium
+    _T6_SHORT_OHM = 0.02      # fitted R0 below this = SHORT
+    _T6_MIN_FIT_POINTS = 3    # 2 unknowns (a, R0); fewer cannot be fitted
+    #    Above this, the I and I³ columns of the fit are too alike over the
+    #    sampled currents to split R₀ from the self-heating term -- see
+    #    fit_cold_resistance(). Sweeps that fit properly measure ~0.85; the
+    #    bench load that does not measures 0.9916.
+    _T6_MAX_COLLINEARITY = 0.95
+    #    How far R at the sweep's opening voltage may drift by the time the
+    #    sweep returns to it before R₀ stops being a COLD resistance. This is a
+    #    repeatability bound, not a physical constant: 5% on R is well inside
+    #    what separates filaments from each other, and well outside INA219
+    #    quantisation at these currents.
+    _T6_HYSTERESIS_TOL = 0.05
 
     @classmethod
     def identity_order(cls) -> list[int]:
@@ -4574,6 +4620,656 @@ class CTClient:
         fired = {k: v for k, v in r.items() if k not in ("measured", "ref_mv")}
         return {"ok": bool(r.get("ok")), "fired": fired,
                 "measured": r.get("measured") or [], "ref_mv": r.get("ref_mv")}
+
+    # ── Test & measurement flows ──────────────────────────────────────────────
+    # Ports of the GUI's "Calibration & Test" tab, so a flow can be run from a
+    # script instead of a browser tab that has to stay open. Same thresholds,
+    # same order of operations, same numbers -- see each method for where it
+    # deliberately differs.
+    #
+    # Only the two flows that need nothing but the INA219 are here. The other
+    # four (emission short scan, focus leak scan, emission current, emission
+    # calibration) all need the DS3502s and the ADS1115 to set and read an HV
+    # operating point, which the lab board does not have fitted -- they can be
+    # written, but not verified, on this bench, so they are not yet written.
+
+    def read_board_faults(self, filaments=None) -> dict:
+        """Per-filament TPS55289 fault / HV-overcurrent flags, keyed by
+        USER_INDEX. Returns {} on failure (never raises).
+
+        Each flag is True, False, or **None**. None means the firmware marked
+        that field's read as invalid (its `*_valid` twin is clear -- a missing
+        or faulty chip, or a board built without it), so the flag is UNKNOWN,
+        not "no fault". The GUI's test 1 reads the raw `tps_fault` bit without
+        consulting its validity twin, which silently turns every unreadable
+        board into a passing one; this is that same data with the hole left
+        visible.
+
+        Returns {user_index: {"tps_fault", "hv_overcurrent", "present",
+        "controller", "channel", "position"}}.
+        """
+        want = self._want_filaments(filaments)
+        mapping = self.get_mapping().get("mapping") or {}
+        site_to_user: dict[tuple, int] = {}
+        for row in mapping.get("filaments") or []:
+            fid = row.get("filament")
+            if fid is None or row.get("slot") is None or row.get("controller") is None:
+                continue
+            site_to_user[(row["controller"] + 1, row["channel"], row["position"])] = \
+                self._user_index_of(fid)
+        out: dict[int, dict] = {}
+        for cid in sorted({site[0] for site in site_to_user}):
+            r = self._get(f"/api/board-snapshot?controller={cid}", timeout=20.0)
+            if not r.get("ok"):
+                continue
+            for b in r.get("boards") or []:
+                user_index = site_to_user.get((cid, b.get("channel"), b.get("mux_port")))
+                if user_index is None:
+                    continue
+                out[user_index] = {
+                    "index": user_index, "controller": cid,
+                    "channel": b.get("channel"), "position": b.get("mux_port"),
+                    "present": bool(b.get("present")),
+                    "tps_fault": (bool(b.get("tps_fault"))
+                                  if b.get("tps_fault_valid") else None),
+                    "hv_overcurrent": (bool(b.get("hv_overcurrent"))
+                                       if b.get("hv_overcurrent_valid") else None),
+                }
+        if want is not None:
+            keep = set(want)
+            out = {k: v for k, v in out.items() if k in keep}
+        return out
+
+    def _thermal_history_raw(self) -> dict:
+        """The raw /api/thermal-history response, so callers can tell an EMPTY
+        history (nothing commanded yet) apart from an ABSENT one (a backend too
+        old to have the endpoint). Both leave thermal_history() returning {},
+        and only one of them is fixed by waiting."""
+        return self._get("/api/thermal-history", timeout=10.0)
+
+    def thermal_history(self, filaments=None) -> dict:
+        """How long each filament has been de-energised, keyed by USER_INDEX.
+
+        A filament that was just run is still hot, and hot tungsten reads a
+        substantially higher resistance than cold tungsten — so "resistance"
+        without a thermal precondition is not a repeatable number. This is the
+        precondition, read from the backend (which outlives any one script and
+        therefore remembers what the previous script left hot).
+
+        Returns {user_index: {"state", "energising", "since_command_s",
+        "cold_for_s"}}. `cold_for_s` is None while the filament is still
+        energised. A filament MISSING from the result is unknown, not cold —
+        the backend only knows what it commanded, so a fresh backend or a
+        controller reconnect erases the history. Do not substitute 0 or
+        infinity for a missing entry; treat it as "must cool it yourself".
+        """
+        want = self._want_filaments(filaments)
+        r = self._thermal_history_raw()
+        out = {}
+        for fid_s, row in (r.get("filaments") or {}).items():
+            user_index = self._user_index_of(int(fid_s))
+            out[user_index] = {**row, "index": user_index}
+        if want is not None:
+            keep = set(want)
+            out = {k: v for k, v in out.items() if k in keep}
+        return out
+
+    def cool_down(self, filaments=None, *, cool_s: float,
+                  poll_s: float = 2.0, progress=None) -> dict:
+        """De-energise `filaments` and wait until every one of them has been off
+        for at least `cool_s` seconds. Returns once the precondition holds.
+
+        Credits time already served: a filament the backend says has been at
+        STOP for 300 s does not get another wait. Only filaments that are
+        actually energised (or whose history is unknown) are commanded to STOP,
+        precisely so that a filament already cooling does not have its clock
+        reset by a redundant STOP.
+
+        There is no default for `cool_s` anywhere in this client and there
+        should not be: the right value is the thermal time constant of the real
+        filament assembly in its vacuum envelope, which is a property of the
+        production rig and cannot be inferred from the bench's dummy loads.
+        Measure it once on the real hardware (sweep_filament_impedance()'s
+        `hysteresis` output is the instrument for that) and pass that.
+
+        Returns {"ok", "waited_s", "already_cold_s", "stopped": [...],
+        "unknown": [...]}.
+        """
+        say = progress or (lambda _msg: None)
+        targets = self._live_user_indices(filaments)
+        if not targets:
+            return {"ok": True, "waited_s": 0.0, "already_cold_s": None,
+                    "stopped": [], "unknown": []}
+        hist = self.thermal_history(targets)
+        unknown = [f for f in targets if f not in hist]
+        hot = [f for f in targets if (hist.get(f) or {}).get("energising")]
+        to_stop = sorted(set(hot) | set(unknown))
+        if to_stop:
+            say(f"STOP on {len(to_stop)} filament(s) before cooling…")
+            self.stop_all(to_stop)
+        hist = self.thermal_history(targets)
+        # The weakest link sets the wait: one filament that was just running
+        # makes the whole batch's measurement warm, not just its own row.
+        served = [float((hist.get(f) or {}).get("cold_for_s") or 0.0)
+                  for f in targets]
+        already = min(served) if served else 0.0
+        wait = max(0.0, float(cool_s) - already)
+        if wait > 0:
+            say(f"cooling {wait:.0f} s (already off {already:.0f} s)…")
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline:
+                time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+        return {"ok": True, "waited_s": wait, "already_cold_s": already,
+                "stopped": to_stop, "unknown": unknown}
+
+    def _thermal_precondition(self, targets, cool_s, say) -> dict:
+        """Shared preamble for the measurement flows: optionally establish, and
+        always REPORT, the cold-start precondition. Never silently asserts the
+        filament was cold."""
+        if cool_s is not None:
+            cooled = self.cool_down(targets, cool_s=cool_s, progress=say)
+        else:
+            cooled = None
+        raw = self._thermal_history_raw()
+        hist = self.thermal_history(targets)
+        known = [float(hist[f]["cold_for_s"]) for f in targets
+                 if f in hist and hist[f].get("cold_for_s") is not None]
+        unknown = [f for f in targets if f not in hist
+                   or hist[f].get("cold_for_s") is None]
+        coldest = min(known) if known else None
+        if not raw.get("ok"):
+            # No endpoint (older backend) or the call failed. Report it as what
+            # it is -- the precondition is UNVERIFIABLE, which is not the same
+            # as unmet, and must not read as met either.
+            return {"required_s": cool_s, "coldest_off_s": None,
+                    "unknown_history": list(targets), "met": None,
+                    # Truncated: a 404's body is a full HTML error page, and an
+                    # unabridged one buries every other line of the report.
+                    "note": f"thermal history unavailable: "
+                            f"{str(raw.get('error') or 'backend did not answer')[:120]}",
+                    "cool_down": cooled}
+        if cool_s is None:
+            note = ("no cool_s requested — R is whatever temperature these "
+                    "filaments happen to be at")
+            met = None
+        elif unknown:
+            note = (f"{len(unknown)} filament(s) have no usable cooling history; "
+                    f"cannot confirm the cold start")
+            met = None
+        else:
+            met = coldest is not None and coldest >= float(cool_s)
+            note = (f"off for at least {coldest:.0f} s" if met else
+                    f"only {coldest:.0f} s off, wanted {float(cool_s):.0f} s")
+        return {"required_s": cool_s, "coldest_off_s": coldest,
+                "unknown_history": unknown, "met": met, "note": note,
+                "cool_down": cooled}
+
+    def measure_filament_resistance(self, filaments=None, *,
+                                    settle_s: float | None = None,
+                                    short_ohm: float | None = None,
+                                    open_ma: float | None = None,
+                                    cool_s: float | None = None,
+                                    progress=None) -> dict:
+        """TEST 1 -- filament resistance at the 0.8 V STANDBY floor.
+
+        Drives every live filament (or just `filaments`) to STANDBY, holds for
+        `settle_s`, then takes ONE live INA219 V+I pair per board and reports
+        R = V/I with a short/open verdict. Cheap and quick -- this is the
+        go/no-go screen you run before anything else; sweep_filament_impedance()
+        is the careful version.
+
+        STANDBY is genuinely energised (the firmware's 0.8 V floor, ~0.9 A into
+        a real filament), so the whole flow runs inside energised() and every
+        touched filament is STOPped on the way out -- including on exception or
+        Ctrl-C.
+
+        A per-filament STANDBY failure does NOT abort the run: those filaments
+        are reported as `standby_fail` and the rest are still measured. Only a
+        STANDBY that applied to nothing at all aborts.
+
+        ## This R is NOT a cold resistance
+
+        It is R at the filament's temperature after `settle_s` at the 0.8 V
+        floor, and 0.8 V into a real filament is ~0.7 W, so the filament is
+        heating for the whole settle. Run this twice back to back and the
+        second run reads higher. That is fine for what this test is -- a
+        short/open screen, where the thresholds are orders of magnitude away
+        from the drift -- but the number must not be recorded as a filament's
+        cold resistance, and two runs' numbers are only comparable if both
+        started from the same temperature. For a cold resistance, use
+        sweep_filament_impedance(), which extrapolates to zero power.
+
+        `cool_s`: de-energise and wait this long before measuring, so runs
+        start from a comparable temperature; None (default) skips the wait. The
+        thermal state is REPORTED either way, under "thermal" -- there is no
+        invented default here, because the right value is a property of the
+        real filament assembly. See cool_down().
+
+        settle_s/short_ohm/open_ma default to the GUI's own box values
+        (_T1_SETTLE_S / _T1_SHORT_OHM / _T1_OPEN_MA).
+        progress: optional callable(str) for a live line; None = silent.
+
+        Returns {"ok", "pass", "results": {user_index: {...}}, "counts",
+        "flagged", "thresholds", "thermal"}. Per filament: "R_ohm" (None when
+        no current flowed -- an absent measurement, not a fabricated 0 or
+        infinity), "bus_mV", "current_mA", "tps_fault", "verdict"
+        ("ok"/"short"/"open"/"standby_fail"), "reason".
+        """
+        settle_s = self._T1_SETTLE_S if settle_s is None else float(settle_s)
+        short_ohm = self._T1_SHORT_OHM if short_ohm is None else float(short_ohm)
+        open_ma = self._T1_OPEN_MA if open_ma is None else float(open_ma)
+        say = progress or (lambda _msg: None)
+        thresholds = {"settle_s": settle_s, "short_ohm": short_ohm, "open_ma": open_ma}
+
+        targets = self._live_user_indices(filaments)
+        if not targets:
+            return {"ok": False, "error": "no live filaments to measure",
+                    "results": {}, "thresholds": thresholds}
+
+        thermal = self._thermal_precondition(targets, cool_s, say)
+        with self.energised(*targets):
+            say(f"STANDBY on {len(targets)} filament(s)…")
+            prep = self.standby_all(targets)
+            failed = {int(f) for f in (prep.get("failed") or [])}
+            applied = int(prep.get("applied") or 0)
+            if applied == 0:
+                return {"ok": False,
+                        "error": prep.get("error") or "STANDBY applied to nothing",
+                        "prep": prep, "results": {}, "thresholds": thresholds,
+                        "thermal": thermal}
+            say(f"settling {settle_s:.1f} s at STANDBY…")
+            time.sleep(settle_s)
+            say("reading INA219 V/I…")
+            vi = self.read_filament_vi_live(targets)
+            faults = self.read_board_faults(targets)
+
+        results: dict[int, dict] = {}
+        for f in targets:
+            entry = vi.get(f) or {}
+            fault = (faults.get(f) or {}).get("tps_fault")
+            row = {"index": f, "bus_mV": entry.get("bus_mV"),
+                   "current_mA": entry.get("current_mA"),
+                   "present": bool(entry.get("present")),
+                   "tps_fault": fault, "R_ohm": None,
+                   "verdict": None, "reason": None}
+            if f in failed:
+                row["verdict"], row["reason"] = "standby_fail", "STANDBY was refused"
+                results[f] = row
+                continue
+            if not row["present"]:
+                row["verdict"], row["reason"] = "absent", "board not present"
+                results[f] = row
+                continue
+            mA, mV = row["current_mA"], row["bus_mV"]
+            if mA is None or mV is None:
+                # The live read fell back to cache (a schedule is firing) or the
+                # board answered nothing. No pair, no resistance -- do not
+                # divide a real voltage by a missing current.
+                row["verdict"], row["reason"] = "no_reading", "no live V/I pair"
+                results[f] = row
+                continue
+            # R is left None rather than infinity when no current flows: the
+            # verdict already says "open", and an infinity here would not
+            # survive a round trip through JSON.
+            if mA > 0:
+                row["R_ohm"] = (mV / 1000.0) / (mA / 1000.0)
+            if fault:
+                row["verdict"], row["reason"] = "short", "TPS55289 fault flag set"
+            elif row["R_ohm"] is not None and row["R_ohm"] < short_ohm:
+                row["verdict"] = "short"
+                row["reason"] = f"R {row['R_ohm']:.3f} Ω < {short_ohm} Ω"
+            elif mA < open_ma:
+                row["verdict"] = "open"
+                row["reason"] = f"{mA:.0f} mA < {open_ma} mA at {mV:.0f} mV"
+            else:
+                row["verdict"] = "ok"
+            if fault is None and row["verdict"] == "ok":
+                # Passed on R alone; the fault bit could not be read, so say so
+                # rather than letting the pass imply it was checked.
+                row["reason"] = "TPS fault flag unreadable — verdict from R only"
+            results[f] = row
+
+        counts: dict[str, int] = {}
+        for row in results.values():
+            counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
+        flagged = [f"F{row['index']}: {row['verdict'].upper()} ({row['reason']})"
+                   for row in results.values()
+                   if row["verdict"] not in ("ok", "absent")]
+        return {"ok": True, "pass": not flagged, "results": results,
+                "counts": counts, "flagged": flagged, "thresholds": thresholds,
+                "thermal": thermal,
+                "dead_skipped": prep.get("dead_skipped") or []}
+
+    @staticmethod
+    def fit_cold_resistance(curve) -> dict:
+        """Least-squares fit of a filament V-I curve to V = a·I³ + R₀·I, i.e.
+        R(I) = a·I² + R₀ -- so R₀ is the cold (zero-current) resistance and `a`
+        is the self-heating coefficient.
+
+        curve: [{"v": volts, "i": amps}, ...]; points with a missing v or i are
+        skipped.
+
+        ALWAYS returns a dict -- never a bare number and never None:
+
+            {"R0_ohm": float|None, "a": float|None, "points": int,
+             "collinearity": float|None, "r0_pinned": bool,
+             "rms_residual_frac": float|None, "reason": str|None}
+
+        `R0_ohm` is None whenever the fit could not resolve it, and `reason`
+        says which of the four ways it failed. Nothing here ever reports an
+        unresolved R₀ as 0 Ω, because downstream that number is compared
+        against a short threshold and a fabricated zero reads as a dead short.
+
+        ## Where this deliberately differs from the GUI's fitR0()
+
+        The maths is identical (verified bit-for-bit against the original JS
+        across eight curves, including its R₀ < 0 branch). Two of its outputs
+        are not carried over, because both are unresolved fits wearing a
+        number:
+
+        1. **Singular normal equations** (every point at the same current --
+           what an empty board pinned at the voltage floor produces). fitR0()
+           returns `{R0: 0, a: 0}`. Here: R₀ None, reason "same current".
+        2. **Ill-conditioned fit.** Over a narrow current range I and I³ are
+           nearly the same shape, so the split between R₀ and `a` is not
+           identifiable and R₀ lands anywhere -- usually negative, which then
+           trips fitR0()'s R₀ < 0 branch and pins it to exactly 0. Measured on
+           this bench: a load holding 0.99-1.11 A across an 0.88-1.46 V sweep,
+           R = 0.89-1.31 Ω throughout, was fitted as R₀ = 0 Ω and would have
+           been reported SHORT. `collinearity` (= Σi⁴² / Σi⁶·Σi², in [0,1],
+           1 = indistinguishable) was 0.9916 there against 0.85 for sweeps that
+           fit properly, so _T6_MAX_COLLINEARITY sits between them.
+
+        A pinned R₀ = 0 from the surviving R₀ < 0 branch is kept, since it is
+        the GUI's documented behaviour, but it is flagged `r0_pinned` so the
+        caller can refuse to call it a short.
+        """
+        pts = [p for p in (curve or [])
+               if p.get("i") is not None and p.get("v") is not None]
+        out = {"R0_ohm": None, "a": None, "points": len(pts),
+               "collinearity": None, "r0_pinned": False,
+               "rms_residual_frac": None, "reason": None}
+        if len(pts) < CTClient._T6_MIN_FIT_POINTS:
+            out["reason"] = (f"only {len(pts)} usable point(s), need "
+                             f"{CTClient._T6_MIN_FIT_POINTS}")
+            return out
+        sI6 = sI4 = sI2 = sI3V = sIV = 0.0
+        for p in pts:
+            i = float(p["i"]); v = float(p["v"])
+            i2 = i * i; i3 = i2 * i
+            sI6 += i3 * i3; sI4 += i2 * i2; sI2 += i2
+            sI3V += i3 * v; sIV += i * v
+        det = sI6 * sI2 - sI4 * sI4
+        if not det or not (sI6 * sI2):
+            out["collinearity"] = 1.0
+            out["reason"] = "every point at the same current — R₀ not resolvable"
+            return out
+        # Cauchy-Schwarz bounds this at 1; it reaches 1 exactly when I and I³
+        # are proportional over the sampled currents, i.e. when the sweep never
+        # moved the current.
+        out["collinearity"] = sI4 * sI4 / (sI6 * sI2)
+        if out["collinearity"] >= CTClient._T6_MAX_COLLINEARITY:
+            currents = [float(p["i"]) for p in pts]
+            span = (max(currents) - min(currents)) / max(currents) * 100
+            out["reason"] = (f"current moved only {span:.0f}% over the sweep "
+                             f"(collinearity {out['collinearity']:.4f} ≥ "
+                             f"{CTClient._T6_MAX_COLLINEARITY}) — R₀ and the I² "
+                             f"term are not separable")
+            return out
+        a = (sI3V * sI2 - sI4 * sIV) / det
+        r0 = (sI6 * sIV - sI4 * sI3V) / det
+        if r0 < 0:
+            r0 = 0.0
+            a = (sI3V / sI6) if sI6 else 0.0
+            out["r0_pinned"] = True
+            out["reason"] = "fitted R₀ was negative — pinned to 0, not measured"
+        out["R0_ohm"], out["a"] = r0, a
+        # How well the model actually describes this load, as an RMS residual
+        # relative to V. Reported, NOT gated on: a threshold would need a
+        # population of real filaments to calibrate, and there isn't one on this
+        # bench. It exists because R₀ alone looks equally authoritative whether
+        # the curve is a tungsten filament or something the a·I²+R₀ form does
+        # not fit at all -- the bench's current-limited dummy load fits to 22%
+        # and still yields a tidy-looking R₀.
+        ss = 0.0
+        for p in pts:
+            i = float(p["i"]); v = float(p["v"])
+            ss += ((a * i * i * i + r0 * i) - v) ** 2 / (v * v) if v else 0.0
+        out["rms_residual_frac"] = (ss / len(pts)) ** 0.5
+        return out
+
+    def sweep_filament_impedance(self, filaments=None, *,
+                                 start_mv: int | None = None,
+                                 end_mv: int | None = None,
+                                 step_mv: int | None = None,
+                                 dwell_s: float | None = None,
+                                 short_ohm: float | None = None,
+                                 cool_s: float | None = None,
+                                 hysteresis_tol: float | None = None,
+                                 save: bool = True,
+                                 progress=None) -> dict:
+        """TEST 6 -- per-filament impedance sweep, fitted to a cold resistance.
+
+        For each live filament in turn: hold VOLTAGE mode at start_mv, dwell,
+        read the INA219, step up by step_mv, repeat to end_mv, STOP, then fit
+        the collected V-I curve with fit_cold_resistance(). One filament is
+        energised at a time, and it is STOPped before the next one starts.
+
+        SLOW -- one filament's sweep is roughly
+        `dwell_s * (1 + (end_mv - start_mv) // step_mv)` seconds, so all 96 at
+        the defaults is well over an hour. Pass `filaments` to sweep a subset.
+
+        Unlike measure_filament_resistance(), which divides one V by one I at a
+        single operating point, this fits a whole curve, so it separates the
+        cold resistance R₀ from the self-heating term -- the number you want
+        when comparing filaments to each other.
+
+        ## R₀ is a cold resistance only if the filament was actually cold
+
+        R₀ is the fit's extrapolation to zero dissipated power, so it equals the
+        room-temperature resistance only when the sweep both STARTS at ambient
+        and stays in thermal equilibrium throughout. A filament that ran
+        recently is still hot and reads high; one swept faster than it can shed
+        heat climbs during the sweep. Neither shows up in the fit -- both just
+        move R₀, and the GUI's version reports the result as a cold resistance
+        either way.
+
+        Two independent guards, because they fail differently:
+
+        - `cool_s` (default None = no wait): de-energise and wait this long
+          before sweeping, crediting time already served. Establishes the start
+          condition. Reported under "thermal".
+        - The **return point** (always taken): after the last step the sweep
+          goes back to `start_mv`, re-measures, and compares R with the opening
+          point. This TESTS equilibrium instead of assuming it, and needs no
+          knowledge of the filament's thermal constant. Drift beyond
+          `hysteresis_tol` (default _T6_HYSTERESIS_TOL) marks R₀ not-cold.
+
+        Per filament, `r0_is_cold` is True / False / None (unverified), with
+        `cold_note` saying why, and the run-level `r0_not_cold` lists every
+        filament whose R₀ fitted but is not a cold resistance. A not-cold R₀ is
+        still returned -- it is a real measurement at an unknown temperature --
+        but it is never silently labelled as cold.
+
+        start_mv is clamped up to the firmware's 0.8 V floor: below it the
+        regulator does not start at all, so a lower request would silently
+        collect points that are all the same voltage.
+
+        save=True writes the curves and fits to the backend's calibration
+        directory as `impedance_sweep_<timestamp>.json` + `.csv`.
+        progress: optional callable(str); None = silent.
+
+        Returns {"ok", "results": {user_index: {"R0_ohm", "a", "verdict",
+        "curve": [{"v","i","mv_set"}], "points"}}, "params", "counts",
+        "flagged", "saved"}. A filament whose curve could not be fitted gets
+        "R0_ohm": None and verdict "no_fit" -- never a placeholder number.
+        """
+        start_mv = self._T6_START_MV if start_mv is None else int(start_mv)
+        end_mv = self._T6_END_MV if end_mv is None else int(end_mv)
+        step_mv = self._T6_STEP_MV if step_mv is None else int(step_mv)
+        dwell_s = self._T6_DWELL_S if dwell_s is None else float(dwell_s)
+        short_ohm = self._T6_SHORT_OHM if short_ohm is None else float(short_ohm)
+        hysteresis_tol = (self._T6_HYSTERESIS_TOL if hysteresis_tol is None
+                          else float(hysteresis_tol))
+        say = progress or (lambda _msg: None)
+
+        start_mv = max(self._T6_START_MV, start_mv)
+        if step_mv <= 0:
+            return {"ok": False, "error": f"step_mv={step_mv} must be positive",
+                    "results": {}}
+        if end_mv < start_mv:
+            return {"ok": False,
+                    "error": f"end_mv={end_mv} is below start_mv={start_mv}",
+                    "results": {}}
+        steps = list(range(start_mv, end_mv + 1, step_mv))
+        params = {"start_mv": start_mv, "end_mv": end_mv, "step_mv": step_mv,
+                  "dwell_s": dwell_s, "short_ohm": short_ohm,
+                  "cool_s": cool_s, "hysteresis_tol": hysteresis_tol,
+                  "steps_per_filament": len(steps)}
+
+        targets = self._live_user_indices(filaments)
+        if not targets:
+            return {"ok": False, "error": "no live filaments to sweep",
+                    "results": {}, "params": params}
+
+        thermal = self._thermal_precondition(targets, cool_s, say)
+        results: dict[int, dict] = {}
+        # One energised() around the whole run, not one per filament: if the
+        # loop dies partway through, the filament being swept AND any earlier
+        # one whose STOP did not land both still get stopped.
+        with self.energised(*targets):
+            for n, f in enumerate(targets, 1):
+                curve = []
+                for mv in steps:
+                    say(f"F{f} ({n}/{len(targets)}) @ {mv} mV…")
+                    r = self.voltage_one(f, mv)
+                    if not r.get("ok"):
+                        curve.append({"mv_set": mv, "v": None, "i": None,
+                                      "error": r.get("error") or "set failed"})
+                        continue
+                    time.sleep(dwell_s)
+                    entry = self.read_filament_vi_live([f]).get(f) or {}
+                    mA, mV = entry.get("current_mA"), entry.get("bus_mV")
+                    if entry.get("present") and mA is not None and mV is not None and mA > 0:
+                        curve.append({"mv_set": mv, "v": mV / 1000.0, "i": mA / 1000.0})
+                    else:
+                        # Kept in the curve with v/i None so the record shows the
+                        # step was attempted; fit_cold_resistance() skips it.
+                        curve.append({"mv_set": mv, "v": None, "i": None})
+                # Return to the FIRST voltage and re-measure. If the filament is
+                # at the same temperature as when the sweep opened, this reads
+                # the same R; if the sweep heated it faster than it could shed
+                # the heat, it reads higher, and by how much. This is the only
+                # thing here that TESTS the fit's premise rather than assuming
+                # it -- and unlike a cool-down time, it needs no prior knowledge
+                # of the filament's thermal constant, so it works on any rig.
+                hysteresis = None
+                first = next((p for p in curve if p.get("i")), None)
+                if first is not None:
+                    say(f"F{f}: return to {steps[0]} mV for the hysteresis check…")
+                    rr = self.voltage_one(f, steps[0])
+                    if rr.get("ok"):
+                        time.sleep(dwell_s)
+                        e = self.read_filament_vi_live([f]).get(f) or {}
+                        mA, mV = e.get("current_mA"), e.get("bus_mV")
+                        if e.get("present") and mA and mV and mA > 0:
+                            r_open = first["v"] / first["i"]
+                            r_back = (mV / 1000.0) / (mA / 1000.0)
+                            hysteresis = {
+                                "mv_set": steps[0], "v": mV / 1000.0,
+                                "i": mA / 1000.0,
+                                "r_open_ohm": r_open, "r_return_ohm": r_back,
+                                # Positive = came back hotter than it started.
+                                "drift_frac": (r_back - r_open) / r_open if r_open else None,
+                            }
+                self.stop_one(f)
+                fit = self.fit_cold_resistance(curve)
+                row = {"index": f, "curve": curve, "points": fit["points"],
+                       "hysteresis": hysteresis,
+                       "R0_ohm": fit["R0_ohm"], "a": fit["a"],
+                       "collinearity": fit["collinearity"],
+                       "r0_pinned": fit["r0_pinned"],
+                       "rms_residual_frac": fit["rms_residual_frac"],
+                       "verdict": "no_fit", "reason": fit["reason"]}
+                if fit["R0_ohm"] is None:
+                    pass                    # reason already explains which way
+                elif fit["r0_pinned"]:
+                    # R₀ = 0 here means "the fit wanted a negative one", not a
+                    # measured 0 Ω. Calling that SHORT is the false alarm this
+                    # whole path exists to avoid.
+                    row["verdict"] = "no_fit"
+                elif fit["R0_ohm"] < short_ohm:
+                    row["verdict"] = "short"
+                    row["reason"] = f"R₀ {fit['R0_ohm']:.4f} Ω < {short_ohm} Ω"
+                else:
+                    row["verdict"], row["reason"] = "ok", None
+                # Whether the R0 that came out is a COLD resistance is a
+                # separate question from whether the fit converged, and is
+                # tracked separately so neither can stand in for the other.
+                drift = (hysteresis or {}).get("drift_frac")
+                if row["R0_ohm"] is None:
+                    row["r0_is_cold"] = None
+                elif drift is None:
+                    row["r0_is_cold"] = None
+                    row["cold_note"] = "no return point — cold start unverified"
+                elif abs(drift) > hysteresis_tol:
+                    row["r0_is_cold"] = False
+                    row["cold_note"] = (
+                        f"R at {steps[0]} mV drifted {drift * 100:+.1f}% over the "
+                        f"sweep (tol ±{hysteresis_tol * 100:.0f}%) — the filament "
+                        f"did not stay at one temperature, so R₀ is not a cold "
+                        f"resistance")
+                elif thermal["met"] is False:
+                    row["r0_is_cold"] = False
+                    row["cold_note"] = f"warm start: {thermal['note']}"
+                elif thermal["met"] is None:
+                    row["r0_is_cold"] = None
+                    row["cold_note"] = f"cold start unconfirmed: {thermal['note']}"
+                else:
+                    row["r0_is_cold"] = True
+                    row["cold_note"] = None
+                results[f] = row
+                say(f"F{f}: " + (f"R₀ = {row['R0_ohm']:.4f} Ω"
+                                 if row["R0_ohm"] is not None else "no fit"))
+
+        counts: dict[str, int] = {}
+        for row in results.values():
+            counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
+        flagged = [f"F{row['index']}: {row['verdict'].upper()} ({row['reason']})"
+                   for row in results.values() if row["verdict"] != "ok"]
+        not_cold = [row["index"] for row in results.values()
+                    if row.get("R0_ohm") is not None and row.get("r0_is_cold") is not True]
+        out = {"ok": True, "pass": not flagged, "results": results,
+               "params": params, "counts": counts, "flagged": flagged,
+               "thermal": thermal, "r0_not_cold": sorted(not_cold),
+               "saved": None}
+        if save:
+            out["saved"] = self.save_calibration("impedance_sweep", {
+                "params": params,
+                "curves": {str(k): v["curve"] for k, v in results.items()},
+                "r0": {str(k): v["R0_ohm"] for k, v in results.items()},
+                "a": {str(k): v["a"] for k, v in results.items()},
+                # Saved alongside R0 on purpose: a stored cold resistance with
+                # no record of whether the filament was cold is not a
+                # calibration, it is a number.
+                "r0_is_cold": {str(k): v.get("r0_is_cold") for k, v in results.items()},
+                "hysteresis": {str(k): v.get("hysteresis") for k, v in results.items()},
+                "thermal": thermal,
+            })
+        return out
+
+    def save_calibration(self, name: str, data: dict) -> dict:
+        """Write a calibration/measurement record to the backend's host disk as
+        `<name>_<timestamp>.json` plus a flat `.csv` of `data["curves"]`.
+
+        The file lands next to backend.py (its `calibration/` directory), NOT
+        next to the calling script -- the backend is what owns the disk here.
+        `name` is sanitised by the backend to [A-Za-z0-9._-].
+
+        Returns {"ok", "json": path, "csv": path, "filaments"}; never raises.
+        """
+        return self._post("/api/calibration/save",
+                          {"name": str(name), "data": data}, timeout=20.0)
 
     # ── Human-readable result decoding ────────────────────────────────────────
     # Every method above returns a plain dict -- convenient for scripting, but
