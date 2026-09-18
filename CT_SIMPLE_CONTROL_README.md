@@ -2289,6 +2289,16 @@ board/HV method above.
 
 #### The normal way: `fire_single_pulse(..., measure=True)`
 
+> ⚠️ **It does not heat the filament.** The schedule it builds carries an empty
+> heating table and it calls nothing in the power-state ladder — the filament
+> stays in whatever state you left it in. What runs end to end is the *schedule*
+> path, not the whole operation.
+>
+> At **minimum** the filament's isolated rail must be on, or `arm` silently
+> SKIPS it and the run still looks normal (`sleep_one()` is enough; the result
+> then carries `skipped_unsafe`). For a real emission measurement it has to be
+> at operating current — walk the ladder first, as in the example below.
+
 **Don't fire and measure as two steps.** Firing and measuring are separate
 subsystems but a single operation: a pulse you fired without measuring tells
 you almost nothing, and arming the detector *after* firing has already missed
@@ -2434,7 +2444,24 @@ ct.pulse_disarm()
 > healthy**. Either use `fire_single_pulse(..., measure=True)`, which arms the
 > relay for you, or pair `pulse_arm` with `ready_arm` and fire a real pulse.
 
-**`pulse_events(since=0)`** — Poll new measured events (`id > since`).
+**`pulse_events(since=0)`** — Poll measured events newer than `since`.
+
+`since` is a **cursor**. The ESP32 keeps a rolling log of measured pulses with
+monotonically increasing `id`s, and it keeps growing — firing does not clear it.
+Passing `since` returns only events newer than that id; without it you get the
+whole backlog, including pulses from someone else's run, with no way to tell
+which were yours.
+
+```python
+since = ct.pulse_events(2_000_000_000)["last_id"]   # cursor only, no history
+...                                                 # fire
+r = ct.pulse_events(since)                          # only your events
+```
+
+That first call passes a deliberately huge `since` so nothing can be newer: zero
+events come back but `last_id` is truthful — it is how you ask *where the log is
+now* without reading it. Keep `r["last_id"]` for the next call. `since=0` means
+"everything still in the log", which is rarely what you want.
 
 | field | meaning |
 |---|---|

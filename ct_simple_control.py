@@ -2872,6 +2872,25 @@ class CTClient:
     ) -> dict:
         """Download a one-entry schedule, arm it, fire, and verify.
 
+        IT DOES NOT HEAT THE FILAMENT. The schedule it builds carries an EMPTY
+        heating table and this method calls nothing in the power-state ladder,
+        so the filament stays in whatever state you left it in. What runs end
+        to end here is the SCHEDULE path (download -> verify -> arm -> trigger
+        -> read back, plus the detector when measure=True), not the whole
+        operation.
+
+        Bring the filament up yourself first. At MINIMUM its isolated rail must
+        be on, or arm silently SKIPS it -- sleep_one() is enough for that, and
+        the result then carries skipped_unsafe. For a real emission measurement
+        it has to be at operating current:
+
+            with ct.energised(f):
+                ct.sleep_one(f); ct.standby_one(f)
+                ct.idle_one(f, 1500, verify=True, timeout_s=30)
+                ct.active_one(f, 2950, verify=True)
+                r = ct.fire_single_pulse(f, width_us=1000, measure=True)
+
+
         Internally: disarm -> download() (the real reliable transfer path,
         same one the GUI uses) -> verify_schedule() -> arm -> trigger -> poll.
         Does NOT raise at any step — every failure mode (dead filament,
@@ -3481,7 +3500,29 @@ class CTClient:
         return self._post("/api/adc/pulse-disarm", {}, timeout=5.0)
 
     def pulse_events(self, since: int = 0) -> dict:
-        """Poll new STM32-measured pulse events with id > `since`.
+        """Poll STM32-measured pulse events NEWER than `since`.
+
+        WHAT `since` IS. The ESP32 keeps a rolling log of measured pulses, each
+        with a monotonically increasing `id`, and that log KEEPS GROWING -- it
+        is not cleared when you fire. `since` is a cursor into it: you get back
+        only events whose id is greater than the number you pass. Without it
+        every poll hands you the whole backlog, including pulses from a run an
+        hour ago, with no way to tell which ones were yours.
+
+        HOW TO USE IT. Read the cursor BEFORE firing, then poll with it after:
+
+            since = ct.pulse_events(2_000_000_000)["last_id"]   # cursor only
+            ...                                                # fire
+            r = ct.pulse_events(since)                          # only yours
+
+        That first call passes a deliberately huge `since` so nothing can be
+        newer: zero events come back, but `last_id` is truthful -- which is how
+        you ask "where is the log right now" without reading it. Same trick the
+        GUI's Clear button uses. Then keep `r["last_id"]` for the next call.
+
+        `since=0` (the default) means "everything still in the log", which is
+        rarely what you want. fire_single_pulse(measure=True) does all of this
+        for you; this is the manual form for when you fire some other way.
 
         Each event:
             "id"        monotonic event id (use as the next `since`)
@@ -3597,12 +3638,7 @@ class CTClient:
                         spread, so zero means the input is stuck or unpowered.
                         Reporting 0 would make the |charge| > sigma test pass
                         for anything -- the guard would silently stop guarding.
-        Returns {"ok", "events": [...], "last_id": int}: persist `last_id`
-        and pass it back as `since` on your next call to get only the
-        delta. Pass an intentionally huge `since` (e.g. 2_000_000_000) to
-        get zero events back but still learn the CURRENT last_id -- the
-        same trick the GUI's own "Clear" button uses to reset its cursor
-        without walking the whole history."""
+        Returns {"ok", "events": [...], "last_id": int}."""
         return self._get(f"/api/pulse-events?since={int(since)}", timeout=5.0)
 
     def get_ads1115_ref_mv(self) -> float | None:

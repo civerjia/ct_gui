@@ -93,13 +93,56 @@ LOG_DIR = Path(__file__).resolve().parent / "logs"
 log = logging.getLogger("ct_gui")
 
 
+class _DailySizeRotatingHandler(logging.handlers.TimedRotatingFileHandler):
+    """Roll at midnight AND at a size cap, keeping the date in the filename.
+
+    Size-only rotation (what this used to do) never produces a huge file, but
+    `backend.log.3` does not say which day it covers -- finding "what happened
+    on the 17th" means opening files and guessing from their contents. Date-only
+    rotation fixes that and reintroduces the unbounded-file problem for a
+    chatty day. Neither alone is right, and the stdlib has no handler that does
+    both.
+
+    Same-day size rolls get a numeric suffix (backend.log.2026-09-18.1) instead
+    of overwriting: TimedRotatingFileHandler deletes an existing destination,
+    which on a second roll within one day would silently discard that day's
+    earlier entries -- losing log lines to make room for log lines.
+    """
+
+    def __init__(self, filename, max_bytes: int, backup_count: int, encoding=None):
+        super().__init__(filename, when="midnight", backupCount=backup_count,
+                         encoding=encoding, utc=False)
+        self.max_bytes = max_bytes
+
+    def shouldRollover(self, record) -> int:
+        if super().shouldRollover(record):
+            return 1
+        if self.max_bytes <= 0:
+            return 0
+        if self.stream is None:
+            self.stream = self._open()
+        self.stream.seek(0, 2)
+        return 1 if self.stream.tell() + len(self.format(record)) + 1 >= self.max_bytes else 0
+
+    def rotation_filename(self, default_name: str) -> str:
+        # Only ever called with the dated name; disambiguate a same-day repeat.
+        if not os.path.exists(default_name):
+            return default_name
+        n = 1
+        while os.path.exists(f"{default_name}.{n}"):
+            n += 1
+        return f"{default_name}.{n}"
+
+
 def _setup_logging() -> None:
     LOG_DIR.mkdir(exist_ok=True)
     log.setLevel(logging.INFO)
     if log.handlers:
         return
-    fh = logging.handlers.RotatingFileHandler(
-        LOG_DIR / "backend.log", maxBytes=4_000_000, backupCount=5, encoding="utf-8")
+    # 14 days kept. backupCount counts FILES, and a size roll makes an extra one
+    # for that day, so this is "at least two weeks" rather than exactly 14 days.
+    fh = _DailySizeRotatingHandler(
+        LOG_DIR / "backend.log", max_bytes=4_000_000, backup_count=14, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
                                       "%Y-%m-%d %H:%M:%S"))
     log.addHandler(fh)
