@@ -634,6 +634,48 @@ with ct.lease(ttl=60, note="firing sequence"):
 # lease released automatically here, even on error
 ```
 
+#### What expires on its own, and what it actually does
+
+Three things here self-expire so a killed script cannot wedge the bench. It is
+worth knowing exactly what each one does on expiry, because none of them does
+what people usually assume:
+
+| mechanism | where | default | on expiry |
+|---|---|---|---|
+| **Lease** (`/api/lock`) | backend | 30 s (max 600) | **Releases the write lock. Sends no hardware command.** |
+| **`ready_relay` arm TTL** | ESP32 firmware | 60 s (`kDefaultArmTtlMs`) | `disarm()` — stops relaying the pulse envelope, releases the STM32 CS claim |
+| **poll-pause** | backend | 15 s | Background PING polling **resumes** |
+
+**None of them de-energises a filament.** There is no watchdog anywhere that
+turns heating off — which is exactly why a killed script can leave a filament
+powered (see the `energised()` warning under *Waiting on state*). Restating
+because it cuts both ways: an expiry can never *interrupt* your heating, and it
+can never *protect* you either.
+
+Read the failure direction of each before worrying about it:
+
+- **Lease** — the risk is the opposite of "it turned my stuff off": if a long
+  operation stops renewing, another client may begin writing while you are
+  mid-run. Reads are never gated at all (every `GET`/`READ` command, plus
+  presence/diagnosis/verify-schedule, stay allowed while someone holds it — a
+  lease reserves the right to *change* the hardware, not to *look* at it). Use
+  `with ct.lease(ttl=...)`, or `renew_lease()` inside a long loop.
+- **`ready_relay` TTL** — the only one that actively does something, and its
+  blast radius is just *pulse measurement*: it does not fire, power, or stop
+  anything, so the worst case is a later pulse going unmeasured. It exists
+  because an abandoned arm makes **every subsequent arm fail** with "already
+  armed" — observed after an interrupted script. For a run legitimately longer
+  than the TTL, pass a larger `ttl_ms` or call `ready_renew()`. Check
+  `ready_status()["ttl_expiries"]`: non-zero means somebody's cleanup is not
+  running.
+- **poll-pause** — fails safe in the direction of doing *more* work, not less;
+  at worst background pings resume during a long operation.
+
+A backend restart additionally clears `LAST_POWER_STATE`, so
+[`thermal_history()`](#resistance-is-meaningless-without-a-temperature) reports
+every filament as **unknown** (not cold) until something is commanded again. The
+dead mask is persisted to disk and survives.
+
 ### Session — guaranteed safe teardown
 
 `with ct.session():` wraps your script body and guarantees a safe teardown

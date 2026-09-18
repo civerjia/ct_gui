@@ -980,6 +980,16 @@ class CTClient:
     #    quantisation at these currents.
     _T6_HYSTERESIS_TOL = 0.05
 
+    # -- ready_relay arm TTL, host side. The ESP32 auto-disarms the pulse-relay
+    #    after this long with NO relayed edge, to reclaim an arm left behind by a
+    #    killed script. Relayed pulses renew it in firmware, so the only thing
+    #    the host has to size is the GAP between pulses -- a schedule sparser
+    #    than the TTL is indistinguishable from an abandoned arm.
+    _READY_TTL_FLOOR_MS = 60000     # never below the firmware's own default
+    _READY_TTL_GAP_FACTOR = 4       # x inter_pulse_ms; room for a late pulse
+                                     # without waiting a whole extra cycle to
+                                     # reclaim a genuinely dead arm
+
     @classmethod
     def identity_order(cls) -> list[int]:
         """The no-swap order: [0, 1, 2, ..., 95]. Start from this, change the
@@ -3948,7 +3958,17 @@ class CTClient:
         # the STM32 took 7.2M samples. With the relay armed the same fire gives
         # 3 events whose measured widths (1009/1002/1000 us) match the commanded
         # 1000 us. See pulse_arm()'s note for the detector-only form.
-        arm = self.ready_arm(rate_hz, post_bg_gap_us=post_bg_gap_us,
+        # Size the relay's abandonment TTL from THIS run rather than taking the
+        # firmware default. The firmware renews the TTL on every relayed edge,
+        # so an active run cannot be reclaimed -- but the renewal is driven by
+        # PULSES, so a gap wider than the TTL still looks abandoned. The binding
+        # gap is inter_pulse_ms; give it room, and never go below the firmware
+        # default. Also covers the head of the run, before the first pulse.
+        arm_ttl_ms = max(self._READY_TTL_FLOOR_MS,
+                         int(inter_pulse_ms) * self._READY_TTL_GAP_FACTOR,
+                         int(timeout_s * 1000))
+        arm = self.ready_arm(rate_hz, ttl_ms=arm_ttl_ms,
+                             post_bg_gap_us=post_bg_gap_us,
                              post_bg_n_us=post_bg_n_us)
         if not arm.get("ok"):
             hint = ""
