@@ -3974,14 +3974,26 @@ class CTClient:
             hint = ""
             if "already armed" in str(arm.get("error", "")):
                 st = self.ready_status()
-                hint = (" — the relay is already armed. The usual cause is a "
-                        "previous run that was KILLED between arming and its "
-                        "cleanup (the disarm is in a finally, so an exception is "
-                        "fine; SIGKILL is not). If nothing else is using it, "
-                        "clear it with ct.ready_disarm(). Not stolen "
-                        "automatically: the relay is a single global resource "
-                        "with no owner recorded, so another client could be "
-                        f"mid-run. Current: {st}")
+                # Armed at the SAME rate is no longer an error (the firmware's
+                # resting state is armed), so reaching here means the rate
+                # differs -- say which, because "already armed" on its own sends
+                # people looking for a stale arm that isn't the problem.
+                armed_rate = st.get("rate_hz")
+                if armed_rate and int(armed_rate) != int(rate_hz):
+                    hint = (f" — the relay is armed at {armed_rate} Hz and this "
+                            f"fire asked for {rate_hz} Hz. Measuring at a rate "
+                            f"you did not ask for would be worse than failing, "
+                            f"so it refuses. ct.ready_disarm() first, or fire at "
+                            f"{armed_rate} Hz.")
+                else:
+                    hint = (" — the relay is already armed. The usual cause is a "
+                            "previous run that was KILLED between arming and its "
+                            "cleanup (the disarm is in a finally, so an exception "
+                            "is fine; SIGKILL is not). If nothing else is using "
+                            "it, clear it with ct.ready_disarm(). Not stolen "
+                            "automatically: the relay is a single global resource "
+                            "with no owner recorded, so another client could be "
+                            f"mid-run. Current: {st}")
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "measured": [], "ref_mv": None,
                     "error": f"detector arm failed, nothing fired: "
