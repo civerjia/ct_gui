@@ -1190,8 +1190,32 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
             for _ in range(n):
                 if off + 12 > len(raw):
                     break
-                recs.append({"filament": raw[off], "flags": raw[off + 1], "seq": _le(raw, off + 2, 2),
-                             "tOnUs": _le(raw, off + 4, 4), "durationUs": _le(raw, off + 8, 2)})
+                # The record is 12 bytes and only 10 were being decoded; the
+                # last two hold the 165 READ-BACK, which is what makes a flagged
+                # pulse judgeable at all.
+                #
+                # flags bits (RP2350 simple_hv_schedule.cpp, pioTick_ verify):
+                #   0x01 ON read-back != the commanded byte
+                #   0x02 OFF read-back was NON-ZERO -- THE HV DID NOT TURN OFF.
+                #        This is the dangerous one and the only bit here that is
+                #        about the pulse rather than about the verification.
+                #   0x04 a read-back was UNAVAILABLE -- the pulse fired but the
+                #        firmware has no evidence either way. Not a failure, and
+                #        the firmware's own mismatch counter deliberately skips
+                #        it.
+                #
+                # 0xEE is a SENTINEL the firmware writes when the ON read-back is
+                # unavailable, not a bus sample -- its bits mean nothing. It only
+                # ever appears with 0x04. Surfaced as None so it cannot be read
+                # as a value, same reasoning as the 0xFFF0 telemetry sentinels.
+                fl = raw[off + 1]
+                rb = _le(raw, off + 10, 2)
+                recs.append({"filament": raw[off], "flags": fl, "seq": _le(raw, off + 2, 2),
+                             "tOnUs": _le(raw, off + 4, 4), "durationUs": _le(raw, off + 8, 2),
+                             "read165": None if (fl & 0x04 and (rb & 0xFF) == 0xEE) else rb,
+                             "on_mismatch": bool(fl & 0x01),
+                             "hv_stuck_on": bool(fl & 0x02),
+                             "unverified": bool(fl & 0x04)})
                 off += 12
             return {"ok": True, "total": _le(raw, 1, 2), "records": recs}
         return {"ok": False}

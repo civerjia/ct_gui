@@ -3323,8 +3323,33 @@ class CTClient:
             if state == SHV_COMPLETE:
                 logs = self.shv_pulse_log(controller)
                 fired = [r for r in logs if r.get("filament") == filament]
-                return {"ok": bool(fired), "fired": len(fired),
-                        "records": fired, "status": st, "schedule": reuse_note}
+                out = {"ok": bool(fired), "fired": len(fired),
+                       "records": fired, "status": st, "schedule": reuse_note}
+                # HV DID NOT TURN OFF (flags bit 0x02): the OFF read-back came
+                # back non-zero. This is the only pulse-log flag that is about
+                # the PULSE rather than about the verification of it, and it is
+                # the one that matters -- a switch that stayed closed leaves HV
+                # on the filament after the pulse. Surfaced at the top level
+                # because it was previously invisible: `flags` was a raw byte
+                # nobody decoded, so this condition could occur and be reported
+                # as a perfectly successful shot.
+                stuck = [r.get("filament") for r in fired if r.get("hv_stuck_on")]
+                if stuck:
+                    out["hv_stuck_on"] = sorted(set(stuck))
+                    out["ok"] = False
+                    out["error"] = (f"HV DID NOT TURN OFF after the pulse on "
+                                    f"filament(s) {sorted(set(stuck))} — the OFF "
+                                    f"read-back was non-zero, so the grid switch "
+                                    f"may still be closed. Check before firing "
+                                    f"again.")
+                # Unverified (0x04) is NOT a failure: the pulse fired, the
+                # firmware just has no read-back evidence about it. Reported so
+                # a caller can tell "verified good" from "no evidence", which
+                # the ok flag alone cannot.
+                unver = [r.get("filament") for r in fired if r.get("unverified")]
+                if unver:
+                    out["unverified"] = sorted(set(unver))
+                return out
             time.sleep(0.05)
 
         self.shv_disarm(controller)
