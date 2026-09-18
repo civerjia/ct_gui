@@ -2707,6 +2707,260 @@ class CTClient:
             "_peak_active": self._peak_for_lead(runs, length, lead, hold_bursts),
         }
 
+    def scan_report(self, controller: int = 1, since: int | None = None,
+                    plan: dict | None = None) -> dict:
+        """Assemble a post-run report from everything the hardware recorded.
+
+        Three independent sources, which is the point -- each can be complete
+        while another is not, and the disagreements are the findings:
+
+          RP2350 pulse log   what FIRED: filament, trigger seq, measured width,
+                             and the per-pulse 165 verification
+          RP2350 status      the run's counters: done/rbIrqs/edges, uncounted,
+                             underfed, unsafeSlots, and the ring health
+          STM32 events       what was MEASURED per pulse: envelope width and
+                             emission current/charge
+
+        `since` is the pulse-event cursor taken BEFORE the run (pulse_cursor());
+        without it the STM32 half covers whatever is still in the ring, which
+        may include an earlier run. `plan` is optional and only used to say
+        which filaments were expected.
+
+        NOT IN HERE, because nothing records it: the filament's HEATING current
+        at the instant each pulse fired. The pulse record has no current field
+        and the STM32 measures EMISSION current, not heating. Sampling it from
+        the host cannot be aligned to pulses -- the ACTIVE window is a few
+        triggers wide and one poll round is ~250 ms -- so this is a firmware
+        change, requested on the RP2350 side. Until it lands, a report can say
+        what each pulse emitted but not what it was heated to.
+        """
+        st = self.shv_status(controller) or {}
+        logs = self.shv_pulse_log(controller) or []
+        ev = self.pulse_events_ma(since if since is not None else 0)
+        events = ev.get("events") or []
+
+        fired = {}
+        for r in logs:
+            fired[r.get("filament")] = fired.get(r.get("filament"), 0) + 1
+        expected = None
+        if plan:
+            expected = {}
+            for e in (plan.get("emission") or []):
+                f = int(e["filament"])
+                expected[f] = expected.get(f, 0) + int(e.get("numPulses", 1))
+
+        # Anything that makes the run untrustworthy, named rather than left for
+        # the reader to notice in a table of counters.
+        problems = []
+        done, irq = st.get("totalPulsesDone"), st.get("rbIrqs")
+        if done is not None and irq is not None and done != irq:
+            problems.append(f"totalPulsesDone {done} != rbIrqs {irq} — the host's "
+                            f"bookkeeping disagrees with what the hardware fired")
+        if st.get("unsafeSlots"):
+            u = st["unsafeSlots"]
+            slots = [i for i in range(64) if (u >> i) & 1]
+            problems.append(f"arm SKIPPED power slots {slots} as unsafe — those "
+                            f"filaments did not fire even though the run looks normal")
+        if st.get("uncounted"):
+            problems.append(f"uncounted={st['uncounted']} — pulses fired that the "
+                            f"edge counter missed"
+                            + ("" if not st.get("rbSaturated") else
+                               " (rbSaturated>0, so this is a LOWER BOUND)"))
+        if st.get("underfed"):
+            problems.append(f"underfed={st['underfed']} — triggers arrived with "
+                            f"nothing staged")
+        if st.get("off_mismatches"):
+            problems.append(f"off_mismatches={st['off_mismatches']} — THE HV DID "
+                            f"NOT TURN OFF on that many pulses")
+        if st.get("rbDropped"):
+            problems.append(f"rbDropped={st['rbDropped']} — read-back ring "
+                            f"overran, verification data was lost")
+        stuck = sorted({r["filament"] for r in logs if r.get("hv_stuck_on")})
+        if stuck:
+            problems.append(f"HV did not turn off on filament(s) {stuck}")
+        mism = sorted({r["filament"] for r in logs if r.get("on_mismatch")})
+        if mism:
+            problems.append(f"read-back did not match the commanded byte on "
+                            f"filament(s) {mism}")
+        dropped_dead = []
+        if expected:
+            # Filaments the dead mask removed are EXPECTED to be missing -- the
+            # plan was built before the filter ran. Reporting them as a
+            # shortfall turns a guard doing its job into an alarm, which is
+            # exactly the failure mode this report exists to avoid.
+            dead = self.dead
+            dropped_dead = sorted(f for f in expected if f in dead)
+            short = {f: (n, fired.get(f, 0)) for f, n in expected.items()
+                     if f not in dead and fired.get(f, 0) != n}
+            if short:
+                problems.append(f"fired count differs from the plan for "
+                                f"{ {f: f'{g}/{w}' for f, (w, g) in short.items()} }")
+        if len(events) != len(logs):
+            problems.append(f"{len(logs)} pulses fired but the STM32 measured "
+                            f"{len(events)} — measurement is incomplete, so the "
+                            f"per-pulse currents do not cover every pulse")
+
+        unverified = sorted({r["filament"] for r in logs if r.get("unverified")})
+        widths = [e.get("on_us") for e in events if e.get("on_us") is not None]
+        charges = [e.get("integral_mams") for e in events
+                   if e.get("integral_mams") is not None]
+        return {
+            "ok": not problems,
+            "problems": problems,
+            "fired_pulses": len(logs),
+            "fired_by_filament": dict(sorted(fired.items())),
+            "expected_by_filament": expected,
+            # Named, not silently subtracted: they were in the plan and did not
+            # fire, and the reader should see WHY rather than wonder.
+            "dropped_dead": dropped_dead,
+            "measured_pulses": len(events),
+            "unverified_filaments": unverified,   # fired, but no read-back evidence
+            "width_us": ({"min": min(widths), "max": max(widths),
+                          "n": len(widths)} if widths else None),
+            "charge_mams": ({"min": min(charges), "max": max(charges),
+                             "n": len(charges)} if charges else None),
+            "heating_at_pulse": None,   # see the docstring: nothing records it yet
+            "status": st,
+            "pulses": logs,
+            "events": events,
+        }
+
+    @staticmethod
+    def is_active_at(plan: dict, filament: int, trigger: int) -> bool:
+        """Was `filament` ACTIVE at trigger `trigger`, per this plan?
+
+        Answers it from the plan's own deltas rather than from a live read, so
+        it works before the run and cannot be perturbed by asking. The window
+        wraps: a filament promoted near the end of the timeline is ACTIVE
+        through the wrap into the start.
+        """
+        iv = CTClient.heating_windows(plan).get(int(filament))
+        if not iv:
+            return False
+        length = iv["length"]
+        span = (iv["demote"] - iv["promote"]) % length or length
+        return (int(trigger) - iv["promote"]) % length < span
+
+    @staticmethod
+    def heating_windows(plan: dict) -> dict:
+        """Per-filament ACTIVE window, as {filament: {promote, demote, length}}.
+
+        This is the data a Gantt chart draws: when each filament comes up and
+        goes back down, on the trigger timeline. Derived from the plan's heating
+        deltas, so it describes what WILL happen rather than what a poll caught.
+        """
+        length = 0
+        for e in (plan.get("emission") or []):
+            length = max(length, int(e.get("numPulses", 1)))
+        # The timeline length is the total trigger count, which for an emission
+        # list in trigger order is the sum of the burst lengths.
+        length = sum(int(e.get("numPulses", 1)) for e in (plan.get("emission") or [])) or 1
+        out: dict = {}
+        for d in (plan.get("heating") or []):
+            f = int(d["filament"])
+            slot = out.setdefault(f, {"promote": None, "demote": None, "length": length})
+            if int(d["state"]) == ACTIVE:
+                slot["promote"] = int(d["triggerIndex"])
+            elif int(d["state"]) == IDLE:
+                slot["demote"] = int(d["triggerIndex"])
+        return {f: v for f, v in out.items()
+                if v["promote"] is not None and v["demote"] is not None}
+
+    def gantt(self, plan: dict, width: int = 72) -> str:
+        """Render the schedule as text — the terminal form of the GUI's Gantt.
+
+        One row per filament: `#` where it fires, `=` where it is held ACTIVE,
+        and blank where it is off. The point is to see the OVERLAP: how many
+        filaments are hot at once, and whether each one is up before its own
+        pulse. A count of concurrently-ACTIVE filaments runs underneath.
+        """
+        emission = plan.get("emission") or []
+        if not emission:
+            return "(empty plan)"
+        length = sum(int(e.get("numPulses", 1)) for e in emission)
+        windows = self.heating_windows(plan)
+        fires: dict = {}
+        t = 0
+        for e in emission:
+            n = int(e.get("numPulses", 1))
+            fires.setdefault(int(e["filament"]), set()).update(range(t, t + n))
+            t += n
+        scale = max(1, -(-length // width))     # triggers per column
+        cols = -(-length // scale)
+        lines = [f"trigger 0..{length - 1}"
+                 + (f"  ({scale} per column)" if scale > 1 else "")]
+        concurrent = [0] * cols
+        for f in sorted(set(list(fires) + list(windows))):
+            row = []
+            for c in range(cols):
+                span = range(c * scale, min(length, (c + 1) * scale))
+                if any(tt in fires.get(f, ()) for tt in span):
+                    row.append("#")
+                elif any(self.is_active_at(plan, f, tt) for tt in span):
+                    row.append("=")
+                    concurrent[c] += 1
+                else:
+                    row.append(" ")
+            # '#' columns are ACTIVE too -- count them, but draw the pulse.
+            for c in range(cols):
+                span = range(c * scale, min(length, (c + 1) * scale))
+                if row[c] == "#" and any(self.is_active_at(plan, f, tt) for tt in span):
+                    concurrent[c] += 1
+            lines.append(f"  fil {f:>3} |{''.join(row)}|")
+        peak = max(concurrent) if concurrent else 0
+        lines.append(f"  ACTIVE   |{''.join(str(min(9, c)) if c else '.' for c in concurrent)}|"
+                     f"  peak {peak}")
+        lines.append("  legend: # pulse   = held ACTIVE   digits = concurrent ACTIVE")
+        return "\n".join(lines)
+
+    def validate_plan(self, plan: dict, rotation_ms: int,
+                      t_settle_ms: float = 0.0) -> dict:
+        """Is every filament ACTIVE long enough before it fires?
+
+        The only check that matters on a scan plan: the pre-heat lead has to be
+        at least the filament's settling time, or pulses land on a filament that
+        has not reached operating current. `rotation_ms` converts the lead from
+        triggers into milliseconds -- the plan itself is in triggers and knows
+        nothing about wall time.
+
+        Returns {"ok", "lead_triggers", "lead_ms", "t_settle_ms", "peak_active",
+        "problems"}. ok is False when the lead is short, which is a REAL
+        finding: build_scan_plan picks the largest lead the concurrency budget
+        allows, so a short one means the budget cannot buy enough pre-heat and
+        the answer is a higher active_count or a slower rotation, not a retry.
+        """
+        length = sum(int(e.get("numPulses", 1)) for e in (plan.get("emission") or [])) or 1
+        lead = plan.get("_lead_triggers")
+        windows = self.heating_windows(plan)
+        if lead is None:
+            # Not built here -- recover the lead from the first filament's own
+            # window rather than refusing to answer.
+            leads = []
+            t = 0
+            for e in (plan.get("emission") or []):
+                f = int(e["filament"])
+                if f in windows:
+                    leads.append((t - windows[f]["promote"]) % length)
+                t += int(e.get("numPulses", 1))
+            lead = min(leads) if leads else 0
+        pulse_ms = rotation_ms / length if (rotation_ms and length) else 0
+        lead_ms = lead * pulse_ms
+        peak = max((sum(1 for f in windows if self.is_active_at(plan, f, t))
+                    for t in range(length)), default=0)
+        problems = []
+        if t_settle_ms and lead_ms + 1e-6 < t_settle_ms:
+            problems.append(
+                f"pre-heat lead is {lead_ms:.0f} ms ({lead} triggers) but the "
+                f"filament needs {t_settle_ms:.0f} ms to settle — pulses will "
+                f"land on filaments that have not reached operating current. "
+                f"Raise active_count (buys a longer lead) or slow the rotation.")
+        if not rotation_ms and t_settle_ms:
+            problems.append("rotation_ms is 0, so the lead cannot be converted "
+                            "to milliseconds and the settle check did not run")
+        return {"ok": not problems, "lead_triggers": lead, "lead_ms": lead_ms,
+                "t_settle_ms": t_settle_ms, "peak_active": peak,
+                "problems": problems}
+
     def download(self, plan: dict,       # {"config", "emission", "heating"?,
                                           # "currents"?} -- see the shape below
                 timeout: float = 30.0) -> dict:  # generous default; a full
