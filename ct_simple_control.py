@@ -2349,6 +2349,14 @@ class CTClient:
 
         Returns {filament_index: {"bus_mV", "current_mA", "present",
         "cached"}}. Returns {} on failure (never raises).
+
+        DO NOT POLL THIS TO WATCH A RAMP. It is a LIVE INA219 read over the same
+        I2C the CC loop uses to rewrite its setpoint, so sampling it slows the
+        thing being sampled. Measured on one IDLE->ACTIVE transition: 3.61 s
+        while polling this at 4 Hz, 3.28 s polling the zero-I2C cache, and
+        3.0 s not polling at all -- a 20% observer effect that is easy to
+        mistake for the loop being slow. Use read_filament_current_cached()
+        (0x3A, costs the RP2350 no I2C), or command, sleep, and read once.
         """
         # ?live=1 is REQUIRED for a voltage: /api/telemetry defaults to the
         # no-I2C cached read, which carries no bus_mV at all (every entry comes
@@ -3679,6 +3687,15 @@ class CTClient:
         round trip per call — fetch it ONCE and reuse it across a batch
         instead, e.g. via pulse_events_ma(), rather than calling this
         directly in a loop)."""
+        # A BENCH WITH NO ANALOG FRONT END READS ZERO, AND ZERO CONVERTS TO
+        # ABOUT -32 mA. The lab test board's STM32 is a bare board: no DS3502,
+        # no ADS1115, no AMC3301. There, `i2c_present` is 0x80 (probe valid,
+        # all four absent), get_ads1115_ref_mv() returns None, adc_window reads
+        # min=0 max=0 with ZERO variance, and every peak/plateau/bg/post_bg is
+        # 0 -- so every current here is pulse_ma(0), and integral_mams is 0.0
+        # with background_flat True. None of that is a fault to chase; the
+        # parts are absent, not broken and not switched off. Emission-current
+        # MAGNITUDES can only be measured on a populated board.
         if ref_mv is None:
             live = self.get_ads1115_ref_mv()
             ref_mv = live if live is not None else 1200.0   # last-known-good fallback

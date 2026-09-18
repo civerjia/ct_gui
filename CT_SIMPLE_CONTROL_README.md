@@ -2580,6 +2580,18 @@ as a fixed constant is exactly what overstated measured current by ~35%
 in the GUI's own history before this was fixed there. `pulse_ma()` needs
 a live reading of this for an accurate conversion.
 
+> ⚠️ **A board with no analog front end reads zero, and zero converts to about
+> −32 mA.** The lab test board's STM32 is a *bare* board — no DS3502, no
+> ADS1115, no AMC3301. On it `i2c_present` is `0x80` (probe valid, all four
+> absent), `get_ads1115_ref_mv()` returns `None`, `adc_window` reads
+> `min=0 max=0` with **zero variance**, every `peak`/`plateau`/`bg`/`post_bg`
+> is 0, and `integral_mams` is `0.0` with `background_flat: True`.
+>
+> None of that is a fault to diagnose — **the parts are absent, not broken and
+> not switched off**, and no supply will change it. Everything digital still
+> works there (heating, schedules, firing, envelope widths, sentinels); only
+> emission-current *magnitudes* need a populated board.
+
 **`pulse_ma(raw, ref_mv=None)`** — Convert one raw ADC count to emission
 current (mA). Formula: `V = raw*3.3/4095; Ie = 2*(V - 0.5*ref_v) /
 R_sense / G_amc` (A→mA), with `R_sense=4.7 Ω`, `G_amc=8.2` (AMC3301's
