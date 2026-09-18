@@ -1901,6 +1901,79 @@ class CTClient:
 
     # ── SHV run policy & HV bit-bang diagnostics ──────────────────────────────
 
+    # The firmware's DEFAULTS, which are NOT the ceilings (below 2000,
+    # above/warm 5000). below/above are the COLD-start rates and sit well under
+    # their ceiling on purpose -- fast cold slew is what trips OCP on the
+    # cold-inrush. Only `warm` is set near its own. Recorded here because
+    # "reset to defaults" is exactly where reaching for the ceiling looks right
+    # and is not: doing that once here made cold starts 5x/10x faster.
+    SLEW_DEFAULTS = {"below_mV_per_s": 400, "above_mV_per_s": 1000,
+                     "warm_mV_per_s": 2800}
+    SLEW_CEILINGS = {"below_mV_per_s": 2000, "above_mV_per_s": 5000,
+                     "warm_mV_per_s": 5000}
+
+    def get_slew_rates(self, controller: int = 1) -> dict:
+        """Read the three voltage-ramp slew rates, in mV/s.
+
+        Returns {"ok", "below_mV_per_s", "above_mV_per_s", "warm_mV_per_s"}:
+        `below` applies under 2 V, `above` above 2 V from cold, `warm` above 2 V
+        on a warm restart (the IDLE<->ACTIVE transition a scan actually uses).
+
+        The configured number IS the real instantaneous dV/dt -- no conversion,
+        and nothing to scale for display. (An earlier firmware halved it: the
+        ramp's step clock was reset on every target increase, and the CC loop
+        re-arms a higher target every 20 ms, so 10 ms of accumulated step credit
+        was discarded each time -- the ramp stepped on a 20 ms cadence while
+        sizing each step for 10 ms. It scaled linearly, so it looked like a
+        clean 0.44 constant. It was a bug and it is fixed.)
+
+        A MEASURED full IDLE->ACTIVE transition averages BELOW the setting, and
+        that is correct rather than a discrepancy: peak dV/dt never exceeds the
+        configured rate, median runs ~91% of it, and the CC loop's fine trim at
+        the operating point is deliberately slow.
+        """
+        r = self._post("/api/cmd", {"controller": int(controller),
+                                    "command": "CH_SLEW_RATE"}, timeout=10.0)
+        raw = ((r.get("response") or {}).get("raw")) if r.get("ok") else None
+        if not raw or len(raw) < 7 or raw[0] != 0:
+            return {"ok": False, "error": r.get("error") or "bad CH_SLEW_RATE response"}
+        le = lambda o: raw[o] | (raw[o + 1] << 8)
+        return {"ok": True, "below_mV_per_s": le(1), "above_mV_per_s": le(3),
+                "warm_mV_per_s": le(5)}
+
+    def set_slew_rates(self, below_mV_per_s: int, above_mV_per_s: int,
+                       warm_mV_per_s: int, controller: int = 1) -> dict:
+        """Set all three slew rates (mV/s). See get_slew_rates for what each is.
+
+        Out-of-range CLAMPS rather than failing (ceilings: below 2000,
+        above/warm 5000), so the return is the values actually IN FORCE, not
+        what you asked for -- check them, and check `clamped`.
+
+        THE CEILINGS ARE NOT THE DEFAULTS; use SLEW_DEFAULTS for that.
+        """
+        # Clamp to the u16 wire range here. The firmware clamps to its own
+        # ceilings, but a value over 65535 would fail to serialise and the call
+        # would error instead of clamping, contradicting the contract the
+        # read-back is built on.
+        w = lambda v: max(0, min(65535, int(v)))
+        asked = (w(below_mV_per_s), w(above_mV_per_s), w(warm_mV_per_s))
+        r = self._post("/api/cmd", {"controller": int(controller),
+                                    "command": "CH_SLEW_RATE",
+                                    "below_mV_per_s": asked[0],
+                                    "above_mV_per_s": asked[1],
+                                    "warm_mV_per_s": asked[2]}, timeout=10.0)
+        raw = ((r.get("response") or {}).get("raw")) if r.get("ok") else None
+        if not raw or len(raw) < 7 or raw[0] != 0:
+            return {"ok": False, "error": r.get("error") or "bad CH_SLEW_RATE response"}
+        le = lambda o: raw[o] | (raw[o + 1] << 8)
+        got = (le(1), le(3), le(5))
+        return {"ok": True, "below_mV_per_s": got[0], "above_mV_per_s": got[1],
+                "warm_mV_per_s": got[2],
+                # Compared against what was actually SENT (post-u16 clamp), so a
+                # request of 99999 reports clamped rather than being measured
+                # against a number that never reached the wire.
+                "clamped": got != asked}
+
     def get_fault_policy(self, controller: int = 1) -> dict:
         """Read the per-run fault policy: two INDEPENDENT stop/continue
         switches for a run that hits trouble.

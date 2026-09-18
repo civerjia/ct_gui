@@ -129,6 +129,22 @@ def build_payload(command: str, b: dict):
         return 0x22, FLAG_SINGLE, bytes([ch, mux]) + _u16(int(b["millivolts"])) + bytes([1 if b.get("enable_after_set", True) else 0])
     if command == "CH_SET_TPS_OCP_THRESHOLD":  # 0x28: ch,mux,mA16 (direct IOUT_LIMIT)
         return 0x28, FLAG_SINGLE, bytes([ch, mux]) + _u16(int(b["threshold_mA"]))
+    if command == "CH_SLEW_RATE":            # 0x3C: empty=GET, 6 bytes=SET
+        # Three voltage-ramp slew rates, runtime-settable. Out-of-range CLAMPS
+        # rather than rejecting, and the response is always the values IN FORCE
+        # -- so a SET is its own read-back and must be read, never assumed.
+        #
+        # The configured number IS the real instantaneous dV/dt -- nothing to
+        # scale. An earlier firmware halved it (the ramp's step clock was reset
+        # on every target increase, so accumulated step credit was discarded),
+        # which looked like a clean 0.44 factor because it scaled linearly. Bug,
+        # fixed. Ceilings: below 2000, above/warm 5000. Defaults are NOT the
+        # ceilings -- see CTClient.SLEW_DEFAULTS.
+        if b.get("below_mV_per_s") is None:
+            return 0x3C, 0, b""
+        return 0x3C, 0, (_u16(int(b["below_mV_per_s"]))
+                         + _u16(int(b["above_mV_per_s"]))
+                         + _u16(int(b["warm_mV_per_s"])))
     if command == "CH_GET_TPS_STATUS":       # 0x23 mask form: mask[8] -> status +
         # seven per-board bitmaps. Payload 57 bytes:
         #   status@0, targeted@1, present@9, enabled@17, fault@25,
