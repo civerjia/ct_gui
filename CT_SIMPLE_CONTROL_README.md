@@ -2119,8 +2119,46 @@ after a run, to confirm what actually happened on the hardware.
 ```python
 log = ct.shv_pulse_log(1)
 for rec in log:
-    print(rec)   # {"filament": 5, "seq": 0, "tOnUs": ..., "durationUs": 998, "flags": 0}
+    print(rec)
+# {"filament": 5, "seq": 0, "tOnUs": ..., "durationUs": 998, "flags": 0,
+#  "read165": 32, "on_mismatch": False, "hv_stuck_on": False, "unverified": False}
 ```
+
+`flags` is a bitfield, decoded into the three booleans above. They are not
+equally serious:
+
+| bit | field | meaning |
+|---|---|---|
+| `0x01` | `on_mismatch` | the ON read-back did not equal the commanded byte |
+| `0x02` | **`hv_stuck_on`** | **the OFF read-back was non-zero — the HV did not turn off** |
+| `0x04` | `unverified` | a read-back was unavailable: the pulse fired, the firmware has no evidence either way |
+
+> ⚠️ **`hv_stuck_on` is the one that is about the PULSE.** The other two are
+> about the *verification* of it. A non-zero OFF read-back means the grid switch
+> may still be closed with HV on the filament after the pulse, so
+> `fire_single_pulse` fails on it and names the filament. It was invisible
+> before: `flags` was a raw byte nobody decoded, so this could occur and be
+> reported as a fully successful shot.
+
+`unverified` does **not** clear `ok` — the pulse fired, and the firmware's own
+mismatch counter deliberately skips it. It is reported separately so you can
+tell "verified good" from "no evidence", which `ok` alone cannot express.
+
+`read165` is the 165 read-back (expected value: `1 << position` for that
+filament). It is `None`, not a number, when the read-back was unavailable — the
+firmware writes a `0xEE` sentinel there and its bits mean nothing.
+
+> **Known firmware issue (fix in progress on the RP2350 side).** The read-back
+> can desync by exactly one pulse mid-run and never recover: one pulse reports
+> `unverified` with `read165: None`, and every pulse after it reads the
+> *previous* pulse's bit as `on_mismatch`. The pulses themselves are correct —
+> durations, envelope measurements and counts are all unaffected; only the
+> verification is lost. It happens at most once per run, because the failure
+> itself is what leaves the consumer one behind, which removes the condition
+> that caused it.
+>
+> Acceptance criterion once the fix lands: **a lone `unverified` is expected and
+> honest; an `on_mismatch` cascade running to the end of the table is not.**
 
 Full manual sequence, equivalent to what `fire_single_pulse` does
 internally (using [`download()`](#schedule-download) — the real transfer
