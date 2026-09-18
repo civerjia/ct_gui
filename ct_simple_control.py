@@ -2566,6 +2566,147 @@ class CTClient:
             out["currents"] = kept_cur
         return out, sorted(dead_skipped)
 
+    # ── Building a full scan plan ────────────────────────────────────────
+    # download() takes a plan; it does not build one. The GUI's builder lives
+    # in JavaScript (buildSchedule / planHeating / buildPlan in static/app.js),
+    # so until now a script had to hand-assemble the dict and re-derive the
+    # heating window from reading that JS. build_scan_plan() is that algorithm
+    # in Python, so the two produce the same plan for the same inputs.
+
+    @staticmethod
+    def _peak_for_lead(runs, length: int, lead: int, hold: int) -> int:
+        """Peak filaments ACTIVE at once for a given pre-heat lead.
+
+        Cyclic difference sweep, monotonic non-decreasing in `lead` -- which is
+        what lets the caller binary-search it.
+        """
+        diff = [0] * (length + 1)
+        for first_start, last_end in runs:
+            promote = (first_start - lead) % length
+            demote = (last_end + hold) % length
+            span = (demote - promote) % length or length
+            if promote + span <= length:
+                diff[promote] += 1
+                diff[promote + span] -= 1
+            else:
+                diff[promote] += 1
+                diff[length] -= 1
+                diff[0] += 1
+                diff[promote + span - length] -= 1
+        cur = peak = 0
+        for t in range(length):
+            cur += diff[t]
+            peak = max(peak, cur)
+        return peak
+
+    def build_scan_plan(self,
+                        emission,              # [{"filament", "trigger",
+                                               #   "burstLen"?, "widthUs"?}]
+                                               # in trigger order
+                        active_count: int = 3,  # peak filaments ACTIVE at once
+                        idle_ma: int = 1500,
+                        active_ma: int = 2950,
+                        rotation_ms: int = 0,   # whole-scan wall time; only
+                                                # shapes the config timeouts
+                        hold_ms: int = 0,       # stay ACTIVE this long past a
+                                                # filament's last pulse
+                        width_us: int = 1000,   # default per-entry width
+                        repeats: int = 1,
+                        no_heat=()) -> dict:    # fire but never heat these
+        """Build a full scan plan — the same shape the GUI downloads.
+
+        Returns {"config", "emission", "heating", "currents"} ready for
+        download(). USER_INDEX throughout; download() crosses to FID.
+
+        The heating window is the part worth not rewriting by hand. Each
+        filament is promoted to ACTIVE some triggers BEFORE its first pulse and
+        demoted after its last, and the lead is chosen by binary search as the
+        LARGEST one whose peak concurrent-ACTIVE count still fits
+        `active_count` -- pre-heat as early as the power budget allows, not a
+        fixed number of steps. A filament's window is the arc complementary to
+        its largest dark gap, so a filament that fires in two bursts is held
+        ACTIVE across the short gap and dropped across the long one.
+
+        `rotation_ms` only feeds the config timeouts (interPulseMs, totalMs);
+        the actual pacing comes from the trigger source. Leave it 0 and the
+        firmware minimums apply.
+
+        Does NOT pre-heat anything. The deltas run during the schedule; the
+        filaments still have to be brought up before arm or arm skips them --
+        see fire_single_pulse's note.
+        """
+        rows = [dict(e) for e in emission]
+        if not rows:
+            raise ValueError("build_scan_plan: emission is empty")
+        for r in rows:
+            r.setdefault("burstLen", 1)
+            r.setdefault("widthUs", width_us)
+        length = max(int(r["trigger"]) + int(r["burstLen"]) for r in rows)
+        if active_count < 1:
+            raise ValueError("build_scan_plan: active_count must be >= 1")
+
+        pulse_ms = (rotation_ms / length) if (rotation_ms and length) else 0
+        hold_bursts = max(1, -(-hold_ms // pulse_ms)) if pulse_ms else 1
+        hold_bursts = int(hold_bursts)
+
+        # Each filament's run = the arc complementary to its largest dark gap.
+        skip = {int(f) for f in no_heat}
+        bursts: dict = {}
+        for r in rows:
+            f = int(r["filament"])
+            if f in skip:
+                continue
+            bursts.setdefault(f, []).append(
+                (int(r["trigger"]), int(r["trigger"]) + int(r["burstLen"])))
+        runs, run_fil = [], []
+        for f, bs in bursts.items():
+            bs.sort()
+            gap_at, max_gap = 0, -1
+            for i, (_s, e) in enumerate(bs):
+                nxt = bs[(i + 1) % len(bs)][0]
+                gap = (nxt - e) % length
+                if gap > max_gap:
+                    max_gap, gap_at = gap, i
+            runs.append((bs[(gap_at + 1) % len(bs)][0], bs[gap_at][1]))
+            run_fil.append(f)
+
+        lo, hi, lead = 0, length, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._peak_for_lead(runs, length, mid, hold_bursts) <= active_count:
+                lead, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+
+        heating = []
+        for (first_start, last_end), f in zip(runs, run_fil):
+            heating.append({"filament": f, "triggerIndex": (first_start - lead) % length,
+                            "state": ACTIVE, "milliamps": int(active_ma)})
+            heating.append({"filament": f, "triggerIndex": (last_end + hold_bursts) % length,
+                            "state": IDLE, "milliamps": int(idle_ma)})
+        heating.sort(key=lambda d: d["triggerIndex"])
+
+        max_width = max(int(r["widthUs"]) for r in rows)
+        return {
+            "config": {
+                # maxOnMs MUST exceed the widest pulse or arm rejects
+                # WidthTooLarge; the other two scale with the scan so a slow
+                # run does not trip InterPulseTimeout / TotalTimeout mid-scan.
+                "interPulseMs": max(3000, int(-(-pulse_ms * 4 // 1)) if pulse_ms else 0),
+                "maxOnMs": max(40, -(-max_width // 1000) + 1),
+                "totalMs": max(60000, int(-(-rotation_ms * repeats * 2 // 1)) if rotation_ms else 0),
+                "triggerEdge": 0,
+            },
+            "emission": [{"filament": int(r["filament"]), "numPulses": int(r["burstLen"]),
+                          "widthUs": int(r["widthUs"])} for r in rows],
+            "heating": heating,
+            "currents": {int(f): {"idle_mA": int(idle_ma), "active_mA": int(active_ma)}
+                         for f in bursts},
+            "_lead_triggers": lead,      # diagnostics, ignored by download()
+            "_hold_triggers": hold_bursts,
+            "_peak_active": self._peak_for_lead(runs, length, lead, hold_bursts),
+        }
+
     def download(self, plan: dict,       # {"config", "emission", "heating"?,
                                           # "currents"?} -- see the shape below
                 timeout: float = 30.0) -> dict:  # generous default; a full
@@ -2642,8 +2783,23 @@ class CTClient:
 
         Returns {"ok", "results": {controller: {"match": bool, ...}}}.
         """
-        wire_plan, _dead = self._plan_to_fids(plan)
-        return self._post("/api/verify-schedule", {"plan": wire_plan}, timeout=10.0)
+        wire_plan, dead_skipped = self._plan_to_fids(plan)
+        r = self._post("/api/verify-schedule", {"plan": wire_plan}, timeout=10.0)
+        # SAY that entries were dropped. Without this a dead filament in the
+        # plan makes the counts differ from what the CALLER built -- they built
+        # 32 heating entries, 30 were verified -- and the only visible symptom
+        # is match=False, which reads as a transfer failure. The dead mask is
+        # backend-held and shared, so the entry may have been marked by someone
+        # else entirely; nothing in the caller's own code would hint at it.
+        if dead_skipped:
+            r = {**r, "dead_skipped": sorted(dead_skipped),
+                 "note": (f"{len(dead_skipped)} filament(s) were dropped from the plan "
+                          f"as dead before it was sent: {sorted(dead_skipped)}. The "
+                          f"counts below are for what was ACTUALLY downloaded, which "
+                          f"is smaller than what you built -- that is the dead mask "
+                          f"working, not a transfer problem. ct.dead_details() says "
+                          f"who marked them and why.")}
+        return r
 
     # ── SHV schedule — low-level ──────────────────────────────────────────────
     # RAW single-op building blocks, useful for advanced/custom sequences (e.g.

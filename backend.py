@@ -2592,8 +2592,19 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
 
     # heating deltas — only THIS controller's filaments (local ch, pos)
     reqs.append((SHV_HEAT_CLEAR, b"", 0)); labels.append("heat_clear"); cur_fil.append(None)
+    # Dead filaments out of the HEATING table too, not just the emission table.
+    # Dropping them from emission alone means a dead filament never gets HV but
+    # the schedule still drives it to ACTIVE mid-run -- and "must not be
+    # energised" is the whole definition of dead. The asymmetry was invisible
+    # because the emission filter is the one you notice.
+    heat_dead = sorted({int(h["filament"]) for h in (plan.get("heating") or [])
+                        if int(h["filament"]) in dead_fids()})
+    if heat_dead:
+        log.warning("download_to_controller: dropped dead filaments %s from the "
+                    "heating table (controller=%d)", heat_dead, controller)
     heat = [h for h in (plan.get("heating") or [])
-            if filament_to_board(int(h["filament"]))[0] == controller]
+            if int(h["filament"]) not in dead_fids()
+            and filament_to_board(int(h["filament"]))[0] == controller]
     heat.sort(key=lambda h: int(h["triggerIndex"]))
     hent = bytearray()
     for h in heat:
@@ -2685,8 +2696,9 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
            "frames": total, "curSent": cur_n, "curCached": cur_skipped,
            "fails": len(fails), "failLabels": fails[:12],
            "timing": {"total": total_ms}}
-    if emit_dead:
-        out["dead_skipped"] = emit_dead
+    dropped = sorted(set(emit_dead) | set(heat_dead))
+    if dropped:
+        out["dead_skipped"] = dropped
     return out
 
 
