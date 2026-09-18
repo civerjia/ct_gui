@@ -731,7 +731,6 @@ class CTClient:
     # construction: the backend enforces the mask itself, so the worst a stale
     # read does is send a request the backend then refuses and reports.
 
-    _DEAD_TTL_S = 5.0
 
     @property
     def dead(self) -> frozenset[int]:
@@ -749,7 +748,6 @@ class CTClient:
     # sighting is not a verdict. At the default 0.1 s poll interval this is a
     # ~0.3 s window -- long enough to ride out a transient, short enough that a
     # real fault still ends the wait immediately rather than at timeout.
-    _FAULT_CONFIRM_READS = 3
 
     def _refresh_dead(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -850,7 +848,6 @@ class CTClient:
     # ENERGISING_STATES -- the two must agree, or the client refuses something
     # the backend would have allowed, which is how a dead filament ends up
     # impossible to turn OFF.
-    _ENERGISING_STATES = frozenset({STANDBY, IDLE, ACTIVE, VOLTAGE})
 
     def _is_dead(self, filament: int) -> bool:
         """True if filament is in the dead mask."""
@@ -874,7 +871,68 @@ class CTClient:
     # to the FID (actually-wired filament) underneath. You never need to
     # translate anything yourself.
 
+    # ── Constants ────────────────────────────────────────────────────────
+    # All of them, in one place. They used to sit next to whichever method
+    # happened to need them, spread over several thousand lines, so there was
+    # no way to see what existed or to check one against another -- and two of
+    # these (the saturation markers, the ACTIVE floor) only make sense read
+    # together with their neighbours.
+    #
+    # Names are unchanged, including the leading underscores, so nothing that
+    # referenced them had to move with them.
+
     FILAMENT_COUNT = 96      # USER_INDEX filaments 0..95
+
+    # -- Wire limits. Exceeding these is rejected HERE rather than silently
+    #    truncated on the wire: `int(x) & 0xFF` once turned a request for 300
+    #    pulses into 44.
+    _U8_MAX = 255            # numPulses is a single byte on the wire
+    _U16_MAX = 65535
+    _U32_MAX = 4294967295
+
+    # -- ADC -> emission current, the STM32's own scale (NOT an ESP32 ADC
+    #    constant -- those belong to a different chip). mA = k*raw + c, and
+    #    pulse_ma() builds both from these two plus a LIVE reference reading.
+    _PULSE_R_SENSE_OHM = 4.7      # shunt
+    _PULSE_AMC3301_GAIN = 8.2     # AMC3301 fixed gain
+
+    # -- Saturation markers the STM32 sends instead of a value it cannot hold.
+    #    `integral` is SIGNED, so both ends are markers, and both are
+    #    REACHABLE: it accumulates over the firmware's internal u32 sample
+    #    count, which duration_samples' u16 does not bound -- at full scale
+    #    INT32 is about 520k samples, ~0.5 s at 1 MSPS.
+    _INTEGRAL_SAT_HI = 2_147_483_647     # INT32_MAX
+    _INTEGRAL_SAT_LO = -2_147_483_648    # INT32_MIN
+    #    duration_samples is truncated to this on the way out, so the envelope
+    #    was AT LEAST this long. It saturates independently of the integral: a
+    #    pulse can have a good charge and an unusable width, which is why this
+    #    does not invalidate integral_mams (that never uses the duration).
+    _DURATION_SATURATED = 0xFFFF
+
+    # -- Power-state ladder. STOP/SLEEP leave the output off; STANDBY enables
+    #    it at the firmware's 0.8 V floor and is therefore NOT a no-power state
+    #    (measured: 2.1 A of inrush decaying to ~885 mA). Guards block
+    #    energising and never de-energising -- refusing STOP would leave a
+    #    faulty filament with no way to be turned off.
+    _ENERGISING_STATES = frozenset({STANDBY, IDLE, ACTIVE, VOLTAGE})
+
+    # -- Poll/confirm timings.
+    _DEAD_TTL_S = 5.0        # dead-mask cache; refreshed on every write
+    #    Consecutive mode 2/3 reads before a fault is believed. A startup-inrush
+    #    OCP that recovers on the next revive can flash the fault bits, so one
+    #    sighting is not a verdict; ~0.3 s at the default poll interval.
+    _FAULT_CONFIRM_READS = 3
+
+    # The firmware's DEFAULTS, which are NOT the ceilings (below 2000,
+    # above/warm 5000). below/above are the COLD-start rates and sit well under
+    # their ceiling on purpose -- fast cold slew is what trips OCP on the
+    # cold-inrush. Only `warm` is set near its own. Recorded here because
+    # "reset to defaults" is exactly where reaching for the ceiling looks right
+    # and is not: doing that once here made cold starts 5x/10x faster.
+    SLEW_DEFAULTS = {"below_mV_per_s": 400, "above_mV_per_s": 1000,
+                     "warm_mV_per_s": 2800}
+    SLEW_CEILINGS = {"below_mV_per_s": 2000, "above_mV_per_s": 5000,
+                     "warm_mV_per_s": 5000}
 
     @classmethod
     def identity_order(cls) -> list[int]:
@@ -1901,16 +1959,6 @@ class CTClient:
 
     # ── SHV run policy & HV bit-bang diagnostics ──────────────────────────────
 
-    # The firmware's DEFAULTS, which are NOT the ceilings (below 2000,
-    # above/warm 5000). below/above are the COLD-start rates and sit well under
-    # their ceiling on purpose -- fast cold slew is what trips OCP on the
-    # cold-inrush. Only `warm` is set near its own. Recorded here because
-    # "reset to defaults" is exactly where reaching for the ceiling looks right
-    # and is not: doing that once here made cold starts 5x/10x faster.
-    SLEW_DEFAULTS = {"below_mV_per_s": 400, "above_mV_per_s": 1000,
-                     "warm_mV_per_s": 2800}
-    SLEW_CEILINGS = {"below_mV_per_s": 2000, "above_mV_per_s": 5000,
-                     "warm_mV_per_s": 5000}
 
     def get_slew_rates(self, controller: int = 1) -> dict:
         """Read the three voltage-ramp slew rates, in mV/s.
@@ -2620,9 +2668,6 @@ class CTClient:
     #                              rejecting it, so keep this one <= 255
     #                              yourself.
 
-    _U8_MAX = 255          # numPulses is a single byte on the wire
-    _U16_MAX = 65535
-    _U32_MAX = 4294967295
 
     def _range_error(self, name: str, value: int, max_value: int) -> str | None:
         """None if `value` fits [0, max_value]; else a ready-to-return error string."""
@@ -3114,9 +3159,12 @@ class CTClient:
                     "error": f"detector arm failed, nothing fired: "
                              f"{arm.get('error')}{hint}"}
         try:
-            # "Huge since" returns no events but a true current cursor, so we
-            # collect only what THIS fire produces and never a stale backlog.
-            since = self.pulse_events(2_000_000_000).get("last_id", 0)
+            # Take the cursor BEFORE firing so we collect only what THIS fire
+            # produces and never a stale backlog. Via pulse_cursor() rather
+            # than a huge `since`: that shortcut saturates at 2**31-1 in the
+            # ESP32's query parsing, and past that id it would stop excluding
+            # old events silently. See pulse_cursor().
+            since = self.pulse_cursor()
             fired = self._fire_core(
                 filament, num_pulses=num_pulses, width_us=width_us,
                 inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
@@ -3507,6 +3555,39 @@ class CTClient:
         for someone else, which is NOT an error, just information."""
         return self._post("/api/adc/pulse-disarm", {}, timeout=5.0)
 
+    def pulse_cursor(self) -> int:
+        """Where the pulse log is RIGHT NOW, as a `since` value for later.
+
+        Read this before firing, then pass it to pulse_events() afterwards to
+        get only your own events:
+
+            cursor = ct.pulse_cursor()
+            ...                                # fire
+            r = ct.pulse_events(cursor)
+
+        Implemented as pulse_events(0) and taking `last_id` from the reply,
+        which every reply carries regardless of `since`. That costs one
+        transfer of the ring (at most 128 events) and is correct for the whole
+        id range, forever.
+
+        The obvious alternative -- pass a huge `since` so nothing can be newer,
+        get zero events and a truthful last_id -- has a CEILING and is the
+        reason this method exists. `pulse_id` is a uint32, but the ESP32 parses
+        the query parameter through Arduino's String::toInt(), which returns a
+        SIGNED long: values above 2**31-1 saturate rather than wrap (verified
+        on the wire -- since=2**32 returns count 0, where a wrap to 0 would have
+        returned the whole ring). So no cursor above 2,147,483,647 can be
+        expressed at all, and once pulse_id passes that the trick silently stops
+        excluding old events instead of failing. At a scan a minute that is
+        centuries away; at 1000 pulses/s it is 23 days, and the id only resets
+        when the ESP32 reboots.
+
+        Returns 0 if the read fails -- which means "from the beginning", the
+        safe direction: you see extra events rather than silently missing yours.
+        """
+        r = self.pulse_events(0)
+        return int(r.get("last_id") or 0) if r.get("ok") else 0
+
     def pulse_events(self, since: int = 0) -> dict:
         """Poll STM32-measured pulse events NEWER than `since`.
 
@@ -3519,14 +3600,14 @@ class CTClient:
 
         HOW TO USE IT. Read the cursor BEFORE firing, then poll with it after:
 
-            since = ct.pulse_events(2_000_000_000)["last_id"]   # cursor only
-            ...                                                # fire
-            r = ct.pulse_events(since)                          # only yours
+            since = ct.pulse_cursor()      # where the log is now
+            ...                            # fire
+            r = ct.pulse_events(since)     # only yours
 
-        That first call passes a deliberately huge `since` so nothing can be
-        newer: zero events come back, but `last_id` is truthful -- which is how
-        you ask "where is the log right now" without reading it. Same trick the
-        GUI's Clear button uses. Then keep `r["last_id"]` for the next call.
+        Then keep `r["last_id"]` and pass it as the next `since`.
+
+        Do not reach for a huge `since` to read the cursor -- see
+        pulse_cursor() for why that has a ceiling this does not.
 
         `since=0` (the default) means "everything still in the log", which is
         rarely what you want. fire_single_pulse(measure=True) does all of this
@@ -3666,8 +3747,6 @@ class CTClient:
     # to correct if either constant changes (this exact formula was
     # independently duplicated 3+ times across this repo before and
     # drifted out of sync once already — see the JS side's tests.js).
-    _PULSE_R_SENSE_OHM = 4.7
-    _PULSE_AMC3301_GAIN = 8.2
 
     def pulse_ma(self, raw: float, ref_mv: float | None = None) -> float:
         """Convert one raw STM32 ADC count (a pulse_events() peak/plateau/
@@ -3698,7 +3777,7 @@ class CTClient:
         # MAGNITUDES can only be measured on a populated board.
         if ref_mv is None:
             live = self.get_ads1115_ref_mv()
-            ref_mv = live if live is not None else 1200.0   # last-known-good fallback
+            ref_mv = live if live is not None else 1227.0   # last-known-good fallback
         v = raw * 3.3 / 4095 - 0.5 * (ref_mv / 1000.0)
         return 2 * v / self._PULSE_R_SENSE_OHM / self._PULSE_AMC3301_GAIN * 1000
 
@@ -3707,8 +3786,6 @@ class CTClient:
     # integral accumulates over the STM32's internal u32 sample count, which is
     # NOT bounded by duration_samples' u16 -- at full scale it hits INT32 in
     # about 520k samples (~0.5 s at 1 MSPS).
-    _INTEGRAL_SAT_HI = 2_147_483_647     # INT32_MAX
-    _INTEGRAL_SAT_LO = -2_147_483_648    # INT32_MIN
     # duration_samples is truncated to this on the way out, so the envelope was
     # AT LEAST this long. It saturates independently of the integral: a pulse
     # can have a perfectly good charge and an unusable width, so this must not
@@ -3719,7 +3796,6 @@ class CTClient:
     # saturation: -1 is an ordinary integral now that the clamp is gone (pure
     # noise sums to about zero), and mixing the two firmware generations is
     # ruled out by flashing both sides together.
-    _DURATION_SATURATED = 0xFFFF
     def _add_charge(self, e: dict, ref_mv: float,
                     integral_signed: bool | None = None) -> None:
         """Add integral_mams (charge, mA*ms) and its scatter to one event.
