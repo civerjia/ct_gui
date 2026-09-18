@@ -2573,6 +2573,110 @@ class CTClient:
     # heating window from reading that JS. build_scan_plan() is that algorithm
     # in Python, so the two produce the same plan for the same inputs.
 
+    # Ring geometry, from the GUI's ct/constants.js. A scan walks a collimator
+    # window around a ring of filaments; these say how big the ring and the
+    # window are.
+    N_FILAMENTS = 96
+    COLLIMATOR_COVERAGE = 35      # filaments under the collimator at once
+    MAX_SCHEDULE_ROWS = 8192      # firmware schedule cap
+
+    def build_scan_schedule(self, *,
+                            mode: str = "stationary",   # or "precision"
+                            collimator_center: int = 0,
+                            collimator_dir: int = +1,   # +1 CCW ring step, -1 CW
+                            filament_dir: int = +1,     # gantry sweep direction
+                            gantry_max_deg: float = 10.0,
+                            gantry_steps: int = 5,
+                            pulses: int = 1,            # burst length per filament
+                            width_us: int = 1000,
+                            ring_order=None,            # ring position -> filament
+                            skip=(),                    # filaments that fire nothing
+                            skip_dead: bool = True,
+                            max_rows: int | None = None) -> dict:
+        """Generate the emission table for a full scan from the ring geometry.
+
+        This is the GUI's buildSchedule/stepScan, which had no API equivalent --
+        build_scan_plan() takes an emission list, it does not produce one. Feed
+        the "emission" from here straight into build_scan_plan().
+
+        The scan walks a collimator window (COLLIMATOR_COVERAGE filaments wide)
+        around the ring. Each step fires the filament at the current position in
+        that window; when the window is exhausted it either steps the collimator
+        round by one (mode="stationary") or advances the gantry to its next
+        angle and only steps the collimator when the gantry reverses at an end
+        (mode="precision"). The scan ends when the collimator has been all the
+        way round -- N_FILAMENTS ring steps.
+
+        `ring_order` maps a RING POSITION to a filament. It is NOT the client's
+        filament_order (USER_INDEX -> FID); that one is applied later, on the
+        wire. Conflating them would silently reorder the scan geometry.
+
+        `skip_dead` leaves out filaments in the backend dead mask, which is why
+        this is an instance method rather than a static one.
+
+        Returns {"emission", "rows", "truncated", "ring_steps", "triggers"}.
+        Precision mode produces a LOT of rows -- roughly
+        N * (2*gantry_steps+1) * COVERAGE -- so `truncated` is not an edge case
+        there, and it is reported rather than left for you to notice the scan
+        ends early.
+        """
+        if mode not in ("stationary", "precision"):
+            raise ValueError("mode must be 'stationary' or 'precision'")
+        n = self.N_FILAMENTS
+        coverage = self.COLLIMATOR_COVERAGE
+        half = (coverage - 1) // 2
+        cap = self.MAX_SCHEDULE_ROWS if max_rows is None else int(max_rows)
+
+        steps = max(0, int(gantry_steps))
+        n_ang = 2 * steps + 1
+        angles = [-gantry_max_deg + 2 * gantry_max_deg * (k / (n_ang - 1))
+                  if n_ang > 1 else 0.0 for k in range(n_ang)]
+
+        excluded = {int(f) for f in skip}
+        if skip_dead:
+            excluded |= set(self.dead)
+
+        window_pos = 0
+        coll = int(collimator_center) % n
+        g_idx = 0 if filament_dir > 0 else n_ang - 1
+        sweep = 1 if filament_dir > 0 else -1
+        ring_step = 0
+        gantry = angles[g_idx] if mode == "precision" else 0.0
+
+        rows, trig, truncated = [], 0, False
+        while ring_step < n:
+            if len(rows) >= cap:
+                truncated = True
+                break
+            pos = (coll - half + window_pos) % n
+            fil = pos if ring_order is None else int(ring_order[pos])
+            if fil not in excluded:
+                burst = max(1, int(pulses))
+                rows.append({"seq": len(rows), "trigger": trig, "burstLen": burst,
+                             "filament": int(fil), "widthUs": int(width_us),
+                             "coll": coll, "gantry": gantry,
+                             "windowPos": window_pos, "ringStep": ring_step})
+                trig += burst
+            # stepScan
+            window_pos += 1
+            if window_pos >= coverage:
+                window_pos = 0
+                if mode == "stationary":
+                    coll = (coll + collimator_dir) % n
+                    ring_step += 1
+                else:
+                    nxt = g_idx + sweep
+                    if nxt < 0 or nxt >= n_ang:
+                        sweep = -sweep
+                        coll = (coll + collimator_dir) % n
+                        ring_step += 1
+                    else:
+                        g_idx = nxt
+                    gantry = angles[g_idx]
+        return {"emission": rows, "rows": len(rows), "truncated": truncated,
+                "ring_steps": ring_step, "triggers": trig,
+                "excluded": sorted(excluded)}
+
     @staticmethod
     def _peak_for_lead(runs, length: int, lead: int, hold: int) -> int:
         """Peak filaments ACTIVE at once for a given pre-heat lead.
