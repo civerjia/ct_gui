@@ -1401,6 +1401,27 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         # unverified pulse it should be. Same trap as faultedFilaments.
         "rbDropped": le32(55) if len(p) >= 59 else None,
         "rbStale": le32(59) if len(p) >= 63 else None,
+        # rb_irqs: pulses the HARDWARE actually fired this run (the shift SM
+        # raises irq 0 after both read-back pushes, unconditionally). Per-run.
+        #
+        # THE INVARIANT IS `totalPulsesDone == rbIrqs` -- the CPU's bookkeeping
+        # agreeing with what the hardware did. That is what the accounting fix
+        # ties together, and it is the one line worth asserting on after a run.
+        #
+        # It is NOT `done == triggerEdges == rbIrqs`. triggerEdges counts edges
+        # the ISR SAW, and on the real pin path notePrecisionTrigger() has no
+        # isParked() guard -- an edge arriving mid-pulse is counted and fires
+        # nothing. So triggerEdges >= done is NORMAL and means the trigger
+        # source is running faster than width + recovery, not that pulses were
+        # lost. Measured on the RP2350 side: done 32, edges 36, rbIrqs 32 with
+        # 4 deliberate over-triggers.
+        #
+        # And the excess is INVISIBLE from here: the simulated-trigger path this
+        # host uses DOES guard on isParked() and returns before counting, so
+        # over-triggering never shows up in these numbers. Equal done/edges out
+        # of /api/sync/simulate is not evidence that a real pin-triggered run
+        # would be equal too.
+        "rbIrqs": le32(63) if len(p) >= 67 else None,
     }
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"

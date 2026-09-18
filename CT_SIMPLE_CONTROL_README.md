@@ -2109,6 +2109,24 @@ Two more, and they are **cumulative** rather than per-run — see the warning be
 | `rbDropped` | the read-back ring OVERRAN. Real data loss, the CPU fell behind |
 | `rbStale` | samples discarded because their pulse was already reported unverified — the pairing **recovering as designed**, about two per unverified pulse |
 
+`rbIrqs` (per-run, like the first group) counts the pulses the **hardware**
+actually fired:
+
+> ✅ **The invariant worth asserting after a run is `totalPulsesDone == rbIrqs`**
+> — the host's bookkeeping agreeing with what the hardware did.
+>
+> It is **not** `done == triggerEdges == rbIrqs`. `triggerEdges` counts edges the
+> ISR *saw*, and on the real pin-trigger path an edge arriving mid-pulse is
+> counted and fires nothing. So **`triggerEdges >= done` is normal** and means
+> the trigger source is running faster than width + recovery — not that pulses
+> were lost.
+>
+> ⚠️ **And that excess cannot be seen from here.** `simulate_sync()` uses the
+> simulated-trigger path, which discards an edge arriving mid-pulse *before*
+> counting it. Equal `done`/`triggerEdges` out of a simulated run is therefore
+> not evidence that a real pin-triggered run would be equal too — the same
+> over-triggering reports differently depending on which trigger path fired it.
+
 > ⚠️ **`rbStale > 0` with `rbDropped == 0` is a HEALTHY run**, not a fault. It is
 > the recovery mechanism working: a late pulse costs one `unverified` pulse and
 > the stale samples behind it are thrown away instead of being handed to the
