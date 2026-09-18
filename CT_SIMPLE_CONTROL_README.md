@@ -2099,7 +2099,28 @@ so two identical runs both reporting 1 is not accumulation:
 | `underfed` | triggers that arrived with nothing staged |
 | `mismatches` | pulses whose 165 read-back disagreed with the commanded byte — **see the warning below** |
 | `rbSaturated` | times the 165 read-back FIFO was full when a pulse was accounted |
+| `off_mismatches` | pulses whose OFF read-back was non-zero — **the HV did not turn off**. The per-run count of the pulse log's `hv_stuck_on` |
 | `unsafeSlots` | bitmap of power slots `arm` SKIPPED as unsafe. **Non-zero means those filaments did not fire even though the run looks normal** |
+
+Two more, and they are **cumulative** rather than per-run — see the warning below:
+
+| field | meaning |
+|---|---|
+| `rbDropped` | the read-back ring OVERRAN. Real data loss, the CPU fell behind |
+| `rbStale` | samples discarded because their pulse was already reported unverified — the pairing **recovering as designed**, about two per unverified pulse |
+
+> ⚠️ **`rbStale > 0` with `rbDropped == 0` is a HEALTHY run**, not a fault. It is
+> the recovery mechanism working: a late pulse costs one `unverified` pulse and
+> the stale samples behind it are thrown away instead of being handed to the
+> next pulse. Only `rbDropped` is data loss.
+
+> ⚠️ **Not every counter resets on `arm`.** `triggerEdges` / `uncounted` /
+> `underfed` / `mismatches` / `off_mismatches` are **per-run** — `arm` zeroes
+> them. `rbStale`, `rbDropped` and `faultedFilaments` are **cumulative** and
+> survive it. Take a reading before and after and use the delta: dividing a
+> cumulative `rbStale` by one run's `unverified` count produces a ratio that
+> grows every run and looks exactly like a defect (measured 4.7–6.7 that way,
+> versus the ~2.0 the deltas actually give).
 
 > ⚠️ **A non-zero `mismatches` is a real verify failure** — a pulse whose 165
 > read-back did not match the byte that was commanded. There is exactly ONE

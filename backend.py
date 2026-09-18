@@ -129,6 +129,12 @@ def build_payload(command: str, b: dict):
         return 0x22, FLAG_SINGLE, bytes([ch, mux]) + _u16(int(b["millivolts"])) + bytes([1 if b.get("enable_after_set", True) else 0])
     if command == "CH_SET_TPS_OCP_THRESHOLD":  # 0x28: ch,mux,mA16 (direct IOUT_LIMIT)
         return 0x28, FLAG_SINGLE, bytes([ch, mux]) + _u16(int(b["threshold_mA"]))
+    if command == "SHV_GET_STATUS":          # 0x79: empty -> status payload
+        # Read-only. Exposed through /api/cmd so the RAW bytes can be inspected
+        # when the payload grows a field -- decode_shv_status only ever returns
+        # what it already knows how to read, so a newly appended field is
+        # invisible through it by construction.
+        return 0x79, 0, b""
     if command == "CH_SLEW_RATE":            # 0x3C: empty=GET, 6 bytes=SET
         # Three voltage-ramp slew rates, runtime-settable. Out-of-range CLAMPS
         # rather than rejecting, and the response is always the values IN FORCE
@@ -1366,6 +1372,35 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         # filament.
         "unsafeSlots": (int.from_bytes(p[43:51], "little")
                         if len(p) >= 51 else None),
+        # off_mismatches: pulses whose OFF read-back was non-zero -- the
+        # per-run count of the pulse-log's 0x02 bit, i.e. THE HV DID NOT TURN
+        # OFF. The safety-relevant counter, and the only one here that is about
+        # the pulse rather than its verification.
+        #
+        # This was already on the wire before this decoder learned about it,
+        # which is how it got mistaken for a newly appended field: the payload
+        # length had moved for a reason that had nothing to do with the change
+        # being investigated. A healthy run reads 0 here, so the mistake showed
+        # no symptom.
+        "off_mismatches": le32(51) if len(p) >= 55 else None,
+        # rb_dropped: the read-back ring OVERRAN -- real data loss, the CPU fell
+        # behind. rb_stale: samples discarded because their pulse had already
+        # been reported unverified, i.e. the pairing RECOVERING as designed
+        # (about two per unverified pulse).
+        #
+        # These must not be conflated, and rb_stale is not interpretable alone:
+        # rb_stale > 0 with rb_dropped == 0 is a HEALTHY run that absorbed a
+        # late pulse. Reporting that as an error would turn the framing fix's
+        # own recovery mechanism into an alarm.
+        #
+        # BOTH ARE CUMULATIVE -- arm does NOT zero them, unlike mismatches /
+        # uncounted / underfed / triggerEdges, which resetRuntime_() clears on
+        # every arm. Read them before and after and use the DELTA. Dividing the
+        # absolute rb_stale by this run's unverified count gives a ratio that
+        # climbs run over run and looks like a defect; by delta it is the ~2 per
+        # unverified pulse it should be. Same trap as faultedFilaments.
+        "rbDropped": le32(55) if len(p) >= 59 else None,
+        "rbStale": le32(59) if len(p) >= 63 else None,
     }
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
