@@ -39,6 +39,7 @@ whole body in ct.session() guarantees enable_emission(False) (and
 enable_focus/hv_grid_clear_all/stop_all) run on the way out, even on an
 exception -- see ct_simple_control.py's session() docstring.
 """
+import _path  # noqa: F401  — makes ct_simple_control importable from tests/
 import sys, time
 import requests
 

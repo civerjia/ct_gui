@@ -9,6 +9,7 @@ bench check uses, so this confirms reliable completion from OUR real hardware
 trigger path, not per-pulse filament correctness (that was already verified
 120/120 on their bench).
 """
+import _path  # noqa: F401  — makes ct_simple_control importable from tests/
 import sys, time
 import requests
 

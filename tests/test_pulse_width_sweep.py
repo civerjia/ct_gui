@@ -4,6 +4,7 @@
 accumulation) holds up across different commanded widths, not just the
 2000us used in the voltage sweep.
 """
+import _path  # noqa: F401  — makes ct_simple_control importable from tests/
 import sys, time
 
 sys.path.insert(0, '.')

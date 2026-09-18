@@ -26,6 +26,7 @@ bg_before still comes from the SAME event's `background_mean` (the
 rolling background captured at the rising edge) -- also on-chip, also
 already in the event, nothing separate needed for it either.
 """
+import _path  # noqa: F401  — makes ct_simple_control importable from tests/
 import sys, time
 import serial
 

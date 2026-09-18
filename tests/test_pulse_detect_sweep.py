@@ -21,6 +21,7 @@ independent of WIDTH_US. If detected-count is flat (always 1) regardless of
 gap, that points to a different, more structural bug (e.g. a one-shot state
 that never re-arms at all, not a slowly-recovering corrupted estimate).
 """
+import _path  # noqa: F401  — makes ct_simple_control importable from tests/
 import sys, time
 import requests
 

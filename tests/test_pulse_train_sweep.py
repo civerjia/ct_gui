@@ -19,6 +19,7 @@ No hv_grid_set() anywhere -- confirmed unnecessary (arm() succeeds and the
 train fires correctly without it, filament stays in STANDBY with ISO
 already on from standby_one()).
 """
+import _path  # noqa: F401  — makes ct_simple_control importable from tests/
 import sys, time
 import requests
 

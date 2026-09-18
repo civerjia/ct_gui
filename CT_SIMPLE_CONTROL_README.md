@@ -176,6 +176,27 @@ your script will use below, which is `backend.py`'s IP.
 
 ---
 
+## Runnable examples
+
+Before reading further: `examples/walkthrough.py` is this whole API as ten
+runnable, individually selectable sections, verified against the bench.
+
+```bash
+python3 examples/walkthrough.py --list                    # what the sections are
+python3 examples/walkthrough.py                           # READ-ONLY sections
+python3 examples/walkthrough.py --only 8                  # just the schedule builder
+python3 examples/walkthrough.py --energise -f 27          # + heating/measurement
+python3 examples/walkthrough.py --energise --fire -f 27   # + firing pulses
+```
+
+Nothing energises without `--energise`, nothing fires without `--fire`, and a
+section whose permission is missing is skipped loudly rather than silently
+downgraded. See [`examples/README.md`](examples/README.md).
+
+Hardware bring-up and reliability scripts live in
+[`tests/`](tests/README.md) — those are bench tests against real hardware, not
+a unit-test suite.
+
 ## Quick start
 
 ```python
