@@ -2169,17 +2169,24 @@ tell "verified good" from "no evidence", which `ok` alone cannot express.
 filament). It is `None`, not a number, when the read-back was unavailable — the
 firmware writes a `0xEE` sentinel there and its bits mean nothing.
 
-> **Known firmware issue (fix in progress on the RP2350 side).** The read-back
-> can desync by exactly one pulse mid-run and never recover: one pulse reports
-> `unverified` with `read165: None`, and every pulse after it reads the
-> *previous* pulse's bit as `on_mismatch`. The pulses themselves are correct —
-> durations, envelope measurements and counts are all unaffected; only the
-> verification is lost. It happens at most once per run, because the failure
-> itself is what leaves the consumer one behind, which removes the condition
-> that caused it.
+> **A healthy run has all three false on every pulse.** Two firmware defects on
+> this path were fixed after being found here, and the shape of each is worth
+> keeping as a regression signature:
 >
-> Acceptance criterion once the fix lands: **a lone `unverified` is expected and
-> honest; an `on_mismatch` cascade running to the end of the table is not.**
+> - **`on_mismatch` cascading to the end of a table** was an unframed read-back
+>   FIFO whose consumer popped two entries per pulse and outran the producer.
+>   One pulse reported `unverified`, consumed nothing, and every pulse after it
+>   read the *previous* pulse's bit — permanently, because nothing re-anchored
+>   the pairing. If this shape ever returns, the framing is broken.
+> - **Scattered `unverified`** was the CPU's pulse accounting running on the
+>   trigger clock while the read-backs do not exist until one pulse WIDTH later.
+>   Fixed by accounting a pulse only once its samples exist.
+>
+> Throughout both, the pulses themselves were always correct — durations,
+> envelope measurements, `done` and `uncounted` were unaffected. Only the
+> verification was lost, which is exactly why decoding these flags matters: a
+> run that looks perfect by every other measure can have no verification behind
+> it.
 
 Full manual sequence, equivalent to what `fire_single_pulse` does
 internally (using [`download()`](#schedule-download) — the real transfer
