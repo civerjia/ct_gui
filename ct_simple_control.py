@@ -2726,13 +2726,14 @@ class CTClient:
         may include an earlier run. `plan` is optional and only used to say
         which filaments were expected.
 
-        NOT IN HERE, because nothing records it: the filament's HEATING current
-        at the instant each pulse fired. The pulse record has no current field
-        and the STM32 measures EMISSION current, not heating. Sampling it from
-        the host cannot be aligned to pulses -- the ACTIVE window is a few
-        triggers wide and one poll round is ~250 ms -- so this is a firmware
-        change, requested on the RP2350 side. Until it lands, a report can say
-        what each pulse emitted but not what it was heated to.
+        `heating_at_pulse` is the firmware's snapshot of the filament's heating
+        current AT THE INSTANT each pulse fired, which is the number that makes
+        an emission reading interpretable -- a shot on a filament that had not
+        reached current is not comparable with one on a hot filament. The host
+        could never supply it: the ACTIVE window is a few triggers wide, one
+        poll round is ~250 ms, and sampling hard enough to align perturbs the
+        ramp being sampled. `fired_cold` picks out the pulses that landed below
+        their setpoint.
         """
         st = self.shv_status(controller) or {}
         logs = self.shv_pulse_log(controller) or []
@@ -2800,6 +2801,41 @@ class CTClient:
                             f"{len(events)} — measurement is incomplete, so the "
                             f"per-pulse currents do not cover every pulse")
 
+        # HEATING AT PULSE TIME -- the firmware's snapshot, now that it records
+        # one. The finding this exists for is a pulse that landed on a filament
+        # that had not reached current: commanded 1500 mA, drawing 1 mA. That is
+        # a REAL reading from a powered board with an open filament, not a
+        # sentinel and not an error, and it is the most important row in a
+        # report when it appears.
+        cold = []
+        heat_unknown = []
+        for r in logs:
+            m, t = r.get("heat_meas_mA"), r.get("heat_target_mA")
+            if m is None:
+                heat_unknown.append((r.get("filament"),
+                                     r.get("heat_meas_unavailable")))
+                continue
+            if t is None or t <= 0:
+                continue
+            if m < t * 0.8:      # 20% short of the setpoint it was told to hold
+                cold.append({"filament": r.get("filament"), "seq": r.get("seq"),
+                             "meas_mA": m, "target_mA": t,
+                             "pct": round(100.0 * m / t, 1)})
+        if cold:
+            worst = min(cold, key=lambda c: c["pct"])
+            problems.append(
+                f"{len(cold)} pulse(s) fired on a filament BELOW its heating "
+                f"setpoint — worst: filament {worst['filament']} at "
+                f"{worst['meas_mA']} mA against {worst['target_mA']} mA "
+                f"({worst['pct']}%). The shot happened before the filament was "
+                f"hot, so its emission reading is not comparable with the rest.")
+        if heat_unknown:
+            reasons = sorted({w for _f, w in heat_unknown if w})
+            problems.append(
+                f"{len(heat_unknown)} pulse(s) have no heating snapshot "
+                f"({', '.join(reasons) or 'unknown'}) — those rows cannot be "
+                f"compared against the others")
+
         unverified = sorted({r["filament"] for r in logs if r.get("unverified")})
         widths = [e.get("on_us") for e in events if e.get("on_us") is not None]
         charges = [e.get("integral_mams") for e in events
@@ -2819,7 +2855,14 @@ class CTClient:
                           "n": len(widths)} if widths else None),
             "charge_mams": ({"min": min(charges), "max": max(charges),
                              "n": len(charges)} if charges else None),
-            "heating_at_pulse": None,   # see the docstring: nothing records it yet
+            # The firmware's snapshot at fire time. `cold` is the finding:
+            # pulses that landed before the filament reached its setpoint.
+            "heating_at_pulse": [
+                {"filament": r.get("filament"), "seq": r.get("seq"),
+                 "meas_mA": r.get("heat_meas_mA"), "target_mA": r.get("heat_target_mA"),
+                 "unavailable": r.get("heat_meas_unavailable")}
+                for r in logs],
+            "fired_cold": cold,
             "status": st,
             "pulses": logs,
             "events": events,
@@ -3222,14 +3265,40 @@ class CTClient:
                       start: int = 0) -> list[dict]:  # log index to start from
                                                        # (paginate through a
                                                        # long run's history)
-        """Fired pulse records: [{filament, seq, tOnUs, durationUs, flags}, …].
-        Returns [] on failure (never raises)."""
-        records = self._shv(controller, {"op": "pulse_log",
-                                         "start": int(start)}).get("records") or []
-        for rec in records:
+        """Fired pulse records, ALL of them, paging until the log is exhausted.
+
+        Each record: {filament, seq, tOnUs, durationUs, flags, read165,
+        on_mismatch, hv_stuck_on, unverified, heat_meas_mA, heat_target_mA} --
+        the last two being the filament's heating current at the instant that
+        pulse fired, or None with a *_unavailable reason.
+
+        PAGES, and the page size is not something to assume. The firmware sizes
+        a page to fit the link (~242 deliverable bytes), so it shrank from 32 to
+        14 records when the record grew from 12 to 16 bytes -- and an oversized
+        frame is DROPPED SILENTLY, so a caller that assumed the old size would
+        have seen a run simply stop reporting past ~19 pulses. This loops on
+        what each page actually returned, against the total the firmware states.
+
+        Returns [] on failure (never raises).
+        """
+        out: list[dict] = []
+        idx = int(start)
+        total = None
+        for _ in range(512):     # bound: 4096-record log / smallest sane page
+            r = self._shv(controller, {"op": "pulse_log", "start": idx})
+            page = r.get("records") or []
+            if total is None:
+                total = r.get("total")
+            if not page:
+                break            # empty page = nothing further, whatever total says
+            out.extend(page)
+            idx += len(page)
+            if total is not None and len(out) >= int(total):
+                break
+        for rec in out:
             if "filament" in rec:
                 rec["filament"] = self._user_index_of(rec["filament"])
-        return records
+        return out
 
     # ── SyncIn simulate (ESP32-generated trigger pulses) ──────────────────────
     # fire_single_pulse(trigger="sim") uses this internally for a single burst.

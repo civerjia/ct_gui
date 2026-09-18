@@ -1,13 +1,32 @@
-# ct_simple_control — CT Power Controller API
+# ct_simple_control — CT Power Controller guide
 
 A thin Python HTTP client for the CT power-controller backend. Third-party
-programs import this module to drive pre-heat, HV setpoints, readback, and
-single-filament HV pulses without touching the GUI.
+programs import this module to drive pre-heat, HV setpoints, readback,
+schedules, and HV pulses without touching the GUI.
+
+## This is a guide, not the API reference
+
+**The API reference is generated from the docstrings:**
+
+```
+tools/ct_gui/make_api_docs.sh      # -> docs/api/ct_simple_control.html
+```
+
+The docstrings are the reference — they carry the measured numbers, the failure
+modes and the "do not do this" notes, and they are what you see in an editor
+anyway. Keeping a second copy here meant the two drifting apart, so this
+document sticks to what a reference cannot give you: which calls belong
+together, which order to make them in, and the traps that only show up when you
+put them in sequence.
+
+The generated output is not committed (it is derived and it churns); run the
+script.
 
 ## Requirements
 
 ```
-pip install requests
+pip install requests      # runtime
+pip install pdoc          # only to regenerate the API reference
 ```
 
 Python 3.10+ required (uses `X | Y` type union syntax).
@@ -2187,6 +2206,47 @@ tell "verified good" from "no evidence", which `ok` alone cannot express.
 filament). It is `None`, not a number, when the read-back was unavailable — the
 firmware writes a `0xEE` sentinel there and its bits mean nothing.
 
+#### The heating current at the moment each pulse fired
+
+Every pulse record carries `heat_meas_mA` (what the filament was actually
+drawing) and `heat_target_mA` (what it had been commanded to hold), sampled by
+the firmware **at the instant the pulse fired**.
+
+This is what makes an emission reading interpretable. A shot on a filament that
+had not reached current is not comparable with one on a hot filament, and
+without this you cannot tell them apart — the run reports 16/16 fired either
+way.
+
+> **The host cannot supply this, which is why the firmware does.** A filament's
+> ACTIVE window is a few triggers wide and one host poll round is ~250 ms, so
+> host sampling cannot be aligned to pulses — and sampling hard enough to try
+> perturbs the ramp being measured (measured: a live-INA poll stretches
+> IDLE→ACTIVE by 20%). The firmware reads only the CC loop's cached value and
+> never touches I2C on the firing path.
+
+Both fields are `None` when there is no reading, with a `*_unavailable` reason
+rather than a number — `0` is a legal current and must never stand for unknown:
+
+| reason | meaning |
+|---|---|
+| `no_answer` | the board did not answer / is not present |
+| `no_live_sample` | never measured, or the sample was older than the firmware's 6 s freshness limit |
+| `not_current_mode` | `heat_target_mA` only — the board is not current-regulated, so there is no setpoint |
+
+> ⚠️ **A small number is not a sentinel.** `1 mA` against a `1500 mA` target is a
+> *real* reading from a powered board whose filament is open — it is exactly the
+> "fired before it was hot" case this field exists to surface, and
+> `scan_report()` flags it as `fired_cold`. On a bench of empty slots every row
+> looks like this, which is correct.
+
+> ⚠️ **The pulse log PAGES, and the page size is not fixed.** It shrank from 32
+> records to 14 when the record grew from 12 to 16 bytes, because a page has to
+> fit the link's ~242 deliverable bytes — and an oversized frame is dropped
+> *silently*, so a reader that assumed the old size would have seen a run stop
+> reporting past ~19 pulses, i.e. exactly on the long runs. `shv_pulse_log()`
+> loops on what each page actually returned; do not assume a size if you read
+> the endpoint directly.
+
 > **A healthy run has all three false on every pulse.** Two firmware defects on
 > this path were fixed after being found here, and the shape of each is worth
 > keeping as a regression signature:
@@ -2453,15 +2513,28 @@ whole backlog, including pulses from someone else's run, with no way to tell
 which were yours.
 
 ```python
-since = ct.pulse_events(2_000_000_000)["last_id"]   # cursor only, no history
-...                                                 # fire
-r = ct.pulse_events(since)                          # only your events
+since = ct.pulse_cursor()      # where the log is right now
+...                            # fire
+r = ct.pulse_events(since)     # only your events
 ```
 
-That first call passes a deliberately huge `since` so nothing can be newer: zero
-events come back but `last_id` is truthful — it is how you ask *where the log is
-now* without reading it. Keep `r["last_id"]` for the next call. `since=0` means
-"everything still in the log", which is rarely what you want.
+Keep `r["last_id"]` and pass it as the next `since`. `since=0` means "everything
+still in the log", which is rarely what you want.
+
+> ⚠️ **Do not read the cursor by passing a huge `since`.** The obvious trick —
+> pass a number nothing can exceed, get zero events and a truthful `last_id` —
+> has a ceiling. `pulse_id` is a `uint32`, but the ESP32 parses the query
+> parameter through Arduino's `String::toInt()`, which returns a **signed**
+> long: anything above `2**31-1` **saturates** rather than wrapping. Verified on
+> the wire — `since=2**32` returns 0 events, where a wrap to 0 would have
+> returned the whole ring.
+>
+> So no cursor above **2,147,483,647** can be expressed, and once `pulse_id`
+> passes that the trick stops excluding old events *silently* instead of
+> failing. At one scan a minute that is centuries away; at 1000 pulses/s it is
+> 23 days, and the id only resets when the ESP32 reboots.
+> `pulse_cursor()` reads `last_id` out of an ordinary reply instead, which is
+> correct for the whole range.
 
 | field | meaning |
 |---|---|
@@ -2568,10 +2641,9 @@ Four behaviours worth knowing before you trust a number:
 `peak`/`plateau`/`bg`/`post_bg` are **raw
 ADC counts**, not mA; convert with `pulse_ma()`/`pulse_events_ma()`
 below, never by hand. Persist the returned `last_id` and pass it back as
-`since` to get only the delta next time. Pass a deliberately huge
-`since` (e.g. `2_000_000_000`) to get zero events back but still learn
-the *current* `last_id` — the same trick the GUI's own "Clear" button
-uses to reset its cursor without walking the whole history.
+`since` to get only the delta next time, and use `pulse_cursor()` to read the
+cursor before a run — not a large `since`, which saturates at `2**31-1` in the
+ESP32's query parsing (see the warning above).
 
 **`get_ads1115_ref_mv()`** — The external differential circuit's LIVE
 reference voltage (mV), off the ADS1115's "1.2V ref" channel. Nominally
@@ -2675,7 +2747,7 @@ rate or the ADC scale yourself:
 > understate the scatter on exactly the longest pulses.
 
 ```python
-since = ct.pulse_events(2_000_000_000)["last_id"]   # cursor, no history
+since = ct.pulse_cursor()                           # cursor, no history
 
 # fire_single_pulse(measure=True) arms the detector AND the envelope relay,
 # fires, and tears both down -- the grid stays off, which is the point.

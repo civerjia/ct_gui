@@ -1237,7 +1237,7 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
         if raw and raw[0] == 0 and len(raw) >= 6:
             n, off = raw[5], 6
             for _ in range(n):
-                if off + 12 > len(raw):
+                if off + 16 > len(raw):
                     break
                 # The record is 12 bytes and only 10 were being decoded; the
                 # last two hold the 165 READ-BACK, which is what makes a flagged
@@ -1259,13 +1259,36 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                 # as a value, same reasoning as the 0xFFF0 telemetry sentinels.
                 fl = raw[off + 1]
                 rb = _le(raw, off + 10, 2)
+                # HEATING SNAPSHOT, taken by the firmware at the instant the
+                # pulse fired (record grew 12 -> 16 bytes). This is the one
+                # thing a host poll could never supply: the ACTIVE window is a
+                # few triggers wide, and sampling it hard enough to align
+                # perturbs the ramp being sampled.
+                #
+                # Sentinels, decoded to None with a REASON rather than passed
+                # through as numbers -- 0 is a legal current and must never
+                # stand for "unknown":
+                #   0xFFFF  board did not answer / not present
+                #   0xFFFD  no live sample: never measured, or older than the
+                #           firmware's 6 s freshness limit
+                #   0xFFFC  target only: board is not current-regulated, so
+                #           there is no heating setpoint
+                def _heat(v):
+                    if v < 0xFFF0:
+                        return v, None
+                    return None, {0xFFFF: "no_answer", 0xFFFD: "no_live_sample",
+                                  0xFFFC: "not_current_mode"}.get(v, f"sentinel_0x{v:04X}")
+                meas, meas_why = _heat(_le(raw, off + 12, 2))
+                tgt, tgt_why = _heat(_le(raw, off + 14, 2))
                 recs.append({"filament": raw[off], "flags": fl, "seq": _le(raw, off + 2, 2),
                              "tOnUs": _le(raw, off + 4, 4), "durationUs": _le(raw, off + 8, 2),
                              "read165": None if (fl & 0x04 and (rb & 0xFF) == 0xEE) else rb,
                              "on_mismatch": bool(fl & 0x01),
                              "hv_stuck_on": bool(fl & 0x02),
-                             "unverified": bool(fl & 0x04)})
-                off += 12
+                             "unverified": bool(fl & 0x04),
+                             "heat_meas_mA": meas, "heat_meas_unavailable": meas_why,
+                             "heat_target_mA": tgt, "heat_target_unavailable": tgt_why})
+                off += 16
             return {"ok": True, "total": _le(raw, 1, 2), "records": recs}
         return {"ok": False}
     if op == "capability":
