@@ -2785,6 +2785,63 @@ Returns `{"ok", "fired": <the full fire_single_pulse result>, "measured": [...],
 "ref_mv"}`. Same arming, correlation and strict-`ok` rules as `measure=True`;
 it takes the same `fire_single_pulse` parameters.
 
+### Waiting on state — what is polled, and what that costs
+
+There is no push path for "this filament arrived". The firmware *knows* — the
+CC loop sets `arrival` (ramping / settled / capped) in the 0x3A cached read —
+but the host has to ask. The one push channel that exists (`EVENT_TELEMETRY`
+mode 2, 20 fps) deliberately **cannot** be used for this: its entries are
+`(channel, port, bus_mV, current_mA)` with *no validity flag*, so a failed read
+arrives as `0 mA` and a stale value arrives looking live. It is advisory, for
+the live view only. Verification goes through 0x3A, which carries the flags.
+
+So every wait here is host-side polling of a **single, shared** link. Measured
+round trips on this bench, idle:
+
+| polled endpoint | transport | median RTT |
+|---|---|---|
+| cached current (bulk 0x3A) | RP2350 link | 39 ms |
+| `shv_status` | RP2350 link | 15 ms |
+| `/api/tps-struggling` | RP2350 link | 68 ms |
+| `/api/pulse-events` | **ESP32 HTTP** | 65 ms (200–300 ms under load) |
+
+Two consequences that are easy to get wrong:
+
+**A short fixed sleep is not a poll rate.** `sleep(0.05)` around a 15 ms or
+65 ms request is not "20 Hz" — it is back-to-back requests with a gap smaller
+than the round trip. Both wait loops that run *while the thing they watch is
+happening* now back off geometrically (`_poll_intervals`), staying fast for the
+first few checks and then settling to ~2 req/s:
+
+- the schedule-completion wait shares the link with the firing run itself and
+  with the 20 fps telemetry push;
+- `/api/pulse-events` is served by the ESP32's `config_portal`, which is
+  single-threaded with the `tcp_bridge` relay carrying those very pulses — so
+  polling harder for pulse events makes them arrive *later*.
+
+**Verify in batches, not one filament at a time.** The cached read is a bulk
+command: it returns every board whether you ask for one or ninety-six. Use
+**`wait_for_currents({filament: mA, ...})`** — one polling loop, one bulk read
+per tick, one shared `struggling` check every 2 s — instead of calling
+`wait_for_current()` per filament, which pays the same bulk read N times over.
+Same rules and the same per-filament result shape.
+
+`wait_for_currents()` refuses ~0 mA targets: confirming a stop needs the
+live-INA219 and power-state fallbacks (stopping drops the rail, so the current
+reading ceases to exist), and those are per-board reads that would put back the
+traffic this removes. Use `stop_one(verify=True)` for those.
+
+> ⚠ `energised()` does not survive `SIGKILL`/`SIGTERM` — the `finally` never
+> runs. Observed here: a test script killed by a harness timeout left a filament
+> at 880 mA. For any script that may be killed, install a handler that turns the
+> signal into an exception so the context manager can do its job:
+> ```python
+> for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+>     signal.signal(s, lambda n, f: (_ for _ in ()).throw(KeyboardInterrupt()))
+> ```
+> A `SIGKILL` still cannot be caught by anything in this process — only a
+> backend-side watchdog could cover that, and there isn't one yet.
+
 ### Test & measurement flows
 
 Ports of the GUI's "Calibration & Test" tab, runnable from a script instead of

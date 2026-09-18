@@ -1350,6 +1350,10 @@ class CTClient:
         # a repaired load forever -- refuse, never drive, never clear, refuse.
         # The delay gives the firmware a revive pass to clear it.
         last_struggle_check = start
+        # Deliberately `start - 1e9`, not `start`: the FIRST iteration should be
+        # allowed to take the live read (that is the one that answers a stale
+        # cache immediately); the rate limit is only about the ones after it.
+        last_live_read = start - 1e9
         fault_streak = 0            # consecutive mode 2/3 reads; see below
         deadline = start + timeout_s
         data: dict = {}
@@ -1411,7 +1415,23 @@ class CTClient:
                                          f"{st.get('state_name')}; no current reading is "
                                          f"available once the rail is down, so this is "
                                          f"confirmed by power state, not measured")}
-                live = self.read_filament_vi_live([filament]).get(int(filament), {})
+                # Rate-limited, NOT once per poll. This is a live INA219 I2C mux
+                # sweep -- the most expensive read in this client -- and it fires
+                # exactly when the cache has nothing, which for an absent board
+                # is every single iteration for the whole timeout. Two costs, and
+                # the second is the bad one: measured, polling a live sweep slows
+                # a CC ramp by ~20%, so on a filament that is merely SLOW this
+                # fallback was making it slower while waiting for it. For an
+                # absent board it is pure waste -- the sweep reports present=False
+                # and the guard below rejects the result every time.
+                #
+                # Once a second is enough to catch the case this exists for (a
+                # cache that is genuinely stale while the board is fine).
+                if time.monotonic() - last_live_read < max(poll_interval_s, 1.0):
+                    live = {}
+                else:
+                    last_live_read = time.monotonic()
+                    live = self.read_filament_vi_live([filament]).get(int(filament), {})
                 # `present` is NOT optional here. The INA sweep reports a board it
                 # could not find as 0 mA with present=False, so accepting any
                 # non-None value re-opens the exact false-success this method
@@ -1533,7 +1553,14 @@ class CTClient:
                         "measured_valid": valid, "measured_from": source,
                         "elapsed_s": time.monotonic() - start,
                         "present": bool(data.get("present", False)),
-                        "cc_mode": cc_mode, "faulted": True,
+                        # `arrival` was missing from THIS return only, so a
+                        # faulted result came back without a key the docstring
+                        # promises and every other path supplies -- a caller
+                        # reading r["arrival"] got None and could not tell
+                        # "firmware reports no arrival" from "this return
+                        # forgot to include it".
+                        "cc_mode": cc_mode, "arrival": data.get("arrival"),
+                        "faulted": True,
                         "error": f"CC loop reports this channel FAULTED (cc_mode "
                                  f"{cc_mode}: 2=open filament, 3=OCP/SCP) on "
                                  f"{fault_streak} consecutive reads — not a "
@@ -1561,6 +1588,158 @@ class CTClient:
                         "cc_mode": data.get("cc_mode", 0),
                         "arrival": data.get("arrival"), "faulted": False}
             time.sleep(poll_interval_s)
+
+    @staticmethod
+    def _poll_intervals(first_s: float, cap_s: float, factor: float = 1.6):
+        """Sleep durations for a wait loop: responsive at first, then backing
+        off geometrically to `cap_s`.
+
+        A fixed short sleep is not a poll rate. Measured on this bench, idle:
+        SHV_GET_STATUS is 15 ms and the ESP32's /pulse_events is 65 ms, so a
+        `sleep(0.05)` loop is not "20 Hz" -- it is back-to-back requests with a
+        gap smaller than the round trip, i.e. as fast as the link will go. That
+        matters because both of those loops run WHILE the thing they are
+        watching is happening: the SHV poll shares the single RP2350 link with
+        the schedule that is firing and with the 20 fps telemetry push, and
+        /pulse_events is served by the ESP32's config_portal, which is
+        single-threaded with the tcp_bridge relay carrying those very pulses
+        (200-300 ms per request under load) -- so polling for pulse events
+        slows the path the pulse events arrive on.
+
+        Backing off keeps the first few checks fast (a fault or an immediate
+        completion is still caught at once) while a wait that turns out to be
+        long costs a request every `cap_s` instead of continuously.
+        """
+        delay = first_s
+        while True:
+            yield delay
+            delay = min(cap_s, delay * factor)
+
+    def wait_for_currents(self, targets: dict,        # {filament: target mA}
+                          tolerance_ma: float = 150.0,
+                          timeout_s: float = 10.0,
+                          poll_interval_s: float = 0.2) -> dict:
+        """Wait for MANY filaments to reach their targets, in ONE polling loop.
+
+        Same rules and the same per-filament result shape as
+        wait_for_current() -- firmware `arrival` is authoritative, faults are
+        debounced over _FAULT_CONFIRM_READS reads, and `struggling` catches a
+        short -- but one bulk read per tick covers the whole batch instead of
+        one loop per filament.
+
+        Use this whenever more than one filament is being brought up. The
+        cached read is a BULK command: it returns every board's current whether
+        you asked for one or ninety-six, so verifying a 35-filament heating
+        step one filament at a time costs 35x the link traffic for exactly the
+        same data. The struggling check is shared too -- one /api/tps-struggling
+        every 2 s for the batch, not one per filament.
+
+        Zero targets are REFUSED here. Confirming ~0 mA needs the live-INA219
+        and power-state fallbacks (a stopped board drops its rail, so no
+        current reading exists any more -- see wait_for_current()), and those
+        are per-board reads that would put back exactly the traffic this
+        exists to remove. Use stop_one(verify=True) for those.
+
+        Returns {"ok": all arrived, "results": {filament: <wait_for_current
+        shape>}, "pending": [...], "elapsed_s", "polls"}.
+        """
+        want = {int(f): float(ma) for f, ma in (targets or {}).items()}
+        zero = sorted(f for f, ma in want.items() if abs(ma) <= tolerance_ma)
+        if zero:
+            return {"ok": False, "results": {}, "pending": sorted(want),
+                    "elapsed_s": 0.0, "polls": 0,
+                    "error": f"filament(s) {zero} have a ~0 mA target; a stop "
+                             f"cannot be confirmed by the bulk cached read "
+                             f"(the rail drops and the reading disappears). "
+                             f"Use stop_one(verify=True) for those."}
+        live = {f: ma for f, ma in want.items() if not self._is_dead(f)}
+        results: dict[int, dict] = {f: self._dead_result(f) for f in want
+                                    if self._is_dead(f)}
+        if not live:
+            return {"ok": False, "results": results, "pending": [],
+                    "elapsed_s": 0.0, "polls": 0,
+                    "error": "every requested filament is in the dead mask"}
+
+        start = time.monotonic()
+        deadline = start + timeout_s
+        last_struggle_check = start
+        streaks = {f: 0 for f in live}
+        pending = set(live)
+        polls = 0
+
+        def finish(f, data, ok, **extra):
+            raw = data.get("current_mA")
+            return {"ok": ok, "filament": f, "target_ma": live[f],
+                    "measured_ma": float(raw) if raw is not None else 0.0,
+                    "measured_valid": raw is not None, "measured_from": "cached",
+                    "elapsed_s": time.monotonic() - start,
+                    "present": bool(data.get("present", False)),
+                    "cc_mode": data.get("cc_mode"),
+                    "arrival": data.get("arrival"), "faulted": False, **extra}
+
+        while pending:
+            rows = self.read_filament_current_cached(sorted(pending))
+            polls += 1
+            # One struggling read for the whole batch, on its own slow cadence:
+            # it is a TPS register read, and the bit needs a few seconds of
+            # failed revives to appear at all.
+            struggling: set = set()
+            if time.monotonic() - last_struggle_check >= 2.0:
+                last_struggle_check = time.monotonic()
+                sr = self._get("/api/tps-struggling", timeout=5.0)
+                if sr.get("ok"):
+                    fid_to_user = {int(self._fid_of(f)): f for f in pending}
+                    for _cid, fids in (sr.get("struggling") or {}).items():
+                        for fid in (fids or []):      # None = no mask (old fw)
+                            if fid in fid_to_user:
+                                struggling.add(fid_to_user[fid])
+            for f in sorted(pending):
+                data = rows.get(f) or {}
+                arrival = data.get("arrival")
+                if arrival == "settled":
+                    results[f] = finish(f, data, True); pending.discard(f); continue
+                if arrival == "capped":
+                    results[f] = finish(f, data, False, capped=True,
+                        error=f"CC loop is CAPPED — pinned at the voltage cap "
+                              f"with {live[f]} mA unreached. Unreachable at this "
+                              f"cap; waiting will not help.")
+                    pending.discard(f); continue
+                if f in struggling:
+                    results[f] = finish(f, data, False, cannot_start=True,
+                        error="the firmware cannot get this output started (TPS "
+                              "'struggling'). A SHORT looks exactly like this.")
+                    pending.discard(f); continue
+                cc_mode = data.get("cc_mode")
+                streaks[f] = streaks[f] + 1 if cc_mode in (2, 3) else 0
+                if streaks[f] >= self._FAULT_CONFIRM_READS:
+                    results[f] = finish(f, data, False, faulted=True,
+                        error=f"CC loop reports this channel FAULTED (cc_mode "
+                              f"{cc_mode}) on {streaks[f]} consecutive reads.")
+                    pending.discard(f); continue
+                # Fallback for firmware with no arrival bits, same as the
+                # single-filament version: compare the sample only when the
+                # loop has given no verdict of its own.
+                raw = data.get("current_mA")
+                if arrival is None and raw is not None \
+                        and abs(float(raw) - live[f]) <= tolerance_ma:
+                    results[f] = finish(f, data, True); pending.discard(f)
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(poll_interval_s)
+
+        if pending:
+            # ONE bulk read for every timed-out filament, not one each -- doing
+            # it per filament here would reinstate exactly the N-fold traffic
+            # this method exists to remove, on the timeout path where the link
+            # is already the likeliest suspect.
+            final = self.read_filament_current_cached(sorted(pending))
+            for f in sorted(pending):
+                results[f] = finish(f, final.get(f) or {}, False,
+                                    error=f"did not reach {live[f]} mA within "
+                                          f"{timeout_s} s")
+        return {"ok": all(r.get("ok") for r in results.values()),
+                "results": results, "pending": sorted(pending),
+                "elapsed_s": time.monotonic() - start, "polls": polls}
 
     def stop_one(self, filament: int,
                 verify: bool = False,      # confirm current drops to ~0 mA
@@ -3821,6 +4000,12 @@ class CTClient:
         ref_mv = None
         deadline = time.monotonic() + grace_s
         cursor = since
+        # Backed off rather than hammered: this endpoint is served by the
+        # ESP32's config_portal, which shares loop() with the tcp_bridge relay
+        # carrying these very pulses (measured 65 ms per request idle,
+        # 200-300 ms under load). A tight loop here steals loop() time from the
+        # path the events arrive on, so polling harder makes them arrive later.
+        naps = self._poll_intervals(0.05, 0.3)
         while len(measured) < want and time.monotonic() < deadline:
             ev = self.pulse_events_ma(cursor)
             if ev.get("ok"):
@@ -3828,8 +4013,9 @@ class CTClient:
                 if ev.get("events"):
                     measured.extend(ev["events"])
                     cursor = ev["events"][-1]["id"]
+                    naps = self._poll_intervals(0.05, 0.3)   # events flowing: re-arm fast
             if len(measured) < want:
-                time.sleep(0.05)
+                time.sleep(next(naps))
         return measured, ref_mv
 
     def _fire_core(
@@ -4014,6 +4200,13 @@ class CTClient:
 
         deadline = time.monotonic() + timeout_s
         state = SHV_IDLE
+        # This loop runs WHILE the schedule is firing, on the same single
+        # RP2350 link that is carrying the run and the 20 fps telemetry push.
+        # A flat sleep(0.05) was ~15 requests/s of pure contention (the status
+        # round trip is 15 ms, so the sleep was smaller than the request).
+        # Fast at first so an immediate fault or a 1-pulse completion is still
+        # seen at once, then backing off to 2 requests/s.
+        naps = self._poll_intervals(0.05, 0.5)
         while time.monotonic() < deadline:
             st = self.shv_status(controller)
             state = st.get("state", SHV_IDLE)
@@ -4054,7 +4247,7 @@ class CTClient:
                 if unver:
                     out["unverified"] = sorted(set(unver))
                 return out
-            time.sleep(0.05)
+            time.sleep(next(naps))
 
         self.shv_disarm(controller)
         return {"ok": False, "timeout": True,
