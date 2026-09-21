@@ -1598,6 +1598,12 @@ POWER_STATE_IDLE = 4
 # reader go look up what 3 is, which is the same bare-integer problem the SHV
 # arm reject codes had -- and this one is on the path people hit while trying to
 # heat a filament, so it should read without a lookup.
+# RP2350 UartStatusCode, for turning a bare status byte into something a
+# caller can act on. Unknown codes print as the number rather than a guess.
+UART_STATUS_NAMES = {0: "Ok", 1: "BadFrame", 2: "BadArgument", 3: "Busy",
+                     4: "Unsupported", 5: "NotReady", 6: "I2cError",
+                     7: "OutOfRange", 8: "VerifyFail"}
+
 POWER_STATE_NAMES = {1: "STOP", 2: "SLEEP", 3: "STANDBY", 4: "IDLE",
                      5: "ACTIVE", 6: "VOLTAGE"}
 
@@ -3933,6 +3939,15 @@ class CtHandler(BaseHTTPRequestHandler):
                     self._json({"ok": ok, "lock": _lease_snapshot(), "you": client,
                                 **({} if ok else {"error": "held by another client"})},
                                HTTPStatus.OK if ok else HTTPStatus.CONFLICT)
+                elif action not in ("status", "release", "unlock"):
+                    # Unknown actions used to fall through to the status branch
+                    # and come back ok=True, so a typo'd "relese" reported
+                    # success while the lease stayed held.
+                    return self._json(
+                        {"ok": False, "you": client, "lock": _lease_snapshot(),
+                         "error": f"unknown lock action {action!r}; expected "
+                                  f"acquire | renew | release | status"},
+                        HTTPStatus.BAD_REQUEST)
                 elif action in ("release", "unlock"):
                     ok = _lease_release(client, force=bool(body.get("steal")))
                     self._json({"ok": ok, "lock": _lease_snapshot(), "you": client,
@@ -4006,7 +4021,16 @@ class CtHandler(BaseHTTPRequestHandler):
                 # Choose which controller carries the STM32 (all STM32/ADC commands
                 # route here). Default Power 1.
                 global MASTER
-                cid = int(body.get("controller", MASTER))
+                # Explicit, not defaulted to the CURRENT master: a caller who
+                # sent the wrong field name (say {"master": 7}) fell through to
+                # "no change" and got ok=True, i.e. the request was ignored and
+                # reported as success.
+                if "controller" not in body and "master" not in body:
+                    return self._json(
+                        {"ok": False, "master": MASTER,
+                         "error": "no controller given; send {\"controller\": 1|2}"},
+                        HTTPStatus.BAD_REQUEST)
+                cid = int(body.get("controller", body.get("master")))
                 if cid not in CONTROLLERS:
                     return self._json({"ok": False, "error": "bad controller"}, HTTPStatus.BAD_REQUEST)
                 MASTER = cid
@@ -4064,6 +4088,13 @@ class CtHandler(BaseHTTPRequestHandler):
             elif path == "/api/download":
                 # Download the bound schedule + config to every connected controller.
                 plan = body.get("plan") or {}
+                if not plan.get("emission"):
+                    return self._json(
+                        {"ok": False, "results": [],
+                         "error": "plan has no emission rows — nothing would be "
+                                  "downloaded, and a download of nothing is not a "
+                                  "successful download"},
+                        HTTPStatus.BAD_REQUEST)
                 # Refuse the WHOLE download, not just the bad entries: a schedule
                 # is a committed artifact, and silently dropping or altering a
                 # heating delta changes what will actually run while the operator
@@ -4096,6 +4127,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 # Read the emission/heat tables back out of each controller and
                 # compare counts to the loaded plan — confirms the download landed.
                 plan = body.get("plan") or {}
+                if not plan.get("emission"):
+                    # 0 == 0 matches, so an empty plan "verified" — immediately
+                    # before arming. Nothing to check is not checked.
+                    return self._json(
+                        {"ok": False, "results": {},
+                         "error": "plan has no emission rows — nothing to verify, "
+                                  "which is not the same as verified"},
+                        HTTPStatus.BAD_REQUEST)
                 emit_expected = len(plan.get("emission") or [])
                 results = {}
                 for cid, link in CONTROLLERS.items():
@@ -4188,9 +4227,23 @@ class CtHandler(BaseHTTPRequestHandler):
                 # board_mask form /api/filament-prep uses even for a 1-filament
                 # call. Use this for isolated single-filament control.
                 filament = int(body.get("filament", -1))
-                state = int(body.get("state", 0))
+                # Parsed defensively: a non-numeric state used to escape as
+                # int()'s own "invalid literal for int() with base 10: 'idle'",
+                # which names a Python builtin rather than the field or its
+                # legal values.
+                try:
+                    state = int(body.get("state", 0))
+                except (TypeError, ValueError):
+                    return self._json(
+                        {"ok": False, "error": f"state must be an integer 1..6 "
+                                               f"({', '.join(f'{v}={n}' for v, n in sorted(POWER_STATE_NAMES.items()))}), "
+                                               f"got {body.get('state')!r}"},
+                        HTTPStatus.BAD_REQUEST)
                 if state < 1 or state > 6:
-                    return self._json({"ok": False, "error": "bad state"}, HTTPStatus.OK)
+                    return self._json(
+                        {"ok": False, "error": f"state {state} out of range 1..6 "
+                                               f"({', '.join(f'{v}={n}' for v, n in sorted(POWER_STATE_NAMES.items()))})"},
+                        HTTPStatus.BAD_REQUEST)
                 arg = int(body.get("arg", 0))
                 # Enforcement, not just bookkeeping: ct_simple_control filters its
                 # own dead mask before calling, but the GUI, a curl, or anyone
@@ -4264,9 +4317,23 @@ class CtHandler(BaseHTTPRequestHandler):
                 # CT-scan prep ladder — apply one PowerState to a batch of
                 # filaments across BOTH connected controllers. Refused while a
                 # schedule is running (would fight the executor's heating).
-                state = int(body.get("state", 0))
+                # Parsed defensively: a non-numeric state used to escape as
+                # int()'s own "invalid literal for int() with base 10: 'idle'",
+                # which names a Python builtin rather than the field or its
+                # legal values.
+                try:
+                    state = int(body.get("state", 0))
+                except (TypeError, ValueError):
+                    return self._json(
+                        {"ok": False, "error": f"state must be an integer 1..6 "
+                                               f"({', '.join(f'{v}={n}' for v, n in sorted(POWER_STATE_NAMES.items()))}), "
+                                               f"got {body.get('state')!r}"},
+                        HTTPStatus.BAD_REQUEST)
                 if state < 1 or state > 6:
-                    return self._json({"ok": False, "error": "bad state"}, HTTPStatus.OK)
+                    return self._json(
+                        {"ok": False, "error": f"state {state} out of range 1..6 "
+                                               f"({', '.join(f'{v}={n}' for v, n in sorted(POWER_STATE_NAMES.items()))})"},
+                        HTTPStatus.BAD_REQUEST)
                 filaments = body.get("filaments")   # None = all populated boards
                 currents = body.get("currents") or {}
                 default_arg = int(body.get("arg", 0))
@@ -4314,6 +4381,16 @@ class CtHandler(BaseHTTPRequestHandler):
                     threshold_ma = int(body.get("threshold_ma"))
                 except (TypeError, ValueError):
                     return self._json({"ok": False, "error": "threshold_ma required"}, HTTPStatus.OK)
+                # Range-check here rather than letting struct raise: an
+                # out-of-range value surfaced as "int too big to convert",
+                # which names a Python detail instead of the actual limit, and
+                # arrived buried in a per-controller results entry.
+                if not (0 <= threshold_ma <= 0xFFFF):
+                    return self._json(
+                        {"ok": False, "error": f"threshold_ma {threshold_ma} out of "
+                                               f"range 0..65535 (TPS55289 IOUT_LIMIT "
+                                               f"is a 16-bit field); nothing written"},
+                        HTTPStatus.BAD_REQUEST)
                 filaments = body.get("filaments")   # None = all populated boards
                 results = {}
                 for cid, link in CONTROLLERS.items():
@@ -4350,12 +4427,24 @@ class CtHandler(BaseHTTPRequestHandler):
                     startup_ma = int(body.get("startup_ma"))
                 except (TypeError, ValueError):
                     return self._json({"ok": False, "error": "startup_ma required"}, HTTPStatus.OK)
+                # Range-checked before packing: _u16 on a negative raised
+                # struct's own "can't convert negative int to unsigned", which
+                # names the packer rather than the field or its limit.
+                steady_ma = int(body["steady_ma"]) if "steady_ma" in body else None
+                out_of_range = {n: v for n, v in (("startup_ma", startup_ma),
+                                                  ("steady_ma", steady_ma))
+                                if v is not None and not (0 <= v <= 0xFFFF)}
+                if out_of_range:
+                    return self._json(
+                        {"ok": False, "error": f"out of range 0..65535: "
+                                               f"{out_of_range}; nothing written"},
+                        HTTPStatus.BAD_REQUEST)
                 # CH_STARTUP_OCP (0x37) wire format: [] get, [mA16] set startup
                 # only, [mA16,mA16] set both — build_payload only covers the
                 # 2-byte set form, so build the frame directly here.
                 payload = _u16(startup_ma)
-                if "steady_ma" in body:
-                    payload += _u16(int(body["steady_ma"]))
+                if steady_ma is not None:
+                    payload += _u16(steady_ma)
                 try:
                     resp = link.client.send_request(0x37, payload, flags=0, timeout=2.0)
                 except Exception as exc:
@@ -4379,6 +4468,17 @@ class CtHandler(BaseHTTPRequestHandler):
                 on = bool(body.get("on"))
                 force = bool(body.get("force", True))
                 filaments = body.get("filaments")   # None = all populated boards
+                # An index outside 0..95 was landing in "not_this_controller",
+                # i.e. reported as belonging to the OTHER power rather than as
+                # not existing -- and the top-level error came back empty, so
+                # the caller saw ok=False with nothing to read.
+                if filaments is not None:
+                    oor = [f for f in filaments if not (0 <= int(f) < FILAMENT_COUNT)]
+                    if oor:
+                        return self._json(
+                            {"ok": False, "results": {}, "excluded": oor,
+                             "error": f"filament(s) {oor} outside 0..{FILAMENT_COUNT - 1}"},
+                            HTTPStatus.BAD_REQUEST)
                 results = {}
                 for cid, link in CONTROLLERS.items():
                     if not link.client.connected:
@@ -4586,7 +4686,15 @@ class CtHandler(BaseHTTPRequestHandler):
                 # channel. We ALSO push it to the firmware (0x34) for completeness,
                 # but the firmware ignores its own mask (always scans all 8), so that
                 # part is cosmetic.
-                mask = int(body.get("mask", 0x3F)) & 0xFF
+                # Refuse rather than & 0xFF: a mask of 999 became 0xE7, i.e. a
+                # DIFFERENT set of channels than asked for, reported as success.
+                raw_mask = int(body.get("mask", 0x3F))
+                if not (0 <= raw_mask <= 0xFF):
+                    return self._json(
+                        {"ok": False, "error": f"mask {raw_mask} out of range "
+                                               f"0..255 (one bit per channel)"},
+                        HTTPStatus.BAD_REQUEST)
+                mask = raw_mask
                 SCAN_MASK = mask
                 only = body.get("controller")
                 out = {}
@@ -4613,7 +4721,12 @@ class CtHandler(BaseHTTPRequestHandler):
                         out[str(cid)] = {"ok": False, "error": str(exc)}
                 self._json({"ok": bool(out), "controllers": out})
             elif path == "/api/trigger":
-                # Bench test: pulse SyncIn `count` times via the ESP32 bridge's
+                count = int(body.get("count", 1))
+                if count < 1:
+                    return self._json(
+                        {"ok": False, "error": f"count={count} must be >= 1; nothing "
+                                               f"was fired"},
+                        HTTPStatus.BAD_REQUEST)
                 # /sync/fire. host defaults to the first connected controller.
                 count = max(1, int(body.get("count", 1)))
                 host = body.get("host")
@@ -5027,7 +5140,13 @@ class CtHandler(BaseHTTPRequestHandler):
                 link = CONTROLLERS.get(cid)
                 if not link or not link.host:
                     return self._json({"ok": False, "error": "controller not connected"}, HTTPStatus.OK)
-                count = max(1, int(body.get("count", 1)))
+                count = int(body.get("count", 1))
+                if count < 1:
+                    return self._json(
+                        {"ok": False, "error": f"count={count} must be >= 1; nothing "
+                                               f"was fired. max(1, ...) used to turn a "
+                                               f"miscomputed count into one real trigger."},
+                        HTTPStatus.BAD_REQUEST)
                 if "interval_ms" in body:
                     interval_ms = max(0.0, float(body["interval_ms"]))
                 else:
@@ -5087,7 +5206,16 @@ class CtHandler(BaseHTTPRequestHandler):
                 raw = link.request(0x7F, payload, flags=0, timeout=2.0 + settle_ms * 4 / 1000).get("raw") or []
                 if not raw or raw[0] != 0x00:
                     status_byte = raw[0] if raw else 0xFF
-                    return self._json({"ok": False, "status": status_byte, "raw": raw}, HTTPStatus.OK)
+                    # A bare status byte is not an error message: the caller
+                    # gets ok=False and no way to know what went wrong short of
+                    # reading the firmware's status table.
+                    return self._json(
+                        {"ok": False, "status": status_byte, "raw": raw,
+                         "error": f"ChReadHvDiag165 rejected with status "
+                                  f"{status_byte} "
+                                  f"({UART_STATUS_NAMES.get(status_byte, 'unknown')})"
+                                  f" — check the channel is 0..7"},
+                        HTTPStatus.OK)
                 self._json({"ok": True, "status": 0,
                             "channel": raw[1] if len(raw) > 1 else channel,
                             "test_byte": raw[2] if len(raw) > 2 else test_byte,
@@ -5111,6 +5239,15 @@ class CtHandler(BaseHTTPRequestHandler):
                     hz = int(body["hz"])
                 except (KeyError, TypeError, ValueError):
                     return self._json({"ok": False, "error": "hz required"}, HTTPStatus.OK)
+                if not (100 <= int(hz) <= 2_000_000):
+                    # The firmware CLAMPS to 100 Hz..2 MHz and echoes what it
+                    # actually installed; asking for 99999999 came back ok=True
+                    # at 2 MHz with nothing saying the request was not honoured.
+                    return self._json(
+                        {"ok": False, "error": f"hz {hz} out of range 100..2000000 "
+                                               f"(the firmware clamps silently, so "
+                                               f"this is refused instead)"},
+                        HTTPStatus.BAD_REQUEST)
                 try:
                     resp = link.client.send_request(HV_SET_SHIFT_HZ, _u32(hz), flags=0, timeout=2.0)
                 except Exception as exc:
@@ -5124,6 +5261,12 @@ class CtHandler(BaseHTTPRequestHandler):
                 # streaming it to the RP2350B schedule table (0x70-0x7B) lands
                 # once a controller is connected.
                 rows = body.get("rows", [])
+                if not rows:
+                    return self._json(
+                        {"ok": False, "error": "no rows to stage; staging an empty "
+                                               "schedule and reporting success hides "
+                                               "the empty build"},
+                        HTTPStatus.BAD_REQUEST)
                 if len(rows) > 8192:
                     return self._json({"ok": False, "error": "exceeds 8192 rows"}, HTTPStatus.OK)
                 global STAGED_SCHEDULE
