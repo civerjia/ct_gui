@@ -627,6 +627,18 @@ class CTClient:
         Returns the raw lease response dict on success.
         """
         r = self._post("/api/lock", {"action": "acquire", "ttl": ttl, "note": note})
+        # The backend clamps ttl to LOCK_TTL_MAX_S (600) silently. A script that
+        # asked for an hour and got ten minutes would find the lease gone
+        # mid-run with nothing having said so, so surface the granted value and
+        # flag the difference rather than echoing the request back.
+        granted = (r.get("lock") or {}).get("expires_in_s")
+        if r.get("ok") and granted is not None and float(granted) < float(ttl) - 1.0:
+            r["ttl_requested_s"] = float(ttl)
+            r["ttl_granted_s"] = float(granted)
+            r["ttl_clamped"] = True
+            r["note_ttl"] = (f"asked for {float(ttl):.0f} s, granted "
+                             f"{float(granted):.0f} s (backend maximum) — renew "
+                             f"before it expires or the lease drops mid-run")
         if not r.get("ok") and not r.get("connection_error"):
             snap = r.get("lock") or {}
             raise CTLeaseError(
@@ -2372,35 +2384,41 @@ class CTClient:
         return {"ok": True, "below_mV_per_s": le(1), "above_mV_per_s": le(3),
                 "warm_mV_per_s": le(5)}
 
-    _SLEW_MIN_MV_PER_S = 1   # the firmware's own floor; see the refusal below
+    # SOFTWARE floor, well above the firmware's own 1 mV/s. The firmware will
+    # happily install 1, which is not "unlimited" but "ramp 10 V in about three
+    # hours" -- and it came back ok=True, so the bench sat at 1/1/1 until a
+    # readback caught it. 400 is the stock `below` rate, so clamping up to it
+    # leaves a working bench rather than a stalled one.
+    _SLEW_MIN_MV_PER_S = 400
 
     def set_slew_rates(self, below_mV_per_s: int, above_mV_per_s: int,
                        warm_mV_per_s: int, controller: int = 1) -> dict:
         """Set all three slew rates (mV/s). See get_slew_rates for what each is.
 
-        A rate of 0 is REFUSED, not clamped. The firmware's floor is 1 mV/s, so
-        asking for 0 used to come back ok=True having quietly installed 1 --
-        which is not "no limit", it is "ramp 10 V in about three hours". The
-        bench sat at 1/1/1 until a readback caught it. Zero is not a rate; if
-        you want the stock behaviour, pass SLEW_DEFAULTS.
+        Anything below _SLEW_MIN_MV_PER_S (400 mV/s) is CLAMPED UP to it, and
+        the clamp is reported. The firmware's own floor is 1 mV/s and it accepts
+        it silently -- that is not "no limit", it is "ramp 10 V in about three
+        hours", and it came back ok=True, so the bench sat at 1/1/1 until a
+        readback caught it. Clamping up to the stock rate leaves a working bench
+        instead of a stalled one.
 
-        Above the ceilings it still CLAMPS rather than failing (below 2000,
+        Above the ceilings it also CLAMPS rather than failing (below 2000,
         above/warm 5000), so the return is the values actually IN FORCE, not
         what you asked for -- check them, and check `clamped`.
 
         THE CEILINGS ARE NOT THE DEFAULTS; use SLEW_DEFAULTS for that.
         """
-        bad = {n: v for n, v in (("below_mV_per_s", below_mV_per_s),
-                                 ("above_mV_per_s", above_mV_per_s),
-                                 ("warm_mV_per_s", warm_mV_per_s))
-               if int(v) < self._SLEW_MIN_MV_PER_S}
-        if bad:
-            return {"ok": False, "controller": int(controller),
-                    "error": f"slew rate(s) below the firmware floor of "
-                             f"{self._SLEW_MIN_MV_PER_S} mV/s: {bad}. Nothing was "
-                             f"written — a 0 would be installed as 1 mV/s, which "
-                             f"is not 'unlimited', it is 'never gets there'. Pass "
-                             f"CTClient.SLEW_DEFAULTS for the stock rates."}
+        # Clamp up to the software floor BEFORE sending. `asked` below keeps the
+        # caller's ORIGINAL numbers, so the existing `clamped` flag still fires
+        # when what came back differs from what was requested -- a clamp the
+        # caller never learns about is the failure this whole guard exists for.
+        requested = (int(below_mV_per_s), int(above_mV_per_s), int(warm_mV_per_s))
+        floored = {n: v for n, v in zip(("below_mV_per_s", "above_mV_per_s",
+                                         "warm_mV_per_s"), requested)
+                   if v < self._SLEW_MIN_MV_PER_S}
+        below_mV_per_s = max(int(below_mV_per_s), self._SLEW_MIN_MV_PER_S)
+        above_mV_per_s = max(int(above_mV_per_s), self._SLEW_MIN_MV_PER_S)
+        warm_mV_per_s  = max(int(warm_mV_per_s),  self._SLEW_MIN_MV_PER_S)
         # Clamp to the u16 wire range here. The firmware clamps to its own
         # ceilings, but a value over 65535 would fail to serialise and the call
         # would error instead of clamping, contradicting the contract the
@@ -2422,7 +2440,12 @@ class CTClient:
                 # Compared against what was actually SENT (post-u16 clamp), so a
                 # request of 99999 reports clamped rather than being measured
                 # against a number that never reached the wire.
-                "clamped": got != asked}
+                "clamped": got != asked,
+                # Which bands this client raised to the floor, and what they
+                # were. Separate from `clamped` (which also covers the
+                # firmware's own ceiling clamp) so the two causes stay apart.
+                "floored_to_min": floored or None,
+                "floor_mV_per_s": self._SLEW_MIN_MV_PER_S}
 
     def get_fault_policy(self, controller: int = 1) -> dict:
         """Read the per-run fault policy: two INDEPENDENT stop/continue
@@ -5538,6 +5561,15 @@ class CTClient:
         "unknown": [...]}.
         """
         say = progress or (lambda _msg: None)
+        # A negative cool_s is almost always a computed value that came out
+        # wrong (a subtraction of timestamps, say). Treating it as "no wait"
+        # silently grants the precondition this call exists to establish.
+        if float(cool_s) < 0:
+            return {"ok": False, "waited_s": 0.0, "already_cold_s": None,
+                    "stopped": [], "unknown": [],
+                    "error": f"cool_s={cool_s} is negative; nothing was cooled. "
+                             f"A negative wait is not zero wait — it is a number "
+                             f"that was computed wrong."}
         targets = self._live_user_indices(filaments)
         if not targets:
             return {"ok": True, "waited_s": 0.0, "already_cold_s": None,
