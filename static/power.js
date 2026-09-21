@@ -1083,6 +1083,7 @@ async function powerCmdRetry(command, extra) {
 // firmware verify, no fault/clear), wait HV_SETTLE_MS, then force a FRESH 165
 // read and fetch the byte. Returns the read-back bit (0/1), or null on a
 // transport error (→ inconclusive).
+const PULSE_ARM_RATE_HZ = 1000000;   // detector sample rate this GUI arms at
 const HV_SETTLE_MS = 12;
 async function hvForceReadBit(c, b, value) {
   const w = await powerCmdRetry('HV_SET_BIT', { channel: c, bit: b, value, force: true });
@@ -1824,7 +1825,7 @@ const EMI_HTML = `
       <span id="pulseSummary" class="hint">no events</span>
     </div>
     <div class="row compact"><input id="pulseSlider" type="range" min="0" max="0" value="0" title="Scroll through the pulse history (drag right = newest = auto-follow)" style="flex:1" /></div>
-    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th>peak mA</th><th>plat mA</th><th>bg±σ mA</th><th title="Samples that actually backed the background mean / the settle gap left before the rise, both in samples. n=0 means NO background was measured — that row's ∫ is not a charge. ? = this firmware does not report it.">bg n/gap</th><th>∫ mA·µs</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
+    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th>peak mA</th><th>plat mA</th><th>bg±σ mA</th><th title="Samples that actually backed the background mean / the settle gap left before the rise, both in samples. n=0 means NO background was measured — that row's ∫ is not a charge. ? = this firmware does not report it.">bg n/gap</th><th title="Charge: integral converted with THIS pulse's own sample_rate_hz, not an assumed rate. — = the event carried no rate.">∫ mA·µs</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
   </div>
 
   <div class="batch-box">
@@ -2045,7 +2046,15 @@ function renderPulses() {
         + (partial ? ' — short of the ' + PULSE_BG_WINDOW + '/' + PULSE_BG_GAP + '-sample default, so the subtracted background is thinner (or less settled) than usual' : '')}">${bn}/${bgap == null ? '?' : bgap}</td>`;
     const intCell = noBg
       ? '<td title="Charge refused: with no background, ∫ is Σx over the envelope with nothing subtracted. That is not a charge.">—</td>'
-      : `<td>${(p.integral * EMI_MA_PER_COUNT).toFixed(1)}</td>`;
+      // integral is count*SAMPLES, so converting it to a TIME needs the rate
+      // this pulse was actually sampled at -- which every event carries. It
+      // used to be printed as mA*us on the assumption of 1 MSPS: true for the
+      // arms this GUI issues today, and silently 2x wrong the moment anything
+      // arms at 500 kHz. Absent rate => no conversion exists, so show the
+      // absence rather than a number that is right only by luck.
+      : (p.rate_hz
+          ? `<td>${(p.integral * EMI_MA_PER_COUNT * 1e6 / p.rate_hz).toFixed(1)}</td>`
+          : `<td title="no sample rate reported — cannot convert samples to time">—</td>`);
     return `<tr${rowStyle}><td>${p.id}</td><td>${p.t_us}</td><td>${p.on_us}</td>`
       + `<td>${emissionMa(p.peak).toFixed(2)}</td>`
       + `<td>${p.plateau ? emissionMa(p.plateau).toFixed(2) : '—'}</td>`
@@ -2151,7 +2160,10 @@ function wireEmission() {
     }
     // The STM32 only emits EVT_PULSE while its ADC is armed (detector mode).
     $p('pulseSummary').textContent = 'arming STM32 detector…';
-    const j = await postJ('/api/adc/pulse-arm', { controller: pwTarget, rate: 1000000 });
+    // The rate this card ARMS at. Named rather than inlined because the pulse
+    // table no longer assumes it -- each row converts with the rate its own
+    // event reports, so changing this does not silently rescale the display.
+    const j = await postJ('/api/adc/pulse-arm', { controller: pwTarget, rate: PULSE_ARM_RATE_HZ });
     if (!j.ok) { $p('pulseSummary').textContent = `can't arm STM32 — ${j.error || j.message || 'arm failed'}`; return; }
     pulseArmed = true;
     pulseTimer = setInterval(pulseTick, 500); $p('pulseStream').classList.add('danger'); pulseTick();

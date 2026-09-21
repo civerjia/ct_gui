@@ -5189,6 +5189,169 @@ class CTClient:
         """
         return self._post("/api/selftest", {}, timeout=60.0)
 
+    # ── HV switch toggle test ─────────────────────────────────────────────────
+
+    _HV_SETTLE_MS = 12          # host-side settle before reading the 165 back
+    _HV_RETRY_ATTEMPTS = 4      # transient-only retries
+    _HV_RETRY_DELAY_S = 0.2
+    _HV_POLLPAUSE_EVERY = 8     # re-arm the auto-expiring pause every N switches
+
+    def _hv_cmd_transient(self, r: dict) -> bool:
+        """True if this failure is worth retrying.
+
+        A transport timeout (no status frame came back at all) or a momentarily
+        busy device mailbox is transient. VERIFY_FAIL is NOT: it means the
+        switch did not actuate, which is the very thing the test is looking
+        for. Retrying it would turn a dead switch into a passing one.
+        """
+        if r.get("ok"):
+            return False
+        st = ((r.get("response") or {}).get("status"))
+        if not st:
+            return True              # no status frame => transport error
+        return st == "BUSY"
+
+    def _hv_cmd_retry(self, command: str, body: dict, controller: int) -> dict:
+        for attempt in range(self._HV_RETRY_ATTEMPTS):
+            # /api/power-cmd, NOT /api/cmd: the HV switch opcodes (notably
+            # HV_REFRESH_FEEDBACK, which is what forces a FRESH 165 read) are
+            # only routed by the power-cmd handler. /api/cmd answers
+            # "unknown command" for it, and that reads as a transport error --
+            # i.e. every switch would come back INCONCLUSIVE rather than the
+            # test failing loudly. Measured exactly that: 8/8 inconclusive,
+            # restored_off 0/8, on a bench whose switches are fine.
+            r = self._post("/api/power-cmd", {"controller": int(controller),
+                                              "command": command, **body}, timeout=10.0)
+            if not self._hv_cmd_transient(r):
+                return r
+            if attempt < self._HV_RETRY_ATTEMPTS - 1:
+                time.sleep(self._HV_RETRY_DELAY_S)
+        return r
+
+    def _hv_force_read_bit(self, controller: int, channel: int, bit: int,
+                           value: bool) -> int | None:
+        """Drive one HV switch and read the 165 sense line back. 0/1, or None on
+        a transport error (which is INCONCLUSIVE, not a failure).
+
+        Why the host settle: the firmware's own HV_SET_BIT verify reads the 165
+        the instant after latching the 595, racing the switch's physical
+        settling, so a marginal switch verifies differently run to run. The
+        settle cannot go in the firmware (it lives in the core-1 verify chain on
+        a tight stack), so it lives here: force-write the bit (no firmware
+        verify, no fault/clear), wait, force a FRESH 165 read, then fetch.
+        """
+        w = self._hv_cmd_retry("HV_SET_BIT",
+                               {"channel": channel, "bit": bit,
+                                "value": bool(value), "force": True}, controller)
+        if not w.get("ok"):
+            return None
+        time.sleep(self._HV_SETTLE_MS / 1000.0)
+        rf = self._hv_cmd_retry("HV_REFRESH_FEEDBACK", {"channel": channel}, controller)
+        if not rf.get("ok"):
+            return None
+        g = self._hv_cmd_retry("HV_GET_ALL_BYTES", {}, controller)
+        fb = ((g.get("response") or {}).get("decoded") or {}).get("feedback") if g.get("ok") else None
+        if not fb:
+            return None
+        return (int(fb[channel]) >> bit) & 1
+
+    def hv_switch_test(self, controller: int = 1,
+                       channel_mask=None,          # None = all 8; or 0xFF-style
+                                                    # int, or a list of channels
+                       progress=None) -> dict:
+        """Exercise every HV grid switch on the selected channels: force it ON,
+        read the 165 sense back TWICE, then restore it OFF.
+
+        Tests the SWITCH, not emission. **Run with the HV voltage at 0** -- this
+        actuates the grid switches, and the read-back says whether the switch
+        moved, which has nothing to do with whether HV is present. For the
+        expander CHIP rather than the switch, use self_test().
+
+        channel_mask: None for all 8, a bitmask (bit N = channel N, so 0b11 is
+        CH1+CH2), or an explicit list like [0, 1]. Channels are 0-based here and
+        labelled CH1..CH8 in the result, matching the GUI.
+
+        ## Three outcomes, not two
+
+        A switch that reads back inconsistently is NOT a pass and NOT a
+        failure -- it is a marginal switch, and collapsing it either way loses
+        the one thing worth knowing about it:
+
+            pass          both reads returned 1 -- consistently actuated
+            dead          both reads returned 0 -- consistently did not actuate
+            inconclusive  the two reads disagreed, or a read never arrived
+
+        Retries follow the same rule: a transport timeout or a busy mailbox is
+        retried, a VERIFY_FAIL never is. Retrying the failure the test exists to
+        find would turn a dead switch into a passing one.
+
+        Returns {"ok", "pass", "results": {"CH1.1": "pass"|"dead"|
+        "inconclusive", ...}, "dead": [...], "inconclusive": [...], "counts",
+        "channels", "restored_off"}. Never raises.
+        """
+        say = progress or (lambda _msg: None)
+        if channel_mask is None:
+            channels = list(range(8))
+        elif isinstance(channel_mask, int):
+            channels = [c for c in range(8) if channel_mask & (1 << c)]
+        else:
+            channels = sorted({int(c) for c in channel_mask})
+        bad = [c for c in channels if not (0 <= c < 8)]
+        if bad:
+            return {"ok": False, "error": f"channel(s) {bad} outside 0..7",
+                    "results": {}}
+        if not channels:
+            return {"ok": False, "error": "channel_mask selected no channels",
+                    "results": {}}
+
+        keys = [(c, b) for c in channels for b in range(8)]
+        results: dict[str, str] = {}
+        restored = 0
+        # The pause stops the backend's 1 Hz PING from interleaving with these
+        # round trips on the single shared bridge socket. It AUTO-EXPIRES
+        # (POLL_PAUSE_MAX_S), which is why it is re-armed below rather than set
+        # once -- and why a crash here cannot wedge the poller.
+        self._post("/api/poll-pause", {"controller": int(controller),
+                                       "paused": True}, timeout=5.0)
+        try:
+            for n, (c, b) in enumerate(keys):
+                if n % self._HV_POLLPAUSE_EVERY == 0:
+                    self._post("/api/poll-pause", {"controller": int(controller),
+                                                   "paused": True}, timeout=5.0)
+                label = f"CH{c + 1}.{b + 1}"
+                say(f"{label} ({n + 1}/{len(keys)})…")
+                s1 = self._hv_force_read_bit(controller, c, b, True)
+                s2 = self._hv_force_read_bit(controller, c, b, True)
+                # Restore OFF whatever the reads said -- a switch left ON
+                # because its read failed is the worst outcome here.
+                if self._hv_force_read_bit(controller, c, b, False) is not None:
+                    restored += 1
+                if s1 is None or s2 is None:
+                    results[label] = "inconclusive"
+                elif s1 == 1 and s2 == 1:
+                    results[label] = "pass"
+                elif s1 == 0 and s2 == 0:
+                    results[label] = "dead"
+                else:
+                    results[label] = "inconclusive"
+        finally:
+            # Always resume, including on exception: leaving the PING paused
+            # would make the controller look unreachable afterwards.
+            self._post("/api/poll-pause", {"controller": int(controller),
+                                           "paused": False}, timeout=5.0)
+
+        counts: dict[str, int] = {}
+        for v in results.values():
+            counts[v] = counts.get(v, 0) + 1
+        dead = sorted(k for k, v in results.items() if v == "dead")
+        inconc = sorted(k for k, v in results.items() if v == "inconclusive")
+        return {"ok": True, "pass": not dead and not inconc, "results": results,
+                "dead": dead, "inconclusive": inconc, "counts": counts,
+                "channels": [c + 1 for c in channels],
+                # Switches whose restore-to-OFF was confirmed. Short of the
+                # total means one may still be ON -- worth seeing, not hiding.
+                "restored_off": f"{restored}/{len(keys)}"}
+
     # ── Test & measurement flows ──────────────────────────────────────────────
     # Ports of the GUI's "Calibration & Test" tab, so a flow can be run from a
     # script instead of a browser tab that has to stay open. Same thresholds,

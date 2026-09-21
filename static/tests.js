@@ -68,7 +68,12 @@ const firePulse = (ctrl, ch, pos, widthUs) =>
 // Per-pulse tests only need the STM32 detector armed (EVT_PULSE over UART), NOT
 // the ESP32 continuous SPI ring read — the ring's 20 MHz read competes with WiFi
 // and drops the link mid-test. pulse-arm arms the STM32 ADC alone.
-const pulseArm = () => tPostJ('/api/adc/pulse-arm', { rate: 1000000 });
+// Detector sample rate these tests arm at. Any charge/width derived from an
+// event must use that EVENT's own rate_hz, not this -- the two can differ if
+// something else armed the detector, and a wrong rate rescales the result
+// silently rather than failing.
+const PULSE_ARM_RATE_HZ = 1000000;
+const pulseArm = () => tPostJ('/api/adc/pulse-arm', { rate: PULSE_ARM_RATE_HZ });
 const pulseDisarm = () => tPostJ('/api/adc/pulse-disarm', {});
 const hvEnable = (chan, on) => tPostJ('/api/stm32/hv-enable', { ch: chan, on });
 // Is the channel's HV output currently energised? (hv_status pin level, same
