@@ -2019,6 +2019,16 @@ class CTClient:
         # whether or not the backend is reachable. ACTIVE may only be entered
         # from IDLE: going straight to firing current damages the filament, and
         # in vacuum that damage is unrepairable.
+        # Existence BEFORE the ladder. Otherwise a filament index that has no
+        # board at all comes back "power state unknown to this backend — run the
+        # ladder STOP→SLEEP→STANDBY→IDLE first", which is true but useless: the
+        # ladder will never produce a state for an index that does not exist,
+        # so the reader is sent to walk a ladder that cannot help. Every other
+        # single-filament call already reports this as "has no board".
+        if self.filament_to_board(filament) is None:
+            return {"ok": False, "filament": int(filament),
+                    "error": f"filament {int(filament)} has no board (unassigned "
+                             f"in the active-list mapping, or out of range)"}
         r = self._state_one(filament, ACTIVE, int(current_ma), "active_one")
         if r.get("ladder_blocked"):
             return r
@@ -2152,6 +2162,15 @@ class CTClient:
         its trip point. Returns {"ok": False, "error": ...} if the filament
         has no board mapping.
         """
+        # Range-check BEFORE the write, so an out-of-range value is reported as
+        # what it is. The batch path can only say "not applied", which it then
+        # explains as a mapping/connection problem -- blaming the bench for a
+        # bad argument, and sending the reader to check a link that is fine.
+        if not (0 <= int(threshold_ma) <= self._U16_MAX):
+            return {"ok": False, "filament": int(filament),
+                    "error": f"threshold_ma={threshold_ma} out of range "
+                             f"0..{self._U16_MAX} (TPS55289 IOUT_LIMIT is a "
+                             f"16-bit field); nothing was written"}
         r = self.set_ocp_threshold_all(filaments=[filament], threshold_ma=threshold_ma)
         # Confirm POSITIVELY that this filament was applied, rather than merely
         # checking it isn't in `failed`. A filament that was silently skipped --
@@ -2353,16 +2372,35 @@ class CTClient:
         return {"ok": True, "below_mV_per_s": le(1), "above_mV_per_s": le(3),
                 "warm_mV_per_s": le(5)}
 
+    _SLEW_MIN_MV_PER_S = 1   # the firmware's own floor; see the refusal below
+
     def set_slew_rates(self, below_mV_per_s: int, above_mV_per_s: int,
                        warm_mV_per_s: int, controller: int = 1) -> dict:
         """Set all three slew rates (mV/s). See get_slew_rates for what each is.
 
-        Out-of-range CLAMPS rather than failing (ceilings: below 2000,
+        A rate of 0 is REFUSED, not clamped. The firmware's floor is 1 mV/s, so
+        asking for 0 used to come back ok=True having quietly installed 1 --
+        which is not "no limit", it is "ramp 10 V in about three hours". The
+        bench sat at 1/1/1 until a readback caught it. Zero is not a rate; if
+        you want the stock behaviour, pass SLEW_DEFAULTS.
+
+        Above the ceilings it still CLAMPS rather than failing (below 2000,
         above/warm 5000), so the return is the values actually IN FORCE, not
         what you asked for -- check them, and check `clamped`.
 
         THE CEILINGS ARE NOT THE DEFAULTS; use SLEW_DEFAULTS for that.
         """
+        bad = {n: v for n, v in (("below_mV_per_s", below_mV_per_s),
+                                 ("above_mV_per_s", above_mV_per_s),
+                                 ("warm_mV_per_s", warm_mV_per_s))
+               if int(v) < self._SLEW_MIN_MV_PER_S}
+        if bad:
+            return {"ok": False, "controller": int(controller),
+                    "error": f"slew rate(s) below the firmware floor of "
+                             f"{self._SLEW_MIN_MV_PER_S} mV/s: {bad}. Nothing was "
+                             f"written — a 0 would be installed as 1 mV/s, which "
+                             f"is not 'unlimited', it is 'never gets there'. Pass "
+                             f"CTClient.SLEW_DEFAULTS for the stock rates."}
         # Clamp to the u16 wire range here. The firmware clamps to its own
         # ceilings, but a value over 65535 would fail to serialise and the call
         # would error instead of clamping, contradicting the contract the
@@ -3440,6 +3478,12 @@ class CTClient:
         allows, so a short one means the budget cannot buy enough pre-heat and
         the answer is a higher active_count or a slower rotation, not a retry.
         """
+        # Same vacuous-truth trap: no emission rows means lead_ms 0 against a
+        # t_settle_ms that also defaults to 0, so ok comes back True for a plan
+        # that cannot fire anything.
+        if not (plan or {}).get("emission"):
+            return {"ok": False, "problems": ["plan has no emission rows"],
+                    "error": "plan has no emission rows — nothing to validate"}
         length = sum(int(e.get("numPulses", 1)) for e in (plan.get("emission") or [])) or 1
         lead = plan.get("_lead_triggers")
         windows = self.heating_windows(plan)
@@ -3500,6 +3544,14 @@ class CTClient:
         Returns {"ok", "results": [...]} — one result dict per controller, plus
         "dead_skipped": [...] whenever the dead mask removed something.
         """
+        # "Nothing to check" is not "checked". An empty emission table makes
+        # every count compare 0 against 0 and a download of nothing report success.
+        # Refuse, so an empty plan fails here rather than at arm time.
+        if not (plan or {}).get("emission"):
+            return {"ok": False, "results": [],
+                    "error": "plan has no emission rows — nothing would be "
+                             "downloaded, and reporting that as a successful "
+                             "download hides the empty plan until arm rejects it."}
         wire_plan, dead_skipped = self._plan_to_fids(plan)
         if isinstance(plan.get("emission"), list) and plan["emission"] and not wire_plan["emission"]:
             return {"ok": False, "results": [], "dead_skipped": dead_skipped,
@@ -3548,6 +3600,15 @@ class CTClient:
 
         Returns {"ok", "results": {controller: {"match": bool, ...}}}.
         """
+        # "Nothing to check" is not "checked". An empty emission table makes
+        # every count compare 0 against 0 and every test pass vacuously -- and
+        # this runs immediately before arming, so a caller who built an empty
+        # plan by mistake gets told it verified. Refuse instead.
+        if not (plan or {}).get("emission"):
+            return {"ok": False, "results": {},
+                    "error": "plan has no emission rows — there is nothing to "
+                             "verify, which is not the same as verified. Build "
+                             "one with build_scan_schedule()/build_scan_plan()."}
         wire_plan, dead_skipped = self._plan_to_fids(plan)
         r = self._post("/api/verify-schedule", {"plan": wire_plan}, timeout=10.0)
         # SAY that entries were dropped. Without this a dead filament in the
@@ -5304,6 +5365,16 @@ class CTClient:
             return {"ok": False, "error": "channel_mask selected no channels",
                     "results": {}}
 
+        # A disconnected controller makes every read fail, which is reported
+        # honestly per switch (inconclusive) but came back ok=True overall --
+        # "the test ran" for a test that could not reach the hardware. Check
+        # first and say so.
+        st = (self.status().get("controllers") or {}).get(str(int(controller)), {})
+        if not st.get("connected"):
+            return {"ok": False, "results": {},
+                    "error": f"controller {controller} is not connected — no "
+                             f"switch could be reached, so there is no result "
+                             f"to report (not even a failing one)"}
         keys = [(c, b) for c in channels for b in range(8)]
         results: dict[str, str] = {}
         restored = 0
