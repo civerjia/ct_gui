@@ -4849,6 +4849,19 @@ class CTClient:
         clean: it needs `post_bg` (absent when post_bg_n_samples=0 or no sample
         was taken) and a non-zero sigma to have a scale to judge against.
         """
+        # How much of the requested window actually backed the mean. None =
+        # firmware predates the field (unknown, NOT complete); an integer short
+        # of the request means the history ran out. background_n == 0 never
+        # reaches here -- _add_charge() refuses that outright.
+        bg_n = e.get("background_n")
+        if bg_n is not None and bg_n < self._BG_WINDOW_US:
+            e["background_partial"] = True
+            e["background_n_note"] = (
+                f"background averaged only {bg_n} of the requested "
+                f"{self._BG_WINDOW_US:.0f} samples — history was short (fresh "
+                f"reset, rate change, or ADC restart)")
+        else:
+            e["background_partial"] = False if bg_n is not None else None
         pre, post, sigma4 = e.get("bg"), e.get("post_bg"), e.get("bg_sigma4")
         if pre is None or post is None:
             e["background_pre_post_delta"] = None
@@ -4874,7 +4887,8 @@ class CTClient:
             if e["background_suspect"] else None)
 
     def _add_charge(self, e: dict, ref_mv: float,
-                    integral_signed: bool | None = None) -> None:
+                    integral_signed: bool | None = None,
+                    background_windowing: bool | None = None) -> None:
         """Add integral_mams (charge, mA*ms) and its scatter to one event.
 
         integral is round(Sigma(sample - background)) over the pulse -- signed,
@@ -4934,6 +4948,24 @@ class CTClient:
             e["integral_mams"] = None
             e["integral_mams_unavailable"] = "saturated"
             e["integral_saturated"] = True
+            return
+        # NO BACKGROUND AT ALL. The STM32 reports background_n = 0 when its
+        # sample history could not supply the window (fresh reset, rate change,
+        # ADC restart). Then background_mean and sigma4 are both 0 and `integral`
+        # degenerates to the RAW in-envelope sum with nothing subtracted -- a
+        # large, entirely plausible number that is not a charge. The STM32
+        # session asked for this to be flagged; refusing is the flag.
+        # Whether the exact-window background (pre-gap honoured, background_n
+        # reported) is running at all. fw_build >= 0x00030000, per the STM32
+        # side -- gated on the build, not a capability bit, because the caps
+        # byte is full and the PULSE_CFG tier design drops an unknown pre-gap
+        # SILENTLY. None = the ESP32 never got GET_INFO, which is UNKNOWN and
+        # must not decay into either answer.
+        e["background_windowing"] = background_windowing
+        bg_n = e.get("background_n")
+        if bg_n == 0:
+            e["integral_mams"] = None
+            e["integral_mams_unavailable"] = "no_background"
             return
         e["integral_saturated"] = False
         self._check_background(e)
@@ -5019,7 +5051,8 @@ class CTClient:
             for key in keys:
                 if e.get(key) is not None:
                     e[f"{key}_ma"] = round(self.pulse_ma(e[key], resolved_ref_mv), 3)
-            self._add_charge(e, resolved_ref_mv, r.get("integral_signed"))
+            self._add_charge(e, resolved_ref_mv, r.get("integral_signed"),
+                             r.get("background_windowing"))
         r["ref_mv"] = ref_mv
         return r
 
