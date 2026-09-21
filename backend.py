@@ -1594,6 +1594,19 @@ ENERGISING_STATES = frozenset({3, 4, 5, 6})   # STANDBY, IDLE, ACTIVE, VOLTAGE
 # carry it out.
 POWER_STATE_ACTIVE = 5
 POWER_STATE_IDLE = 4
+# For messages. A refusal that says "currently at power state 3" makes the
+# reader go look up what 3 is, which is the same bare-integer problem the SHV
+# arm reject codes had -- and this one is on the path people hit while trying to
+# heat a filament, so it should read without a lookup.
+POWER_STATE_NAMES = {1: "STOP", 2: "SLEEP", 3: "STANDBY", 4: "IDLE",
+                     5: "ACTIVE", 6: "VOLTAGE"}
+
+
+def power_state_name(state: int) -> str:
+    """"STANDBY(3)" for a known state, "3" for anything else. Never invents a
+    name for a value the ladder does not define."""
+    n = POWER_STATE_NAMES.get(int(state))
+    return f"{n}({int(state)})" if n else str(state)
 # fid -> (state, monotonic when it was commanded). The backend is the ONLY
 # writer to the bridge (single-client TCP), so what it last commanded is what
 # the hardware has -- except across a reconnect, where the board may have been
@@ -1729,9 +1742,10 @@ def ladder_blocks_active(fid: int, arrival: str | None = None,
     if st == POWER_STATE_ACTIVE:
         return None          # re-commanding a new target while already ACTIVE
     if st != POWER_STATE_IDLE:
-        return (f"currently at power state {st}; ACTIVE may only be entered from "
-                f"IDLE(4) — going straight to firing current damages the filament, "
-                f"and in vacuum that is unrepairable")
+        return (f"currently at {power_state_name(st)}; ACTIVE may only be entered "
+                f"from IDLE(4) — going straight to firing current damages the "
+                f"filament, and in vacuum that is unrepairable. Ladder: "
+                f"STOP→SLEEP→STANDBY→IDLE→(settle)→ACTIVE")
     if not arrival_known:
         return None          # older firmware reports no arrival: state-only check
     if arrival == "settled":
