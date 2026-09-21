@@ -2491,30 +2491,29 @@ def adc_pulse_diag(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict
 
 
 def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
-                  post_bg_gap: int | None = None, post_bg_n: int | None = None,
-                  ttl_ms: int | None = None, bg_window: int | None = None,
+                  bg_gap: int | None = None, bg_window: int | None = None,
+                  ttl_ms: int | None = None,
                   timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
     """Arm the RP2350->STM32 pulse-envelope relay AND (inside it) the STM32
     detector. This is what makes a fired pulse actually get MEASURED: the
     detector times each pulse from the real envelope on PA4, which only moves
     while the relay is mirroring GPIO39 -> GPIO34. adc_pulse_arm() alone arms the
-    detector but not the relay, so PA4 never moves and a fire yields 0 events."""
+    detector but not the relay, so PA4 never moves and a fire yields 0 events.
+
+    bg_gap / bg_window are ONE symmetric pair in SAMPLES: the ESP32 applies each
+    to BOTH sides of the envelope (settle, then average). The ESP32 rejects
+    bg_window outside 4..128 rather than letting the STM32 clamp silently."""
     url = (f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ready_arm"
            f"?rate_hz={int(rate_hz)}&n_samples={int(n_samples)}")
     # Omitted entirely rather than sent as 0: the ESP32 falls back to its own
-    # defaults for an absent param, and 0 means something different (post_bg_n=0
-    # is "do not measure"). Passing 0 to mean "unspecified" would silently turn
-    # the measurement off.
-    if post_bg_gap is not None: url += f"&post_bg_gap={int(post_bg_gap)}"
-    if post_bg_n   is not None: url += f"&post_bg_n={int(post_bg_n)}"
+    # defaults for an absent param, and 0 means something different (a window of
+    # 0 is "do not measure"). Passing 0 to mean "unspecified" would silently
+    # turn the measurement off.
+    if bg_gap    is not None: url += f"&bg_gap={int(bg_gap)}"
+    if bg_window is not None: url += f"&bg_window={int(bg_window)}"
     # Same omit-vs-zero rule: ttl_ms=0 explicitly DISABLES the auto-disarm, so
     # sending 0 for "unspecified" would turn off the very recovery it is for.
-    if ttl_ms       is not None: url += f"&ttl_ms={int(ttl_ms)}"
-    # Same rule again. bg_window is the PRE-pulse baseline -- the average the
-    # charge subtracts -- and the ESP32 rejects anything outside 4..128 rather
-    # than clamping, so an out-of-range value comes back as an error instead of
-    # silently becoming something else.
-    if bg_window    is not None: url += f"&bg_window={int(bg_window)}"
+    if ttl_ms    is not None: url += f"&ttl_ms={int(ttl_ms)}"
     try:
         status, text = _http_post_form(url, {}, timeout)
         return _post_result(status, text)

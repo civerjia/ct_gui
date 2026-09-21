@@ -4639,16 +4639,15 @@ class CtHandler(BaseHTTPRequestHandler):
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
-                pbg = body.get("post_bg_gap")
-                pbn = body.get("post_bg_n")
-                ttl = body.get("ttl_ms")
+                # ONE symmetric pair, applied to both sides of the envelope.
+                bgg = body.get("bg_gap")
                 bgw = body.get("bg_window")
+                ttl = body.get("ttl_ms")
                 self._json(adc_ready_arm(host, int(body.get("rate", 1000000)),
                                          int(body.get("n_samples", 2000)),
-                                         None if pbg is None else int(pbg),
-                                         None if pbn is None else int(pbn),
-                                         None if ttl is None else int(ttl),
-                                         None if bgw is None else int(bgw)))
+                                         None if bgg is None else int(bgg),
+                                         None if bgw is None else int(bgw),
+                                         None if ttl is None else int(ttl)))
             elif path == "/api/recover":
                 # Clear state left behind by an operation that did not finish:
                 # a killed script, a backend that exited before its cleanup, a

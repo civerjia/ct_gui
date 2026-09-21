@@ -996,6 +996,23 @@ class CTClient:
     #    physical baseline, so on a clean pulse they agree to within noise.
     _BG_DELTA_SIGMA = 3.0
 
+    # -- Background measurement, SYMMETRIC around the envelope. ONE pair, in
+    #    MICROSECONDS; at 1 MSPS one microsecond is one sample.
+    #
+    #      <- gap 200 -><- win 50 ->| envelope |<- win 50 -><- gap 200 ->
+    #            (pre: SUBTRACTED)                 (post: reference)
+    #
+    #    Pre and post deliberately share the numbers: same front end, same
+    #    disturbance next to each edge, so no reason to differ -- and one pair
+    #    is half the wire and half the ways to get it wrong.
+    _BG_GAP_US = 200.0
+    _BG_WINDOW_US = 50.0
+    #    Quiet time every pulse needs around it for BOTH backgrounds to exist:
+    #    gap + window on each side. Fire tighter than this and one pulse's
+    #    background is measured over its neighbour's tail -- which does not
+    #    error, it just biases the charge.
+    MIN_INTER_PULSE_US = 2 * (200 + 50)
+
     _READY_TTL_FLOOR_MS = 60000     # never below the firmware's own default
     _READY_TTL_GAP_FACTOR = 4       # x inter_pulse_ms; room for a late pulse
                                      # without waiting a whole extra cycle to
@@ -3846,10 +3863,10 @@ class CTClient:
                                   # "measure" in the docstring
         rate_hz: int = 1000000,  # detector ADC sample rate; only used
                                   # when measure=True
-        post_bg_gap_us: float | None = None,  # measure=True only: wait this long
+        bg_gap_us: float | None = None,  # measure=True only: wait this long
                                                # after the pulse ends before
                                                # sampling the post-pulse level
-        post_bg_n_us: float | None = None,    # measure=True only: then average
+        bg_window_us: float | None = None,    # measure=True only: then average
                                                # over this long. None = firmware
                                                # default (50 us / 50 us)
     ) -> dict:
@@ -4022,18 +4039,18 @@ class CTClient:
         detector again -- including if the fire raises or times out.
 
         POST-PULSE BACKGROUND. Each event's post_bg is measured by waiting
-        post_bg_gap_us after the envelope ends (for the analog front end to
-        settle) and then averaging over post_bg_n_us. Both default to the
+        bg_gap_us after the envelope ends (for the analog front end to
+        settle) and then averaging over bg_window_us. Both default to the
         firmware's 50 us / 50 us; pass your own when that doesn't fit this
         board. If post_bg comes back looking like the tail of the pulse rather
-        than a settled level, the gap is too short. Setting post_bg_n_us=0
+        than a settled level, the gap is too short. Setting bg_window_us=0
         disables the measurement, and post_bg then reports None -- NOT 0, which
         would be a legal post-pulse current.
 
             r = ct.fire_single_pulse(5, num_pulses=3, width_us=1000,
                                      measure=True,
-                                     post_bg_gap_us=200,   # let it settle longer
-                                     post_bg_n_us=100)
+                                     bg_gap_us=400,        # let it settle longer
+                                     bg_window_us=100)
 
         With measure=True the result gains:
             "measured": [ ... ]   one event per pulse, each with peak_ma /
@@ -4050,6 +4067,25 @@ class CTClient:
         fired at all and the error says so, so measure=True never leaves you
         guessing whether HV went out.
         """
+        # Both backgrounds need gap + window of quiet on each side of the pulse.
+        # Fire tighter than that and one pulse's background is measured over its
+        # neighbour's tail: no error, no flag, just a biased charge -- which is
+        # exactly the failure this whole background pass exists to remove. So it
+        # is refused here rather than measured badly.
+        #
+        # Only when measure=True: firing faster is legitimate when nobody is
+        # integrating, and this client has no business dictating pulse spacing
+        # for a run whose charge nobody reads.
+        if measure and int(inter_pulse_ms) * 1000 < self.MIN_INTER_PULSE_US:
+            return {"ok": False, "fired": 0, "records": [], "status": {},
+                    "measured": [], "ref_mv": None,
+                    "error": (f"inter_pulse_ms={inter_pulse_ms} is "
+                              f"{int(inter_pulse_ms) * 1000} us, below the "
+                              f"{self.MIN_INTER_PULSE_US} us each pulse needs for "
+                              f"its backgrounds (gap {self._BG_GAP_US:.0f} + window "
+                              f"{self._BG_WINDOW_US:.0f} us on each side). Fire "
+                              f"further apart, shorten bg_gap_us/bg_window_us, or "
+                              f"pass measure=False if you do not need the charge.")}
         if not measure:
             return self._fire_core(
                 filament, num_pulses=num_pulses, width_us=width_us,
@@ -4080,8 +4116,8 @@ class CTClient:
                          int(inter_pulse_ms) * self._READY_TTL_GAP_FACTOR,
                          int(timeout_s * 1000))
         arm = self.ready_arm(rate_hz, ttl_ms=arm_ttl_ms,
-                             post_bg_gap_us=post_bg_gap_us,
-                             post_bg_n_us=post_bg_n_us)
+                             bg_gap_us=bg_gap_us,
+                             bg_window_us=bg_window_us)
         if not arm.get("ok"):
             hint = ""
             if "already armed" in str(arm.get("error", "")):
@@ -4422,21 +4458,38 @@ class CTClient:
 
     def ready_arm(self, rate_hz: int = 1000000, n_samples: int = 2000,
                   ttl_ms: int | None = None,
-                  post_bg_gap_us: float | None = None,
-                  post_bg_n_us: float | None = None,
-                  bg_window: int | None = None) -> dict:
+                  bg_gap_us: float | None = None,
+                  bg_window_us: float | None = None) -> dict:
         """Arm the pulse-envelope RELAY plus the STM32 detector inside it.
 
-        post_bg_gap_us / post_bg_n_us tune the POST-PULSE background window: the
-        STM32 waits `gap` after the envelope ends for the signal to settle, then
-        averages `n` to produce each event's post_bg. Both are in MICROSECONDS
-        here (converted to samples at rate_hz on the way out). Leave them None
-        to use the firmware defaults (50 us / 50 us). The right gap depends on
-        how long this board's analog front end takes to settle -- if post_bg
-        still looks like the tail of the pulse rather than a settled level,
-        raise the gap. post_bg_n_us=0 turns the measurement off, and events then
-        report post_bg as None rather than 0.
+        bg_gap_us / bg_window_us are ONE SYMMETRIC PAIR applied to BOTH sides of
+        the envelope: settle for `gap`, then average `window`.
 
+            <- gap 200 -><- win 50 ->| envelope |<- win 50 -><- gap 200 ->
+                  (pre: SUBTRACTED)                 (post: reference)
+
+        Pre and post share the numbers on purpose -- same front end, same
+        disturbance beside each edge. The gap keeps that disturbance out of the
+        average, and it matters most on the PRE side: `integral = Sx -
+        (F-R)*mean_bg`, so a biased pre-background biases the charge in
+        proportion to pulse width. (The pre side used to have no gap at all and
+        a shorter window than the post side, i.e. the less accurate average was
+        the one being subtracted.)
+
+        Defaults _BG_GAP_US / _BG_WINDOW_US. Both in MICROSECONDS; at 1 MSPS
+        that is samples one-for-one. The ESP32 refuses a window outside 4..128
+        samples rather than letting the STM32 clamp it silently.
+
+        Together they set MIN_INTER_PULSE_US: a pulse needs gap + window of
+        quiet on each side, so 200 + 50 twice is 500 us. fire_single_pulse()
+        enforces it.
+
+        ⚠ THE PRE-SIDE GAP IS NOT CONFIRMABLE YET. It rides a new 20-byte
+        PULSE_CFG tier; STM32 firmware without that tier ignores the trailing
+        bytes silently, and every capability bit is already allocated (bit 7 is
+        documented as the last free one), so nothing can report whether it was
+        applied. ready_status()["bg_gap"] echoes what was REQUESTED. The window
+        and the POST gap ride tiers that already exist and do take effect.
 
         This is the one you want when you intend to MEASURE fired pulses, and it
         is what fire_single_pulse(measure=True) uses. The STM32 times each pulse
@@ -4454,18 +4507,11 @@ class CTClient:
         # The wire wants SAMPLES; callers here think in microseconds like every
         # other timing argument in this client, so convert at the boundary using
         # the rate actually being armed. Omitted (not 0) when unspecified -- 0 is
-        # a real value on the wire meaning "do not measure the post-pulse
-        # background at all", so it must not double as "caller said nothing".
-        for key, us in (("post_bg_gap", post_bg_gap_us), ("post_bg_n", post_bg_n_us)):
+        # a real value on the wire meaning "do not measure that background at
+        # all", so it must not double as "caller said nothing".
+        for key, us in (("bg_gap", bg_gap_us), ("bg_window", bg_window_us)):
             if us is not None:
                 body[key] = max(0, int(round(float(us) * rate_hz / 1_000_000)))
-        # bg_window is in SAMPLES, not microseconds, unlike the two above. It is
-        # a COUNT -- how many points the mean averages -- and its whole purpose
-        # is that sigma_mean = sigma/sqrt(n). Converting it from a duration would
-        # silently change the averaging whenever the rate changed, which is the
-        # opposite of what a caller asking for "average 128 points" wants.
-        if bg_window is not None:
-            body["bg_window"] = int(bg_window)
         return self._post("/api/adc/ready-arm", body)
 
     def recover(self, stop_heating: bool = False) -> dict:
@@ -4991,8 +5037,8 @@ class CTClient:
         timeout_s: float = 15.0,
         verify: bool = True,
         reuse: bool = False,
-        post_bg_gap_us: float | None = None,
-        post_bg_n_us: float | None = None,
+        bg_gap_us: float | None = None,
+        bg_window_us: float | None = None,
     ) -> dict:
         """Fire and measure, returning the two halves separately.
 
@@ -5010,7 +5056,7 @@ class CTClient:
 
         See fire_single_pulse's "measure=True" section for the arming and
         correlation rules, why a partial measurement reports ok=False, and what
-        post_bg_gap_us/post_bg_n_us do -- they are forwarded unchanged, so this
+        bg_gap_us/bg_window_us do -- they are forwarded unchanged, so this
         wrapper can do everything the call it wraps can.
         """
         r = self.fire_single_pulse(
@@ -5019,7 +5065,7 @@ class CTClient:
             total_ms=total_ms, controller=controller, trigger=trigger,
             timeout_s=timeout_s, verify=verify, reuse=reuse,
             measure=True, rate_hz=rate_hz,
-            post_bg_gap_us=post_bg_gap_us, post_bg_n_us=post_bg_n_us)
+            bg_gap_us=bg_gap_us, bg_window_us=bg_window_us)
         fired = {k: v for k, v in r.items() if k not in ("measured", "ref_mv")}
         return {"ok": bool(r.get("ok")), "fired": fired,
                 "measured": r.get("measured") or [], "ref_mv": r.get("ref_mv")}
