@@ -2492,7 +2492,7 @@ def adc_pulse_diag(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict
 
 def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
                   post_bg_gap: int | None = None, post_bg_n: int | None = None,
-                  ttl_ms: int | None = None,
+                  ttl_ms: int | None = None, bg_window: int | None = None,
                   timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
     """Arm the RP2350->STM32 pulse-envelope relay AND (inside it) the STM32
     detector. This is what makes a fired pulse actually get MEASURED: the
@@ -2510,6 +2510,11 @@ def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
     # Same omit-vs-zero rule: ttl_ms=0 explicitly DISABLES the auto-disarm, so
     # sending 0 for "unspecified" would turn off the very recovery it is for.
     if ttl_ms       is not None: url += f"&ttl_ms={int(ttl_ms)}"
+    # Same rule again. bg_window is the PRE-pulse baseline -- the average the
+    # charge subtracts -- and the ESP32 rejects anything outside 4..128 rather
+    # than clamping, so an out-of-range value comes back as an error instead of
+    # silently becoming something else.
+    if bg_window    is not None: url += f"&bg_window={int(bg_window)}"
     try:
         status, text = _http_post_form(url, {}, timeout)
         return _post_result(status, text)

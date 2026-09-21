@@ -4423,7 +4423,8 @@ class CTClient:
     def ready_arm(self, rate_hz: int = 1000000, n_samples: int = 2000,
                   ttl_ms: int | None = None,
                   post_bg_gap_us: float | None = None,
-                  post_bg_n_us: float | None = None) -> dict:
+                  post_bg_n_us: float | None = None,
+                  bg_window: int | None = None) -> dict:
         """Arm the pulse-envelope RELAY plus the STM32 detector inside it.
 
         post_bg_gap_us / post_bg_n_us tune the POST-PULSE background window: the
@@ -4458,6 +4459,13 @@ class CTClient:
         for key, us in (("post_bg_gap", post_bg_gap_us), ("post_bg_n", post_bg_n_us)):
             if us is not None:
                 body[key] = max(0, int(round(float(us) * rate_hz / 1_000_000)))
+        # bg_window is in SAMPLES, not microseconds, unlike the two above. It is
+        # a COUNT -- how many points the mean averages -- and its whole purpose
+        # is that sigma_mean = sigma/sqrt(n). Converting it from a duration would
+        # silently change the averaging whenever the rate changed, which is the
+        # opposite of what a caller asking for "average 128 points" wants.
+        if bg_window is not None:
+            body["bg_window"] = int(bg_window)
         return self._post("/api/adc/ready-arm", body)
 
     def recover(self, stop_heating: bool = False) -> dict:
