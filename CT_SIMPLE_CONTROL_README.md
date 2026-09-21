@@ -2478,21 +2478,76 @@ if the fire fails or times out.
 | `ref_mv` | the live reference reading actually used for the mA conversion |
 | `ok` | stricter — True only if the fire succeeded **and** every fired pulse produced a measured event |
 
-**Tuning the post-pulse background** — `post_bg` is measured by waiting
-`post_bg_gap_us` after the envelope ends (so the analog front end can settle)
-and then averaging over `post_bg_n_us`. Both default to the firmware's
-50 µs / 50 µs; pass your own when that doesn't fit the board:
+**Tuning the background** — the background is measured **symmetrically** around
+the envelope, from ONE pair of numbers applied to both sides: settle for
+`bg_gap_us`, then average `bg_window_us`.
+
+```
+    <- gap 200 -><- win 50 ->| envelope |<- win 50 -><- gap 200 ->
+          (pre: SUBTRACTED)                 (post: reference)
+```
+
+Pre and post share the numbers on purpose — same front end, same disturbance
+beside each edge — and one pair is half the wire and half the ways to get it
+wrong. Defaults 200 µs / 50 µs.
 
 ```python
 r = ct.fire_single_pulse(25, num_pulses=3, width_us=1000, measure=True,
-                         post_bg_gap_us=200,    # let it settle longer
-                         post_bg_n_us=100)      # then average 100 µs
+                         bg_gap_us=400,       # let it settle longer
+                         bg_window_us=100)    # then average 100 µs
 ```
 
-If `post_bg` comes back looking like the tail of the pulse rather than a
-settled level, the gap is too short. `post_bg_n_us=0` turns the measurement
-off, and `post_bg` then reports `None` — **not** `0`, which would be a legal
-post-pulse current.
+**Why the gap matters most on the PRE side.** The charge is
+`integral = Σx − (F−R)·mean_bg`, so an error in the **pre**-pulse background
+biases the charge in proportion to pulse width — 1 LSB of background error on a
+1000-sample pulse is 1000 LSB·samples of integral error, arriving as a
+perfectly plausible number. The pre side used to have **no gap at all** and a
+shorter window than the post side (20 vs 50): the less accurate average was the
+one being subtracted. While the STM32 processed samples in coarse batches, edges
+landed late and the window sat well before the real edge by accident; once edges
+were placed at the exact sample, the window began abutting the edge and picking
+up whatever leads the envelope.
+
+If `post_bg` comes back looking like the tail of the pulse rather than a settled
+level, the gap is too short. `bg_window_us=0` turns the measurement off, and
+`post_bg` then reports `None` — **not** `0`, which would be a legal post-pulse
+current.
+
+**Minimum pulse spacing.** gap + window on each side is 500 µs of quiet per
+pulse, so `MIN_INTER_PULSE_US` is derived, not chosen.
+`fire_single_pulse(measure=True)` **refuses** a tighter interval: firing closer
+measures one pulse's background over its neighbour's tail, which produces no
+error and no flag, just a biased charge. Only enforced when `measure=True` —
+firing faster is legitimate when nobody is integrating.
+
+**Limits.** window 1–1024 samples, gap 0–3072, and their sum ≤ 4096 (the STM32's
+raw-sample history). Both the ESP32 and the STM32 **refuse** out-of-range values
+rather than clamping, so a request for 2000 can never silently average 1024.
+
+**Knowing whether it worked** — three fields, all on every event:
+
+| field | meaning |
+|---|---|
+| `background_n` | samples that actually backed the mean. Short of the request only when history is short (fresh reset, rate change, ADC restart). **`0` = no background at all** |
+| `background_gap` | gap actually left before the rise. Equal to your request = the pre-gap took effect |
+| `background_windowing` | whether this firmware does exact windowing at all (`fw_build ≥ 0x00030000`) |
+
+`background_n == 0` **refuses the charge** (`integral_mams` None,
+`integral_mams_unavailable="no_background"`). Without a background, `integral`
+degenerates to the raw in-envelope sum with nothing subtracted — a large,
+entirely plausible number that is not a charge.
+
+`background_n` short of the request sets `background_partial`. It is `None`, not
+`False`, on firmware that does not report the field: unknown must not read as
+complete.
+
+⚠ **Check `background_n == 0` before `bg_sigma4 == 0`.** When there is no
+background, sigma is 0 too — but that is "no background", not "flat input".
+Deciding on sigma first files a missing background as a dead front end and sends
+someone to check an analog path that is fine.
+
+This was verified on hardware: three pulses, `background_n = 50` and
+`background_gap = 200` on every one, exactly as requested.
 
 These are microseconds here and samples on the wire; the client converts using
 the `rate_hz` it is arming. They are sent on **every** arm, because the STM32
@@ -2528,7 +2583,7 @@ already has Stream or Record running just **joins** that arm (your
 only actually disarms the hardware once nothing else still wants it
 armed. Safe to run this script alongside an open GUI tab.
 
-**`ready_arm(rate_hz=1000000, n_samples=2000, post_bg_gap_us=None, post_bg_n_us=None)`**
+**`ready_arm(rate_hz=1000000, n_samples=2000, bg_gap_us=None, bg_window_us=None)`**
 / **`ready_disarm()`** — Arm/release the pulse-envelope **relay** *and* the STM32
 detector inside it. This is what `fire_single_pulse(measure=True)` uses, and
 what you want if you are arming by hand and intend to measure.
@@ -2541,7 +2596,7 @@ what you want if you are arming by hand and intend to measure.
 > everything else looks healthy.
 
 ```python
-ct.ready_arm(post_bg_gap_us=200, post_bg_n_us=100)   # relay + detector
+ct.ready_arm(bg_gap_us=200, bg_window_us=50)   # relay + detector
 try:
     ...                                              # fire from elsewhere
 finally:
@@ -2606,7 +2661,7 @@ still in the log", which is rarely what you want.
 | `on_us` | **measured** pulse width, from the real envelope on the STM32's PA4 pin — not the width you commanded. Compare the two; they should agree closely |
 | `peak` | highest sample inside the pulse |
 | `plateau` | mean raw code over `[rise + margin, fall)`, margin = 0 → whole envelope. **`None` when not measured** |
-| `bg` | rolling background **before** the pulse |
+| `bg` | background **before** the pulse — an exact window `[R−gap−win+1, R−gap]`, no longer a rolling accumulator |
 | `post_bg` | mean **after** the pulse — the STM32 waits ~50 µs to settle, then averages ~50 µs. **`None` when not measured** (see below) |
 | `bg_sigma4` | 4× the background σ (σ = `bg_sigma4/4`) |
 | `integral` | background-subtracted sum over the pulse, raw counts: `round(Σ(sample − bg))`. **Signed** — see below |
@@ -2654,10 +2709,11 @@ reset reverts the STM32 to its own defaults, which happen to match):
 
 | parameter | value sent | changeable from here |
 |---|---|---|
-| `bg_window` | 20 samples | no — firmware constant |
+| `bg_window` | 50 samples | yes — `bg_window_us` (**both** sides) |
+| `bg_gap` | 200 samples | yes — `bg_gap_us` (**both** sides) |
 | `plateau_margin` | 0 (plateau = whole envelope) | no — firmware constant |
-| `post_bg_gap` | 50 samples | yes — `post_bg_gap_us` |
-| `post_bg_n` | 50 samples | yes — `post_bg_n_us` |
+| `post_bg_gap` | 200 samples | same `bg_gap_us` — not separately settable |
+| `post_bg_n` | 50 samples | same `bg_window_us` — not separately settable |
 
 Four behaviours worth knowing before you trust a number:
 
