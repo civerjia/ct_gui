@@ -4291,9 +4291,11 @@ class CTClient:
 
         arm_r = self.shv_arm(controller, repeats=1)
         if not arm_r.get("ok"):
-            return {"ok": False, "error": f"arm rejected (code {arm_r.get('reject')}) — "
-                                          "check active list and filament power states",
-                    "arm_reject": arm_r.get("reject"),
+            code = arm_r.get("reject")
+            why = self._SHV_REJECT_NAMES.get(code, "unknown reject code")
+            return {"ok": False,
+                    "error": f"arm rejected (code {code}): {why}",
+                    "arm_reject": code, "arm_reject_name": why,
                     "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
 
         # A SUCCESSFUL arm can still have silently dropped this filament. Under
@@ -4951,6 +4953,75 @@ class CTClient:
         fired = {k: v for k, v in r.items() if k not in ("measured", "ref_mv")}
         return {"ok": bool(r.get("ok")), "fired": fired,
                 "measured": r.get("measured") or [], "ref_mv": r.get("ref_mv")}
+
+    # ── Board self-test & I2C diagnostics ─────────────────────────────────────
+    # The GUI's I2C panel, as API calls. These ask "is the hardware wired up and
+    # answering", not "is the filament good" -- for the latter see the test
+    # flows below.
+    #
+    # All four return {controller: {...}} keyed by 1/2, covering only CONNECTED
+    # controllers. A controller missing from the result was not reached, which
+    # is NOT the same as a controller that answered with nothing; each one also
+    # carries its own `*_error` key when that controller's own call failed, so
+    # one dead controller never silently shrinks the other's result.
+
+    def chip_health(self) -> dict:
+        """I2C presence scan (CH_GET_PRESENT): which chips answer, per board.
+
+        Read-only and safe at any time, including while a schedule fires.
+        Returns {"ok", "controllers": {"1": {...}}}; a controller whose scan
+        raised carries "present_error" instead of counts.
+
+        This is NOT present_filaments(): that one sleeps every board to power
+        the presence-sense rail and returns global filament indices; this reads
+        the chips and returns the per-controller health the GUI's I2C panel
+        shows. They also disagree by design -- a board can answer I2C here and
+        still be unusable as a filament.
+        """
+        return self._post("/api/present", {}, timeout=30.0)
+
+    def diagnosis(self) -> dict:
+        """Deep per-board, per-chip I2C classification (CH_GET_DIAGNOSIS).
+
+        Each chip lands in one of: operational / register-only / address-only /
+        missing -- so a chip that ACKs its address but will not talk registers
+        is distinguishable from one that is simply absent. That distinction is
+        the whole point: both look like "not working" from every other read in
+        this client.
+
+        Read-only, ~300 ms per controller. Returns {"ok", "controllers": {...}},
+        each carrying "channel_mask" (the host's poll set) and
+        "fw_channel_mask" (the firmware's own, kept only for diagnostics -- it
+        is inert), or "error".
+        """
+        return self._post("/api/diagnosis", {}, timeout=30.0)
+
+    def read_tca9554(self) -> dict:
+        """Full TCA9554 expander register dump per channel (CH_READ_TCA9554).
+
+        Config/input/output/polarity registers with the per-read ACK flag, which
+        is what tells you a register value is real rather than a bus artefact.
+        Read-only. Returns {"ok", "controllers": {...}} with "tca9554_error" on
+        a controller that failed.
+        """
+        return self._post("/api/tca9554-read", {}, timeout=30.0)
+
+    def self_test(self) -> dict:
+        """TCA9554 toggle self-test (CH_TCA9554_SELF_TEST) + a chip-health scan.
+
+        THIS ONE DRIVES PINS. The backend refuses it on any controller that is
+        running a schedule and says so in that controller's "selftest_error"
+        rather than disarming for you -- stopping someone else's run to satisfy
+        a diagnostic is not a decision this call gets to make. Disarm first.
+
+        Non-destructive on an idle controller: it toggles the expander outputs
+        and reads them back. On firmware without the 0x60 handler it falls back
+        to deriving chip liveness from the 0x61 register read's ACK flags, so a
+        missing handler degrades to a weaker answer rather than to a wrong one.
+
+        Returns {"ok", "controllers": {...}}.
+        """
+        return self._post("/api/selftest", {}, timeout=60.0)
 
     # ── Test & measurement flows ──────────────────────────────────────────────
     # Ports of the GUI's "Calibration & Test" tab, so a flow can be run from a
@@ -5612,6 +5683,25 @@ class CTClient:
     # generic ok/error summary for anything it doesn't recognize. Never
     # raises: an unrecognized dict still gets the generic summary, and a
     # non-dict input is just str()'d.
+
+    # ShvArm's rejection reasons (RP2350 SimpleHvReject, simple_hv_schedule.h).
+    # Mirrored here because the arm result carried a bare integer: "arm rejected
+    # (code 7)" gives the caller nothing to act on, and the two codes that
+    # actually occur on this bench mean opposite things -- IsoOff is "you forgot
+    # to power the filament", NotReady is "the controller itself is not set up".
+    _SHV_REJECT_NAMES = {
+        0: "none",
+        1: "IndexOutOfWindow — channel >= 8 or bit > 7",
+        2: "WidthTooLarge — pulseWidthUs exceeds maxOnMs",
+        3: "EmptyTable — no schedule entries were loaded",
+        4: "TpsDisabled — the board's TPS55289 is not enabled",
+        5: "TpsFault — the board's TPS55289 reports a fault",
+        6: "IsoOff — the filament's board is not powered (isolated 12 V rail "
+           "off). Put it at SLEEP or above before arming",
+        7: "NotReady — the controller/channel is not initialised. Usually the "
+           "active list was never pushed, or the RP2350 reset since it was",
+        8: "StateConflict — already armed or running; disarm first",
+    }
 
     _SHV_STATE_NAMES = {0: "idle", 1: "armed", 2: "running",
                         3: "complete", 4: "fault"}

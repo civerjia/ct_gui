@@ -186,6 +186,46 @@ def s5(ct, args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+@section(11, "Board self-test and I2C diagnostics")
+def s11(ct, args):
+    # "Is the hardware wired up and answering" -- a different question from
+    # "is the filament good" (that is sections 6 and 7). All four are keyed by
+    # controller and cover only CONNECTED ones; a controller missing from the
+    # result was not reached, which is not the same as one that answered with
+    # nothing.
+    ch = (ct.chip_health().get("controllers") or {}).get("1", {})
+    print(f"  chip_health   : {ch.get('present_counts')}")
+    # NOT present_filaments(): that one sleeps every board to power the
+    # presence-sense rail and returns global filament indices. This reads chips.
+
+    dg = (ct.diagnosis().get("controllers") or {}).get("1", {})
+    # op / reg / addr / missing -- a chip that ACKs its address but will not
+    # talk registers is distinguishable from one that is simply absent. Every
+    # other read in this client shows both as "not working".
+    print(f"  diagnosis     : {dg.get('diagnosis_counts')}")
+
+    tca = (ct.read_tca9554().get("controllers") or {}).get("1", {}).get("tca9554_channels") or []
+    print(f"  read_tca9554  : {len(tca)} channel(s); ch0 chips="
+          f"{list((tca[0].get('chips') if tca else {}) or {})}")
+    # Each register carries its own ACK flag -- that is what says a value is
+    # real rather than a bus artefact.
+
+    # self_test() DRIVES PINS. The backend refuses it on a controller running a
+    # schedule and says so in selftest_error rather than disarming for you.
+    stt = (ct.self_test().get("controllers") or {}).get("1", {})
+    if stt.get("selftest_error"):
+        print(f"  self_test     : refused — {stt['selftest_error']}")
+    else:
+        print(f"  self_test     : {stt.get('selftest_counts')} "
+              f"via '{stt.get('selftest_method')}'")
+        if stt.get("selftest_method") == "polarity":
+            # Fallback: firmware without the 0x60 handler derives liveness from
+            # the 0x61 register read's ACK flags. A weaker answer, not a wrong
+            # one -- but worth knowing which one you got.
+            print("      ^ fallback method: firmware has no 0x60 self-test handler")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 @section(6, "Heating ladder + BATCH verify", needs="energise")
 def s6(ct, args):
     targets = {args.filament: 1500}
