@@ -990,6 +990,12 @@ class CTClient:
     #    killed script. Relayed pulses renew it in firmware, so the only thing
     #    the host has to size is the GAP between pulses -- a schedule sparser
     #    than the TTL is indistinguishable from an abandoned arm.
+    # -- How far the PRE-pulse background may sit from the POST-pulse one, in
+    #    units of the background's own sigma, before it is called suspect. 3 is
+    #    the usual "outside the noise" line; the two windows measure the same
+    #    physical baseline, so on a clean pulse they agree to within noise.
+    _BG_DELTA_SIGMA = 3.0
+
     _READY_TTL_FLOOR_MS = 60000     # never below the firmware's own default
     _READY_TTL_GAP_FACTOR = 4       # x inter_pulse_ms; room for a late pulse
                                      # without waiting a whole extra cycle to
@@ -4758,6 +4764,61 @@ class CTClient:
     # saturation: -1 is an ordinary integral now that the clamp is gone (pure
     # noise sums to about zero), and mixing the two firmware generations is
     # ruled out by flashing both sides together.
+    def _check_background(self, e: dict) -> None:
+        """Cross-check the PRE-pulse background against the POST-pulse one, and
+        annotate the event. Uses only fields already on the wire.
+
+        Why this is needed. The charge is
+        `integral = Sx - (F-R)*mean_bg`, so an error in the background biases
+        the charge by `duration * error` -- LINEARLY with pulse width, and
+        silently: a contaminated background produces a perfectly plausible
+        number. On a 1000-sample pulse, 1 LSB of background error is 1000
+        LSB*samples of integral error.
+
+        The two windows are NOT measured the same way, and that asymmetry is
+        the point. The POST window waits `post_bg_gap_samples` (default 50) for
+        the signal to settle after the fall. The PRE window has NO equivalent
+        guard -- the firmware snapshots "the samples right before this edge",
+        abutting the rising edge with zero margin. While the detector processed
+        samples in coarse batches, edges were applied late and the window
+        effectively sat well before the real edge; now that edges are
+        timestamped by DMA position and "applied at the exact sample", the
+        window tightly abuts the edge and picks up whatever leads it (switch
+        pre-charge, gate coupling, a driver turning on before the envelope).
+
+        On a clean measurement both windows sample the same quiet baseline and
+        agree. A material disagreement says the PRE window was contaminated --
+        and the pre window is the one the charge depends on.
+
+        Sets `background_pre_post_delta` (counts, pre - post) always, and
+        `background_suspect` True/False/None. None means UNVERIFIABLE, not
+        clean: it needs `post_bg` (absent when post_bg_n_samples=0 or no sample
+        was taken) and a non-zero sigma to have a scale to judge against.
+        """
+        pre, post, sigma4 = e.get("bg"), e.get("post_bg"), e.get("bg_sigma4")
+        if pre is None or post is None:
+            e["background_pre_post_delta"] = None
+            e["background_suspect"] = None
+            e["background_note"] = ("no post-pulse background to compare against "
+                                    "(post_bg_n_samples=0, or none was taken)")
+            return
+        delta = float(pre) - float(post)
+        e["background_pre_post_delta"] = delta
+        if not sigma4:
+            # Same reasoning as background_flat: zero spread is a dead input,
+            # not a noise-free one, and it leaves no scale to judge delta by.
+            e["background_suspect"] = None
+            e["background_note"] = ("background has zero spread — no scale to "
+                                    "judge the pre/post delta against")
+            return
+        sigma = float(sigma4) / 4.0
+        e["background_suspect"] = abs(delta) > self._BG_DELTA_SIGMA * sigma
+        e["background_note"] = (
+            f"pre-pulse background is {delta:+.1f} counts off the post-pulse one "
+            f"({abs(delta) / sigma:.1f} sigma). The PRE window has no settle "
+            f"guard, so it is the suspect one — and the charge depends on it."
+            if e["background_suspect"] else None)
+
     def _add_charge(self, e: dict, ref_mv: float,
                     integral_signed: bool | None = None) -> None:
         """Add integral_mams (charge, mA*ms) and its scatter to one event.
@@ -4821,6 +4882,7 @@ class CTClient:
             e["integral_saturated"] = True
             return
         e["integral_saturated"] = False
+        self._check_background(e)
         slope = self.pulse_ma(1, ref_mv) - self.pulse_ma(0, ref_mv)   # mA per count
         # 9 decimals, not 6: a 1 ms pulse of a few mA is ~2e-4 mA*ms and its
         # sigma ~1e-5, which 6 decimals would flatten to one significant digit
