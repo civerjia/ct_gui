@@ -4854,6 +4854,21 @@ class CTClient:
         # of the request means the history ran out. background_n == 0 never
         # reaches here -- _add_charge() refuses that outright.
         bg_n = e.get("background_n")
+        # ORDER MATTERS, and the STM32 side flagged it: when background_n is 0,
+        # sigma4 is fixed at 0 too -- but that is "there was no background",
+        # not "the input is flat". Decide on background_n FIRST, or a missing
+        # background gets filed as a dead front end and sends someone to check
+        # the analog path. _add_charge() refuses before reaching here; this
+        # keeps the check correct when called on its own.
+        if bg_n == 0:
+            e["background_partial"] = True
+            e["background_pre_post_delta"] = None
+            e["background_suspect"] = None
+            e["background_n_note"] = ("no background at all (background_n = 0) — "
+                                      "not a flat input; the sample history "
+                                      "could not supply the window")
+            e["background_note"] = None
+            return
         if bg_n is not None and bg_n < self._BG_WINDOW_US:
             e["background_partial"] = True
             e["background_n_note"] = (
@@ -4872,6 +4887,8 @@ class CTClient:
         delta = float(pre) - float(post)
         e["background_pre_post_delta"] = delta
         if not sigma4:
+            # Reachable only with background_n > 0 (the 0 case returned above),
+            # so a zero spread here really is a flat input.
             # Same reasoning as background_flat: zero spread is a dead input,
             # not a noise-free one, and it leaves no scale to judge delta by.
             e["background_suspect"] = None
