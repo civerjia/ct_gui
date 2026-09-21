@@ -306,7 +306,12 @@ class CTClient:
         self._dead_fetched_at = 0.0
         self._dead_stale = False
         # Software-level USER_INDEX -> FID swap — see set_filament_order().
-        self.filament_order: dict[int, int] = {}
+        # The BACKEND is the authority; these are this client's SNAPSHOT of it,
+        # taken once on first use. None = not fetched yet (lazy, so constructing
+        # a CTClient still costs no network round trip).
+        self._order: dict[int, int] | None = None
+        self._order_rev: dict[int, int] = {}
+        self._order_epoch: str | None = None
         self._order_rev: dict[int, int] = {}     # FID -> USER_INDEX, see _user_index_of
         # Auto-retry for TRANSIENT failures only — see _is_transient() below.
         # Does NOT retry deterministic rejections (dead filament, bad state,
@@ -996,6 +1001,101 @@ class CTClient:
         entries you need, and pass the whole list to set_filament_order()."""
         return list(range(cls.FILAMENT_COUNT))
 
+    @property
+    def filament_order(self) -> dict[int, int]:
+        """This client's USER_INDEX -> FID table (sparse: only entries that
+        differ from identity). Read-only -- assign via set_filament_order().
+
+        SNAPSHOT, taken once, deliberately NOT re-polled. Every index this
+        client sends or receives is crossed through it, so a table that changed
+        halfway through a loop would send some commands under the old lens and
+        some under the new, with nothing in any result saying which. A script's
+        numbering has to hold still for the length of the script.
+
+        So: a new CTClient inherits whatever order the backend currently holds;
+        an already-running one keeps the order it started with. Call
+        reload_filament_order() to deliberately re-sync, and
+        filament_order_status() to see whether you have drifted from the
+        backend.
+        """
+        if self._order is None:
+            self._adopt_order(self._get("/api/filament-order", timeout=10.0))
+        return self._order
+
+    def _adopt_order(self, snap: dict) -> None:
+        """Install a backend snapshot as this client's order."""
+        if not snap.get("ok"):
+            # Identity is the only safe fallback: it is the one mapping that
+            # cannot send a command to a filament other than the one named. An
+            # order we failed to read must not be GUESSED -- but record that we
+            # never got one, so filament_order_status() can say so rather than
+            # reporting a confident identity.
+            self._order, self._order_rev, self._order_epoch = {}, {}, None
+            return
+        seq = list(snap.get("order") or range(self.FILAMENT_COUNT))
+        self._order = {i: int(v) for i, v in enumerate(seq) if int(v) != i}
+        self._order_rev = {v: k for k, v in self._order.items()}
+        self._order_epoch = snap.get("epoch")
+        # The dead cache holds USER_INDEX values translated under the PREVIOUS
+        # order, so it now names the wrong filaments. Drop it rather than
+        # translate.
+        self._dead_fetched_at = 0.0
+
+    def reload_filament_order(self) -> list[int]:
+        """Re-read the order from the backend and adopt it, discarding this
+        client's snapshot. Returns the new 96-entry list.
+
+        The deliberate version of what the property will not do on its own --
+        call it at a point where you know no partially-issued operation is in
+        flight, not inside a loop.
+        """
+        self._adopt_order(self._get("/api/filament-order", timeout=10.0))
+        return self.get_filament_order()
+
+    def filament_order_status(self) -> dict:
+        """Compare this client's snapshot against the backend's live order.
+
+        Returns {"ok", "in_sync", "client": [96], "backend": [96],
+        "epoch_client", "epoch_backend", "backend_restarted", "set_by",
+        "note"}. Never raises.
+
+        `backend_restarted` True means the backend has been restarted since
+        this client took its snapshot: the order is held in memory only and a
+        restart forgets it, so the backend is back at identity while this
+        client is still crossing indices through the old table. Nothing will
+        error -- this client stays self-consistent -- but the NEXT script to
+        start will get identity, so re-apply the order if it still reflects the
+        hardware.
+        """
+        live = self._get("/api/filament-order", timeout=10.0)
+        mine = self.get_filament_order()
+        if not live.get("ok"):
+            return {"ok": False, "error": live.get("error"), "in_sync": None,
+                    "client": mine, "backend": None,
+                    "epoch_client": self._order_epoch, "epoch_backend": None,
+                    "backend_restarted": None,
+                    "note": "could not read the backend's order"}
+        theirs = list(live.get("order") or [])
+        restarted = (self._order_epoch is not None
+                     and live.get("epoch") != self._order_epoch)
+        in_sync = theirs == mine
+        if in_sync:
+            note = "client and backend agree"
+        elif restarted:
+            note = ("the backend restarted and forgot the order (it is held in "
+                    "memory only, by design). This client still uses its own "
+                    "snapshot and stays consistent, but the next script to "
+                    "start will get identity — re-apply with "
+                    "set_filament_order() if it still matches the hardware.")
+        else:
+            note = ("another client changed the order after this one took its "
+                    "snapshot. This client keeps its own until "
+                    "reload_filament_order().")
+        return {"ok": True, "in_sync": in_sync, "client": mine, "backend": theirs,
+                "epoch_client": self._order_epoch, "epoch_backend": live.get("epoch"),
+                "backend_restarted": restarted, "set_by": live.get("set_by"),
+                "note": note}
+
     def set_filament_order(self, order) -> None:
         """Define the USER_INDEX -> FID mapping EXPLICITLY.
 
@@ -1032,9 +1132,7 @@ class CTClient:
         """
         n = self.FILAMENT_COUNT
         if order is None or (hasattr(order, "__len__") and len(order) == 0):
-            self.filament_order = {}
-            self._order_rev = {}
-            self._dead_fetched_at = 0.0   # same reason as below
+            self._push_order(None)
             return
         if isinstance(order, dict):
             raise ValueError(
@@ -1073,24 +1171,31 @@ class CTClient:
                 + (f" (and {len(dupes) - 6} more)" if len(dupes) > 6 else "")
                 + ". Every filament 0..%d must appear exactly once, or "
                   "translating results back to your numbering is ambiguous." % (n - 1))
-        # Store only the entries that actually differ: _fid_of/_user_index_of short-
-        # circuit on an empty table, so identity stays free.
-        self.filament_order = {i: v for i, v in enumerate(seq) if v != i}
-        # Built here, not on lookup: set_filament_order() already proved the
-        # mapping is a permutation, so the inverse is well-defined and total.
-        self._order_rev = {v: k for k, v in self.filament_order.items()}
-        # The dead cache holds USER_INDEX values translated under the PREVIOUS
-        # order, so it now names the wrong filaments. Drop it rather than
-        # translate: re-fetching costs one request, and a mask that quietly
-        # points at the wrong indices is the failure this whole naming pass
-        # exists to prevent.
-        self._dead_fetched_at = 0.0
+        self._push_order(seq)
+
+    def _push_order(self, seq) -> None:
+        """Send the order to the backend and adopt what it echoes back.
+
+        Adopting the ECHO rather than the local copy is the point: the backend
+        is the authority, so this client ends up using exactly what the next
+        script will read, epoch included. If the write fails the local table is
+        left ALONE -- silently continuing under a mapping the backend does not
+        have is how two scripts end up disagreeing about which filament is which.
+        """
+        r = self._post("/api/filament-order",
+                       {"order": list(seq) if seq is not None else None},
+                       timeout=10.0)
+        if not r.get("ok"):
+            raise CTError(f"set_filament_order: the backend rejected it: "
+                          f"{r.get('error')}. The local order is unchanged.")
+        self._adopt_order(r)
 
     def get_filament_order(self) -> list[int]:
         """The current mapping as an explicit 96-entry list, order[i] = the
         FID that USER_INDEX i refers to. Identity when no remapping is
         set, so this always round-trips through set_filament_order()."""
-        return [self.filament_order.get(i, i) for i in range(self.FILAMENT_COUNT)]
+        order = self.filament_order     # bound once: property, may fetch
+        return [order.get(i, i) for i in range(self.FILAMENT_COUNT)]
 
     @property
     def _swap_active(self) -> bool:
@@ -1098,12 +1203,13 @@ class CTClient:
         places `filament_order` itself is read are the two crossing functions
         and its own setter/getter -- which makes the boundary rule something a
         grep can check, not just a convention."""
-        return bool(self.filament_order)
+        return bool(self.filament_order)   # property; cached after first use
 
     def _fid_of(self, filament: int) -> Fid:
         """USER_INDEX -> FID. The only outbound crossing (identity with no swap)."""
         f = int(filament)
-        return Fid(self.filament_order.get(f, f) if self.filament_order else f)
+        order = self.filament_order      # bound once, not read twice
+        return Fid(order.get(f, f) if order else f)
 
     def _fids_of(self, filaments) -> list[Fid]:
         """Translate a list of USER_INDEX values to FIDs."""

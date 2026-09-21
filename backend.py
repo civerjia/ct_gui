@@ -1601,6 +1601,69 @@ POWER_STATE_IDLE = 4
 # ACTIVE rather than allowing it: not knowing must not read as permission.
 LAST_POWER_STATE: dict[int, tuple[int, float]] = {}
 
+# ── filament order (USER_INDEX -> FID), held HERE so it outlives a script ────
+# A client-side LENS, not something this backend applies: every endpoint here
+# speaks FID and keeps doing so. It lives in the backend only so a second script
+# sees the same numbering the first one set, instead of every run silently
+# starting at identity.
+#
+# DELIBERATELY NOT PERSISTED TO DISK, unlike DEAD_FIDS. Those two look similar
+# and must not be treated alike:
+#   - dead is a property of the HARDWARE. A burnt filament is still burnt after
+#     a restart, so forgetting it would be unsafe.
+#   - the order is a property of a SESSION's convention. Reloading a stale
+#     permutation from disk into a rig whose backplane has since been rewired
+#     sends every command to the wrong filament, and nothing about that failure
+#     announces itself -- every index stays in range and every call succeeds.
+# Identity is the only honest default for a backend that just started, so a
+# restart forgets, on purpose.
+FILAMENT_ORDER: list[int] | None = None       # None = identity
+# Changes on every backend start. A client that cached an order can compare
+# this and know the backend forgot, rather than assuming its own snapshot is
+# still shared.
+ORDER_EPOCH: str = f"{int(time.time())}-{os.getpid()}"
+ORDER_SET_BY: str = ""
+ORDER_SET_AT: float = 0.0
+_ORDER_LOCK = threading.Lock()
+
+
+def order_snapshot() -> dict:
+    with _ORDER_LOCK:
+        order = list(FILAMENT_ORDER) if FILAMENT_ORDER else list(range(FILAMENT_COUNT))
+        return {"ok": True, "order": order, "identity": FILAMENT_ORDER is None,
+                "epoch": ORDER_EPOCH, "set_by": ORDER_SET_BY,
+                "set_at_s_ago": (round(time.monotonic() - ORDER_SET_AT, 1)
+                                 if ORDER_SET_AT else None)}
+
+
+def order_validate(seq) -> str | None:
+    """Reason this is not a usable order, or None. Checked HERE as well as in
+    the client: the backend is what other clients read it back from, so a
+    non-permutation stored here would corrupt every one of them, not just the
+    caller that sent it."""
+    n = FILAMENT_COUNT
+    if not isinstance(seq, list) or len(seq) != n:
+        return f"expected a list of exactly {n} integers, got {type(seq).__name__} " \
+               f"of length {len(seq) if hasattr(seq, '__len__') else '?'}"
+    try:
+        vals = [int(v) for v in seq]
+    except (TypeError, ValueError):
+        return "entries must be integers"
+    bad = [(i, v) for i, v in enumerate(vals) if not (0 <= v < n)]
+    if bad:
+        return "value(s) outside 0..%d: %s" % (
+            n - 1, ", ".join(f"order[{i}]={v}" for i, v in bad[:8]))
+    if len(set(vals)) != n:
+        seen: dict[int, int] = {}
+        dupes = []
+        for i, v in enumerate(vals):
+            if v in seen:
+                dupes.append(f"FID {v} claimed by both USER_INDEX {seen[v]} and {i}")
+            else:
+                seen[v] = i
+        return "not one-to-one — " + "; ".join(dupes[:6])
+    return None
+
 # ── ACTIVE current floor ─────────────────────────────────────────────────────
 # ACTIVE below the IDLE operating current is refused. The firmware clamps IDLE
 # at 2 A but deliberately does NOT clamp ACTIVE, so this is the only guard on
@@ -3206,6 +3269,13 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "space": "fid", "count": len(entries),
                         "dead": entries, "path": str(DEAD_STATE_PATH)})
 
+        elif path == "/api/filament-order":
+            # The USER_INDEX -> FID lens, so a new script inherits the numbering
+            # the last one set. See FILAMENT_ORDER -- this is not applied here,
+            # it is only remembered here, and it is NOT persisted across a
+            # backend restart on purpose.
+            self._json(order_snapshot())
+
         elif path == "/api/thermal-history":
             # How long each filament has been de-energised, so a measurement
             # that is only meaningful on a COLD filament can check its own
@@ -4371,6 +4441,34 @@ class CtHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         out[str(cid)] = {"tca9554_error": str(exc)}
                 self._json({"ok": bool(out), "controllers": out})
+            elif path == "/api/filament-order":
+                # {"order": [96 ints]} to set, {"order": null} to clear back to
+                # identity. Validated here too -- every other client reads this
+                # back, so a non-permutation stored here corrupts all of them.
+                global FILAMENT_ORDER, ORDER_SET_BY, ORDER_SET_AT
+                order = body.get("order")
+                if order is None:
+                    with _ORDER_LOCK:
+                        FILAMENT_ORDER = None
+                        ORDER_SET_BY = self._client()
+                        ORDER_SET_AT = time.monotonic()
+                    log.info("filament order cleared to identity by %s", self._client())
+                    self._json(order_snapshot())
+                else:
+                    why = order_validate(order)
+                    if why:
+                        self._json({"ok": False, "error": f"bad order: {why}"})
+                    else:
+                        with _ORDER_LOCK:
+                            FILAMENT_ORDER = ([int(v) for v in order]
+                                              if list(map(int, order)) != list(range(FILAMENT_COUNT))
+                                              else None)
+                            ORDER_SET_BY = self._client()
+                            ORDER_SET_AT = time.monotonic()
+                        swapped = sum(1 for i, v in enumerate(order) if int(v) != i)
+                        log.info("filament order set by %s (%d entries differ from identity)",
+                                 self._client(), swapped)
+                        self._json(order_snapshot())
             elif path == "/api/dead-fids":
                 # Mark filaments as must-not-energise, or clear them. FID space.
                 # body: {op: "set"|"add"|"remove", fids: [...], reason: str}
