@@ -2501,8 +2501,12 @@ def adc_ready_arm(host: str, rate_hz: int = 1000000, n_samples: int = 2000,
     detector but not the relay, so PA4 never moves and a fire yields 0 events.
 
     bg_gap / bg_window are ONE symmetric pair in SAMPLES: the ESP32 applies each
-    to BOTH sides of the envelope (settle, then average). The ESP32 rejects
-    bg_window outside 4..128 rather than letting the STM32 clamp silently."""
+    to BOTH sides of the envelope (settle, then average). Both the ESP32 and the
+    STM32 REFUSE out-of-range values rather than clamping: window 1..1024, gap
+    0..3072, and their sum <= 4096 (the STM32's raw-sample history). Clamping
+    would be invisible at both ends -- background_n and background_gap also
+    shrink legitimately when history is short, so a truncated request could not
+    be told apart from one that simply ran out of history."""
     url = (f"http://{host}:{BRIDGE_HTTP_PORT}/adc/ready_arm"
            f"?rate_hz={int(rate_hz)}&n_samples={int(n_samples)}")
     # Omitted entirely rather than sent as 0: the ESP32 falls back to its own

@@ -1447,9 +1447,15 @@ async function sbEmission(ctrl, ch, pos) {
   const cur = { id: await calApi.pulseCursor() };
   sbMsg(`firing ${w} µs HV pulse on CH${ch + 1}.${pos + 1}…`);
   const r = await calApi.fireAndMeasure(cur, ctrl, ch, pos, w);
-  sbMsg(r
-    ? `net Ie ${r.netMa.toFixed(1)} mA · peak ${r.peakMa.toFixed(1)} − bg ${r.bgMa.toFixed(1)} · high ${r.plateauMa.toFixed(1)} mA`
-    : 'no pulse measured (no EVT_PULSE — set heat + emission V, or arm the detector)');
+  // fireAndMeasure always returns an object; `unusable` is set instead of a
+  // current whenever no trustworthy one exists. Say which of the two it was —
+  // "no event at all" and "an event whose background was never measured" send
+  // you to completely different places (link/detector vs. pulse spacing).
+  sbMsg(r.unusable === 'no background'
+    ? 'pulse measured but its current is REFUSED — the STM32 averaged 0 background samples (background_n 0), so bg is 0 for want of a measurement, not because the baseline is at zero. Subtracting it would report ~32 mA too much.'
+    : r.unusable
+      ? 'no pulse measured (no EVT_PULSE — set heat + emission V, or arm the detector)'
+      : `net Ie ${r.netMa.toFixed(1)} mA · peak ${r.peakMa.toFixed(1)} − bg ${r.bgMa.toFixed(1)} · high ${r.plateauMa.toFixed(1)} mA`);
 }
 
 async function sbCalib(ctrl, ch, pos) {
@@ -1461,6 +1467,7 @@ async function sbCalib(ctrl, ch, pos) {
   if (fil == null) { sbMsg('board not mapped to a filament — cannot save curve'); return; }
   const levels = []; for (let mv = from; mv <= to + 1e-6; mv += step) levels.push(Math.round(mv));
   const pts = [], curve = [], cur = { id: await calApi.pulseCursor() };
+  let sbSkipped = 0;
   await calApi.pulseArm();
   try {
     for (let i = 0; i < levels.length; i++) {
@@ -1469,9 +1476,18 @@ async function sbCalib(ctrl, ch, pos) {
       sbMsg(`F${fil} @ ${mv} mV (${i + 1}/${levels.length})…`);
       await calApi.setState(ctrl, ch, pos, 6, mv);                 // VOLTAGE mode = manual heating voltage
       await calApi.tSleep(settle);
-      const r = await calApi.fireAndMeasure(cur, ctrl, ch, pos, 1000), mA = r ? r.netMa : 0;
+      const r = await calApi.fireAndMeasure(cur, ctrl, ch, pos, 1000);
+      // An unmeasurable point goes into the curve as null with the reason, and
+      // is NOT plotted. It used to become 0 mA, which draws as a real "no
+      // emission at this heating voltage" datum and is then fitted as one.
+      if (r.unusable) {
+        curve.push({ heatMv: mv, mA: null, peak: r.peak, unmeasured: r.unusable });
+        sbSkipped++;
+        continue;
+      }
+      const mA = r.netMa;
       pts.push({ x: mv, y: Math.max(0, mA) });
-      curve.push({ heatMv: mv, mA: +mA.toFixed(2), peak: r ? r.peak : null });
+      curve.push({ heatMv: mv, mA: +mA.toFixed(2), peak: r.peak });
       calApi.drawCurve('sbPlot', pts, { xMax: to, yLabel: `Ie (mA) · F${fil}`, xUnit: 'mV' });
     }
   } finally {
@@ -1479,7 +1495,8 @@ async function sbCalib(ctrl, ch, pos) {
   }
   if (curve.length) {
     const s = await calApi.saveCalibration('emission_calibration_sb', { params: { fromMv: from, toMv: to, stepMv: step, settleMs: settle, board: `P${ctrl}.CH${ch + 1}.${pos + 1}` }, curves: { [fil]: curve } });
-    sbMsg(s.ok ? `✓ saved F${fil} curve — ${s.csv}` : `save failed: ${s.error || ''}`);
+    const skipNote = sbSkipped ? ` · ⚠ ${sbSkipped}/${curve.length} point(s) unmeasured (saved as blank, not 0)` : '';
+    sbMsg(s.ok ? `✓ saved F${fil} curve — ${s.csv}${skipNote}` : `save failed: ${s.error || ''}${skipNote}`);
   }
 }
 
@@ -1807,7 +1824,7 @@ const EMI_HTML = `
       <span id="pulseSummary" class="hint">no events</span>
     </div>
     <div class="row compact"><input id="pulseSlider" type="range" min="0" max="0" value="0" title="Scroll through the pulse history (drag right = newest = auto-follow)" style="flex:1" /></div>
-    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th>peak mA</th><th>plat mA</th><th>bg±σ mA</th><th>∫ mA·µs</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
+    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th>peak mA</th><th>plat mA</th><th>bg±σ mA</th><th title="Samples that actually backed the background mean / the settle gap left before the rise, both in samples. n=0 means NO background was measured — that row's ∫ is not a charge. ? = this firmware does not report it.">bg n/gap</th><th>∫ mA·µs</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
   </div>
 
   <div class="batch-box">
@@ -1936,7 +1953,12 @@ let recTimer = null;
 async function recPoll() {
   let j; try { j = await (await fetch('/api/record/status')).json(); } catch { return; }
   if (!j.ok || !j.recording) { if (!j.recording) $p('recStatus').textContent = 'idle'; return; }
-  $p('recStatus').textContent = `● REC ${j.duration_s || 0}s · pulses ${j.pulse_events}`;
+  // no_background = pulses recorded with background_n 0, whose `integral` is
+  // the raw in-envelope sum with nothing subtracted. Surfaced live so a run
+  // that is filling the .csv with uncharges is caught while it is still worth
+  // stopping, not when someone opens the file.
+  $p('recStatus').textContent = `● REC ${j.duration_s || 0}s · pulses ${j.pulse_events}`
+    + (j.no_background ? ` · ⚠ ${j.no_background} with NO background` : '');
 }
 function wireRecord() {
   $p('recStart').onclick = async () => {
@@ -1957,6 +1979,7 @@ function wireRecord() {
     $p('recStart').disabled = false; $p('recStop').disabled = true; $p('recStart').classList.remove('danger');
     if (j.ok) {
       $p('recStatus').textContent = `saved · ${j.pulse_events || 0} pulses`
+        + (j.no_background ? ` · ⚠ ${j.no_background} of them had NO background (their ∫ is not a charge)` : '')
         + (j.still_armed_for && j.still_armed_for.length ? ` (detector still armed for: ${j.still_armed_for.join(', ')})` : '');
       $p('recFiles').innerHTML = j.pulse_file ? `<a href="/api/record/download?file=${j.pulse_file}" download>${j.pulse_file}</a>` : '';
     } else { $p('recStatus').textContent = j.error || 'stop failed'; }
@@ -1964,6 +1987,24 @@ function wireRecord() {
 }
 const PULSE_WIN = 50;        // rows shown at once
 let pulseFollow = true;      // auto-track the newest pulses (slider pinned right)
+// Background measurement, in SAMPLES. ONE symmetric pair applied to BOTH sides
+// of the envelope: settle for `gap`, then average `window` —
+//   <- gap 200 -><- win 50 ->| envelope |<- win 50 -><- gap 200 ->
+//         (pre: SUBTRACTED)                 (post: reference)
+// The pre side is the one that matters: integral = Σx − (F−R)·mean_bg, so an
+// error in the PRE background biases the charge IN PROPORTION TO PULSE WIDTH
+// and arrives as a perfectly plausible number. These are the STM32's defaults;
+// Stream arms through /api/adc/pulse-arm, which sends no pair, so a full-length
+// background looks exactly like this. Used ONLY to tell "the window was short"
+// from "the window was full" — if a (gap, window) pair ever becomes settable
+// from this card, compare against the REQUEST instead of these.
+const PULSE_BG_WINDOW = 50, PULSE_BG_GAP = 200;
+// Top-level background_windowing from the last /api/pulse-events response:
+// true = this firmware windows the background exactly, false = it does not,
+// null = it does not say (fw_build < 0x00030000). null and false are different
+// answers — "unknown" must never be shown as "no" — so the reported flag and
+// "have we asked yet" are tracked separately.
+let pulseBgWindowing = null, pulseBgWindowingKnown = false;
 function renderPulses() {
   const body = $p('pulseBody'); if (!body) return;
   const sl = $p('pulseSlider'), n = pulseList.length;
@@ -1976,19 +2017,67 @@ function renderPulses() {
   const rows = pulseList.slice(off, off + PULSE_WIN);
   // ADC-count fields → emission mA. peak/plateau/bg are absolute (emissionMa);
   // σ (bg_sigma4/4) and integral (Σ of sample−bg) are bg-relative → slope only.
-  body.innerHTML = rows.map((p) =>
-    `<tr><td>${p.id}</td><td>${p.t_us}</td><td>${p.on_us}</td>`
-    + `<td>${emissionMa(p.peak).toFixed(2)}</td>`
-    + `<td>${p.plateau ? emissionMa(p.plateau).toFixed(2) : '—'}</td>`
-    + `<td>${emissionMa(p.bg).toFixed(2)}±${((p.bg_sigma4 / 4) * EMI_MA_PER_COUNT).toFixed(2)}</td>`
-    + `<td>${(p.integral * EMI_MA_PER_COUNT).toFixed(1)}</td></tr>`).join('');
+  body.innerHTML = rows.map((p) => {
+    // background_n = samples that actually backed the mean; background_gap =
+    // the settle gap actually left before the rise. Three cases, all different:
+    //   0     → there was NO background. bg and bg_sigma4 are 0 because nothing
+    //           was averaged, not because the input was quiet, and `integral`
+    //           degenerates to the raw in-envelope sum with NOTHING subtracted
+    //           — a large, entirely plausible number that is not a charge. Show
+    //           both as absent. Printing "0.00±0.00" here made a missing
+    //           background indistinguishable from a genuine quiet baseline.
+    //   null  → firmware that does not report it. Unknown, not zero: bg/∫ are
+    //           printed as they come (they are the best that firmware offers)
+    //           and the count reads "?" rather than a number.
+    //   short → the mean is real but thinner than the request (short history:
+    //           fresh reset, rate change, ADC restart), or the pre-gap did not
+    //           fully take. Flagged, not hidden — a biased bg still integrates.
+    const bn = p.background_n, bgap = p.background_gap;
+    const noBg = bn === 0;
+    const partial = bn > 0 && (bn < PULSE_BG_WINDOW || (bgap != null && bgap < PULSE_BG_GAP));
+    const rowStyle = noBg ? ' style="color:var(--danger)"' : partial ? ' style="color:var(--warn)"' : '';
+    const bgCell = noBg
+      ? '<td title="NO background was measured (background_n 0). bg and σ read 0 because nothing was averaged — not because the input was quiet.">—</td>'
+      : `<td>${emissionMa(p.bg).toFixed(2)}±${((p.bg_sigma4 / 4) * EMI_MA_PER_COUNT).toFixed(2)}</td>`;
+    const bgnCell = bn == null
+      ? '<td title="This firmware does not report background_n/background_gap (fw_build &lt; 0x00030000) — unknown, not zero.">?</td>'
+      : `<td title="${noBg ? 'no background: 0 samples averaged' : bn + ' samples averaged after a ' + (bgap == null ? '?' : bgap) + '-sample settle gap'
+        + (partial ? ' — short of the ' + PULSE_BG_WINDOW + '/' + PULSE_BG_GAP + '-sample default, so the subtracted background is thinner (or less settled) than usual' : '')}">${bn}/${bgap == null ? '?' : bgap}</td>`;
+    const intCell = noBg
+      ? '<td title="Charge refused: with no background, ∫ is Σx over the envelope with nothing subtracted. That is not a charge.">—</td>'
+      : `<td>${(p.integral * EMI_MA_PER_COUNT).toFixed(1)}</td>`;
+    return `<tr${rowStyle}><td>${p.id}</td><td>${p.t_us}</td><td>${p.on_us}</td>`
+      + `<td>${emissionMa(p.peak).toFixed(2)}</td>`
+      + `<td>${p.plateau ? emissionMa(p.plateau).toFixed(2) : '—'}</td>`
+      + bgCell + bgnCell + intCell + '</tr>';
+  }).join('');
   const span = rows.length ? `${off + 1}–${off + rows.length}` : '0';
-  $p('pulseSummary').textContent = `${n} events · showing ${span}${pulseFollow ? ' · live' : ' · held'}`;
+  // Count over the WHOLE history, not the visible window: a run whose charges
+  // are unusable must say so even when the offending rows are scrolled away.
+  const noBgN = pulseList.reduce((a, p) => a + (p.background_n === 0 ? 1 : 0), 0);
+  $p('pulseSummary').textContent = `${n} events · showing ${span}${pulseFollow ? ' · live' : ' · held'}`
+    + (noBgN ? ` · ⚠ ${noBgN} with NO background — their ∫ is not a charge` : '')
+    + (!pulseBgWindowingKnown ? ''
+      : pulseBgWindowing === true ? ''
+      : pulseBgWindowing === false ? ' · ⚠ this firmware does not window the background exactly — bg is approximate'
+      : ' · background windowing not reported by this firmware (unknown, not off)');
 }
 async function pulseTick() {
   if (!masterConnected()) { $p('pulseSummary').textContent = `master (Power ${masterId()}) not connected`; return; }
   let j; try { j = await (await fetch(`/api/pulse-events?controller=${masterId()}&since=${pulseSince}`)).json(); } catch { return; }
   if (j && j.ok === false) { $p('pulseSummary').textContent = `pulse read failed — ${j.error || j.message || ''}`; return; }
+  if (j.ok) {
+    // Top-level (not per event). Absent → null, i.e. "this firmware doesn't
+    // say"; never coerce that to false, which would claim the firmware windows
+    // badly when in fact we have no idea.
+    const was = pulseBgWindowingKnown ? pulseBgWindowing : 'unasked';
+    pulseBgWindowingKnown = true;
+    pulseBgWindowing = (j.background_windowing === undefined) ? null : j.background_windowing;
+    // Redraw on the first answer / a change so the caveat appears without
+    // waiting for the next pulse — but not while the table is still empty,
+    // where it would wipe the "armed — waiting for pulses…" line.
+    if (was !== pulseBgWindowing && pulseList.length) renderPulses();
+  }
   if (j.ok && j.events && j.events.length) {
     pulseList.push(...j.events); if (pulseList.length > 4096) pulseList = pulseList.slice(-4096);
     pulseSince = j.events[j.events.length - 1].id; renderPulses();

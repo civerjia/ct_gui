@@ -2304,6 +2304,11 @@ class MeasurementRecorder:
         self.host: str | None = None
         self.pulse_path: Path | None = None
         self.pulse_count = 0
+        # Recorded pulses whose background_n was 0 — i.e. whose `integral` is
+        # the raw in-envelope sum with nothing subtracted. Counted so a run
+        # that recorded nothing but unusable charges says so while it is
+        # running, instead of at whatever point someone opens the .csv.
+        self.pulse_no_bg = 0
         self.started: float | None = None
         self._pulse_thread: threading.Thread | None = None
         self._pulse_stop = threading.Event()
@@ -2320,6 +2325,7 @@ class MeasurementRecorder:
             if not pa.get("ok"):
                 return {"ok": False, "error": f"pulse arm: {pa.get('error') or pa.get('message')}"}
             self.pulse_count = 0
+            self.pulse_no_bg = 0
             self._pulse_stop.clear()
             self._pulse_thread = threading.Thread(
                 target=self._pulse_loop, args=(host,), name="rec_pulses", daemon=True)
@@ -2340,7 +2346,18 @@ class MeasurementRecorder:
                 # charge. It can also change between pulses, so one value in a
                 # header comment would not be enough. Empty cell = the firmware
                 # did not report it (do not backfill 1e6 when reading these).
-                f.write("id,t_us,on_us,peak,plateau,bg,post_bg,bg_sigma4,integral,rate_hz,recv_ms\n")
+                #
+                # background_n / background_gap ride along with every row because
+                # integral = Σx − (F−R)·mean_bg: the charge is only as good as the
+                # background that was subtracted from it, and a .csv that records
+                # the charge but not that is a file of numbers nobody can qualify
+                # later. background_n 0 means NO background was measured — that
+                # row's `integral` is the raw in-envelope sum with nothing taken
+                # off, i.e. not a charge — and an EMPTY cell means the firmware
+                # does not report the field at all. Those are different: do not
+                # read a blank as 0 when analysing these files.
+                f.write("id,t_us,on_us,peak,plateau,bg,post_bg,bg_sigma4,integral,"
+                        "background_n,background_gap,rate_hz,recv_ms\n")
                 since = 0
                 while not self._pulse_stop.is_set():
                     r = pulse_events_get(host, since)
@@ -2348,20 +2365,32 @@ class MeasurementRecorder:
                         evs = r.get("events") or []
                         for e in evs:
                             def _cell(v):
-                                # None -> empty cell, never 0: post_bg and
-                                # rate_hz are both legitimately absent, and 0 is
-                                # a real post-pulse current.
+                                # None -> empty cell, never 0: post_bg, rate_hz
+                                # and background_n/background_gap are all
+                                # legitimately absent on older firmware, and 0 is
+                                # a real value for every one of them (a real
+                                # post-pulse current, and a real "no background
+                                # was measured" / "no settle gap was left").
                                 return "" if v is None else v
-                            f.write("{id},{t_us},{on_us},{peak},{plateau},{bg},{post_bg},{bg_sigma4},{integral},{rate_hz},{recv_ms}\n".format(
+                            f.write("{id},{t_us},{on_us},{peak},{plateau},{bg},{post_bg},{bg_sigma4},{integral},"
+                                    "{background_n},{background_gap},{rate_hz},{recv_ms}\n".format(
                                 id=e.get("id", ""), t_us=e.get("t_us", ""), on_us=e.get("on_us", ""),
                                 peak=e.get("peak", ""), plateau=e.get("plateau", ""), bg=e.get("bg", ""),
                                 post_bg=_cell(e.get("post_bg")),
                                 bg_sigma4=e.get("bg_sigma4", ""),
                                 integral=e.get("integral", ""),
+                                background_n=_cell(e.get("background_n")),
+                                background_gap=_cell(e.get("background_gap")),
                                 rate_hz=_cell(e.get("rate_hz")),
                                 recv_ms=e.get("recv_ms", "")))
                             since = e.get("id", since)
                             self.pulse_count += 1
+                            # `is not None and == 0`, never a bare falsy test:
+                            # None (firmware does not report it) must not be
+                            # counted as "no background was measured".
+                            bn = e.get("background_n")
+                            if bn is not None and int(bn) == 0:
+                                self.pulse_no_bg += 1
                         if evs:
                             f.flush()
                     self._pulse_stop.wait(0.3)
@@ -2385,12 +2414,14 @@ class MeasurementRecorder:
                 self._pulse_thread = None
             self.active = False
             return {"ok": True, "pulse_events": self.pulse_count,
+                    "no_background": self.pulse_no_bg,
                     "pulse_file": self.pulse_path.name if self.pulse_path else None,
                     "still_armed_for": still_armed_for}
 
     def status(self) -> dict[str, Any]:
         dur = (time.time() - self.started) if (self.started and self.active) else None
         return {"recording": self.active, "pulse_events": self.pulse_count,
+                "no_background": self.pulse_no_bg,
                 "duration_s": round(dur, 1) if dur else None,
                 "pulse_file": self.pulse_path.name if self.pulse_path else None,
                 "error": self._last_error}
@@ -4398,7 +4429,15 @@ class CtHandler(BaseHTTPRequestHandler):
                 lines = ["filament" + ("," + ",".join(cols) if cols else "")]
                 for fil, curve in sorted(curves.items(), key=lambda kv: int(kv[0])):
                     for pt in curve:
-                        lines.append(str(fil) + "".join("," + str(pt.get(k, "")) for k in cols))
+                        # A JSON null -> EMPTY cell, not the string "None". The
+                        # GUI sends mA null for a point it could not measure
+                        # (no pulse event, or an event with background_n 0, so
+                        # the current would have been ~32 mA of pure offset);
+                        # "None" in a numeric column parses as garbage or, worse,
+                        # gets cleaned to 0 downstream, which is the fabricated
+                        # reading this null exists to avoid.
+                        lines.append(str(fil) + "".join(
+                            "," + ("" if pt.get(k) is None else str(pt.get(k))) for k in cols))
                 base.with_suffix(".csv").write_text("\n".join(lines) + "\n")
                 self._json({"ok": True, "json": str(base.with_suffix(".json")),
                             "csv": str(base.with_suffix(".csv")), "filaments": len(data.get("curves") or {})})
@@ -4653,14 +4692,43 @@ class CtHandler(BaseHTTPRequestHandler):
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
-                # ONE symmetric pair, applied to both sides of the envelope.
+                # ONE symmetric pair, in SAMPLES, applied to BOTH sides of the
+                # envelope: settle for bg_gap, then average bg_window —
+                #   <- gap -><- win ->| envelope |<- win -><- gap ->
+                # (the pre-side mean is the one SUBTRACTED from the charge).
+                # There is no separate post_bg_gap/post_bg_n any more; a caller
+                # still sending those is sending nothing, so say so rather than
+                # arming with the defaults and reporting success.
+                stale = [k for k in ("post_bg_gap", "post_bg_n") if k in body]
+                if stale:
+                    return self._json({"ok": False, "error":
+                        f"{', '.join(stale)} no longer exist — the background is one symmetric "
+                        "pair applied to both sides. Send bg_gap / bg_window."}, HTTPStatus.OK)
                 bgg = body.get("bg_gap")
                 bgw = body.get("bg_window")
                 ttl = body.get("ttl_ms")
+                bgg = None if bgg is None else int(bgg)
+                bgw = None if bgw is None else int(bgw)
+                # Refuse out-of-range, never clamp — the ESP32 and the STM32 both
+                # refuse too, and a silently clamped window would average a
+                # different number of samples than the one that gets recorded as
+                # the request. Checked here as well so the refusal names the
+                # limit instead of arriving as a bare device 400.
+                # Ranges are the STM32's raw-sample history: window 1..1024,
+                # gap 0..3072, and gap+window <= 4096 per side.
+                if bgw is not None and not (1 <= bgw <= 1024):
+                    return self._json({"ok": False, "error":
+                        f"bg_window {bgw} out of range (1..1024 samples)"}, HTTPStatus.OK)
+                if bgg is not None and not (0 <= bgg <= 3072):
+                    return self._json({"ok": False, "error":
+                        f"bg_gap {bgg} out of range (0..3072 samples)"}, HTTPStatus.OK)
+                if bgw is not None and bgg is not None and bgg + bgw > 4096:
+                    return self._json({"ok": False, "error":
+                        f"bg_gap + bg_window = {bgg + bgw} exceeds the STM32's 4096-sample "
+                        "history; one of them has to come down"}, HTTPStatus.OK)
                 self._json(adc_ready_arm(host, int(body.get("rate", 1000000)),
                                          int(body.get("n_samples", 2000)),
-                                         None if bgg is None else int(bgg),
-                                         None if bgw is None else int(bgw),
+                                         bgg, bgw,
                                          None if ttl is None else int(ttl)))
             elif path == "/api/recover":
                 # Clear state left behind by an operation that did not finish:

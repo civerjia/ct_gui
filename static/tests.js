@@ -216,6 +216,12 @@ async function setHvAndWait(chan, magV, timeoutMs = 8000) {
   return true;
 }
 async function pulseCursor() { const j = await tGetJ('/api/pulse-events?since=0'); return (j && j.last_id) || 0; }
+// Fire one pulse and return its measurement. ALWAYS returns an object, never
+// null: `unusable` is a short reason string whenever there is no trustworthy
+// current, and `mA`/`netMa` are then null rather than 0. Callers must branch on
+// `unusable` — a failed measurement that comes back as 0 mA is indistinguishable
+// from a filament that really emitted nothing, and gets averaged, plotted,
+// classified and saved as if it were a reading.
 async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
   await firePulse(ctrl, ch, pos, widthUs);
   // Poll until a NEW event (id > cursor) lands rather than a single fixed wait —
@@ -229,8 +235,23 @@ async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
     evs = (j && j.events) || [];
     if (evs.length) { cur.id = (j.last_id != null) ? j.last_id : evs[evs.length - 1].id; break; }
   } while (Date.now() < deadline);
-  if (!evs.length) return null;
+  if (!evs.length) return { unusable: 'no event', mA: null, netMa: null, peak: null, plateau: null, bg: null };
   const e = evs[evs.length - 1];
+  // background_n = samples that actually backed `bg`. 0 means the STM32
+  // measured NO background for this pulse: `bg` is 0 because nothing was
+  // averaged, not because the baseline was at zero. peakToMa is affine with a
+  // large negative offset (peakToMa(0) ≈ −32 mA), so plateauMa − peakToMa(0)
+  // would hand back a current tens of mA too high — a legal-looking number
+  // with nothing behind it. Refuse it rather than average it into a result.
+  // Checked BEFORE anything else about bg: with no background, bg_sigma4 is 0
+  // too, and reading that first files a missing background as a dead front end
+  // and sends someone to check an analog path that is fine.
+  // null (old firmware that does not report the field) is NOT 0 — it falls
+  // through and is measured as before, which is all that firmware can offer.
+  if (e.background_n === 0) {
+    return { unusable: 'no background', mA: null, netMa: null, peak: e.peak, plateau: e.plateau, bg: null,
+             id: e.id, background_n: 0, background_gap: e.background_gap };
+  }
   // Per-pulse summary carries raw ADC counts: peak (highest single sample),
   // plateau (MEAN over the pulse's steady/hot region — hundreds of samples, edges
   // excluded, matches the DC steady-state mean), bg (baseline). peakToMa is affine,
@@ -241,9 +262,14 @@ async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
   const bgMa = (e.bg != null) ? peakToMa(e.bg) : 0;
   const plateauMa = (e.plateau != null) ? peakToMa(e.plateau) : peakMa;
   return {
+    unusable: null,
     peak: e.peak, plateau: e.plateau, bg: e.bg,
     mA: Math.max(0, plateauMa - bgMa),
     peakMa, plateauMa, bgMa, netMa: plateauMa - bgMa,
+    // Passed through so a caller can see a THIN background (short history) even
+    // though it was good enough to subtract. null on firmware that doesn't say.
+    background_n: e.background_n == null ? null : e.background_n,
+    background_gap: e.background_gap == null ? null : e.background_gap,
   };
 }
 
@@ -641,7 +667,7 @@ async function test4() {
   const widthUs = parseInt($t('t4Width').value, 10) || 1000;
   const nMin = parseFloat($t('t4Min').value) || 2, nMax = parseFloat($t('t4Max').value) || 40;
   const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
-  const items = [], bad = [], cur = { id: await pulseCursor() }; let cer = null;
+  const items = [], bad = [], unmeasured = [], cur = { id: await pulseCursor() }; let cer = null;
   try {
     tMsg(`Emission → −${emV} V…`);
     if (!(await setHvAndWait('emission', emV))) return;
@@ -654,19 +680,35 @@ async function test4() {
       await setState(m.ctrl, m.ch, m.pos, 5, heatMa);     // ACTIVE
       await tSleep(settle);
       if (abortFlag) { await setState(m.ctrl, m.ch, m.pos, 2, 0); break; }
-      const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs), mA = r ? r.mA : 0;
+      const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs);
       await setState(m.ctrl, m.ch, m.pos, 2, 0);          // STOP before next
+      // No trustworthy current for this filament (no event at all, or an event
+      // whose background was never measured). It is NOT 0 mA: 0 classifies as
+      // 'open' and accuses the filament of a fault the measurement never
+      // established. Its own bucket, its own bar colour, and it blocks the PASS
+      // — "all in range" must not be said about filaments nobody measured.
+      if (r.unusable) {
+        unmeasured.push(`F${f}: ${r.unusable}`);
+        items.push({ f, value: 0, cls: 'skip' });
+        drawBars('t4Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(nMax * 1.5, 60), fmt: (v) => v.toFixed(0) });
+        continue;
+      }
+      const mA = r.mA;
       const cls = (mA >= nMin && mA <= nMax) ? 'ok' : (mA < nMin ? 'open' : 'short');
       items.push({ f, value: Math.max(0, mA), cls });
       if (cls !== 'ok') bad.push(`F${f}: ${mA.toFixed(1)} mA`);
       drawBars('t4Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(nMax * 1.5, 60), fmt: (v) => v.toFixed(0) });
     }
     testResult('t4Result', {
-      title: 'Emission current', pass: bad.length === 0,
-      counts: [{ n: fils.length, label: 'tested' }, { n: fils.length - bad.length, label: 'in-range' }, { n: bad.length, label: 'out', bad: bad.length > 0 }],
-      note: `range ${nMin}–${nMax} mA`, flagged: bad,
+      title: 'Emission current', pass: bad.length === 0 && unmeasured.length === 0,
+      counts: [{ n: fils.length, label: 'tested' }, { n: fils.length - bad.length - unmeasured.length, label: 'in-range' },
+               { n: bad.length, label: 'out', bad: bad.length > 0 },
+               { n: unmeasured.length, label: 'unmeasured', bad: unmeasured.length > 0 }],
+      note: `range ${nMin}–${nMax} mA`, flagged: bad.concat(unmeasured),
     });
-    tMsg(`Emission current test done — ${bad.length ? bad.length + ' out of range' : 'all in range'}.`, bad.length ? 'bad' : '');
+    tMsg(`Emission current test done — ${bad.length ? bad.length + ' out of range' : 'all measured in range'}`
+      + `${unmeasured.length ? `, ${unmeasured.length} NOT measured` : ''}.`,
+      (bad.length || unmeasured.length) ? 'bad' : '');
   } finally {
     if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 2, 0);
     await hvEnable('emission', false); await lutZeroV('emission'); await pulseDisarm();
@@ -683,7 +725,7 @@ async function test5() {
   const nLevels = Math.max(1, Math.round((toA - fromA) / stepA) + 1);   // integer index avoids float drift dropping the top level
   const levels = []; for (let k = 0; k < nLevels; k++) levels.push(+(fromA + k * stepA).toFixed(3));
   const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
-  const curves = {}, cur = { id: await pulseCursor() }; let cer = null;
+  const curves = {}, cur = { id: await pulseCursor() }; let cer = null, skipped = 0;
   const params = { fromA, toA, stepA, settleMs: settle, emissionV: -emV, pulseUs: widthUs, levels };
   try {
     tMsg(`Calibration — emission → −${emV} V (${fils.length} filaments × ${levels.length} levels)…`);
@@ -698,8 +740,14 @@ async function test5() {
         tMsg(`Calibration: F${f} (${i + 1}/${fils.length}) @ ${a.toFixed(2)} A…`);
         await setState(m.ctrl, m.ch, m.pos, 5, Math.round(a * 1000));   // ACTIVE @ a amps
         await tSleep(settle);
-        const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs), mA = r ? r.mA : 0;
-        curves[f].push({ heatA: a, mA: +mA.toFixed(2), peak: r ? r.peak : null });
+        const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs);
+        // A point with no trustworthy current is saved as mA null + the reason,
+        // and is not plotted or fitted. Writing 0 instead drew it as a real
+        // "no emission at this heating current" reading, and the saved curve
+        // gave no way to tell that apart afterwards.
+        if (r.unusable) { curves[f].push({ heatA: a, mA: null, peak: r.peak, unmeasured: r.unusable }); skipped++; continue; }
+        const mA = r.mA;
+        curves[f].push({ heatA: a, mA: +mA.toFixed(2), peak: r.peak });
         pts.push({ x: a, y: Math.max(0, mA) });
         drawCurve('t5Plot', pts, { xMax: toA, yLabel: `Ie (mA) · F${f}` });
       }
@@ -714,10 +762,13 @@ async function test5() {
     const save = await tPostJ('/api/calibration/save', { name: 'emission_calibration', data: { params, curves } });
     testResult('t5Result', {
       title: 'Emission calibration', pass: save.ok ? null : false,
-      counts: [{ n: save.filaments != null ? save.filaments : Object.keys(curves).length, label: 'curves' }],
-      note: save.ok ? `saved · ${save.csv || 'disk'}` : `save failed: ${save.error || ''}`,
+      counts: [{ n: save.filaments != null ? save.filaments : Object.keys(curves).length, label: 'curves' },
+               { n: skipped, label: 'unmeasured pts', bad: skipped > 0 }],
+      note: (save.ok ? `saved · ${save.csv || 'disk'}` : `save failed: ${save.error || ''}`)
+        + (skipped ? ` · ${skipped} point(s) had no trustworthy current — saved blank, NOT 0` : ''),
     });
-    tMsg(`Calibration done — ${Object.keys(curves).length} filaments ${save.ok ? 'saved to disk' : 'NOT saved'}.`, save.ok ? '' : 'bad');
+    tMsg(`Calibration done — ${Object.keys(curves).length} filaments ${save.ok ? 'saved to disk' : 'NOT saved'}`
+      + `${skipped ? `, ${skipped} point(s) unmeasured` : ''}.`, save.ok ? '' : 'bad');
   } else { tMsg('Calibration produced no data.', 'bad'); }
 }
 
