@@ -3487,6 +3487,7 @@ class CtHandler(BaseHTTPRequestHandler):
             # all connected controllers. The GUI uses this to one-click disable the
             # absent ones so the schedule fits the bench (arm rejects absent boards).
             present = []
+            iso_errors: dict[str, str] = {}
             for cid, link in CONTROLLERS.items():
                 if not link.client.connected:
                     continue
@@ -3498,8 +3499,11 @@ class CtHandler(BaseHTTPRequestHandler):
                 # power-up → then read. Leaves boards at Sleep (iso on, low power).
                 try:
                     prep_filaments(link, cid - 1, 2, None)   # state 2 = Sleep → iso on
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Without iso power the INA219s cannot answer, so EVERY board
+                    # reads absent. Reporting that as "0 present" states a fact
+                    # the scan never established.
+                    iso_errors[str(cid)] = str(exc)
                 time.sleep(0.4)
                 # presence (CH_GET_PRESENT) still flakes on a slow link → union a
                 # few reads; stop early once two passes agree on a non-empty set.
@@ -3518,7 +3522,17 @@ class CtHandler(BaseHTTPRequestHandler):
                     if c == cid - 1 and (ch, pos) in pres:
                         present.append(fil)
             present = sorted(set(present))
-            self._json({"ok": True, "present": present, "count": len(present),
+            # If iso power could not be applied, "0 present" is not a finding --
+            # the INA219s simply had no supply to answer from. Say which
+            # controllers that happened on rather than letting the count stand
+            # as a measurement.
+            self._json({"ok": not iso_errors, "present": present,
+                        "count": len(present),
+                        "iso_enable_errors": iso_errors or None,
+                        "error": (f"could not power the presence rail on controller(s) "
+                                  f"{sorted(iso_errors)} — a board reads ABSENT without "
+                                  f"it, so this count is not a presence result"
+                                  if iso_errors else None),
                         "note": "boards left at Sleep (iso on) after the scan"})
         elif path == "/api/hv-snapshot":
             # Raw per-channel ISO-grid bitmap for one controller (?controller=1|2,
@@ -4293,12 +4307,21 @@ class CtHandler(BaseHTTPRequestHandler):
                 link = CONTROLLERS.get(cid)
                 if not link or not link.client.connected:
                     return self._json({"ok": False, "error": f"controller {cid} not connected"}, HTTPStatus.OK)
+                # FAIL CLOSED. This asks "is a schedule firing right now?"
+                # before changing one filament's power state. Swallowing the
+                # error meant a guard that could not run was a guard that
+                # passed -- the one case where the answer matters most is
+                # exactly when the link is sick enough to fail the read.
                 try:
                     st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
-                    if st and st.get("state") == 2:
-                        return self._json({"ok": False, "error": "running — disarm first"}, HTTPStatus.OK)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    return self._json(
+                        {"ok": False, "error": f"cannot confirm controller {cid} is "
+                                               f"not running a schedule ({exc}); "
+                                               f"refusing rather than assuming idle"},
+                        HTTPStatus.OK)
+                if st and st.get("state") == 2:
+                    return self._json({"ok": False, "error": "running — disarm first"}, HTTPStatus.OK)
                 ft, flags, payload = build_payload("CH_SET_POWER_STATE", {
                     "channel": ch, "mux_port": pos, "state": state, "arg": arg,
                 })
@@ -4904,12 +4927,23 @@ class CtHandler(BaseHTTPRequestHandler):
                         pass
                 found["energised_filaments"] = sorted(hot)
                 if hot and bool(body.get("stop_heating")):
+                    # A failed emergency STOP must never be silent: this is the
+                    # call someone makes BECAUSE something is already wrong, and
+                    # reporting the filaments it found while hiding that it could
+                    # not stop them is the worst combination available here.
+                    stop_errors = {}
                     for cid, link in CONTROLLERS.items():
                         if link.client.connected:
                             try:
                                 prep_filaments(link, cid - 1, 1, None)   # STOP
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                stop_errors[str(cid)] = str(exc)
+                    found["stop_heating_errors"] = stop_errors or None
+                    found["stop_heating_ok"] = not stop_errors
+                    if stop_errors:
+                        found["error"] = (f"STOP failed on controller(s) "
+                                          f"{sorted(stop_errors)} — filaments may "
+                                          f"still be energised")
                     cleared.append(f"stopped {len(hot)} energised filament(s)")
                 if cleared:
                     log.warning("recover by %s: cleared %s", self._client(), cleared)
