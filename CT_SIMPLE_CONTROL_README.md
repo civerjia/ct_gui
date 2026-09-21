@@ -609,6 +609,42 @@ back  = ct.board_to_filament(board["controller"], board["channel"], board["posit
 print(back)   # 5 -- reverse-translated back to your logical number
 ```
 
+#### The backend holds it, and forgets it on restart
+
+The order used to be a CTClient attribute, so every script silently started at
+identity. The **backend** holds it now: a new client inherits whatever the last
+one set, for as long as the backend stays up.
+
+**Deliberately not persisted to disk**, unlike the dead mask. The two look
+alike and must not be treated alike — `dead` is a property of the HARDWARE (a
+burnt filament is still burnt after a restart), while the order is a property
+of a SESSION's convention. Reloading a stale permutation into a rig whose
+backplane has since been rewired sends every command to the wrong filament, and
+nothing announces it: every index stays in range and every call succeeds.
+Identity is the only honest default for a backend that just started.
+
+The backend only REMEMBERS it — every endpoint still speaks FID, and this
+client still does the crossing.
+
+**Your snapshot does not move.** The client reads the order once and does not
+re-poll. Every index it sends or receives is crossed through that table, so a
+table that changed halfway through a loop would issue some commands under the
+old lens and some under the new, with nothing in any result saying which.
+
+- **`reload_filament_order()`** — deliberately re-sync, at a point you know no
+  partially-issued operation is in flight.
+- **`filament_order_status()`** — compare your snapshot against the backend's
+  live order. `backend_restarted=True` means the backend forgot (memory only,
+  by design): this client stays self-consistent, but the NEXT script to start
+  gets identity, so re-apply if the order still reflects the hardware. The
+  epoch it compares changes on every backend start, so "the backend forgot" is
+  **detected**, not inferred from the order happening to look like identity —
+  which is also what a deliberate clear looks like.
+
+Validation runs on both sides. A rejected write leaves your local table alone:
+continuing under a mapping the backend does not have is how two scripts end up
+disagreeing about which filament is which.
+
 ### Lease
 
 Coordinates write access between your script and the GUI (or other scripts).
@@ -1103,6 +1139,32 @@ if st["ok"] and st["fault"] != 0:
 
 `state`: 1=STOP, 2=SLEEP, 3=STANDBY, 4=IDLE, 5=ACTIVE, 6=VOLTAGE.
 `fault`: 0=none, 1=open filament, 2=OCP/SCP.
+
+### Slew rates
+
+**`get_slew_rates(controller=1)`** / **`set_slew_rates(below, above, warm,
+controller=1)`** — how fast the CC loop may ramp the output, in mV/s. Three
+bands: `below`/`above` are the COLD-start rates, `warm` applies once the
+filament is hot.
+
+⚠ **The ceilings are NOT the defaults.**
+
+| | below | above | warm |
+|---|---|---|---|
+| `SLEW_DEFAULTS` | 400 | 1000 | 2800 |
+| `SLEW_CEILINGS` | 2000 | 5000 | 5000 |
+
+Cold slew sits far below its ceiling deliberately — fast cold ramping is what
+trips OCP on the cold inrush. "Resetting to defaults" by writing the ceilings
+once made cold starts 5×/10× faster. To restore: `ct.set_slew_rates(
+**CTClient.SLEW_DEFAULTS)`.
+
+Below 400 mV/s is **clamped up** to it and the clamp is reported in
+`floored_to_min`. The firmware's own floor is 1 mV/s and it installs that
+silently, which is not "unlimited" but "ramp 10 V in about three hours" — a
+`set_slew_rates(0, 0, 0)` returned ok=True and left this bench at 1/1/1 until a
+readback caught it. Above the ceilings it still clamps, reported separately via
+`clamped`, so the two causes never merge.
 
 ### OCP protection
 
@@ -1656,6 +1718,49 @@ print(results)   # {5: 8.4, 6: 0.1, 7: 9.1}  (fil 6's switch may be
                   # unseated/faulty here — near-zero current with the
                   # switch commanded ON is worth investigating)
 ```
+
+### Building a schedule
+
+Nothing produced an emission table before these existed — a script either
+hand-wrote the rows or read `buildSchedule`/`stepScan` out of `app.js`.
+
+```python
+sch  = ct.build_scan_schedule(mode="stationary", collimator_center=0)
+plan = ct.build_scan_plan(sch["emission"], active_count=35, rotation_ms=360000)
+v    = ct.validate_plan(plan, rotation_ms=360000, t_settle_ms=2000)
+print(ct.gantt(plan, width=72))
+```
+
+**`build_scan_schedule(...)`** — ring geometry → emission rows. A faithful port
+of the GUI's `buildSchedule`/`stepScan`, verified field-by-field against the
+original JS under node across four parameter sets.
+
+⚠ `ring_order` maps a RING POSITION to a filament. It is **not** the client's
+`filament_order` (USER_INDEX → FID), which is applied later, on the wire.
+Conflating them silently reorders the scan geometry while every index still
+looks valid.
+
+⚠ `truncated` is returned, not left implicit. Precision mode generates roughly
+`N × (2·steps+1) × coverage` rows, so hitting the firmware's 8192 cap is the
+**normal** case there — and a scan that quietly ends at ring step 21 of 96
+reads exactly like one that ran fine.
+
+**`build_scan_plan(emission, active_count, rotation_ms)`** — emission rows →
+heating deltas + timing config, holding `active_count` filaments hot at once.
+
+**`validate_plan(plan, rotation_ms, t_settle_ms)`** — is the pre-heat lead long
+enough? This is the public view of the plan's timing: read `lead_ms`,
+`lead_triggers` and `peak_active` from here, **not** from the plan dict's own
+`_lead_triggers`/`_peak_active`, which are underscore-prefixed internals.
+
+**`gantt(plan, width=72)`** — a text overlap chart. **`heating_windows(plan)`**
+and **`is_active_at(plan, filament, trigger)`** answer "was F7 hot when trigger
+42 fired?" without re-deriving the plan.
+
+All four refuse a plan with no emission rows. An empty plan makes every count
+compare 0 against 0, so `validate_plan`, `verify_schedule` and `download` all
+used to pass vacuously — and `verify_schedule` runs immediately before arming,
+so "nothing to check" was being reported as "checked".
 
 ### Schedule download
 
@@ -2961,6 +3066,58 @@ traffic this removes. Use `stop_one(verify=True)` for those.
 > A `SIGKILL` still cannot be caught by anything in this process — only a
 > backend-side watchdog could cover that, and there isn't one yet.
 
+### Board self-test and I²C diagnostics
+
+"Is the hardware wired up and answering" — a different question from "is the
+filament good". All return `{controller: {...}}` keyed 1/2, covering only
+CONNECTED controllers.
+
+| method | what it reads |
+|---|---|
+| `chip_health()` | presence scan — which chips answer |
+| `diagnosis()` | per board+chip: **op / reg / addr / missing** |
+| `read_tca9554()` | expander register dump + the per-read ACK flag |
+| `self_test()` | TCA9554 toggle test — **drives pins** |
+| `read_board_faults()` | per-filament TPS fault / HV-overcurrent, `None` when the validity twin says the read failed |
+
+**`diagnosis()` is the one that earns its keep.** `chip_health()` only checks
+the address ACK, so it happily reports `mux: 16, iso_io: 16` for a board where
+nothing works. `addr` means the chip ACKs its address and will not talk
+registers — and a board-wide `addr` result means **the control cable is
+unplugged**, not that the chips are dead. That cost a working RP2350 a
+near-replacement here before the distinction was read correctly.
+
+`self_test()` is the only one that is not read-only. The backend refuses it on
+a controller running a schedule and says so in `selftest_error` rather than
+disarming for you.
+
+### HV switch toggle test
+
+**`hv_switch_test(controller=1, channel_mask=None)`** — force every HV grid
+switch ON, read the 165 sense back twice, restore OFF. Tests the **switch**,
+not emission; run with the HV voltage at 0. `channel_mask` takes `None` (all
+8), a bitmask (`0b11` = CH1+CH2), or a list (`[0, 1]`).
+
+Three outcomes, not two — a switch that reads back inconsistently is neither a
+pass nor a failure, and collapsing it either way loses the one thing worth
+knowing:
+
+| verdict | meaning |
+|---|---|
+| `pass` | both reads returned 1 |
+| `dead` | both reads returned 0 |
+| `inconclusive` | the reads disagreed, or one never arrived |
+
+Retries follow the same rule: a transport timeout or a busy mailbox is retried,
+**`VERIFY_FAIL` never is** — retrying the failure the test exists to find would
+turn a dead switch into a passing one. Every bit is restored OFF whatever the
+reads said, and `restored_off` is reported as a count rather than assumed.
+
+That third verdict paid for itself immediately: a wrong endpoint in the first
+draft made all 8 switches come back `inconclusive` with `restored_off 0/8` on a
+bench whose switches were fine. With only pass/fail, a tooling bug would have
+read as 8 dead switches.
+
 ### Test & measurement flows
 
 Ports of the GUI's "Calibration & Test" tab, runnable from a script instead of
@@ -3068,6 +3225,23 @@ calibrating a threshold needs a population of real filaments.
 `tps_fault` is read with its `tps_fault_valid` twin: unreadable becomes `None`,
 not "no fault". The GUI's test 1 reads the raw bit, which silently turns every
 unreadable board into a passing one.
+
+### Recovery and saving records
+
+**`recover(stop_heating=False)`** — clear state a killed operation left behind:
+a relay still armed, a schedule still loaded, filaments still energised.
+`stop_heating=True` also de-energises what it finds.
+
+A failed STOP is **reported, not swallowed**: `stop_heating_ok` and
+`stop_heating_errors` say which controllers could not be stopped, with a
+top-level error naming them. This is the call made BECAUSE something is already
+wrong, so reporting the energised filaments it found while hiding that it could
+not stop them would be the worst combination available.
+
+**`save_calibration(name, data)`** — write a record to the backend's
+`calibration/` directory as `<name>_<timestamp>.json` plus a flat `.csv` of
+`data["curves"]`. The file lands next to `backend.py`, **not** next to the
+calling script: the backend owns the disk here.
 
 ### Human-readable results
 
