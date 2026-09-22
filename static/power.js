@@ -958,16 +958,22 @@ function renderHvGrid() {
     const tile = document.createElement('div');
     const tested = hvTest && hvTest.has(k);
     const mark = tested ? hvTest.get(k) : undefined;     // true=pass · false=real fail · 'err'=inconclusive
-    const testPass = mark === true, testErr = mark === 'err';
-    const glyph = testPass ? '✓' : testErr ? '⚠' : '✗';
-    const word = testPass ? 'OK' : testErr ? 'INCONCLUSIVE (link busy/timeout — re-run)' : 'FAILED';
+    const testPass = mark === true, testErr = mark === 'err', testStuck = mark === 'stuck';
+    // A switch that will not release must never carry the pass tick: that tile
+    // also shows "!" for its desired/feedback mismatch, and ✓ beside ! reads as
+    // "tested fine" for the worse of the two failures.
+    const glyph = testPass ? '✓' : testStuck ? '⭘' : testErr ? '⚠' : '✗';
+    const word = testPass ? 'OK'
+      : testStuck ? 'STUCK ON — actuated but did not release; the grid is still connected'
+      : testErr ? 'INCONCLUSIVE (link busy/timeout — re-run)' : 'FAILED (did not actuate)';
     tile.className = 'status-tile ' + (mis ? 'fault' : d ? 'present' : 'absent') + (hvSel.has(k) ? ' selected' : '')
       + (chEnabled(ch) ? '' : ' masked')
-      + (mark === false ? ' test-fail' : testErr ? ' test-err' : '');
+      + (mark === false || testStuck ? ' test-fail' : testErr ? ' test-err' : '');
     tile.innerHTML = `<span class="tile-title">C${ch + 1}.${b + 1}</span><span class="hv-state">${mis ? '!' : d}</span>`
       + (tested ? `<span class="hv-test ${testPass ? 'pass' : testErr ? 'err' : 'fail'}" title="switch verify ${word}">${glyph}</span>` : '');
     tile.title = `CH${ch + 1} bit ${b + 1} — desired ${d}, feedback ${f}`
-      + (tested ? ` · switch test ${testPass ? 'PASS' : testErr ? 'INCONCLUSIVE' : 'FAIL'}` : '');
+      + (tested ? ` · switch test ${testPass ? 'PASS' : testStuck ? 'STUCK ON (did not release)'
+                                     : testErr ? 'INCONCLUSIVE' : 'FAIL (did not actuate)'}` : '');
     tile.addEventListener('click', (e) => {
       if (!chEnabled(ch)) return;                        // masked channel: non-interactive
       if (e.shiftKey) {
@@ -1115,7 +1121,7 @@ async function hvSwitchTest() {
   hvTestAbort = false;
   const btn = $p('hvSelTest'); if (btn) btn.disabled = true;
   const stop = $p('hvSelTestStop'); if (stop) stop.disabled = false;
-  const fails = [], inconc = [];
+  const fails = [], inconc = [], stuck = [];
   let aborted = false;
   await pollPause(true);
   try {
@@ -1127,10 +1133,20 @@ async function hvSwitchTest() {
       $p('hvStatus').textContent = `toggle test CH${c + 1}.${b + 1}… (${hvTest.size + 1}/${keys.length})`;
       const s1 = await hvForceReadBit(c, b, true);       // settled read #1
       const s2 = await hvForceReadBit(c, b, true);       // settled read #2 (must agree)
-      await hvForceReadBit(c, b, false);                 // restore off
-      let mark;                                          // true=pass · false=real dead · 'err'=inconclusive
+      // Restore off AND CHECK IT LANDED. This return used to be discarded, so a
+      // switch that actuates ON reliably but will not RELEASE scored a clean ✓
+      // -- while the same tile showed "!" for its desired/feedback mismatch,
+      // because the switch was still closed. Tick plus warning on one tile, and
+      // the tick is the one people read. Not releasing is the worse failure of
+      // the two: it leaves the grid connected.
+      const off = await hvForceReadBit(c, b, false);
+      let mark;   // true=pass · false=real dead · 'stuck'=won't release · 'err'=inconclusive
       if (s1 === null || s2 === null) { mark = 'err'; inconc.push(`CH${c + 1}.${b + 1}`); }
-      else if (s1 === 1 && s2 === 1) mark = true;        // consistently actuated
+      else if (s1 === 1 && s2 === 1) {                   // actuated — did it release?
+        if (off === 0) mark = true;
+        else if (off === 1) { mark = 'stuck'; stuck.push(`CH${c + 1}.${b + 1}`); }
+        else { mark = 'err'; inconc.push(`CH${c + 1}.${b + 1}`); }   // release unconfirmed
+      }
       else if (s1 === 0 && s2 === 0) { mark = false; fails.push(`CH${c + 1}.${b + 1}`); }  // consistently dead
       else { mark = 'err'; inconc.push(`CH${c + 1}.${b + 1}`); }   // reads disagree → flaky/marginal
       hvTest.set(k, mark);
@@ -1143,9 +1159,12 @@ async function hvSwitchTest() {
   if (stop) stop.disabled = true;
   await refreshHv(true);
   const done = hvTest.size;
-  const ok = done - fails.length - inconc.length;
+  const ok = done - fails.length - inconc.length - stuck.length;
   const parts = [];
-  if (fails.length) parts.push(`FAILED ${fails.join(' ')}`);
+  // STUCK first: a switch that will not release leaves the grid connected, so
+  // it outranks one that never closed.
+  if (stuck.length) parts.push(`STUCK ON ${stuck.join(' ')} (actuated but did NOT release — grid still connected)`);
+  if (fails.length) parts.push(`FAILED ${fails.join(' ')} (did not actuate)`);
   if (inconc.length) parts.push(`INCONCLUSIVE ${inconc.join(' ')} (link busy or flaky switch — re-run)`);
   $p('hvStatus').textContent = aborted
     ? `toggle test ABORTED at ${done}/${keys.length}${parts.length ? ' · ' + parts.join(' · ') : ''}`

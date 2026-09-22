@@ -5361,9 +5361,13 @@ class CTClient:
         failure -- it is a marginal switch, and collapsing it either way loses
         the one thing worth knowing about it:
 
-            pass          both reads returned 1 -- consistently actuated
+            pass          actuated on both reads AND released when restored
             dead          both reads returned 0 -- consistently did not actuate
-            inconclusive  the two reads disagreed, or a read never arrived
+            stuck_on      actuated, but did NOT release when driven back OFF --
+                          the grid is left connected, which is worse than a
+                          switch that never closes
+            inconclusive  the two reads disagreed, a read never arrived, or the
+                          release could not be confirmed
 
         Retries follow the same rule: a transport timeout or a busy mailbox is
         retried, a VERIFY_FAIL never is. Retrying the failure the test exists to
@@ -5416,14 +5420,27 @@ class CTClient:
                 say(f"{label} ({n + 1}/{len(keys)})…")
                 s1 = self._hv_force_read_bit(controller, c, b, True)
                 s2 = self._hv_force_read_bit(controller, c, b, True)
-                # Restore OFF whatever the reads said -- a switch left ON
-                # because its read failed is the worst outcome here.
-                if self._hv_force_read_bit(controller, c, b, False) is not None:
+                # Restore OFF, and CHECK IT LANDED. This used to count a
+                # restore as successful whenever the READ succeeded, ignoring
+                # what it read -- so a switch that actuates ON reliably but will
+                # not release read back 1, counted as restored, and scored a
+                # clean pass. That is the more dangerous failure of the two: the
+                # grid is left connected. The GUI showed it as a tick beside the
+                # tile's own desired/feedback mismatch marker.
+                off = self._hv_force_read_bit(controller, c, b, False)
+                if off == 0:
                     restored += 1
                 if s1 is None or s2 is None:
                     results[label] = "inconclusive"
                 elif s1 == 1 and s2 == 1:
-                    results[label] = "pass"
+                    # It actuated. Whether it RELEASED is a separate question,
+                    # and a switch that will not release is not a pass.
+                    if off == 0:
+                        results[label] = "pass"
+                    elif off == 1:
+                        results[label] = "stuck_on"
+                    else:
+                        results[label] = "inconclusive"
                 elif s1 == 0 and s2 == 0:
                     results[label] = "dead"
                 else:
@@ -5439,7 +5456,9 @@ class CTClient:
             counts[v] = counts.get(v, 0) + 1
         dead = sorted(k for k, v in results.items() if v == "dead")
         inconc = sorted(k for k, v in results.items() if v == "inconclusive")
-        return {"ok": True, "pass": not dead and not inconc, "results": results,
+        stuck = sorted(k for k, v in results.items() if v == "stuck_on")
+        return {"ok": True, "pass": not dead and not inconc and not stuck,
+                "results": results, "stuck_on": stuck,
                 "dead": dead, "inconclusive": inconc, "counts": counts,
                 "channels": [c + 1 for c in channels],
                 # Switches whose restore-to-OFF was confirmed. Short of the
