@@ -411,7 +411,13 @@ if not s.get("controllers", {}).get("1", {}).get("connected"):
 ```
 
 **`present_filaments()`** — Live-scan every connected controller for
-physically-present boards and return the global filament indices found.
+physically-present boards and return the filaments found, **in your own
+numbering (USER_INDEX)** like every other read on this client. The wire
+carries FIDs; they are translated on the way back, which is what makes the
+`set_dead()` pairing below correct — `set_dead()` maps USER_INDEX→FID
+outbound, so handing it raw FIDs would map them a *second* time and disable a
+different set of filaments, silently, and only once a non-identity order is
+installed.
 **Slow** (a few seconds per controller — it sleeps every board to power the
 presence-sense rail, then re-scans I2C) and leaves touched boards at SLEEP
 afterward, so run it once at setup, not in a polling loop. This pairs
@@ -2862,6 +2868,29 @@ Four behaviours worth knowing before you trust a number:
 > never an assumed 1 MSPS: charge and duration scale 1:1 with it, so a guessed
 > rate produces a wrong answer wearing the right units.
 
+> ⚠️ **Which fields have the background removed** — read this before quoting
+> any of them as "the pulse current":
+>
+> | field | | |
+> |---|---|---|
+> | `peak` | **ABSOLUTE** — background INCLUDED | single sample (noisy) |
+> | `plateau` | **ABSOLUTE** — background INCLUDED | mean over the envelope |
+> | `bg` / `post_bg` | **ABSOLUTE** | the background level itself |
+> | `integral` | **NET** — background ALREADY REMOVED | `Σx − (F−R)·mean_bg` |
+>
+> `peak` and `plateau` are measured against the ADC's own zero, **not** against
+> the filament's standing emission. Bench, at 2.8 A heating: `bg` 5.78 mA,
+> `plateau` 15.86 mA — the pulse contributed **10.08 mA** and the other 5.78 mA
+> was already flowing before it. Quoting `plateau_ma` as the pulse current
+> overstates it by the whole background, and the hotter the filament the worse
+> it gets. Subtract — or let `pulse_events_ma()` do it, via `plateau_net_ma`.
+> `integral`/`integral_mams` need no subtraction; doing it twice is the
+> mirror-image mistake.
+>
+> `peak` is additionally **not a level at all** — one conversion, carrying that
+> conversion's full noise. On this bench it ran 9–39 mA on five pulses whose
+> `plateau` never left 15.86–16.07 mA. Use `plateau`.
+
 `peak`/`plateau`/`bg`/`post_bg` are **raw
 ADC counts**, not mA; convert with `pulse_ma()`/`pulse_events_ma()`
 below, never by hand. Persist the returned `last_id` and pass it back as
@@ -2903,6 +2932,18 @@ instead (see `pulse_events_ma()`).
 also gets `peak_ma`/`plateau_ma`/`bg_ma`/`post_bg_ma` fields, converted with ONE live
 reference reading shared across the whole batch. Returns `{"ok",
 "events": [...], "last_id", "ref_mv"}`.
+
+Those are **absolute** (see the warning above), so it also adds the
+subtracted forms — nobody should have to remember to do it by hand:
+
+| field | meaning |
+|---|---|
+| `plateau_net_ma` | `plateau_ma − bg_ma` — **the pulse's own current** |
+| `peak_net_ma` | `peak_ma − bg_ma` (still a single noisy sample) |
+
+Both are **absent** — not `0.0`, not `None` — when there is no background to
+subtract, for the same reason the `_ma` fields are: a net current with no
+background behind it is not a measurement.
 
 It also adds the **charge** per event, so you don't have to know the sample
 rate or the ADC scale yourself:
@@ -2977,10 +3018,12 @@ since = ct.pulse_cursor()                           # cursor, no history
 # fires, and tears both down -- the grid stays off, which is the point.
 ct.fire_single_pulse(5, width_us=1000, measure=True)
 
-r = ct.pulse_events_ma(since)
+r = ct.print_pulse_events(since)    # grouped ABSOLUTE vs NET -- see below
+
+# ...or by hand, if you need the numbers rather than a report:
 for e in r["events"]:
-    print(f"peak {e.get('peak_ma')} mA, plateau {e.get('plateau_ma')} mA "
-          f"(ref {r['ref_mv']} mV)")
+    print(f"pulse {e.get('plateau_net_ma')} mA net "          # NOT plateau_ma
+          f"(plateau {e.get('plateau_ma')} over bg {e.get('bg_ma')})")
     mas = e.get("integral_mams")
     if mas is None:
         print(f"  charge unavailable: {e.get('integral_mams_unavailable')}")
@@ -2990,6 +3033,48 @@ for e in r["events"]:
         print(f"  charge {mas} mA*ms  (sigma {sigma} mA*ms"
               f" @ {e['rate_hz']} Hz){flag}")
 ```
+
+**`print_pulse_events(since=0)`** — Fetch pulse events and print them
+**grouped**, instead of as a wall of numbers. Returns exactly what
+`pulse_events_ma()` does, so it can stand in for that call.
+
+An event carries ~25 fields — half absolute levels, half background-subtracted,
+plus six different "this number is not a measurement" flags. Printed flat, the
+distinction that matters (which figures still contain the standing emission) is
+invisible and the flags scroll past unread. This splits them:
+
+```
+5 pulse event(s)   ref 1227.8 mV (live ADS1115)
+
+#21  width 4993 us   1000.0 kSPS   bg n=50 gap=800
+  ABSOLUTE — background still included
+    peak            1355 ct     24.808 mA   single sample: circuit noise, not the pulse level
+    plateau         1142 ct     15.900 mA   mean over the whole envelope, ramps included
+    bg (pre)         899 ct      5.738 mA   sigma 8.25 ct = 0.345 mA
+    post_bg          901 ct      5.822 mA   pre−post -2.0 ct (0.2 sigma)
+  NET — background removed
+    plateau − bg                10.162 mA   <- the pulse's own current
+    charge                      50.786 mA·ms   +/- 0.024
+    charge/width                10.171 mA   cross-check against plateau − bg
+```
+
+Quoting an ABSOLUTE figure as "the pulse current" is the easiest mistake to
+make with this data and the hardest to notice, because the number looks
+perfectly reasonable — it is just the pulse *plus* whatever the filament was
+already emitting. Anything marked `!!` is not a measurement; read that line
+before reading the numbers above it.
+
+`charge/width` is printed as a cross-check, not as a second result: with
+`plateau_margin` at 0 the plateau mean and the integral cover the **same**
+span, so they agree to ~0.1% on this bench. That confirms both paths used the
+same background — it is not independent confirmation of the level.
+
+**`format_pulse_events(r)` / `format_pulse_event(e, ref_mv=None)`** — the same
+rendering as a string instead of printed, for a whole result (or a bare list of
+events, e.g. `fire_single_pulse(measure=True)`'s `"measured"`) and for a single
+event respectively. Pass the batch's `ref_mv` to the single-event form so the
+count→mA scale shown for σ matches the one the event's fields were converted
+with; without it, one live reading is fetched.
 
 **`measure_pulse_current(filament, num_pulses=1, width_us=1000, rate_hz=1000000, ...)`**
 — Identical work to `fire_single_pulse(..., measure=True)`, which is the

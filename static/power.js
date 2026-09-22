@@ -904,7 +904,7 @@ const HV_HTML = `
       <label class="numlabel">pos<select id="sbPos">${[1, 2, 3, 4, 5, 6, 7, 8].map((n) => `<option>${n}</option>`).join('')}</select></label>
     </div>
     <div class="seg sm" id="sbSeg">
-      <button class="seg-btn active" data-sb="2" title="Emission current — fire one pulse on the selected board and read the per-pulse measurement (net Ie = peak − bg). Set heating current + emission voltage manually first.">Emis I</button>
+      <button class="seg-btn active" data-sb="2" title="Emission current — fire one pulse on the selected board and read the per-pulse measurement (net Ie = plateau − bg — the plateau MEAN, not the single-sample peak, which is noise). Set heating current + emission voltage manually first.">Emis I</button>
       <button class="seg-btn" data-sb="3" title="Emission calibration — sweep heating voltage (mV), read per-pulse emission current at each step, plot + save the curve. Set emission V manually first.">Calib</button>
       <button class="seg-btn" data-sb="4" title="Impedance sweep — voltage sweep, plots V-I, fit R₀">Imped</button>
     </div>
@@ -1844,7 +1844,7 @@ const EMI_HTML = `
       <span id="pulseSummary" class="hint">no events</span>
     </div>
     <div class="row compact"><input id="pulseSlider" type="range" min="0" max="0" value="0" title="Scroll through the pulse history (drag right = newest = auto-follow)" style="flex:1" /></div>
-    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th>peak mA</th><th>plat mA</th><th>bg±σ mA</th><th title="Samples that actually backed the background mean / the settle gap left before the rise, both in samples. n=0 means NO background was measured — that row's ∫ is not a charge. ? = this firmware does not report it.">bg n/gap</th><th title="Charge: integral converted with THIS pulse's own sample_rate_hz, not an assumed rate. — = the event carried no rate.">∫ mA·µs</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
+    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th title="ABSOLUTE — the background is NOT removed, and this is a SINGLE sample, so it carries the full noise of one conversion. Not the pulse current.">peak mA</th><th title="ABSOLUTE — the background is NOT removed. Mean over the whole envelope, ramps included. The pulse's own current is the next column (plat − bg), not this one.">plat mA</th><th title="ABSOLUTE — the pre-pulse background level itself, ± its sigma. This is what gets subtracted.">bg±σ mA</th><th title="NET emission current = plat − bg, i.e. what THIS pulse added on top of the standing emission. This is the pulse current; the peak/plat columns are absolute levels that still contain the background.">net mA</th><th title="Samples that actually backed the background mean / the settle gap left before the rise, both in samples. n=0 means NO background was measured — that row's ∫ is not a charge. ? = this firmware does not report it.">bg n/gap</th><th title="Charge: integral converted with THIS pulse's own sample_rate_hz, not an assumed rate. — = the event carried no rate.">∫ mA·µs</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
   </div>
 
   <div class="batch-box">
@@ -2059,6 +2059,15 @@ function renderPulses() {
     const bgCell = noBg
       ? '<td title="NO background was measured (background_n 0). bg and σ read 0 because nothing was averaged — not because the input was quiet.">—</td>'
       : `<td>${emissionMa(p.bg).toFixed(2)}±${((p.bg_sigma4 / 4) * EMI_MA_PER_COUNT).toFixed(2)}</td>`;
+    // NET = plat − bg: the current THIS pulse added, which is the number a
+    // reader actually wants. peak/plat are absolute levels — on a filament
+    // already emitting, most of them can be standing DC (bench: bg 5.8 mA,
+    // plat 15.9 mA, so the pulse was 10.1 mA, not 15.9). Both counts are
+    // needed; with no background there is nothing to subtract and the cell
+    // stays absent rather than showing the absolute level unmarked.
+    const netCell = (noBg || p.plateau == null || p.bg == null)
+      ? '<td title="No background to subtract — the absolute plat column is NOT the pulse current.">—</td>'
+      : `<td>${((p.plateau - p.bg) * EMI_MA_PER_COUNT).toFixed(2)}</td>`;
     const bgnCell = bn == null
       ? '<td title="This firmware does not report background_n/background_gap (fw_build &lt; 0x00030000) — unknown, not zero.">?</td>'
       : `<td title="${noBg ? 'no background: 0 samples averaged' : bn + ' samples averaged after a ' + (bgap == null ? '?' : bgap) + '-sample settle gap'
@@ -2077,7 +2086,7 @@ function renderPulses() {
     return `<tr${rowStyle}><td>${p.id}</td><td>${p.t_us}</td><td>${p.on_us}</td>`
       + `<td>${emissionMa(p.peak).toFixed(2)}</td>`
       + `<td>${p.plateau ? emissionMa(p.plateau).toFixed(2) : '—'}</td>`
-      + bgCell + bgnCell + intCell + '</tr>';
+      + bgCell + netCell + bgnCell + intCell + '</tr>';
   }).join('');
   const span = rows.length ? `${off + 1}–${off + rows.length}` : '0';
   // Count over the WHOLE history, not the visible window: a run whose charges

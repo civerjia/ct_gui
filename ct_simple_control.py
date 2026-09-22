@@ -482,7 +482,16 @@ class CTClient:
 
     def present_filaments(self) -> list[int]:
         """Live-scan every connected controller for physically-present
-        boards and return the global filament indices found.
+        boards and return the filaments found, in YOUR numbering
+        (USER_INDEX), same as every other read on this client.
+
+        The wire carries FIDs; they are translated here, which is the whole
+        reason this does not just return the response. Handing FIDs back
+        would break the documented use below in the worst possible way:
+        set_dead() takes USER_INDEX and maps outbound, so feeding it FIDs
+        maps them a second time and marks a DIFFERENT set of filaments dead
+        -- silently, and only once a non-identity order is installed, so it
+        tests clean on the bench that has no remapping.
 
         SLOW (several seconds per controller — it sleeps every board to
         power the presence-sense rail, then re-scans I2C) and leaves
@@ -495,7 +504,7 @@ class CTClient:
             ct.set_dead(set(range(96)) - present)
         """
         r = self._get("/api/present-filaments", timeout=30.0)
-        return list(r.get("present") or [])
+        return [self._user_index_of(int(f)) for f in (r.get("present") or [])]
 
     # ── active-list mapping (filament <-> power slot) ─────────────────────────
     # Which global filament (0-95) sits at which power slot — the
@@ -4729,7 +4738,15 @@ class CTClient:
             "on_us"     MEASURED pulse width, from the real envelope on the
                         STM32's PA4 pin -- not the commanded width. Compare it
                         against what you asked for; they should agree closely.
-            "peak"      highest raw code inside the pulse. **None when not
+            "peak"      highest raw code inside the pulse. ABSOLUTE --
+                        the background is NOT removed, so on a filament that
+                        is already emitting, most of this number can be
+                        standing DC rather than pulse. It is also a SINGLE
+                        sample, so it carries the full noise of one
+                        conversion: on this bench peak ran ~7 mA above
+                        plateau on the same pulse, all of it circuit noise.
+                        Do not report peak as "the pulse current"; use
+                        plateau, minus bg. **None when not
                         measured** (empty envelope), on firmware with the
                         measure_flags capability. Older firmware reports the
                         field's initial 0 there, which converts to a confident
@@ -4737,7 +4754,17 @@ class CTClient:
                         on_us, stays the authoritative test and this null is
                         the second layer.
             "plateau"   mean raw code over [rise + plateau_margin, fall),
-                        margin = 0 here so it is the whole envelope. **None
+                        margin = 0 here so it is the whole envelope --
+                        INCLUDING the rise and fall ramps, despite the name.
+                        ABSOLUTE: the background is NOT removed. The pulse's
+                        own current is `plateau - bg`, and nothing in the
+                        event carries that already-subtracted (see
+                        pulse_events_ma()'s plateau_net_ma, which does).
+                        Because margin is 0, plateau*duration and `integral`
+                        cover the SAME span, so they agree to ~0.1% on this
+                        bench -- that agreement checks the two paths use the
+                        same background, it does not independently confirm
+                        the plateau level. **None
                         when not measured** (empty range), on firmware with the
                         measure_flags capability. Older firmware reports "peak"
                         instead, with no flag.
@@ -4746,11 +4773,22 @@ class CTClient:
                         misfires on the CLEANEST data. With margin at 0 the
                         empty case needs duration_samples <= 0 -- a zero-length
                         envelope -- which a real pulse never produces.
-            "bg"        floor of the mean over the 20 samples BEFORE the
-                        rise. If the previous pulse ended fewer than 20 samples
-                        ago, this still holds samples from before THAT pulse --
-                        back-to-back firing quietly degrades bg, and with it
-                        integral and sigma.
+            "bg"        PRE-pulse background: floor of the mean over
+                        `background_n` samples ending `background_gap` samples
+                        BEFORE the rise. Taken RETROSPECTIVELY out of the
+                        STM32's sample history at the moment the rise is
+                        detected -- nothing waits, because a pulse's arrival
+                        cannot be predicted. Symmetric with post_bg: one
+                        gap/window pair (ready_arm's bg_gap_us/bg_window_us,
+                        default 200 us / 50 us) configures both sides.
+                        This is a LEVEL, not a correction: it is the number
+                        you subtract from peak/plateau, and it is what
+                        `integral` already has subtracted.
+                        Pulses closer together than MIN_INTER_PULSE_US leave
+                        no clean history, so the pre-window would hold the
+                        previous pulse's tail -- ready_arm() refuses that
+                        spacing rather than quietly degrading bg, integral
+                        and sigma.
             "post_bg"   mean AFTER the pulse: the STM32 waits ~50 us for the
                         signal to settle, then averages ~50 us. **None when it
                         was not measured** -- either the window is configured
@@ -4791,6 +4829,26 @@ class CTClient:
                         are in samples of THIS rate -- so with it None, they
                         cannot be turned into time or charge at all.
             "recv_ms"   host receive time
+
+        WHICH FIELDS HAVE THE BACKGROUND REMOVED -- read this before
+        quoting any of them as "the pulse current":
+
+            peak      ABSOLUTE   background INCLUDED   single sample (noisy)
+            plateau   ABSOLUTE   background INCLUDED   mean over the envelope
+            bg        ABSOLUTE   the background itself (pre-pulse level)
+            post_bg   ABSOLUTE   the background itself (post-pulse level)
+            integral  NET        background ALREADY REMOVED, exactly:
+                                 Sigma(x) - (F-R)*mean_bg
+
+        So peak and plateau are levels measured against the ADC's own zero,
+        NOT against the filament's standing emission. Measured on this
+        bench at 2.8 A heating: bg 5.78 mA, plateau 15.86 mA -- the pulse
+        contributed 10.08 mA and the other 5.78 mA was already flowing
+        before it. Quoting plateau_ma as the pulse current overstates it by
+        the whole background, and the hotter the filament the worse that
+        gets. Subtract: `plateau_ma - bg_ma` (pulse_events_ma() hands you
+        that as plateau_net_ma). `integral`/`integral_mams` need no such
+        subtraction -- doing it twice is the mirror-image mistake.
 
         peak/plateau/bg/post_bg are RAW ADC
         counts, not mA; convert with pulse_ma()/pulse_events_ma() below,
@@ -5122,6 +5180,23 @@ class CTClient:
         actually used, or None if that read failed and the ~1.2V fallback
         was used instead>}.
 
+        BACKGROUND. peak_ma/plateau_ma are ABSOLUTE — the standing emission
+        is still in them (see pulse_events()' "WHICH FIELDS HAVE THE
+        BACKGROUND REMOVED"). This adds the subtracted forms so nobody has
+        to remember to do it:
+
+            "peak_net_ma"     peak_ma - bg_ma
+            "plateau_net_ma"  plateau_ma - bg_ma   <- the pulse's own current
+
+        Both are ABSENT (not 0.0, not None) when there is no background to
+        subtract, for the same reason the _ma fields are: a net current with
+        no background behind it is not a measurement.
+        integral_mams is already net — do not subtract from it as well.
+
+        Use print_pulse_events() rather than printing these by hand; it
+        groups absolute against net so the two cannot be confused at a
+        glance.
+
         A field that was not measured stays None and gets NO _ma companion --
         post_bg_ma is simply absent on such an event, rather than carrying a
         converted stand-in. Check `"post_bg_ma" in event`, or guard on
@@ -5152,9 +5227,185 @@ class CTClient:
             for key in keys:
                 if e.get(key) is not None:
                     e[f"{key}_ma"] = round(self.pulse_ma(e[key], resolved_ref_mv), 3)
+            # peak_ma/plateau_ma are ABSOLUTE levels -- the standing emission
+            # is still in them. The pulse's OWN current is the difference, and
+            # leaving every caller to remember that is how plateau_ma gets
+            # quoted as "the pulse current" (at 2.8 A heating that overstates
+            # it by ~57%). Subtract once, here. Raw counts first: bg and
+            # plateau are integers, and taking the difference before the
+            # conversion keeps its large offset from cancelling inexactly.
+            bg_raw = e.get("bg")
+            for key in ("peak", "plateau"):
+                if e.get(key) is not None and bg_raw is not None:
+                    e[f"{key}_net_ma"] = round(
+                        self.pulse_ma(e[key], resolved_ref_mv)
+                        - self.pulse_ma(bg_raw, resolved_ref_mv), 3)
+                # else: NO field at all. A net current with no background to
+                # subtract is not a measurement, and 0.0 would read as one.
             self._add_charge(e, resolved_ref_mv, r.get("integral_signed"),
                              r.get("background_windowing"))
         r["ref_mv"] = ref_mv
+        return r
+
+    # ---- structured display -------------------------------------------
+    # A pulse event carries ~25 fields, half of them absolute levels and
+    # half of them background-subtracted, plus six different "this number
+    # is not a measurement" flags. Printed as a flat list of numbers the
+    # important distinction -- which figures still contain the standing
+    # emission -- is invisible, and the flags scroll past unread. These
+    # render it grouped instead, so ABSOLUTE and NET cannot be mistaken
+    # for each other and an unusable event says so on its own line.
+
+    def format_pulse_event(self, e: dict, ref_mv: float | None = None) -> str:
+        """One event (from pulse_events_ma()) as a readable block. See
+        print_pulse_events() for the whole batch and for what the layout
+        means. Pass the batch's `ref_mv` so the count->mA scale shown for
+        sigma matches the one the event's own fields were converted with;
+        without it a live reading is fetched (one HTTP round trip)."""
+        if ref_mv is None:
+            ref_mv = self.get_ads1115_ref_mv() or 1200.0
+        slope = self.pulse_ma(1.0, ref_mv) - self.pulse_ma(0.0, ref_mv)
+        out: list[str] = []
+        W = 14        # label column
+        def row(label, raw, ma, note=""):
+            raw_s = f"{raw:>6} ct" if raw is not None else "     — ct"
+            ma_s = f"{ma:>9.3f} mA" if ma is not None else "        — mA"
+            out.append(f"    {label:<{W}}{raw_s}  {ma_s}" + (f"   {note}" if note else ""))
+
+        rate = e.get("rate_hz")
+        on_us = e.get("on_us")
+        head = f"#{e.get('id')}"
+        head += f"  width {on_us} us" if on_us is not None else "  width —"
+        head += f"   {rate / 1000.0:.1f} kSPS" if rate else "   rate UNKNOWN"
+        bg_n, bg_gap = e.get("background_n"), e.get("background_gap")
+        if bg_n is not None:
+            head += f"   bg n={bg_n}"
+            if bg_gap is not None:
+                head += f" gap={bg_gap}"
+        out.append(head)
+
+        # Unusable events first and alone: on a zero-length envelope every
+        # level below is the field's initial value, not a measurement, and
+        # a reader who has already seen numbers will not go back up.
+        if e.get("empty_envelope"):
+            out.append("    !! EMPTY ENVELOPE — rise and fall on the same sample "
+                       "(a PA4 glitch, not a pulse).")
+            out.append("       peak/plateau/integral are initial values, not "
+                       "measurements. Discard this event.")
+            if e.get("bg") is not None:
+                row("bg", e.get("bg"), e.get("bg_ma"), "(this one IS real)")
+            return "\n".join(out)
+
+        out.append("  ABSOLUTE — background still included")
+        row("peak", e.get("peak"), e.get("peak_ma"),
+            "single sample: circuit noise, not the pulse level")
+        row("plateau", e.get("plateau"), e.get("plateau_ma"),
+            "mean over the whole envelope, ramps included")
+        sigma4 = e.get("bg_sigma4")
+        sig_note = ""
+        if e.get("bg") is None:
+            # No window at all. "zero spread" would read as a verdict on a
+            # measurement that was never taken -- a different fault entirely
+            # (dead front end) from "no background was windowed".
+            sig_note = "!! no pre-pulse background was measured"
+        elif e.get("background_flat"):
+            sig_note = "!! zero spread — input stuck or unpowered"
+        elif sigma4:
+            sig_note = f"sigma {sigma4 / 4.0:.2f} ct = {sigma4 / 4.0 * slope:.3f} mA"
+        row("bg (pre)", e.get("bg"), e.get("bg_ma"), sig_note)
+        delta = e.get("background_pre_post_delta")
+        post_note = ""
+        if delta is not None:
+            post_note = f"pre−post {delta:+.1f} ct"
+            if sigma4:
+                post_note += f" ({abs(delta) / (sigma4 / 4.0):.1f} sigma)"
+            if e.get("background_suspect"):
+                post_note = "!! " + post_note + " — PRE window suspect"
+        row("post_bg", e.get("post_bg"), e.get("post_bg_ma"), post_note)
+
+        out.append("  NET — background removed")
+        net = e.get("plateau_net_ma")
+        if net is not None:
+            out.append(f"    {'plateau − bg':<{W}}{'':>9}  {net:>9.3f} mA"
+                       f"   <- the pulse's own current")
+        else:
+            out.append(f"    {'plateau − bg':<{W}}{'':>9}  {'—':>12}"
+                       f"   no background to subtract")
+        charge = e.get("integral_mams")
+        if charge is None:
+            why = e.get("integral_mams_unavailable") or "unknown"
+            out.append(f"    {'charge':<{W}}{'':>9}  {'—':>12}   !! not available: {why}")
+        else:
+            csig = e.get("integral_mams_sigma")
+            note = f"+/- {csig:.3f}" if csig is not None else "sigma unavailable"
+            if csig is not None and abs(charge) <= csig:
+                note = f"!! |charge| <= sigma ({csig:.3f}) — NOT distinguished from noise"
+            out.append(f"    {'charge':<{W}}{'':>9}  {charge:>9.3f} mA·ms   {note}")
+            if on_us:
+                out.append(f"    {'charge/width':<{W}}{'':>9}"
+                           f"  {charge / (on_us / 1000.0):>9.3f} mA"
+                           f"   cross-check against plateau − bg")
+        if e.get("integral_saturated"):
+            out.append("    !! integral SATURATED — clamped, the true charge is larger")
+        if e.get("duration_saturated"):
+            out.append("    !! duration SATURATED — sigma cannot be scaled")
+        if e.get("background_partial"):
+            out.append(f"    !! {e.get('background_n_note')}")
+        return "\n".join(out)
+
+    def format_pulse_events(self, r) -> str:
+        """A whole pulse_events_ma() result (or a bare list of its events)
+        as one readable report. See print_pulse_events()."""
+        # A bare list carries no ref_mv because the shape has nowhere to put
+        # one -- which is NOT the same as a batch whose live read failed and
+        # fell back to ~1200 mV. Only the latter makes the mA approximate, so
+        # only the latter gets the warning.
+        if isinstance(r, dict):
+            if not r.get("ok", True):
+                return f"pulse events unavailable: {r.get('error') or r}"
+            events, ref_mv = r.get("events") or [], r.get("ref_mv")
+            ref_note = (f"ref {ref_mv:.1f} mV (live ADS1115)" if ref_mv is not None
+                        else "!! ref UNKNOWN — the live read failed and the "
+                             "~1200 mV fallback was used, so every mA below is "
+                             "approximate")
+        else:
+            events, ref_mv = list(r or []), None
+            ref_note = "ref not carried by this list — mA came from its own batch"
+        head = f"{len(events)} pulse event(s)   {ref_note}"
+        if not events:
+            return head + "\n    (none — the detector produced no event for this fire)"
+        resolved = ref_mv if ref_mv is not None else (self.get_ads1115_ref_mv() or 1200.0)
+        blocks = [self.format_pulse_event(e, resolved) for e in events]
+        return head + "\n\n" + "\n\n".join(blocks)
+
+    def print_pulse_events(self, since: int = 0) -> dict:
+        """Fetch pulse events and print them grouped, instead of as a wall
+        of numbers. Returns the same dict pulse_events_ma() does, so it can
+        stand in for that call:
+
+            since = ct.pulse_cursor()
+            ct.fire_single_pulse(8, num_pulses=1, width_us=5000)
+            r = ct.print_pulse_events(since)
+
+        Printed per event:
+
+            ABSOLUTE      peak / plateau / bg / post_bg — raw levels with
+                          the standing emission STILL IN THEM
+            NET           plateau − bg (the pulse's own current), charge,
+                          and charge/width as a cross-check on it
+
+        The split is the point: quoting an ABSOLUTE figure as "the pulse
+        current" is the easiest mistake to make with this data and the
+        hardest to notice, because the number looks perfectly reasonable —
+        it is just the pulse plus however much the filament was already
+        emitting. Anything marked `!!` is not a measurement; read that line
+        before reading the numbers above it.
+
+        For a whole fire+measure in one call see fire_single_pulse(
+        measure=True) and pass its "measured" list to
+        format_pulse_events()."""
+        r = self.pulse_events_ma(since)
+        print(self.format_pulse_events(r))
         return r
 
     def measure_pulse_current(
@@ -5296,7 +5547,28 @@ class CTClient:
         return st == "BUSY"
 
     def _hv_cmd_retry(self, command: str, body: dict, controller: int) -> dict:
+        saved, self.max_retries = self.max_retries, 0
+        try:
+            return self._hv_cmd_retry_(command, body, controller)
+        finally:
+            self.max_retries = saved
+
+    def _hv_cmd_retry_(self, command: str, body: dict, controller: int) -> dict:
         for attempt in range(self._HV_RETRY_ATTEMPTS):
+            # ONE layer of retry, not two. _post() already retries transients
+            # with exponential backoff (3 attempts, 0.5 s then 1.0 s), and this
+            # loop adds 4 more at 200 ms -- they MULTIPLY. Measured on a
+            # 48-switch run: the first five operations took 11, 13, 20, 23 and
+            # 8 seconds, about 76 s before the link settled and the remaining
+            # 43 switches ran at 0.2-1 s each. From the GUI, which has no
+            # progress at this granularity, that opening stretch is
+            # indistinguishable from a hang.
+            #
+            # A per-bit switch read has no business waiting 20 s: nothing about
+            # the answer improves, and the test's own INCONCLUSIVE verdict
+            # already means "re-run this one". So the outer loop owns the
+            # policy and the inner client is told not to retry at all.
+            #
             # /api/power-cmd, NOT /api/cmd: the HV switch opcodes (notably
             # HV_REFRESH_FEEDBACK, which is what forces a FRESH 165 read) are
             # only routed by the power-cmd handler. /api/cmd answers

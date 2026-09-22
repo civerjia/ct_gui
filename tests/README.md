@@ -19,6 +19,7 @@ from ct_simple_control import CTClient
 
 | script | what it exercises |
 |---|---|
+| `test_api.py` | end-to-end API: mapping → HV → heating ladder → fire → measure, with PASS/FAIL per step and a non-zero exit on failure |
 | `test_hv_diag165.py` | 74HC165 read-back of the RP2350b HV shift-register chain |
 | `test_pulse_sweep.py` | voltage sweep via the STM32 pulse detector's on-chip summary |
 | `test_pulse_width_sweep.py` | pulse-width sweep at fixed voltage; known-timing mode |
@@ -29,6 +30,21 @@ from ct_simple_control import CTClient
 | `test_schedule_power.py` | schedule bench test, one power controller |
 | `test_schedule_twopower.py` | schedule bench test, two power controllers |
 | `test_liuxing.py` | — |
+
+`test_api.py` is the one to run first — it is the only script here that
+*checks* rather than prints, so "did the rig come up correctly" has a one-line
+answer:
+
+```bash
+python3 tests/test_api.py                    # default: USER_INDEX 8, one 5 ms pulse
+python3 tests/test_api.py --filaments 8,9,10 # several
+python3 tests/test_api.py --skip-hv          # mapping + ladder + detector, no HV
+python3 tests/test_api.py --scan-presence    # refuse absent boards up front (slow)
+```
+
+⚠ `--filaments` takes **USER_INDEX**, your own numbering, not the FID on the
+wire. Under the liuxing order `--filaments 0` addresses FID 8 (a CH2 board) —
+a different filament from `--filaments 8`, which is FID 0 on CH1.1.
 
 For a guided tour of the API rather than a stress test, see
 [`../examples/walkthrough.py`](../examples/walkthrough.py).
