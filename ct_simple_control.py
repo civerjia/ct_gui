@@ -7109,6 +7109,47 @@ class CTClient:
         the whole point: both look like "not working" from every other read in
         this client.
 
+        THREE THINGS IN A DUMP THAT LOOK LIKE FAULTS AND ARE NOT. Each of
+        these was read as a fault on this bench before being run down:
+
+          hv_io_state never better than `addr`, on EVERY channel
+              The HV-current expander (0x23) is NOT FITTED -- these are 3-chip
+              boards. The firmware's own `scan` says so outright:
+              "hv=not fitted (3-chip board; 0x23 removed)". Nothing to
+              diagnose, and it will never improve.
+
+          tps_state / ina_state = `addr` on a populated, healthy channel
+              Those chips sit behind the isolated 12 V rail. With the filaments
+              at STOP the rail is off, so they ACK their address and nothing
+              else. Energise before reading anything into it.
+
+          tps_state / ina_state = `op`
+              Impossible by construction: their operational-register writes
+              have side effects (voltage change, measurement reset), so the
+              firmware leaves both `op` masks at 0 permanently. `reg` is their
+              ceiling.
+
+        A board-wide `addr` CAN mean the control cable is unplugged -- that
+        cost a working RP2350 a near-replacement here -- but check the three
+        above first.
+
+        WHAT THIS CANNOT TELL YOU: whether the bus wedged or the devices went
+        quiet. Both arrive here as `missing`, and they send you to opposite
+        ends of the hardware. The RP2350's own counters separate them, over its
+        USB serial (`i2cstat`; no Python wrapper yet):
+
+            timeouts/recoveries/busClears/sdaStuck climbing
+                -> the BUS wedged, a slave was holding SDA
+            nacks climbing with timeouts flat
+                -> the bus is fine, the DEVICES are not answering (no ISO
+                   power, absent board, dead chip)
+
+        Measured here: a channel whose entire board set read `missing` had
+        timeouts=0, recoveries=0, sdaStuck=0 and only NACKs -- nothing had ever
+        been stuck, and time spent on the I2C driver for it was time wasted.
+        `i2cstat clear` zeroes the counters, which is what makes a
+        single-operation before/after measurement possible.
+
         Read-only, ~300 ms per controller. Returns {"ok", "controllers": {...}},
         each carrying "channel_mask" (the host's poll set) and
         "fw_channel_mask" (the firmware's own, kept only for diagnostics -- it
@@ -7119,8 +7160,26 @@ class CTClient:
     def read_tca9554(self) -> dict:
         """Full TCA9554 expander register dump per channel (CH_READ_TCA9554).
 
-        Config/input/output/polarity registers with the per-read ACK flag, which
-        is what tells you a register value is real rather than a bus artefact.
+        Config/input/output/polarity registers with the per-read ACK flag.
+
+        THE VALUES ARE ONLY MEANINGFUL WHERE `ok` SAYS SO. `ok` is a 4-bit mask
+        of which reads ACKed -- bit0 config(0x03), bit1 input(0x00), bit2
+        output(0x01), bit3 polarity(0x02) -- and a register that did not answer
+        comes back as 0, which is a perfectly legal register value. A chip
+        reading `config=0 input=0 output=0 polarity=0 ok=0` has told you
+        NOTHING; the same four zeros with `ok=15` is a real, all-zero chip.
+        Gate on `ok` before reading any value; `ok=15` is the only fully
+        trusted row.
+
+        The partial values carry information of their own. `ok=1` means the
+        FIRST read of the burst landed and the rest did not -- a different
+        fault from `ok=0`. On this bench that exact pattern (first transaction
+        answered, everything after it silent until the bus went idle) was the
+        entire signature of a bad channel, and it is invisible unless the mask
+        is read. It survived swapping that channel's I2C implementation
+        outright, which is what ruled the controller out and sent the hunt to
+        the channel's own hardware.
+
         Read-only. Returns {"ok", "controllers": {...}} with "tca9554_error" on
         a controller that failed.
         """

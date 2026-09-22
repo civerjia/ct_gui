@@ -3413,16 +3413,57 @@ CONNECTED controllers.
 |---|---|
 | `chip_health()` | presence scan — which chips answer |
 | `diagnosis()` | per board+chip: **op / reg / addr / missing** |
-| `read_tca9554()` | expander register dump + the per-read ACK flag |
+| `read_tca9554()` | expander register dump + the per-read ACK flag `ok` |
 | `self_test()` | TCA9554 toggle test — **drives pins** |
 | `read_board_faults()` | per-filament TPS fault / HV-overcurrent, `None` when the validity twin says the read failed |
 
 **`diagnosis()` is the one that earns its keep.** `chip_health()` only checks
 the address ACK, so it happily reports `mux: 16, iso_io: 16` for a board where
 nothing works. `addr` means the chip ACKs its address and will not talk
-registers — and a board-wide `addr` result means **the control cable is
-unplugged**, not that the chips are dead. That cost a working RP2350 a
-near-replacement here before the distinction was read correctly.
+registers.
+
+> ⚠️ **Three things in a `diagnosis()` dump that look like faults and are not.**
+> Each of these was read as a fault on this bench before being run down:
+>
+> | reads | why it is normal |
+> |---|---|
+> | `hv_io_state` never better than `addr`, on **every** channel | the HV-current expander (0x23) is **not fitted** — these are 3-chip boards. The firmware's own `scan` says so: `hv=not fitted (3-chip board; 0x23 removed)`. Nothing to diagnose |
+> | `tps_state` / `ina_state` = `addr` on a populated, healthy channel | those chips sit behind the isolated 12 V rail. With the filaments at STOP the rail is off, so they answer their address and nothing else. Energise before reading anything into it |
+> | `tps_state` / `ina_state` = `op` — ever | impossible by construction: their operational-register writes have side effects, so the firmware leaves the `op` masks at 0 for both. `reg` is their ceiling |
+>
+> A board-wide `addr` **can** mean the control cable is unplugged — that cost a
+> working RP2350 a near-replacement here before the distinction was read
+> correctly — but check the three rows above first.
+
+> ⚠️ **`diagnosis()` cannot tell a wedged bus from a silent device**, and the
+> difference decides where to look. The RP2350's own counters can, and are
+> reachable over its USB serial with `i2cstat`:
+>
+> - `timeouts` / `recoveries` / `busClears` / `sdaStuck` climbing → the **bus**
+>   wedged; a slave was holding SDA
+> - `nacks` climbing with `timeouts` flat → the bus is fine and the **devices**
+>   are not answering, e.g. they have no ISO power
+>
+> Measured here: a channel whose whole board set read `missing` had
+> `timeouts=0 recoveries=0 sdaStuck=0` with only NACKs — so nothing was ever
+> stuck, and an hour spent on the I²C driver would have been an hour wasted.
+> `i2cstat clear` zeroes them, which is what makes a single-operation
+> before/after possible. There is no Python wrapper for this yet.
+
+> ⚠️ **`read_tca9554()`'s values are only meaningful where `ok` says so.**
+> `ok` is a 4-bit mask of which reads ACKed — bit0 config(0x03), bit1
+> input(0x00), bit2 output(0x01), bit3 polarity(0x02) — and a register that did
+> not answer comes back as **0**, which is a perfectly legal register value. A
+> chip reading `config=0 input=0 output=0 polarity=0 ok=0` has told you
+> nothing; the same four zeros with `ok=15` is a real, all-zero chip. Always
+> gate on `ok` before reading a value, and `ok=15` is the only fully trusted
+> row.
+>
+> The partial values matter too: `ok=1` means the FIRST read of the burst
+> landed and the rest did not, which is a different fault from `ok=0`. On this
+> bench that exact pattern — first transaction answered, everything after it
+> silent until the bus went idle — was the whole signature of a bad channel,
+> and it is invisible unless the mask is read.
 
 `self_test()` is the only one that is not read-only. The backend refuses it on
 a controller running a schedule and says so in `selftest_error` rather than
