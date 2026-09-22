@@ -3094,6 +3094,22 @@ Returns `{"ok", "fired": <the full fire_single_pulse result>, "measured": [...],
 "ref_mv"}`. Same arming, correlation and strict-`ok` rules as `measure=True`;
 it takes the same `fire_single_pulse` parameters.
 
+### Emission: two functions, two jobs
+
+They are not interchangeable. Pick by what the answer has to survive.
+
+| | `emission_vs_heating()` | `emission_ramp()` |
+|---|---|---|
+| **for** | the precise measurement | quick verification |
+| time at firing current | 45–96 s | **~6 s** |
+| how | steps setpoints, measures V+I *with* the shots | one ramp, nothing settles |
+| temperature | **yes** — every point has a resistance | **no** — no live V during a run |
+| feeds `fit_richardson()` | yes | no (declines: `r_total_ohm` is `None`) |
+| the curve it returns | as close to steady as the hardware allows | **dynamic** — see thermal lag |
+
+Use the ramp to ask *is this filament emitting, and roughly how much* — across
+a rig, or after a change. Use the stepped one when the number has to stand up.
+
 ### Emission current vs heating current
 
 **`emission_vs_heating(filament, start_ma=2500, max_ma=2800, step_ma=100, width_us=1000, pulses_per_point=3, idle_ma=1500, end_state="stop", ...)`**
@@ -3202,6 +3218,14 @@ for tens of seconds (R +12.7%, emission +17% between 8 s and 33 s). Every
 > `r_total_ohm: None` rather than a resistance borrowed from a neighbour, and
 > `fit_richardson()` declines them. Use `emission_vs_heating()` when
 > temperature is the point.
+
+**`problems` vs `notes`.** `problems` means the run is invalid — no events, an
+unpairable log, an ACTIVE command that never landed — and clears `ok`. `notes`
+describes what a ramp inherently *is*: thermal lag, shots bunching at the
+destination, partial coverage. Those are properties of measuring on a
+transient, not faults, and they leave `ok` True. Filing them as problems made a
+perfectly good quick check report `ok: False`, which teaches a reader to ignore
+the field on the one function whose whole job is to be run often.
 
 > ⚠️ **It is a DYNAMIC curve.** The current arrives before the temperature
 > does, so emission at a given heating current is not a function of that

@@ -5533,7 +5533,21 @@ class CTClient:
         save_as: str | None = None,        # write the curve to the backend's disk
         pedestal_ma: float | None = None,  # None = measure it; 0.0 = don't subtract
     ) -> dict:
-        """Measure ONE filament's emission current against its heating current.
+        """PRECISE MEASUREMENT of one filament's emission against its heating current.
+
+        One of a pair, and they are not interchangeable:
+
+            emission_vs_heating()   THIS. Steps setpoints, measures V and I
+                                    with the shots so every point has a
+                                    resistance and therefore a temperature,
+                                    and feeds fit_richardson(). Tens of
+                                    seconds at firing current.
+            emission_ramp()         quick verification -- one ramp, no
+                                    settling, seconds. No temperature, and the
+                                    curve is dynamic.
+
+        Use this when the number has to stand up; use the other one to check
+        that a filament is alive.
 
         Pre-heats through the ladder, then walks ACTIVE from `start_ma` up to
         `max_ma` in `step_ma` steps, firing `pulses_per_point` pulses at each
@@ -5819,7 +5833,22 @@ class CTClient:
         controller: int | None = None,
         save_as: str | None = None,
     ) -> dict:
-        """The whole curve in one ramp -- no settling, seconds instead of a minute.
+        """QUICK VERIFICATION. The whole curve in one ramp, seconds not a minute.
+
+        One of a pair, and they are not interchangeable:
+
+            emission_vs_heating()   the PRECISE measurement. Steps setpoints,
+                                    measures V and I with the shots, gives a
+                                    temperature, feeds fit_richardson().
+                                    Tens of seconds at firing current.
+            emission_ramp()         THIS. Quick verification -- is this
+                                    filament emitting, and roughly how much.
+                                    No temperature, and the curve it returns
+                                    is dynamic (see below). Seconds.
+
+        Reach for this to check a filament, compare filaments, or confirm
+        nothing has broken. Reach for the other one when the number has to
+        stand up.
 
         Nothing waits. The schedule is armed first, the ACTIVE command is
         issued in the gap between arming and triggering, and the train then
@@ -5866,6 +5895,13 @@ class CTClient:
         """
         fil = int(filament)
         problems: list[str] = []
+        # `problems` makes the run INVALID; `notes` describes what a ramp
+        # inherently is. Thermal lag and shots bunching at the destination are
+        # properties of measuring on a transient, not faults -- filing them as
+        # problems made a perfectly good quick check report ok=False, which
+        # trains a reader to ignore the field on the one function whose whole
+        # job is to be run often.
+        notes: list[str] = []
         if end_state not in self._END_STATES:
             return {"ok": False, "filament": fil, "points": [], "problems": [
                 f"end_state {end_state!r} is not one of {sorted(self._END_STATES)}"]}
@@ -6029,7 +6065,7 @@ class CTClient:
                            "change_frac": round(frac, 4),
                            "apart_ms": (b["shot"] - a["shot"]) * int(inter_pulse_ms)}
         if lag and abs(lag["change_frac"]) > 0.10:
-            problems.append(
+            notes.append(
                 f"thermal lag: two shots {lag['apart_ms']} ms apart at the same "
                 f"{lag['heat_mA']} mA read {lag['emission_ma'][0]} and "
                 f"{lag['emission_ma'][1]} mA ({lag['change_frac'] * 100:+.0f}%). "
@@ -6052,7 +6088,7 @@ class CTClient:
             top = max(heats)
             at_top = sum(1 for h in heats if h >= top - 0.01 * top)
             if at_top > max(3, len(heats) // 3):
-                problems.append(
+                notes.append(
                     f"{at_top} of {len(heats)} shots landed within 1% of the "
                     f"top current — the {ramp['train_ms']} ms train outlasted "
                     f"the ramp, so they are a dwell series at the destination, "
@@ -6060,7 +6096,7 @@ class CTClient:
                     f"spacing with fewer of them) to match the ramp, and slow "
                     f"the slew rate if you want more points across it")
         if span and span[1] - span[0] < 0.5 * (to_ma - from_ma):
-            problems.append(
+            notes.append(
                 f"the shots only cover {span[0]}–{span[1]} mA of the "
                 f"{from_ma}–{to_ma} mA that was asked for — the train ended "
                 f"before the ramp did, or the ramp finished before the train "
@@ -6068,7 +6104,8 @@ class CTClient:
                 f"rate rather than reading the missing range as flat")
         out = {"ok": not problems, "filament": fil, "points": points,
                "end_state": end_state, "active_s": ramp.get("active_s"),
-               "problems": problems, "ref_mv": fired.get("ref_mv"),
+               "problems": problems, "notes": notes, "thermal_lag": lag,
+               "ref_mv": fired.get("ref_mv"),
                "pedestal_ma": float(pedestal_ma), "pedestal": ped,
                "ramp": ramp, "span_ma": span, "gap_max_ma": gap_max,
                "temperature_available": False}
@@ -7018,12 +7055,23 @@ class CTClient:
             note = p.get("note") or ("" if p["usable"] else "unusable")
             if p.get("heat_unavailable"):
                 note = f"no snapshot ({p['heat_unavailable']}); " + note
-            out.append(f"  {p['commanded_ma']:>7} "
-                       f"{(p['settled_ma'] if p['settled_ma'] is not None else float('nan')):>8.0f} "
+            # A ramp point has no setpoint at all -- it fired wherever the CC
+            # loop happened to be -- so the first column carries its shot index
+            # instead. Formatting these as numbers regardless is what made this
+            # crash on a ramp result: `None` has no format spec.
+            cmd = (f"{p['commanded_ma']:>7}" if p.get("commanded_ma") is not None
+                   else f"#{p.get('shot', '?')}".rjust(7))
+            settled = (f"{p['settled_ma']:>8.0f}" if p.get("settled_ma") is not None
+                       else f"{'—':>8}")
+            out.append(f"  {cmd} {settled} "
                        f"{heat} {rtot} {net} {emis} {sd} "
-                       f"{p['n_used']}/{len(p['pulses']):<3}  {note}")
+                       f"{p['n_used']}/{max(len(p['pulses']), p.get('n_fired', 0)):<3}  {note}")
         for prob in r.get("problems") or []:
             out.append(f"  !! {prob}")
+        # Notes are not failures -- they describe what a ramp inherently is.
+        # Printed under their own marker so the two never read alike.
+        for note in r.get("notes") or []:
+            out.append(f"  -- {note}")
         return "\n".join(out)
 
     # ── Board self-test & I2C diagnostics ─────────────────────────────────────
