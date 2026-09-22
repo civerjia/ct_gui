@@ -3173,6 +3173,104 @@ under the result's `saved` key.
 
 **`format_emission_curve(r)`** — the table above, as a string.
 
+### The pedestal — subtract it before believing any emission number
+
+**`measure_emission_pedestal(filament, heat_ma=1400, widths_us=(1000, 10000), ...)`**
+— A fired pulse's net current is not all emission: heating-supply noise
+contributes a floor. On this bench at −200 V it is **~2.0 mA**, and it sat under
+every point of the first sweeps — between 1500 and 2100 mA of heating, net
+stayed at 2.0 mA while the filament crossed several hundred K.
+
+Left in, it dominates the cold end and bends the Richardson slope **while the
+fit still looks tidy**, which is what makes it dangerous. Measured here, with
+every positive point kept: r² 0.998 → 0.891 and work function 4.12 → 2.41 eV.
+
+`emission_vs_heating()` measures and subtracts it by default, giving each point
+an `emission_ma` (= `net_ma − pedestal_ma`) alongside the raw `net_ma`. Pass
+`pedestal_ma=0.0` to opt out, or a float to supply your own.
+
+> ⚠️ **It scales with the emission rail**, so it must be measured at the voltage
+> the curve will use — 0.49 mA at −50 V against 1.98 mA at −200 V. The voltage
+> in force is recorded in the result.
+
+Two properties have to hold for one subtracted number to be right across a whole
+sweep, and both are **checked**, not assumed:
+
+| check | what it rules out | bench |
+|---|---|---|
+| `width_independent` | edge charge from the switching (would fall as 1/width) | 2.13 mA at 500 µs vs 2.01 mA at 10 ms |
+| `temperature_independent` | that `heat_ma` is already emitting, so the "pedestal" contains signal | STANDBY 2.08 mA vs IDLE 1400 mA 2.02 mA |
+
+`pedestal_ma` comes back `None` — never a plausible number with the checks
+quietly failed — when the measurement does not hold together.
+
+`emission_ma` is **not clamped at zero**: at the cold end it scatters either
+side of it, which is the correct behaviour of a subtracted pedestal. Flooring it
+would bias the bottom of the curve upward and bend the Arrhenius slope, the same
+reason `integral` is signed.
+
+### Richardson-Dushman — temperature and work function
+
+**`fit_richardson(result, r_cold_ohm=0.257, r_lead_ohm=None, min_snr=5.0, ...)`**
+— Fits `I = A_eff·T²·exp(−φ/kT)` to an `emission_vs_heating()` result. Two
+relations over the same sweep:
+
+- **resistance thermometry** — tungsten's resistivity is a known function of
+  temperature, so `R_filament / r_cold_ohm` gives T
+- **Richardson-Dushman** — `ln(I/T²)` against `1/T` is a straight line of slope
+  `−φ/k`
+
+What is measured is `R_total = V_bus/I_heat`, which is the filament **in series
+with its leads**; the leads are outside the INA219's sense point and differ per
+filament. `r_lead_ohm=None` scans for the value giving the straightest
+Richardson line; a float pins it.
+
+> ⚠️ **The emission curve cannot determine the lead resistance.** Measured on
+> this bench: r² moves only from 0.99807 to 0.99766 across 0 → 0.30 Ω, while φ
+> swings 4.12 → 3.41 eV. Shifting `R_lead` rescales every temperature in nearly
+> the same way and an Arrhenius slope absorbs that, so the fit is blind to it.
+> The result says so — `r_lead_plateau_ohm` is the width of the band fitting
+> within 1% of the best, and `r_lead_at_edge` flags an optimum that merely ran
+> into the scan limit. **Take `R_lead` from the I–V side and pin it.**
+
+`sensitivity_to_r_lead` is the number that couples the two measurements:
+
+```
+per +0.1 ohm lead  work function -0.228 eV, mean T -59 K
+```
+
+**Bench result** (filament 8, −201 V, 1 ms pulses, `r_lead_ohm=0.20`):
+
+```
+Richardson-Dushman fit · 10 points · r^2 0.99854
+  work function     3.646 eV
+  temperature span  297 K            T = 2038 .. 2335 K
+  dropped           5 point(s) below the pedestal noise
+```
+
+`min_snr` drops points whose emission is not significantly above the pedestal
+noise. A log fit treats 0.015 mA and 0.085 mA as a factor of 5.7 apart when both
+are the same zero seen through noise. The default of 5 sits inside a plateau —
+5 and 8 select the identical point set, while 3 admitted two points whose
+residuals were 3–5× every other point's and took r² to 0.9795. Dropped points
+are listed under `dropped`.
+
+`trustworthy` is True only when **no** warning fired. Warnings cover: an
+unconstrained or edge-pinned `R_lead`; a work function outside 1.5–6.0 eV
+(tungsten 4.55, thoriated ~2.6, oxide ~1–2); temperatures near tungsten's 3695 K
+melting point; a temperature span under 200 K; r² under 0.98; and a curve with
+no pedestal correction at all.
+
+**`format_richardson(f)`** — the fit block above, as a string.
+
+**`tungsten_resistivity(T)` / `tungsten_temperature(ratio, t_ref_k=293)`** —
+the thermometry, usable on their own. Resistivity is the Desai *et al.* (J.
+Phys. Chem. Ref. Data **13**, 1069, 1984) reference fit, within ~2% of the
+tabulated values over 300–3000 K; `tungsten_temperature()` inverts the ratio by
+bisection and returns **`None`** outside 300–3600 K rather than a clamped edge
+value — a ratio below 1 means the hot resistance came out under the cold one,
+which is an input error (usually too large an `R_lead`).
+
 ### Waiting on state — what is polled, and what that costs
 
 There is no push path for "this filament arrived". The firmware *knows* — the
