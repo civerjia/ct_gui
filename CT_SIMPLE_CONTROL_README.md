@@ -3173,6 +3173,57 @@ under the result's `saved` key.
 
 **`format_emission_curve(r)`** — the table above, as a string.
 
+### The fast way — one ramp, no settling
+
+**`emission_ramp(filament, from_ma=1500, to_ma=2800, num_pulses=24, inter_pulse_ms=120, ...)`**
+— The whole curve in one ramp. The schedule is armed first, the ACTIVE command
+is issued in the gap between arming and triggering (`fire_single_pulse`'s
+`on_armed` hook), and the train fires straight through the CC loop's ramp. Each
+shot lands at whatever current the filament was passing through, and the
+firmware's per-pulse snapshot says which — so the x axis comes out of the log
+instead of out of a setpoint that was waited for.
+
+| | time at ACTIVE | points |
+|---|---|---|
+| `emission_vs_heating()`, settle 1.0 s | 95.6 s | 15 |
+| `emission_vs_heating()`, bracketed, settle 0.3 s | 45.5 s | 11 |
+| **`emission_ramp()`** | **5.75 s** | 30 |
+
+Waiting was never what made the stepped version right — measuring the pair
+*together* was. And waiting does not reach equilibrium anyway: at a fixed
+2400 mA the CC loop reports settled in 2.6 s while the filament keeps warming
+for tens of seconds (R +12.7%, emission +17% between 8 s and 33 s). Every
+"settled" point was on a transient too, just a slower one.
+
+> ⚠️ **No temperature.** A live INA219 read is I2C and the backend refuses it
+> while a schedule is firing; the cached CC read carries current only. So this
+> gives emission against heating **current** — the curve — but not the
+> Richardson reduction, which needs R. Points come back with
+> `r_total_ohm: None` rather than a resistance borrowed from a neighbour, and
+> `fit_richardson()` declines them. Use `emission_vs_heating()` when
+> temperature is the point.
+
+> ⚠️ **It is a DYNAMIC curve.** The current arrives before the temperature
+> does, so emission at a given heating current is not a function of that
+> current alone. The run measures this on itself: wherever two shots fired at
+> the same current at different times, it compares them. Bench, 20 shots over a
+> 1500→2800 mA ramp — two shots 4.4 s apart at 2768 and 2780 mA read **10.03
+> and 13.54 mA, +35%**. Reported, not corrected: there is no correction, and
+> how far a ramp sits below the settled curve depends on the slew rate.
+
+**Match the train to the ramp, not the other way round.** Firing faster adds no
+resolution once the ramp is over — every extra shot lands at the destination.
+Measured: 20 shots at 400 ms spanned 8 s against a ~2.8 s ramp, so 7 covered it
+and 13 piled up at the top with a 222 mA hole in the middle (flagged). The knob
+for resolution is the **slew rate** (`set_slew_rates()`), not the pulse rate.
+`span_ma` and `gap_max_ma` report what was actually covered, so a ramp that
+finished early reads as a hole rather than as a curve with an invented middle.
+
+**`fire_single_pulse(..., on_armed=callable)`** — runs after arming, one
+instant before the trigger. The only place a caller can start something that
+must be *concurrent* with the firing. An exception from it disarms and fires
+nothing.
+
 ### The pedestal — subtract it before believing any emission number
 
 **`measure_emission_pedestal(filament, heat_ma=1400, widths_us=(1000, 10000), ...)`**

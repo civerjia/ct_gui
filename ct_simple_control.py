@@ -3962,6 +3962,9 @@ class CTClient:
         bg_window_us: float | None = None,    # measure=True only: then average
                                                # over this long. None = firmware
                                                # default (50 us / 50 us)
+        on_armed=None,               # callable() run after arming,
+                                      # immediately before the trigger
+                                      # -- see emission_ramp()
     ) -> dict:
         """Download a one-entry schedule, arm it, fire, and verify.
 
@@ -4184,7 +4187,8 @@ class CTClient:
                 filament, num_pulses=num_pulses, width_us=width_us,
                 inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
                 total_ms=total_ms, controller=controller, trigger=trigger,
-                timeout_s=timeout_s, verify=verify, reuse=reuse)
+                timeout_s=timeout_s, verify=verify, reuse=reuse,
+                on_armed=on_armed)
 
         # Arm BEFORE firing -- a detector armed afterwards has already missed
         # the pulses. If it can't arm we fire nothing: silently firing HV that
@@ -4250,7 +4254,8 @@ class CTClient:
                 filament, num_pulses=num_pulses, width_us=width_us,
                 inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
                 total_ms=total_ms, controller=controller, trigger=trigger,
-                timeout_s=timeout_s, verify=verify, reuse=reuse)
+                timeout_s=timeout_s, verify=verify, reuse=reuse,
+                on_armed=on_armed)
             measured, ref_mv = self._collect_pulse_events(since, int(num_pulses))
             out = {**fired, "measured": measured, "ref_mv": ref_mv,
                    "ok": bool(fired.get("ok")) and len(measured) >= int(num_pulses)}
@@ -4307,6 +4312,9 @@ class CTClient:
         timeout_s: float = 15.0,     # PYTHON CLIENT's polling timeout (seconds)
                                       # — see docstring, "total_ms vs timeout_s"
         verify: bool = True,
+        on_armed=None,         # callable() run after arming, immediately before
+                                # the trigger — the only place a caller can start
+                                # something CONCURRENT with the firing
         reuse: bool = False,   # skip re-download if unchanged since your last
                                 # call — see docstring, "reuse — skipping the
                                 # download when nothing changed"; OFF by
@@ -4460,6 +4468,28 @@ class CTClient:
                              f"look like a successful shot. Bring the rail up "
                              f"(sleep_one({filament}) is enough — it enables iso "
                              f"without heating current) and fire again."}
+
+        # Everything above is setup -- download, detector arm, schedule arm,
+        # safety checks -- and none of it is time-critical. The trigger below
+        # is. `on_armed` runs in the gap between the two, which is the only
+        # place a caller can start something that must be CONCURRENT with the
+        # firing: the RP2350 is armed and waiting, so whatever this does
+        # happens while nothing is yet in flight, and the trigger follows
+        # immediately after. Used to ramp the heating current across a pulse
+        # train -- see emission_ramp(). Its return value is ignored; an
+        # exception from it aborts the fire and disarms, rather than leaving a
+        # schedule armed on a filament whose state the caller was mid-way
+        # through changing.
+        if callable(on_armed):
+            try:
+                on_armed()
+            except BaseException as exc:
+                self.shv_disarm(controller)
+                self.ready_disarm()
+                return {"ok": False, "fired": 0, "records": [], "status": {},
+                        "error": f"on_armed raised before the trigger "
+                                 f"({type(exc).__name__}: {exc}) — disarmed "
+                                 f"without firing"}
 
         if trigger == "sim":
             r = self._post("/api/sync/simulate", {
@@ -5771,6 +5801,285 @@ class CTClient:
             return None
         return (float(vi["bus_mV"]), float(vi["current_mA"]),
                 float(vi["bus_mV"]) / float(vi["current_mA"]))
+
+    def emission_ramp(
+        self,
+        filament: int,
+        from_ma: int = 1500,           # where the ramp starts (already held)
+        to_ma: int = 2800,             # where it is commanded to go
+        num_pulses: int = 24,          # shots fired ACROSS the ramp
+        inter_pulse_ms: int = 120,     # spacing -> the whole train is
+                                       # num_pulses * this, in ms
+        width_us: int = 1000,
+        idle_ma: int = 1400,
+        end_state: str = "stop",
+        pedestal_ma: float | None = None,
+        bg_gap_us: float | None = None,
+        bg_window_us: float | None = None,
+        controller: int | None = None,
+        save_as: str | None = None,
+    ) -> dict:
+        """The whole curve in one ramp -- no settling, seconds instead of a minute.
+
+        Nothing waits. The schedule is armed first, the ACTIVE command is
+        issued in the gap between arming and triggering, and the train then
+        fires straight through the CC loop's ramp. Each shot lands at whatever
+        heating current the filament happened to be passing through, and the
+        firmware's per-pulse snapshot says which -- so the x-axis comes out of
+        the log rather than out of a setpoint that was waited for.
+
+            r = ct.emission_ramp(8, from_ma=1500, to_ma=2800)
+            print(ct.format_emission_curve(r))     # ~3 s at ACTIVE
+
+        WHY THIS IS AS VALID AS THE STEPPED SWEEP. Richardson is an
+        instantaneous relation: a shot's emission and the current it fired at
+        belong together whether or not anything had settled. Waiting was never
+        what made the stepped version right -- measuring the pair TOGETHER was.
+        And waiting does not even reach equilibrium: at a fixed 2400 mA the CC
+        loop reports settled in 2.6 s while the filament keeps warming for
+        tens of seconds (R_total +12.7% and emission +17% between 8 s and 33 s).
+        Every "settled" point was a point on a transient too -- just a slower,
+        more expensive one.
+
+        WHAT IS LOST, and it is not nothing. No filament VOLTAGE, so no
+        resistance and no temperature. A live INA219 read is I2C and the
+        backend refuses it while a schedule is firing (it would stall pulses),
+        and the cached CC read carries current only. So this gives emission
+        against heating CURRENT -- the curve itself -- but not the Richardson
+        reduction, which needs R. Points come back with `r_total_ohm: None`
+        rather than a resistance borrowed from elsewhere, and fit_richardson()
+        will decline them. Use emission_vs_heating() when temperature is the
+        point; use this when the curve is.
+
+        COVERAGE IS NOT CONTROLLED. Where the shots land depends on how fast
+        the CC loop ramps, which is a property of the slew configuration and
+        the filament, not of this call. The result reports what was actually
+        covered (`span_ma`, `gap_max_ma`) instead of pretending to a grid: a
+        ramp that finished early bunches every shot at the top, and that shows
+        up as a large gap rather than as a curve with an invented middle.
+
+        Returns the same shape emission_vs_heating() does -- one dict per
+        distinct shot rather than per setpoint -- plus:
+            {"ramp": {"from_ma", "to_ma", "commanded_at_s", "train_ms"},
+             "span_ma":   lowest to highest heating current actually hit,
+             "gap_max_ma": the largest hole between consecutive shots}
+        """
+        fil = int(filament)
+        problems: list[str] = []
+        if end_state not in self._END_STATES:
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                f"end_state {end_state!r} is not one of {sorted(self._END_STATES)}"]}
+        if self._is_dead(fil):
+            return {**self._dead_result(fil), "points": [], "problems": [
+                f"filament {fil} is marked dead"]}
+        if to_ma <= from_ma:
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                f"to_ma {to_ma} is not above from_ma {from_ma} — a ramp needs "
+                f"somewhere to go"]}
+        hv = self.hv_status()
+        if not hv.get("ok") or not hv.get("emission_on"):
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                "the emission rail is OFF — every pulse would measure "
+                "background only"]}
+
+        ped = None
+        if pedestal_ma is None:
+            ped = self.measure_emission_pedestal(fil, heat_ma=idle_ma,
+                                                 controller=controller)
+            pedestal_ma = ped.get("pedestal_ma")
+            if pedestal_ma is None:
+                return {"ok": False, "filament": fil, "points": [],
+                        "pedestal": ped, "problems": [
+                            "could not measure the emission pedestal: "
+                            + "; ".join(ped.get("warnings") or ["unknown"])]}
+            problems.extend(ped.get("warnings") or [])
+
+        ramp = {"from_ma": int(from_ma), "to_ma": int(to_ma),
+                "commanded_at_s": None,
+                "train_ms": int(num_pulses) * int(inter_pulse_ms)}
+        fired = {}
+        try:
+            with self.energised(fil):
+                self.sleep_all([fil])
+                self.standby_all([fil])
+                r = self.idle_one(fil, from_ma, verify=True, timeout_s=40.0)
+                h = r.get("heating") or {}
+                if not h.get("ok"):
+                    problems.append(
+                        f"could not reach the ramp's starting current "
+                        f"{from_ma} mA ({h.get('measured_ma')} mA, arrival="
+                        f"{h.get('arrival')})")
+                    return {"ok": False, "filament": fil, "points": [],
+                            "problems": problems, "ramp": ramp,
+                            "pedestal_ma": pedestal_ma, "pedestal": ped}
+
+                t0 = time.monotonic()
+
+                def start_ramp():
+                    # Runs ARMED, one instant before the trigger. verify=False
+                    # deliberately: waiting here would defeat the whole point,
+                    # and the ramp is verified after the fact by the per-pulse
+                    # snapshots, which are better evidence than a poll anyway.
+                    ramp["commanded_at_s"] = round(time.monotonic() - t0, 3)
+                    ramp["command"] = self.active_one(fil, to_ma, verify=False)
+
+                fired = self.fire_single_pulse(
+                    fil, num_pulses=num_pulses, width_us=width_us,
+                    inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
+                    total_ms=max(10000, ramp["train_ms"] + 5000),
+                    controller=controller, trigger="sim",
+                    timeout_s=15.0 + ramp["train_ms"] / 1000.0,
+                    verify=True, reuse=False, measure=True,
+                    bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
+                    on_armed=start_ramp)
+                ramp["active_s"] = round(time.monotonic() - t0, 2)
+        finally:
+            if end_state != "stop":
+                self._state_one(fil, self._END_STATES[end_state],
+                                idle_ma if end_state == "idle" else 0,
+                                "emission_ramp end_state")
+
+        cmd = (ramp.get("command") or {})
+        if not cmd.get("ok"):
+            problems.append(
+                f"the ACTIVE command itself did not land ("
+                f"{self.describe(cmd)[:110]}) — the filament never ramped, so "
+                f"every shot is at the starting current")
+        events = fired.get("measured") or []
+        if not events:
+            problems.append(fired.get("error") or "the detector measured no pulse")
+            return {"ok": False, "filament": fil, "points": [],
+                    "problems": problems, "ramp": ramp,
+                    "pedestal_ma": pedestal_ma, "pedestal": ped}
+
+        log = [rec for rec in (self.shv_pulse_log(controller or 1) or [])
+               if rec.get("filament") == fil]
+        if len(log) != len(events):
+            # Without a 1:1 pairing every emission reading would go to the
+            # wrong current, which on a RAMP is the whole measurement -- unlike
+            # the stepped sweep, there is no setpoint to fall back on.
+            problems.append(
+                f"{len(log)} firmware snapshot(s) for {len(events)} measured "
+                f"pulse(s) — they cannot be paired, and on a ramp there is no "
+                f"setpoint to fall back on, so no point has a heating current")
+            return {"ok": False, "filament": fil, "points": [],
+                    "problems": problems, "ramp": ramp,
+                    "pedestal_ma": pedestal_ma, "pedestal": ped}
+
+        slope = (self.pulse_ma(1.0, fired.get("ref_mv") or 1200.0)
+                 - self.pulse_ma(0.0, fired.get("ref_mv") or 1200.0))
+        points = []
+        for i, (e, rec) in enumerate(zip(events, log)):
+            heat = rec.get("heat_meas_mA")
+            net = e.get("plateau_net_ma")
+            sigma4 = e.get("bg_sigma4")
+            emis = None if net is None else round(net - pedestal_ma, 3)
+            points.append({
+                "shot": i, "seq": rec.get("seq"),
+                "commanded_ma": None,          # there was no setpoint per shot
+                "settled_ma": None,
+                "heat_mA": heat,
+                "heat_unavailable": rec.get("heat_meas_unavailable"),
+                "heat_target_mA": rec.get("heat_target_mA"),
+                # No live V during a run, so no resistance and no temperature.
+                # None, not a value carried over from a neighbouring shot.
+                "bus_mV": None, "vi_current_mA": None, "r_total_ohm": None,
+                "r_drift_frac": None,
+                "pedestal_ma": round(float(pedestal_ma), 3),
+                "net_ma": net, "emission_ma": emis, "net_ma_sd": None,
+                "charge_mams": e.get("integral_mams"),
+                "on_us": e.get("on_us"),
+                "bg_ma": e.get("bg_ma"),
+                "sigma_ma": round((sigma4 / 4.0) * slope, 4) if sigma4 else None,
+                "n_used": 1 if (emis is not None and not e.get("empty_envelope")) else 0,
+                "n_fired": 1, "n_cold": 0,
+                "usable": bool(emis is not None and heat is not None
+                               and not e.get("empty_envelope")),
+                "pulses": [], "note": None,
+            })
+        # THERMAL LAG. On a ramp the current arrives before the temperature
+        # does, so emission at a given heating current is not a function of
+        # that current alone -- it depends on how long the filament has been
+        # there. This is measurable from the run itself and costs nothing:
+        # wherever two shots fired at the SAME current at different times,
+        # compare them. Measured on this bench, 20 shots over a 1500->2800 mA
+        # ramp: the train outlasted the ramp, so 13 shots piled up at
+        # 2757-2780 mA and emission went 10.03 -> 13.54 mA (+35%) across them
+        # at a constant current.
+        #
+        # Reported rather than corrected. There is no correction: the honest
+        # statement is that a ramp measures a DYNAMIC curve, and how far it
+        # sits below the steady one depends on the slew rate.
+        lag = None
+        by_i = sorted((p for p in points if p["heat_mA"] is not None
+                       and p["emission_ma"] is not None),
+                      key=lambda p: p["shot"])
+        for a in by_i:
+            for b in by_i:
+                if b["shot"] - a["shot"] < 3 or not a["heat_mA"]:
+                    continue
+                if abs(b["heat_mA"] - a["heat_mA"]) > 0.01 * a["heat_mA"]:
+                    continue
+                if a["emission_ma"] <= 0.2:      # noise, not a ratio
+                    continue
+                frac = (b["emission_ma"] - a["emission_ma"]) / a["emission_ma"]
+                if lag is None or abs(frac) > abs(lag["change_frac"]):
+                    lag = {"heat_mA": a["heat_mA"], "shots": [a["shot"], b["shot"]],
+                           "emission_ma": [a["emission_ma"], b["emission_ma"]],
+                           "change_frac": round(frac, 4),
+                           "apart_ms": (b["shot"] - a["shot"]) * int(inter_pulse_ms)}
+        if lag and abs(lag["change_frac"]) > 0.10:
+            problems.append(
+                f"thermal lag: two shots {lag['apart_ms']} ms apart at the same "
+                f"{lag['heat_mA']} mA read {lag['emission_ma'][0]} and "
+                f"{lag['emission_ma'][1]} mA ({lag['change_frac'] * 100:+.0f}%). "
+                f"The current arrives before the temperature does, so this is a "
+                f"DYNAMIC curve — at a given heating current it sits below the "
+                f"settled one, by an amount that depends on the slew rate")
+
+        points.sort(key=lambda p: (p["heat_mA"] is None, p["heat_mA"] or 0))
+        heats = [p["heat_mA"] for p in points if p["heat_mA"] is not None]
+        span = [min(heats), max(heats)] if heats else None
+        gaps = [b - a for a, b in zip(heats, heats[1:])] if len(heats) > 1 else []
+        gap_max = max(gaps) if gaps else None
+        # The train and the ramp have to be the same LENGTH. Firing faster does
+        # not add resolution once the ramp is over -- every extra shot lands at
+        # the destination. Measured: 20 shots at 400 ms spanned 8 s against a
+        # ~2.8 s ramp, so 7 covered it and 13 piled up at the top with a 222 mA
+        # hole in the middle. The knob for resolution is the SLEW RATE, not the
+        # pulse rate.
+        if heats:
+            top = max(heats)
+            at_top = sum(1 for h in heats if h >= top - 0.01 * top)
+            if at_top > max(3, len(heats) // 3):
+                problems.append(
+                    f"{at_top} of {len(heats)} shots landed within 1% of the "
+                    f"top current — the {ramp['train_ms']} ms train outlasted "
+                    f"the ramp, so they are a dwell series at the destination, "
+                    f"not coverage. Shorten the train (fewer pulses, or a wider "
+                    f"spacing with fewer of them) to match the ramp, and slow "
+                    f"the slew rate if you want more points across it")
+        if span and span[1] - span[0] < 0.5 * (to_ma - from_ma):
+            problems.append(
+                f"the shots only cover {span[0]}–{span[1]} mA of the "
+                f"{from_ma}–{to_ma} mA that was asked for — the train ended "
+                f"before the ramp did, or the ramp finished before the train "
+                f"started. Adjust num_pulses × inter_pulse_ms against the slew "
+                f"rate rather than reading the missing range as flat")
+        out = {"ok": not problems, "filament": fil, "points": points,
+               "end_state": end_state, "active_s": ramp.get("active_s"),
+               "problems": problems, "ref_mv": fired.get("ref_mv"),
+               "pedestal_ma": float(pedestal_ma), "pedestal": ped,
+               "ramp": ramp, "span_ma": span, "gap_max_ma": gap_max,
+               "temperature_available": False}
+        if save_as:
+            out["saved"] = self.save_emission_curves(save_as, {fil: out}, {
+                "mode": "ramp", "from_ma": from_ma, "to_ma": to_ma,
+                "num_pulses": num_pulses, "inter_pulse_ms": inter_pulse_ms,
+                "width_us": width_us, "end_state": end_state,
+                "emission_v": self.read_emission_v(),
+                "focus_v": self.read_focus_v(), "ref_mv": fired.get("ref_mv")})
+        return out
 
     def _emission_point(self, fil: int, ma: int, *, width_us: int, pulses: int,
                         inter_pulse_ms: int, settle_s: float, timeout_s: float,
