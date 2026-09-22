@@ -3094,6 +3094,85 @@ Returns `{"ok", "fired": <the full fire_single_pulse result>, "measured": [...],
 "ref_mv"}`. Same arming, correlation and strict-`ok` rules as `measure=True`;
 it takes the same `fire_single_pulse` parameters.
 
+### Emission current vs heating current
+
+**`emission_vs_heating(filament, start_ma=2500, max_ma=2800, step_ma=100, width_us=1000, pulses_per_point=3, idle_ma=1500, end_state="stop", ...)`**
+— How much a filament emits depends on how hot it is, so the curve that matters
+is net emission current against **heating** current. Pre-heats through the
+ladder, walks ACTIVE from `start_ma` up to `max_ma`, fires and measures
+`pulses_per_point` shots at each step, and leaves the filament in `end_state`.
+
+```python
+ct.set_emission_v(200); ct.set_focus_v(350); ct.enable_emission(True)
+r = ct.emission_vs_heating(8, save_as="emission_vs_heating")
+print(ct.format_emission_curve(r))
+```
+
+```
+filament 8 · emission vs heating current   (32.6 s at ACTIVE, ref 1227.9 mV)
+   cmd mA  settled  at pulse   net mA     sd    charge     n  note
+     2500     2476    2470.0    3.374  0.039     3.367 3/3
+     2600     2575    2570.7    4.739  0.039     4.711 3/3
+     2700     2670    2683.7    7.249  0.079     7.236 3/3
+     2800     2778    2774.3   10.469  0.052    10.451 3/3
+```
+
+> ⚠️ **The x-axis is `heat_mA`, not `commanded_ma`.** Each point carries three
+> heating numbers and they are not interchangeable:
+>
+> | field | what it is |
+> |---|---|
+> | `commanded_ma` | what ACTIVE was *told* to hold. A label, not a measurement |
+> | `settled_ma` | what the CC loop reported after settling — one host poll, before the shots |
+> | `heat_mA` | the mean of the **firmware's per-pulse snapshots**: the filament's current at the *instant* each pulse fired |
+>
+> `heat_mA` is the only one of the three the host could not have produced
+> itself. The CC loop settles *near*, not at, its target, and a shot that lands
+> during the ramp sits at a current no later poll can recover — the ACTIVE
+> window is a few triggers wide and sampling it hard enough to align perturbs
+> the ramp being sampled. It comes from the RP2350's pulse log (`heat_meas_mA`);
+> see [`scan_report()`](#scan-report)'s `heating_at_pulse`.
+>
+> When the firmware supplies no snapshot, `heat_mA` is **`None`** with a
+> `heat_unavailable` reason and the point is kept as `usable: False` — it does
+> **not** fall back to `commanded_ma`. A curve whose x-axis silently mixes
+> "measured" with "asked for" is worse than one with a gap in it.
+
+> ⚠️ **Pulses that fired cold are dropped, not averaged.** A shot whose snapshot
+> is more than 20% below the point's target landed before the filament got
+> there, and its emission is not comparable with the rest. Those are recorded
+> individually with `cold: True`, excluded from the point's mean, and counted in
+> `n_cold`.
+
+> ⚠️ **HV must already be on.** This does not touch the HV rails. It checks
+> `hv_status()` before heating anything and **refuses** if emission is off —
+> because the alternative is a complete, plausible-looking curve of zeros that
+> looks exactly like a filament that does not emit.
+
+**Safety.** The ladder is walked in full (STOP→SLEEP→STANDBY→IDLE→ACTIVE), the
+sweep only ever steps **up**, `max_ma` is a hard ceiling (a `step_ma` that would
+overshoot simply is not taken), ACTIVE is held only as long as the shots need,
+and `active_s` in the result reports how long that actually was. `end_state`
+accepts `stop` (default) / `sleep` / `standby` / `idle` — **not** `ACTIVE`: the
+point of an end state is that the filament is no longer at firing current when
+the call returns. The teardown runs on an exception and on Ctrl-C.
+
+A point that fails to reach its current is **not** fatal — a filament that
+cannot hold 2800 mA may well have held 2500, and those points are real. Only a
+`ladder_blocked` / dead refusal stops the sweep, because the next point is
+higher and will not get through either.
+
+**`save_emission_curves(name, results, params=None)`** — Write one or more
+`emission_vs_heating()` results (as `{filament: result}`) to the backend's
+`calibration/` directory: one JSON with everything including the per-shot
+detail, and one flat CSV of the points covering every filament. Built to take a
+whole sweep at once rather than one file per filament — the interesting
+comparison is *between* filaments. `emission_vs_heating(save_as=...)` calls it
+for a single curve. A failed save does not fail the measurement; it is reported
+under the result's `saved` key.
+
+**`format_emission_curve(r)`** — the table above, as a string.
+
 ### Waiting on state — what is polled, and what that costs
 
 There is no push path for "this filament arrived". The firmware *knows* — the

@@ -5455,6 +5455,413 @@ class CTClient:
         return {"ok": bool(r.get("ok")), "fired": fired,
                 "measured": r.get("measured") or [], "ref_mv": r.get("ref_mv")}
 
+    # ── emission vs heating current ───────────────────────────────────────────
+    # How much a filament emits depends on how hot it is, so the useful curve is
+    # net emission current against HEATING current. The x-axis has to be what
+    # the filament was ACTUALLY drawing when the pulse fired, not what it was
+    # commanded: the CC loop settles near, not at, its target, and a pulse that
+    # lands during the ramp sits at a current no host poll can recover
+    # afterwards. The RP2350 snapshots it per pulse (heat_meas_mA in the pulse
+    # log), which is the one number a host could never supply -- see
+    # scan_report()'s "heating_at_pulse". This uses it as the x-axis and keeps
+    # the commanded value only as a label.
+
+    # ACTIVE below this is refused by the backend (it is the idle operating
+    # current -- promoting to ACTIVE must not LOWER the current). Mirrored here
+    # so a sweep whose whole range is under the floor says so before it heats
+    # anything, rather than failing on the first point.
+    _ACTIVE_FLOOR_MA = 1500
+
+    #: end_state values emission_vs_heating() will leave a filament in. ACTIVE
+    #: is deliberately absent: the whole point of an end state is that the
+    #: filament is no longer at firing current when the call returns.
+    _END_STATES = {"stop": STOP, "sleep": SLEEP, "standby": STANDBY, "idle": IDLE}
+
+    def emission_vs_heating(
+        self,
+        filament: int,                     # USER_INDEX, as everywhere
+        start_ma: int = 2500,              # first ACTIVE point -- where firing starts
+        max_ma: int = 2800,                # last ACTIVE point; never exceeded
+        step_ma: int = 100,                # spacing between points
+        width_us: int = 1000,              # pulse width
+        pulses_per_point: int = 3,         # shots averaged at each heating current
+        idle_ma: int = 1500,               # the IDLE rung of the ladder (pre-heat)
+        end_state: str = "stop",           # where to leave it: stop/sleep/standby/idle
+        inter_pulse_ms: int = 1000,
+        settle_s: float = 1.0,             # extra dwell after the CC loop says settled
+        idle_timeout_s: float = 40.0,
+        active_timeout_s: float = 30.0,
+        bg_gap_us: float | None = None,
+        bg_window_us: float | None = None,
+        controller: int | None = None,
+        progress=None,                     # callable(point_dict) after each point
+        save_as: str | None = None,        # write the curve to the backend's disk
+    ) -> dict:
+        """Measure ONE filament's emission current against its heating current.
+
+        Pre-heats through the ladder, then walks ACTIVE from `start_ma` up to
+        `max_ma` in `step_ma` steps, firing `pulses_per_point` pulses at each
+        step and measuring every one. Leaves the filament in `end_state`
+        (default STOP) whatever happens -- including on an exception or Ctrl-C.
+
+            r = ct.emission_vs_heating(8)                      # 2500..2800 mA
+            for p in r["points"]:
+                print(p["heat_mA"], "mA ->", p["net_ma"], "mA emission")
+
+        WHY THE X-AXIS IS NOT `commanded_ma`. Each point reports three heating
+        numbers and they are not interchangeable:
+
+            commanded_ma   what ACTIVE was told to hold. A label, not a
+                           measurement.
+            settled_ma     what the CC loop reported after settling, from the
+                           host's own verify. One poll, before the shots.
+            heat_mA        the mean of the firmware's per-pulse snapshots --
+                           the filament's current at the INSTANT each pulse
+                           fired. This is the x-axis. On this bench a point
+                           commanded 2600 mA fired at 2574 and 2566 mA.
+
+        `heat_mA` is `None` when the firmware supplied no snapshot (see
+        `heat_unavailable` for which reason), and such a point is kept with
+        `usable: False` rather than falling back to the commanded value -- a
+        curve whose x-axis silently mixes "measured" and "asked for" is worse
+        than one with a gap in it.
+
+        PULSES THAT FIRED COLD ARE DROPPED, NOT AVERAGED. A shot whose snapshot
+        is more than 20% below the point's target landed before the filament
+        got there; its emission is not comparable with the rest. Those pulses
+        are recorded individually with `cold: True` and excluded from the
+        point's mean, and the point says how many it lost.
+
+        RECORDING. `save_as="emission_curve"` writes the result to the
+        backend's own disk through save_calibration() -- a JSON with everything
+        including the per-shot detail, and a flat CSV of the points, one row per
+        heating current. The paths come back under `saved`. A save that fails
+        does NOT fail the measurement (the numbers are already in the returned
+        dict); it is reported under `saved` instead.
+
+        HV MUST ALREADY BE ON. This does not touch the HV rails -- set them
+        with set_emission_v()/set_focus_v()/enable_emission() first. It checks
+        before heating anything and refuses if emission is off, because the
+        alternative is a complete, plausible-looking curve of zeros.
+
+        SAFETY. The ladder is walked in full (STOP->SLEEP->STANDBY->IDLE->
+        ACTIVE): going straight to firing current damages a filament, and in
+        vacuum that is unrepairable. ACTIVE is held only as long as the shots
+        need, the sweep steps UPWARD so the filament is never taken above the
+        point it has already reached, and `max_ma` is a hard ceiling -- a
+        `start_ma`/`step_ma` combination that would overshoot it stops at the
+        last point at or below instead. `end_state` cannot be ACTIVE.
+        `active_s` in the result reports how long it actually spent at firing
+        current.
+
+        Returns
+            {"ok":        every point produced at least one usable pulse,
+             "filament":  int,
+             "points":    [ ... one per heating current, see below ... ],
+             "end_state": the state actually left behind,
+             "active_s":  seconds spent at ACTIVE,
+             "problems":  [str], empty when ok,
+             "ref_mv":    the live reference used for the mA conversion}
+
+        each point:
+            {"commanded_ma", "settled_ma", "heat_mA", "heat_target_mA",
+             "heat_unavailable":  reason string, or None,
+             "net_ma":      mean net emission current (plateau - bg), or None,
+             "net_ma_sd":   spread across the point's pulses (0.0 for one),
+             "charge_mams": mean charge, or None,
+             "n_used", "n_fired", "n_cold",
+             "usable":      bool,
+             "pulses":      [ per-shot {heat_mA, net_ma, charge_mams, on_us,
+                              bg_ma, sigma_ma, cold} ]}
+        """
+        fil = int(filament)
+        problems: list[str] = []
+
+        # ---- refuse bad requests BEFORE heating anything ---------------------
+        if end_state not in self._END_STATES:
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                f"end_state {end_state!r} is not one of "
+                f"{sorted(self._END_STATES)} — ACTIVE is deliberately not "
+                f"offered: the filament must not be left at firing current"]}
+        if self._is_dead(fil):
+            return {**self._dead_result(fil), "points": [], "problems": [
+                f"filament {fil} is marked dead"]}
+        if self.filament_to_board(fil) is None:
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                f"filament {fil} has no board (unassigned in the active-list "
+                f"mapping, or out of range)"]}
+        if step_ma <= 0:
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                f"step_ma must be positive, got {step_ma}"]}
+        if start_ma > max_ma:
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                f"start_ma {start_ma} is above max_ma {max_ma} — there is no "
+                f"point to measure"]}
+        if start_ma < self._ACTIVE_FLOOR_MA:
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                f"start_ma {start_ma} mA is below the {self._ACTIVE_FLOOR_MA} mA "
+                f"ACTIVE floor — ACTIVE may not lower the current below idle"]}
+        if idle_ma >= start_ma:
+            problems.append(
+                f"idle_ma {idle_ma} is not below start_ma {start_ma}; the "
+                f"pre-heat rung should be cooler than the first firing point")
+
+        # A curve of zeros is what an off rail produces, and it looks exactly
+        # like a filament that does not emit. Check once, up front.
+        hv = self.hv_status()
+        if not hv.get("ok"):
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                f"could not read HV status: {hv.get('error')} — refusing to "
+                f"sweep without knowing whether the emission rail is on"]}
+        if not hv.get("emission_on"):
+            return {"ok": False, "filament": fil, "points": [], "problems": [
+                "the emission rail is OFF — every pulse would measure "
+                "background only. Set it with set_emission_v()/"
+                "enable_emission(True) before calling this"]}
+
+        # Inclusive of max_ma, and never past it: a step that would overshoot
+        # simply is not taken. The ceiling is the caller's stated limit for the
+        # filament, not a rounding target.
+        currents = list(range(int(start_ma), int(max_ma) + 1, int(step_ma)))
+
+        points: list[dict] = []
+        ref_mv = None
+        active_s = 0.0
+        try:
+            with self.energised(fil):
+                self.sleep_all([fil])
+                self.standby_all([fil])
+                r = self.idle_one(fil, idle_ma, verify=True,
+                                  timeout_s=idle_timeout_s)
+                h = r.get("heating") or {}
+                if not h.get("ok"):
+                    problems.append(
+                        f"pre-heat to IDLE {idle_ma} mA did not complete "
+                        f"({h.get('measured_ma')} mA, arrival="
+                        f"{h.get('arrival')}) — not promoting to ACTIVE")
+                    return {"ok": False, "filament": fil, "points": [],
+                            "problems": problems, "end_state": end_state,
+                            "active_s": 0.0, "ref_mv": None}
+
+                t_active0 = time.monotonic()
+                for ma in currents:
+                    pt = self._emission_point(
+                        fil, ma, width_us=width_us,
+                        pulses=pulses_per_point,
+                        inter_pulse_ms=inter_pulse_ms,
+                        settle_s=settle_s, timeout_s=active_timeout_s,
+                        bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
+                        controller=controller)
+                    ref_mv = pt.pop("_ref_mv", ref_mv)
+                    points.append(pt)
+                    if callable(progress):
+                        progress(pt)
+                    if pt.get("_fatal"):
+                        problems.append(pt["_fatal"])
+                        break
+                active_s = time.monotonic() - t_active0
+        finally:
+            # energised() has already STOPped on the way out. Re-command the
+            # requested end state after it, so "leave it at IDLE" means IDLE and
+            # not "STOP, then IDLE would have been nice" -- and so the STOP
+            # still happens on the paths where this one fails.
+            if end_state != "stop":
+                self._state_one(fil, self._END_STATES[end_state],
+                                idle_ma if end_state == "idle" else 0,
+                                "emission_vs_heating end_state")
+
+        for p in points:
+            p.pop("_fatal", None)
+        unusable = [p["commanded_ma"] for p in points if not p["usable"]]
+        if unusable:
+            problems.append(f"no usable pulse at {unusable} mA")
+        if not points:
+            problems.append("no points were measured")
+        out = {"ok": not problems, "filament": fil, "points": points,
+               "end_state": end_state, "active_s": round(active_s, 1),
+               "problems": problems, "ref_mv": ref_mv}
+        if save_as:
+            out["saved"] = self.save_emission_curves(save_as, {fil: out}, {
+                "start_ma": start_ma, "max_ma": max_ma, "step_ma": step_ma,
+                "width_us": width_us, "pulses_per_point": pulses_per_point,
+                "idle_ma": idle_ma, "end_state": end_state,
+                "emission_v": self.read_emission_v(),
+                "focus_v": self.read_focus_v(), "ref_mv": ref_mv})
+        return out
+
+    def save_emission_curves(self, name: str, results: dict,
+                             params: dict | None = None) -> dict:
+        """Write one or more emission_vs_heating() results to the backend's
+        disk, as one JSON plus one flat CSV covering every filament.
+
+        `results` is {filament: <an emission_vs_heating() result>}. Built to
+        take a whole sweep's worth at once rather than one file per filament:
+        the interesting comparison is between filaments, and that is a lot
+        easier from one table.
+
+        The CSV carries the POINTS only, one row per heating current; the
+        per-shot detail would not fit a flat table and lives in the JSON's
+        "pulses" section instead. Returns save_calibration()'s
+        {"ok", "json", "csv", "filaments"}."""
+        curves, shots, meta = {}, {}, {}
+        for fil, r in results.items():
+            # `pulses` is a LIST -- it cannot go in a CSV cell, so it is lifted
+            # out here rather than stringified into one. The point rows keep
+            # the counts (n_used/n_fired/n_cold), which is what a flat table
+            # can actually carry.
+            curves[str(int(fil))] = [{k: v for k, v in p.items() if k != "pulses"}
+                                     for p in (r.get("points") or [])]
+            shots[str(int(fil))] = [{"commanded_ma": p.get("commanded_ma"),
+                                     **s} for p in (r.get("points") or [])
+                                    for s in (p.get("pulses") or [])]
+            meta[str(int(fil))] = {"ok": r.get("ok"), "problems": r.get("problems"),
+                                   "active_s": r.get("active_s"),
+                                   "end_state": r.get("end_state")}
+        return self.save_calibration(name, {"params": params or {},
+                                            "curves": curves,
+                                            "pulses": shots,
+                                            "per_filament": meta})
+
+    def _emission_point(self, fil: int, ma: int, *, width_us: int, pulses: int,
+                        inter_pulse_ms: int, settle_s: float, timeout_s: float,
+                        bg_gap_us, bg_window_us, controller) -> dict:
+        """One heating current: promote, settle, fire, pair, average."""
+        pt = {"commanded_ma": int(ma), "settled_ma": None, "heat_mA": None,
+              "heat_target_mA": None, "heat_unavailable": None,
+              "net_ma": None, "net_ma_sd": None, "charge_mams": None,
+              "n_used": 0, "n_fired": 0, "n_cold": 0, "usable": False,
+              "pulses": [], "note": None}
+
+        r = self.active_one(fil, ma, verify=True, timeout_s=timeout_s)
+        if r.get("ladder_blocked") or r.get("dead"):
+            # Fatal for the whole sweep: the ladder will not let the next,
+            # HIGHER point through either.
+            pt["note"] = self.describe(r)[:160]
+            pt["_fatal"] = f"{ma} mA: {pt['note']}"
+            return pt
+        h = r.get("heating") or {}
+        pt["settled_ma"] = h.get("measured_ma")
+        if not h.get("ok"):
+            # Not fatal: a filament that cannot hold 2800 mA may still have
+            # held 2500, and those points are real. Record and move on.
+            pt["note"] = (f"did not reach {ma} mA "
+                          f"({h.get('measured_ma')} mA, arrival={h.get('arrival')})")
+            return pt
+        if settle_s > 0:
+            time.sleep(settle_s)
+
+        since = self.pulse_cursor()
+        fr = self.fire_single_pulse(
+            fil, num_pulses=pulses, width_us=width_us,
+            inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
+            total_ms=max(10000, pulses * (inter_pulse_ms + 1000)),
+            controller=controller, trigger="sim",
+            timeout_s=15.0 + pulses * inter_pulse_ms / 1000.0,
+            verify=True, reuse=False, measure=True,
+            bg_gap_us=bg_gap_us, bg_window_us=bg_window_us)
+        events = fr.get("measured") or []
+        pt["_ref_mv"] = fr.get("ref_mv")
+        pt["n_fired"] = int(fr.get("fired") or 0)
+        if not events:
+            pt["note"] = fr.get("error") or "the detector measured no pulse"
+            return pt
+
+        # The RP2350's heating snapshots and the STM32's measurements are two
+        # INDEPENDENT records of the same shots. Pair them by index only when
+        # the counts agree; when they do not, the pairing is a guess and a
+        # wrong pairing puts a real emission reading at the wrong heating
+        # current -- the one error this whole function exists to avoid. Keep
+        # the emission numbers, drop the per-pulse x, and say so.
+        log = [rec for rec in (self.shv_pulse_log(controller or 1) or [])
+               if rec.get("filament") == fil]
+        paired = len(log) == len(events)
+        if not paired:
+            pt["note"] = (f"{len(log)} firmware snapshot(s) for {len(events)} "
+                          f"measured pulse(s) — cannot pair them, so this "
+                          f"point has no measured heating current")
+
+        slope = (self.pulse_ma(1.0, fr.get("ref_mv") or 1200.0)
+                 - self.pulse_ma(0.0, fr.get("ref_mv") or 1200.0))
+        nets, charges, heats = [], [], []
+        for i, e in enumerate(events):
+            rec = log[i] if paired else {}
+            heat = rec.get("heat_meas_mA")
+            target = rec.get("heat_target_mA")
+            if target:
+                pt["heat_target_mA"] = target
+            if pt["heat_unavailable"] is None:
+                pt["heat_unavailable"] = rec.get("heat_meas_unavailable")
+            # 20% short of the setpoint = the shot landed during the ramp.
+            cold = bool(heat is not None and target and heat < 0.8 * target)
+            sigma4 = e.get("bg_sigma4")
+            shot = {"heat_mA": heat,
+                    "net_ma": e.get("plateau_net_ma"),
+                    "charge_mams": e.get("integral_mams"),
+                    "on_us": e.get("on_us"),
+                    "bg_ma": e.get("bg_ma"),
+                    "sigma_ma": round((sigma4 / 4.0) * slope, 4) if sigma4 else None,
+                    "cold": cold,
+                    "empty_envelope": bool(e.get("empty_envelope"))}
+            pt["pulses"].append(shot)
+            if cold:
+                pt["n_cold"] += 1
+                continue
+            if shot["empty_envelope"] or shot["net_ma"] is None:
+                continue
+            nets.append(shot["net_ma"])
+            if shot["charge_mams"] is not None:
+                charges.append(shot["charge_mams"])
+            if heat is not None:
+                heats.append(heat)
+
+        pt["n_used"] = len(nets)
+        if nets:
+            pt["net_ma"] = round(sum(nets) / len(nets), 3)
+            pt["net_ma_sd"] = round(
+                math.sqrt(sum((x - sum(nets) / len(nets)) ** 2
+                              for x in nets) / len(nets)), 3)
+            pt["usable"] = True
+        if charges:
+            pt["charge_mams"] = round(sum(charges) / len(charges), 4)
+        if heats:
+            pt["heat_mA"] = round(sum(heats) / len(heats), 1)
+        elif pt["usable"] and pt["heat_unavailable"] is None and paired:
+            pt["heat_unavailable"] = "no snapshot in any paired record"
+        if pt["n_cold"]:
+            pt["note"] = ((pt["note"] + "; ") if pt["note"] else "") + (
+                f"{pt['n_cold']} of {len(pt['pulses'])} pulse(s) fired below "
+                f"80% of the setpoint and were excluded")
+        return pt
+
+    def format_emission_curve(self, r: dict) -> str:
+        """An emission_vs_heating() result as a readable table."""
+        if not r.get("points"):
+            return (f"filament {r.get('filament')}: no points — "
+                    + "; ".join(r.get("problems") or ["(no reason given)"]))
+        out = [f"filament {r.get('filament')} · emission vs heating current"
+               f"   ({r.get('active_s')} s at ACTIVE"
+               + (f", ref {r['ref_mv']:.1f} mV" if r.get("ref_mv") else "")
+               + ")",
+               f"  {'cmd mA':>7} {'settled':>8} {'at pulse':>9} "
+               f"{'net mA':>8} {'sd':>6} {'charge':>9} {'n':>5}  note"]
+        for p in r["points"]:
+            # The x-axis is `at pulse`. A point with none is printed with a
+            # dash there rather than borrowing the commanded value.
+            heat = f"{p['heat_mA']:>9.1f}" if p["heat_mA"] is not None else f"{'—':>9}"
+            net = f"{p['net_ma']:>8.3f}" if p["net_ma"] is not None else f"{'—':>8}"
+            sd = f"{p['net_ma_sd']:>6.3f}" if p["net_ma_sd"] is not None else f"{'—':>6}"
+            chg = f"{p['charge_mams']:>9.3f}" if p["charge_mams"] is not None else f"{'—':>9}"
+            note = p.get("note") or ("" if p["usable"] else "unusable")
+            if p.get("heat_unavailable"):
+                note = f"no snapshot ({p['heat_unavailable']}); " + note
+            out.append(f"  {p['commanded_ma']:>7} "
+                       f"{(p['settled_ma'] if p['settled_ma'] is not None else float('nan')):>8.0f} "
+                       f"{heat} {net} {sd} {chg} "
+                       f"{p['n_used']}/{len(p['pulses']):<3}  {note}")
+        for prob in r.get("problems") or []:
+            out.append(f"  !! {prob}")
+        return "\n".join(out)
+
     # ── Board self-test & I2C diagnostics ─────────────────────────────────────
     # The GUI's I2C panel, as API calls. These ask "is the hardware wired up and
     # answering", not "is the filament good" -- for the latter see the test

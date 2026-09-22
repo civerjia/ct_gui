@@ -20,6 +20,7 @@ from ct_simple_control import CTClient
 | script | what it exercises |
 |---|---|
 | `test_api.py` | end-to-end API: mapping → HV → heating ladder → fire → measure, with PASS/FAIL per step and a non-zero exit on failure |
+| `test_emission_curve.py` | emission current vs heating current — sweeps ACTIVE 2500→2800 mA, measures pulses at each step, saves JSON + CSV |
 | `test_hv_diag165.py` | 74HC165 read-back of the RP2350b HV shift-register chain |
 | `test_pulse_sweep.py` | voltage sweep via the STM32 pulse detector's on-chip summary |
 | `test_pulse_width_sweep.py` | pulse-width sweep at fixed voltage; known-timing mode |

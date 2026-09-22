@@ -16,6 +16,7 @@ STM32 = the device's HTTP /stm32 status (age_ms).
 from __future__ import annotations
 
 import copy
+import csv
 import datetime
 import json
 import logging
@@ -4549,19 +4550,28 @@ class CtHandler(BaseHTTPRequestHandler):
                         for k in pt:
                             if k not in cols:
                                 cols.append(k)
-                lines = ["filament" + ("," + ",".join(cols) if cols else "")]
-                for fil, curve in sorted(curves.items(), key=lambda kv: int(kv[0])):
-                    for pt in curve:
-                        # A JSON null -> EMPTY cell, not the string "None". The
-                        # GUI sends mA null for a point it could not measure
-                        # (no pulse event, or an event with background_n 0, so
-                        # the current would have been ~32 mA of pure offset);
-                        # "None" in a numeric column parses as garbage or, worse,
-                        # gets cleaned to 0 downstream, which is the fabricated
-                        # reading this null exists to avoid.
-                        lines.append(str(fil) + "".join(
-                            "," + ("" if pt.get(k) is None else str(pt.get(k))) for k in cols))
-                base.with_suffix(".csv").write_text("\n".join(lines) + "\n")
+                # Written through csv.writer, NOT by joining on commas: a point
+                # field may legitimately contain a comma (a free-text note, a
+                # list), and hand-joining silently splits that value across
+                # columns -- every later row field shifts by one, so the file
+                # still parses and every number in it is attributed to the wrong
+                # column. Quoting is the difference between a corrupt file and
+                # one that says what it means.
+                with base.with_suffix(".csv").open("w", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["filament"] + cols)
+                    for fil, curve in sorted(curves.items(), key=lambda kv: int(kv[0])):
+                        for pt in curve:
+                            # A JSON null -> EMPTY cell, not the string "None".
+                            # The GUI sends mA null for a point it could not
+                            # measure (no pulse event, or an event with
+                            # background_n 0, so the current would have been ~32
+                            # mA of pure offset); "None" in a numeric column
+                            # parses as garbage or, worse, gets cleaned to 0
+                            # downstream, which is the fabricated reading this
+                            # null exists to avoid.
+                            w.writerow([fil] + ["" if pt.get(k) is None else pt.get(k)
+                                                for k in cols])
                 self._json({"ok": True, "json": str(base.with_suffix(".json")),
                             "csv": str(base.with_suffix(".csv")), "filaments": len(data.get("curves") or {})})
             elif path == "/api/present":
