@@ -5485,10 +5485,15 @@ class CTClient:
         step_ma: int = 100,                # spacing between points
         width_us: int = 1000,              # pulse width
         pulses_per_point: int = 3,         # shots averaged at each heating current
+                                           # (3, not 2: the scatter of 2 shots
+                                           # is not an estimate -- several
+                                           # points came back sd = 0.000, which
+                                           # then disables the significance cut
+                                           # that uses it)
         idle_ma: int = 1500,               # the IDLE rung of the ladder (pre-heat)
         end_state: str = "stop",           # where to leave it: stop/sleep/standby/idle
-        inter_pulse_ms: int = 1000,
-        settle_s: float = 1.0,             # extra dwell after the CC loop says settled
+        inter_pulse_ms: int = 400,
+        settle_s: float = 0.3,             # extra dwell after the CC loop says settled
         idle_timeout_s: float = 40.0,
         active_timeout_s: float = 30.0,
         bg_gap_us: float | None = None,
@@ -5735,13 +5740,37 @@ class CTClient:
             shots[str(int(fil))] = [{"commanded_ma": p.get("commanded_ma"),
                                      **s} for p in (r.get("points") or [])
                                     for s in (p.get("pulses") or [])]
+            # The pedestal block travels WITH the curve, sigma included. It
+            # is part of the reduction, not a side note: without its sigma the
+            # significance cut lands somewhere else and the saved run replays
+            # to different numbers than the live one did. Measured: 12 points
+            # and phi 2.87 eV offline against 10 points and 3.65 eV live.
             meta[str(int(fil))] = {"ok": r.get("ok"), "problems": r.get("problems"),
                                    "active_s": r.get("active_s"),
-                                   "end_state": r.get("end_state")}
+                                   "end_state": r.get("end_state"),
+                                   "ref_mv": r.get("ref_mv"),
+                                   "pedestal_ma": r.get("pedestal_ma"),
+                                   "pedestal": r.get("pedestal")}
         return self.save_calibration(name, {"params": params or {},
                                             "curves": curves,
                                             "pulses": shots,
                                             "per_filament": meta})
+
+    #: Flag a point whose total resistance moved more than this across its own
+    #: shots. 2% is about 25 K at these temperatures -- small against the 300 K
+    #: the curve spans, large enough to be worth seeing.
+    _R_DRIFT_WARN = 0.02
+
+    def _vi_pair(self, fil: int):
+        """One matched INA219 V+I, as (mV, mA, ohm). None if it was not a live
+        matched pair -- a fresh voltage over a stale current, or a cached entry
+        with no voltage at all, would be a resistance that looks measured and
+        is not."""
+        vi = (self.read_filament_vi_live([fil]) or {}).get(fil) or {}
+        if vi.get("cached") or not vi.get("bus_mV") or not vi.get("current_mA"):
+            return None
+        return (float(vi["bus_mV"]), float(vi["current_mA"]),
+                float(vi["bus_mV"]) / float(vi["current_mA"]))
 
     def _emission_point(self, fil: int, ma: int, *, width_us: int, pulses: int,
                         inter_pulse_ms: int, settle_s: float, timeout_s: float,
@@ -5751,6 +5780,7 @@ class CTClient:
         pt = {"commanded_ma": int(ma), "settled_ma": None, "heat_mA": None,
               "heat_target_mA": None, "heat_unavailable": None,
               "bus_mV": None, "vi_current_mA": None, "r_total_ohm": None,
+              "r_drift_frac": None,
               "net_ma": None, "net_ma_sd": None, "charge_mams": None,
               "pedestal_ma": round(float(pedestal_ma), 3), "emission_ma": None,
               "n_used": 0, "n_fired": 0, "n_cold": 0, "usable": False,
@@ -5774,19 +5804,25 @@ class CTClient:
         if settle_s > 0:
             time.sleep(settle_s)
 
-        # Matched V+I at the settled point, BEFORE firing -- a real INA219 read,
-        # which the backend refuses mid-run (it would stall pulses), so this is
-        # the only window it fits in. R_total = V/I here is the filament PLUS
-        # its leads; separating the two is what fit_richardson() does.
-        vi = (self.read_filament_vi_live([fil]) or {}).get(fil) or {}
-        if not vi.get("cached"):
-            pt["bus_mV"] = vi.get("bus_mV")
-            pt["vi_current_mA"] = vi.get("current_mA")
-            # Only from a matched pair: dividing a fresh voltage by a stale
-            # current (or by the commanded value) would produce a resistance
-            # that looks measured and is not.
-            if pt["bus_mV"] and pt["vi_current_mA"]:
-                pt["r_total_ohm"] = round(pt["bus_mV"] / pt["vi_current_mA"], 5)
+        # Matched V+I, a real INA219 read, which the backend refuses mid-run
+        # (it would stall pulses) -- so it has to go either side of the firing,
+        # never during it. R_total = V/I is the filament PLUS its leads.
+        #
+        # TAKEN TWICE, BRACKETING THE SHOTS, because the filament is still
+        # heating. The CC loop's "settled" is about CURRENT, not temperature:
+        # it holds the current within ~2.6 s while the filament keeps warming
+        # for tens of seconds. Measured at 2400 mA, from the moment the loop
+        # reported settled: R_total 2.754 -> 3.105 ohm over 8 to 33 s (+12.7%)
+        # and emission 1.24 -> 1.45 mA, still climbing at 35 s.
+        #
+        # That does NOT mean the sweep has to wait -- Richardson is an
+        # instantaneous relation, so a (T, I) pair measured together is
+        # self-consistent wherever it sits on the transient. What it means is
+        # that R has to be measured WITH the shots rather than before them.
+        # The bracket gives the mean, and r_drift_frac says how far it moved
+        # while they were taken, so a point whose temperature ran away during
+        # its own measurement is visible instead of averaged into the curve.
+        vi_before = self._vi_pair(fil)
 
         since = self.pulse_cursor()
         fr = self.fire_single_pulse(
@@ -5797,6 +5833,20 @@ class CTClient:
             timeout_s=15.0 + pulses * inter_pulse_ms / 1000.0,
             verify=True, reuse=False, measure=True,
             bg_gap_us=bg_gap_us, bg_window_us=bg_window_us)
+        vi_after = self._vi_pair(fil)
+        pair = [v for v in (vi_before, vi_after) if v]
+        if pair:
+            pt["bus_mV"] = round(sum(v[0] for v in pair) / len(pair), 1)
+            pt["vi_current_mA"] = round(sum(v[1] for v in pair) / len(pair), 1)
+            pt["r_total_ohm"] = round(sum(v[2] for v in pair) / len(pair), 5)
+            if len(pair) == 2 and vi_before[2]:
+                pt["r_drift_frac"] = round((vi_after[2] - vi_before[2]) / vi_before[2], 5)
+                if abs(pt["r_drift_frac"]) > self._R_DRIFT_WARN:
+                    pt["note"] = ((pt["note"] + "; ") if pt.get("note") else "") + (
+                        f"resistance moved {pt['r_drift_frac'] * 100:+.1f}% across "
+                        f"this point's own shots — it is still heating, so its "
+                        f"temperature is a mean over a moving target")
+
         events = fr.get("measured") or []
         pt["_ref_mv"] = fr.get("ref_mv")
         pt["n_fired"] = int(fr.get("fired") or 0)
@@ -6079,6 +6129,234 @@ class CTClient:
             else:
                 hi = mid
         return 0.5 * (lo + hi)
+
+    #: Nominal work function, eV. Pure tungsten. Used as an INPUT rather than
+    #: fitted, because fitting it and the lead resistance together is what
+    #: leaves both undetermined -- see solve_lead_resistance().
+    WORK_FUNCTION_EV = 4.5
+
+    @classmethod
+    def emission_temperature(cls, emission_ma: float,
+                             a_eff_ma_per_k2: float,
+                             work_function_ev: float = WORK_FUNCTION_EV
+                             ) -> float | None:
+        """Invert Richardson-Dushman for T: solve I = A_eff*T^2*exp(-phi/kT).
+
+        Returns None when no temperature in 300-3600 K produces this current --
+        a non-positive current, or one outside what the given A_eff and phi can
+        make. None, not a clamped edge value: an emission reading that the
+        model cannot account for is a fact about the inputs, and a temperature
+        returned for it would be read as a measurement.
+        """
+        i = float(emission_ma)
+        if not (i > 0) or not (a_eff_ma_per_k2 > 0):
+            return None
+
+        def model(t):
+            return a_eff_ma_per_k2 * t * t * math.exp(
+                -work_function_ev / (cls._BOLTZMANN_EV_PER_K * t))
+
+        lo, hi = cls._W_RHO_T_MIN, cls._W_RHO_T_MAX
+        if i < model(lo) or i > model(hi):
+            return None
+        for _ in range(80):      # monotonic in T over this range
+            mid = 0.5 * (lo + hi)
+            if model(mid) < i:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    @classmethod
+    def filament_temperature(cls, *,
+                             r_total_ohm: float | None = None,
+                             r_lead_ohm: float = 0.0,
+                             r_cold_ohm: float = 0.257,
+                             t_ref_k: float = 293.0,
+                             emission_ma: float | None = None,
+                             a_eff_ma_per_k2: float | None = None,
+                             work_function_ev: float = WORK_FUNCTION_EV) -> dict:
+        """Filament temperature, by whichever of the two routes you can feed.
+
+            ct.filament_temperature(r_total_ohm=3.30, r_lead_ohm=0.20)
+            ct.filament_temperature(emission_ma=2.79, a_eff_ma_per_k2=120.)
+            ct.filament_temperature(r_total_ohm=3.30, r_lead_ohm=0.20,
+                                    emission_ma=2.79, a_eff_ma_per_k2=120.)
+
+        RESISTANCE route. `R_filament = r_total_ohm - r_lead_ohm`, then
+        `R_filament / r_cold_ohm` inverted through tungsten's resistivity.
+        Needs the lead resistance, which the INA219 cannot separate out (it
+        sits upstream of the leads), and is SENSITIVE to it -- about -59 K per
+        +0.1 ohm on this bench.
+
+        EMISSION route. Richardson-Dushman inverted at a GIVEN work function.
+        Needs `a_eff_ma_per_k2`, which folds in the emitting area, so it is a
+        per-filament constant that has to come from a fit. Completely
+        independent of the lead resistance, which is what makes the pair
+        useful: where the two disagree, the lead resistance is wrong. That is
+        what solve_lead_resistance() exploits.
+
+        Returns every field always, None where an input was missing -- never a
+        silent fallback from one route to the other:
+
+            {"t_resistance_K", "t_emission_K", "delta_K",   # emission - resistance
+             "r_filament_ohm", "r_ratio", "inputs": {...}, "notes": [str]}
+        """
+        out = {"t_resistance_K": None, "t_emission_K": None, "delta_K": None,
+               "r_filament_ohm": None, "r_ratio": None, "notes": [],
+               "inputs": {"r_total_ohm": r_total_ohm, "r_lead_ohm": r_lead_ohm,
+                          "r_cold_ohm": r_cold_ohm, "t_ref_k": t_ref_k,
+                          "emission_ma": emission_ma,
+                          "a_eff_ma_per_k2": a_eff_ma_per_k2,
+                          "work_function_ev": work_function_ev}}
+        if r_total_ohm is not None:
+            r_fil = float(r_total_ohm) - float(r_lead_ohm)
+            out["r_filament_ohm"] = round(r_fil, 5)
+            if r_fil <= 0:
+                out["notes"].append(
+                    f"lead resistance {r_lead_ohm} ohm is at or above the "
+                    f"measured total {r_total_ohm} ohm — nothing is left for "
+                    f"the filament")
+            else:
+                ratio = r_fil / float(r_cold_ohm)
+                out["r_ratio"] = round(ratio, 4)
+                t = cls.tungsten_temperature(ratio, t_ref_k)
+                out["t_resistance_K"] = None if t is None else round(t, 1)
+                if t is None:
+                    out["notes"].append(
+                        f"resistance ratio {ratio:.3f} is outside what "
+                        f"300-3600 K tungsten produces" + (
+                            " — below 1, so the hot resistance came out under "
+                            "the cold one (r_lead_ohm too large)"
+                            if ratio < 1 else ""))
+        if emission_ma is not None and a_eff_ma_per_k2:
+            t = cls.emission_temperature(emission_ma, a_eff_ma_per_k2,
+                                         work_function_ev)
+            out["t_emission_K"] = None if t is None else round(t, 1)
+            if t is None:
+                out["notes"].append(
+                    f"{emission_ma} mA is outside what phi={work_function_ev} eV "
+                    f"and A_eff={a_eff_ma_per_k2} produce over 300-3600 K")
+        elif emission_ma is not None:
+            out["notes"].append(
+                "emission route needs a_eff_ma_per_k2 — it folds in the "
+                "emitting area, so it is per filament and comes from a fit "
+                "(fit_richardson()'s richardson_a_eff_ma_per_k2)")
+        if out["t_resistance_K"] is not None and out["t_emission_K"] is not None:
+            out["delta_K"] = round(out["t_emission_K"] - out["t_resistance_K"], 1)
+        return out
+
+    def solve_lead_resistance(self, result: dict,
+                              work_function_ev: float = WORK_FUNCTION_EV,
+                              r_cold_ohm: float = 0.257,
+                              r_lead_min: float = -0.20,
+                              r_lead_max: float = 0.60,
+                              min_snr: float = 5.0,
+                              t_ref_k: float = 293.0) -> dict:
+        """The lead resistance implied by a KNOWN work function.
+
+        Fitting phi and R_lead together leaves both undetermined -- the
+        Richardson line stays straight across a wide band of R_lead because
+        shifting it rescales every temperature and the slope absorbs that
+        (measured: r^2 0.99860 -> 0.99846 across 0 to 0.40 ohm while phi went
+        4.115 -> 3.205 eV). Fixing phi removes that freedom: the slope is then
+        -phi/k, R_lead is the only thing that can change the slope, and it has
+        a unique solution.
+
+        So this is the same fit run backwards. It brackets and bisects for the
+        R_lead whose fitted slope equals -work_function_ev/k.
+
+            s = ct.solve_lead_resistance(curve)            # phi = 4.5 eV
+            print(s["r_lead_ohm"], s["temperatures_K"])
+
+        `r_lead_min` is allowed to be NEGATIVE on purpose. A negative solution
+        is not a lead resistance -- it is the measurement telling you that
+        `r_cold_ohm` or the assumed phi is wrong, and clamping it at 0 would
+        hide that behind a plausible-looking answer.
+
+        Returns
+            {"ok", "r_lead_ohm", "work_function_ev", "physical": bool,
+             "bracketed": bool, "r_squared", "richardson_a_eff_ma_per_k2",
+             "temperatures_K": [...], "points": [...], "warnings": [str]}
+        """
+        target = float(work_function_ev)
+
+        def phi_at(rl):
+            f = self.fit_richardson(result, r_cold_ohm=r_cold_ohm,
+                                    r_lead_ohm=rl, min_snr=min_snr,
+                                    t_ref_k=t_ref_k)
+            return f["work_function_eV"] if f.get("ok") else None
+
+        lo, hi = float(r_lead_min), float(r_lead_max)
+        p_lo, p_hi = phi_at(lo), phi_at(hi)
+        # Walk the ends inward until both are computable -- an R_lead that
+        # drives a point below the cold resistance has no fit at all.
+        step = (hi - lo) / 40.0
+        while p_lo is None and lo < hi:
+            lo += step
+            p_lo = phi_at(lo)
+        while p_hi is None and hi > lo:
+            hi -= step
+            p_hi = phi_at(hi)
+        warnings: list[str] = []
+        if p_lo is None or p_hi is None:
+            return {"ok": False, "r_lead_ohm": None,
+                    "work_function_ev": target, "physical": False,
+                    "bracketed": False, "warnings": [
+                        f"no lead resistance in [{r_lead_min}, {r_lead_max}] ohm "
+                        f"gives a fit at all — check r_cold_ohm and the "
+                        f"measured voltages"], "points": [], "temperatures_K": []}
+        # phi falls monotonically with R_lead, so the target must sit between
+        # the two ends for a solution to exist.
+        if not (min(p_lo, p_hi) <= target <= max(p_lo, p_hi)):
+            return {"ok": False, "r_lead_ohm": None,
+                    "work_function_ev": target, "physical": False,
+                    "bracketed": False, "warnings": [
+                        f"phi = {target} eV is not reachable: over R_lead "
+                        f"{lo:.3f} to {hi:.3f} ohm the fitted work function only "
+                        f"spans {min(p_lo, p_hi):.3f} to {max(p_lo, p_hi):.3f} eV. "
+                        f"Either the cold resistance ({r_cold_ohm} ohm) is wrong, "
+                        f"or this cathode is not a {target} eV emitter"],
+                    "points": [], "temperatures_K": [],
+                    "phi_range_eV": [round(min(p_lo, p_hi), 4),
+                                     round(max(p_lo, p_hi), 4)]}
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            p_mid = phi_at(mid)
+            if p_mid is None:
+                break
+            if (p_mid - target) * (p_lo - target) > 0:
+                lo, p_lo = mid, p_mid
+            else:
+                hi, p_hi = mid, p_mid
+        r_lead = 0.5 * (lo + hi)
+        f = self.fit_richardson(result, r_cold_ohm=r_cold_ohm, r_lead_ohm=r_lead,
+                                min_snr=min_snr, t_ref_k=t_ref_k)
+        if not f.get("ok"):
+            return {"ok": False, "r_lead_ohm": round(r_lead, 5),
+                    "work_function_ev": target, "physical": r_lead >= 0,
+                    "bracketed": True, "points": [], "temperatures_K": [],
+                    "warnings": f.get("warnings") or ["fit failed at the solution"]}
+        physical = r_lead >= 0
+        if not physical:
+            warnings.append(
+                f"the solution is NEGATIVE ({r_lead:.4f} ohm), which no wiring "
+                f"can be. At phi = {target} eV the data wants LESS resistance "
+                f"than the INA219 measures, so one of the two assumptions is "
+                f"off: r_cold_ohm = {r_cold_ohm} ohm, or the work function "
+                f"itself. It is not a lead resistance")
+        warnings.extend(w for w in (f.get("warnings") or [])
+                        if "lead resistance" not in w and "scan edge" not in w)
+        temps = [p["T_K"] for p in f["points"]]
+        return {"ok": True, "r_lead_ohm": round(r_lead, 5),
+                "work_function_ev": target, "physical": physical,
+                "bracketed": True,
+                "r_squared": f["r_squared"],
+                "richardson_a_eff_ma_per_k2": f["richardson_a_eff_ma_per_k2"],
+                "r_cold_ohm": r_cold_ohm,
+                "temperatures_K": [round(t, 1) for t in temps],
+                "n_points": f["n_points"], "dropped": f.get("dropped"),
+                "points": f["points"], "warnings": warnings}
 
     def fit_richardson(self, result: dict,
                        r_cold_ohm: float = 0.257,    # filament at t_ref_k
