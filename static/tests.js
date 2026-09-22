@@ -258,8 +258,15 @@ async function fireAndMeasure(cur, ctrl, ch, pos, widthUs) {
              id: e.id, background_n: 0, background_gap: e.background_gap };
   }
   // Per-pulse summary carries raw ADC counts: peak (highest single sample),
-  // plateau (MEAN over the pulse's steady/hot region — hundreds of samples, edges
-  // excluded, matches the DC steady-state mean), bg (baseline). peakToMa is affine,
+  // plateau (arithmetic MEAN of the envelope samples: plateau_sum/plateau_n over
+  // (rise + plateau_margin, fall]). plateau_margin is 0 in everything this repo
+  // ships, so it is the mean over the WHOLE envelope, rise and fall ramps
+  // INCLUDED — not "the steady region with edges excluded", as this comment
+  // used to claim. That makes it a systematic UNDER-read of the flat top, by
+  // roughly the ramp fraction of the pulse: negligible on a 5 ms shot, not on a
+  // short one. There is also no trailing margin in the firmware at all, so the
+  // falling ramp is always in the average even if plateau_margin is set.
+  // bg (baseline). peakToMa is affine,
   // so (plateau − bg) → net emission current. Use the plateau-mean (NOT peak) as
   // the emission current: peak is noise-biased high (~2–3σ above the mean), while
   // the plateau-mean agrees with the steady-state ADC summary. Clamped ≥ 0.
