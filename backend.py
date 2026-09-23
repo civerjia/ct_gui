@@ -4727,10 +4727,18 @@ class CtHandler(BaseHTTPRequestHandler):
                                                "since it was downloaded — re-download first",
                          "dead_in_table": {str(k + 1): v for k, v in stale.items()}},
                         HTTPStatus.OK)
+                # Master LAST. The master forwards the trigger to the other
+                # board only while it is itself armed (RP2350 9705e60), so with
+                # the others armed first no edge reaches them before the master
+                # is counting too -- an edge that lands in between is dropped by
+                # both, not by one. Armed the other way round, or all at once in
+                # dict order, a trigger between two arms leaves the boards a
+                # whole entry apart for the run.
+                order = sorted((cid for cid, link in CONTROLLERS.items() if link.client.connected),
+                               key=lambda cid: cid == MASTER)
                 results = {}
-                for cid, link in CONTROLLERS.items():
-                    if not link.client.connected:
-                        continue
+                for cid in order:
+                    link = CONTROLLERS[cid]
                     try:
                         resp = link.request(SHV_ARM, payload, flags=0)
                         raw = resp.get("raw") if isinstance(resp, dict) else None
@@ -4738,8 +4746,24 @@ class CtHandler(BaseHTTPRequestHandler):
                         results[str(cid)] = {"ok": bool(raw) and raw[0] == 0 and reject == 0, "reject": reject}
                     except Exception as exc:
                         results[str(cid)] = {"ok": False, "error": str(exc)}
-                self._json({"ok": all(r.get("ok") for r in results.values()) if results else False,
-                            "results": results})
+                    if not results[str(cid)]["ok"]:
+                        break
+                ok = bool(results) and all(r.get("ok") for r in results.values())
+                if results and not ok:
+                    # Half a rig armed runs half a schedule. Stop at the first
+                    # failure (the master, last, is then never armed) and put
+                    # back down every board that did arm.
+                    for cid in order:
+                        if results.get(str(cid), {}).get("ok"):
+                            try:
+                                results[str(cid)]["disarmed"] = _status_ok(
+                                    CONTROLLERS[cid].request(SHV_DISARM, b"", flags=0))
+                            except Exception as exc:
+                                results[str(cid)]["disarmed"] = False
+                                results[str(cid)]["disarm_error"] = str(exc)
+                        elif str(cid) not in results:
+                            results[str(cid)] = {"ok": False, "skipped": "an earlier board failed to arm"}
+                self._json({"ok": ok, "order": order, "results": results})
             elif path == "/api/disarm":
                 # Disarm the schedule engine on every connected controller
                 # (SHV_DISARM, 0x78) — the firmware clears the ENTIRE HV ISO
