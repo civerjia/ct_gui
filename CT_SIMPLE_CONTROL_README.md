@@ -3584,6 +3584,87 @@ registers.
 a controller running a schedule and says so in `selftest_error` rather than
 disarming for you.
 
+### Reading a result
+
+Every call returns a **`Result`** — a `dict` subclass. Nothing about the data
+changes (`r["ok"]`, `r.get()`, `json.dumps(r)`, `**r`, `isinstance(r, dict)` all
+work as before); only `repr()` differs, which is what a REPL and a bare
+`print()` use.
+
+```
+>>> ct.idle_one(8, 2500)
+Result(FAILED)
+  error: IDLE 2500 mA is above the 2000 mA ceiling — the RP2350 would clamp
+        it to 2000 and report success, so a verify would wait for a current
+        that never arrives. Ask for 2000 or less, or use active_one() if you
+        need more
+  filament: 8
+  above_idle_ceiling: True
+  idle_ceiling_mA: 2000
+```
+
+The verdict leads, then the reason **in full** — `error` and `reason` are never
+truncated, since truncating the one field that says *why* makes a summary
+useless exactly when it is needed. Then the fields that were actually measured.
+Fields that are `None` (not measured) and bulk payloads (`events`, `points`,
+`records`, `measured`, …) are folded away and **named** on the last line, not
+just counted: "+3 more" would not tell you whether the thing you are looking for
+is in there. `dict(r)` or `r.raw()` gives the original, unabridged.
+
+### HV grid MOSFET test — does the switch actually conduct?
+
+**`mosfet_test(filaments=None, emission_v=100.0, limit_ma=5.0, width_us=1000, pulses=3, ...)`**
+— Fires a real HV pulse per filament with every filament **cold**, and measures
+the current.
+
+Cold is what makes it a MOSFET test rather than an emission test: with no
+thermionic current the only path is the sub-board's two diodes in series with
+its 100 kΩ resistor, so
+
+```
+I = (|V| − Vf₁ − Vf₂) / R = (100 − 0.82 − 2) / 100 kΩ = 0.972 mA at 100 V
+```
+
+Seeing that current means the device conducted. Near zero means it did not.
+
+> ⚠️ **The filaments go to SLEEP, not STOP, and that is not a preference.** At
+> STOP the board's isolated 12 V rail is off, so `ShvArm` **skips** the filament
+> as unsafe — the envelope still fires for the counted trigger and the detector
+> still records a shot. A STOPped filament would therefore read ~0 mA and be
+> reported as a **dead MOSFET when nothing was ever tried**. SLEEP raises the
+> rail without any heating current.
+
+**`format_mosfet_test(r)`** renders the result as a table.
+
+This **complements** `hv_switch_test()` rather than replacing it. That one reads
+the 74HC165 sense back and proves the *control path* reached the gate — which a
+dead MOSFET also passes. A disagreement between the two is the informative
+result: switch bit set, no current, is a failed device.
+
+Three verdicts, for the same reason the toggle test has three — a reading that
+is neither the expected current nor zero is not a pass and not a failure:
+
+| verdict | meaning |
+|---|---|
+| `pass` | within `tolerance_frac` (default 35%) of expected |
+| `dead` | below 30% of expected — not conducting |
+| `inconclusive` | in between, or no pulse was measured at all |
+
+The tolerance is wide on purpose: a diode's Vf moves with temperature and with
+the current through it, and at ~1 mA neither drop is the datasheet number. The
+question is "does it conduct at all", not "is the resistor 1% tolerance".
+
+`expected_ma` is computed from the rail voltage **actually read back**, not the
+one that was asked for — a rail sitting 15 V low would otherwise make every good
+MOSFET look 15% weak.
+
+> **Already confirmed on this bench.** What the emission work called a
+> non-emission "pedestal" turns out to match this diode path to within 3% at
+> four voltages — measured 0.488 / 1.004 / 1.533 / 1.979 mA at 50 / 100 / 150 /
+> 200 V against 0.472 / 0.972 / 1.472 / 1.972 expected. That current was the HV
+> grid MOSFET conducting all along. It is still correctly subtracted from an
+> emission curve (it is not thermionic), and now its identity is known.
+
 ### HV switch toggle test
 
 **`hv_switch_test(controller=1, channel_mask=None)`** — force every HV grid

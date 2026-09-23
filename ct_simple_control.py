@@ -173,7 +173,10 @@ Dependencies: pip install requests
 """
 
 import enum
+import functools
+import inspect
 import math
+import textwrap
 import threading
 import time
 from contextlib import contextmanager
@@ -192,6 +195,96 @@ import requests
 # for CTLeaseError, the one thing this client actually raises. The others
 # are kept for backward compatibility / advanced use but are not raised by
 # any method here by default — every failure comes back as {"ok": False}.
+
+class Result(dict):
+    """A result dict that PRINTS readably and behaves exactly like a dict.
+
+    Every call returns one of these. Nothing about the data changes -- it is a
+    dict subclass, so `r["ok"]`, `r.get(...)`, `json.dumps(r)`, `**r` and
+    `isinstance(r, dict)` all work as before. Only `repr()` differs, which is
+    what a REPL and a bare `print()` use.
+
+    The problem it solves: these dicts carry 10-25 fields and the two that
+    matter -- did it work, and if not why -- were buried among the ones that
+    are None, absent, or identical on every call. Reading a result meant
+    scanning a wall of keys for the one word that was different.
+
+    So the repr leads with the verdict and the reason, then the fields worth
+    seeing, then a count of what was folded away. Nothing is hidden: `dict(r)`
+    or `r.raw()` gives the original, unabridged, and the fold line says how
+    many keys it is holding back so it can never read as "that was all of it".
+    """
+
+    #: Shown first, in this order, when present. Everything else follows
+    #: alphabetically. These are the fields that answer "what happened".
+    _LEAD = ("ok", "error", "reason", "filament", "filaments", "state",
+             "state_name", "fired", "measured_ma", "arrival", "verdict")
+    #: Never worth a line of their own in a summary -- either noise or better
+    #: rendered by a dedicated formatter (see print_pulse_events etc.).
+    _FOLD = ("records", "events", "points", "pulses", "measured", "curve",
+             "raw", "scan", "status", "results", "heating_at_pulse")
+    _MAX_INLINE = 68          # longer values are summarised, not wrapped
+
+    def raw(self) -> dict:
+        """The plain dict, unabridged. `dict(r)` does the same."""
+        return dict(self)
+
+    @staticmethod
+    def _short(v) -> str:
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        # Length decides, not type. A 2-key dict of 2-key dicts is short by
+        # every structural measure and 400 characters on screen -- which is
+        # exactly the wall of text this class exists to stop.
+        if isinstance(v, (list, tuple)):
+            t = repr(list(v))
+            return t if len(t) <= Result._MAX_INLINE else f"[{len(v)} items]"
+        if isinstance(v, dict):
+            t = repr(v)
+            return t if len(t) <= Result._MAX_INLINE else (
+                f"{{{len(v)} keys: {', '.join(map(str, list(v)[:4]))}"
+                + (", …}" if len(v) > 4 else "}"))
+        t = repr(v)
+        return t if len(t) <= Result._MAX_INLINE else t[:Result._MAX_INLINE - 3] + "..."
+
+    def __repr__(self) -> str:
+        if not self:
+            return "Result({})"
+        head = "ok" if self.get("ok") else ("FAILED" if "ok" in self else "")
+        lines = []
+        shown = set()
+        for k in self._LEAD:
+            if k in self and k not in ("ok",):
+                # error/reason are never truncated. Truncating the one field
+                # that says WHY is how a summary becomes useless exactly when
+                # it is needed; they are wrapped instead.
+                if k in ("error", "reason") and isinstance(self[k], str):
+                    body = textwrap.fill(self[k], width=76,
+                                         initial_indent=f"  {k}: ",
+                                         subsequent_indent="        ")
+                    lines.append(body)
+                else:
+                    lines.append(f"  {k}: {self._short(self[k])}")
+                shown.add(k)
+        for k in sorted(self):
+            if k in shown or k == "ok" or k in self._FOLD:
+                continue
+            # A field that is None almost always means "not measured" and is
+            # the normal case -- it belongs in the fold, not in the summary.
+            if self[k] is None:
+                continue
+            lines.append(f"  {k}: {self._short(self[k])}")
+            shown.add(k)
+        folded = [k for k in self if k not in shown and k != "ok"]
+        out = f"Result({head})" if head else "Result"
+        if lines:
+            out += "\n" + "\n".join(lines)
+        if folded:
+            # Named, not just counted: "+3 more" tells you nothing about
+            # whether the thing you are looking for is in there.
+            out += "\n  … " + ", ".join(sorted(folded)) + "  (use dict(r) or r.raw())"
+        return out
+
 
 class CTError(Exception):
     """Base error class. Not raised by default — kept for compatibility."""
@@ -443,8 +536,8 @@ class CTClient:
                             f"{r.text[:200]}"}
         if isinstance(data, dict):
             data.setdefault("ok", r.ok)
-            return data
-        return {"ok": r.ok, "data": data}
+            return Result(data)
+        return Result({"ok": r.ok, "data": data})
 
     def _one_post(self, path: str, body: dict, timeout: float | None) -> dict:
         try:
@@ -480,7 +573,10 @@ class CTClient:
             r = self._one_post(path, body, timeout)
         if attempt:
             r["retries"] = attempt
-        return r
+        # Wrapped HERE, not only in _parse(): the refusals and connection
+        # errors built locally never touch _parse, and those are exactly the
+        # results a reader is squinting at.
+        return r if isinstance(r, Result) else Result(r)
 
     def _get(self, path: str, timeout: float | None = None) -> dict:
         r = self._one_get(path, timeout)
@@ -491,7 +587,7 @@ class CTClient:
             r = self._one_get(path, timeout)
         if attempt:
             r["retries"] = attempt
-        return r
+        return r if isinstance(r, Result) else Result(r)
 
     # ── connection ────────────────────────────────────────────────────────────
     # A CTClient talking to a running backend.py does NOT imply a controller is
@@ -7319,6 +7415,211 @@ class CTClient:
             out.append(f"  -- {note}")
         return "\n".join(out)
 
+    # ── HV grid MOSFET test (via a real SHV pulse) ───────────────────────────
+    # hv_switch_test() drives the switch and reads the 74HC165 sense back: it
+    # proves the CONTROL path reached the gate. It cannot prove the MOSFET
+    # actually conducts -- a dead device still reads back the bit that was
+    # written to it.
+    #
+    # This fires a real HV pulse instead and measures the current that flows.
+    # Each sub-board has two diodes in series with a 100 kOhm resistor across
+    # the switch, so with the MOSFET on and the filament COLD the only path is
+    #
+    #     I = (|V_emission| - Vf1 - Vf2) / R     e.g. (100 - 2.82) / 100k
+    #                                                 = 0.972 mA at 100 V
+    #
+    # Seeing that current is the proof. It is also already confirmed on this
+    # bench: what the emission work earlier called a non-emission "pedestal"
+    # matches this path to within 3% at 50, 100, 150 and 200 V (measured
+    # 0.488 / 1.004 / 1.533 / 1.979 mA against 0.472 / 0.972 / 1.472 / 1.972).
+
+    #: Sub-board diode drops, volts. Two in series with _MOSFET_R_OHM.
+    _MOSFET_VF_V = (0.82, 2.0)
+    _MOSFET_R_OHM = 100_000.0
+    #: A reading this far from expected is still a pass. Wide on purpose: a
+    #: diode's Vf moves with temperature and with the current through it, and
+    #: at ~1 mA neither drop is the datasheet number. The test is asking "does
+    #: it conduct at all", not "is the resistor 1% tolerance".
+    _MOSFET_TOL_FRAC = 0.35
+    #: Below this fraction of expected, the switch is not conducting.
+    _MOSFET_DEAD_FRAC = 0.30
+
+    @classmethod
+    def mosfet_expected_ma(cls, emission_v: float,
+                           r_ohm: float | None = None,
+                           vf_v=None) -> float:
+        """The current the diode path should pass at this rail voltage."""
+        vf = sum(vf_v if vf_v is not None else cls._MOSFET_VF_V)
+        return (abs(float(emission_v)) - vf) / float(r_ohm or cls._MOSFET_R_OHM) * 1000.0
+
+    def mosfet_test(self, filaments=None,
+                    emission_v: float = 100.0,
+                    limit_ma: float = 5.0,
+                    width_us: int = 1000,
+                    pulses: int = 3,
+                    inter_pulse_ms: int = 400,
+                    r_ohm: float | None = None,
+                    vf_v=None,
+                    tolerance_frac: float | None = None,
+                    controller: int | None = None,
+                    progress=None) -> dict:
+        """Prove each HV grid MOSFET actually CONDUCTS, by firing through it.
+
+            r = ct.mosfet_test([0, 1, 2], emission_v=100)
+            print(ct.format_mosfet_test(r))
+
+        Fires a real pulse per filament with every filament COLD, and measures
+        the current. Cold is what makes it a MOSFET test rather than an
+        emission test: with no thermionic current the only path is the
+        sub-board's two diodes in series with its 100 kOhm resistor, so a
+        reading of (|V| - Vf1 - Vf2)/R means the device conducted and anything
+        near zero means it did not.
+
+        WHY NOT STOP. The filaments are driven to SLEEP, not STOP, and that is
+        not a preference. At STOP the board's isolated 12 V rail is off, so
+        ShvArm SKIPS the filament as unsafe -- the envelope still fires for the
+        counted trigger and the detector still records a shot, so a STOPped
+        filament would read as ~0 mA and be reported as a DEAD MOSFET when in
+        fact nothing was ever tried. SLEEP enables the rail without any heating
+        current, which is exactly what this test wants.
+
+        This complements hv_switch_test() rather than replacing it: that one
+        reads the 74HC165 sense back and proves the CONTROL path reached the
+        gate, which a dead MOSFET also passes. Run both and a disagreement is
+        informative -- switch bit set, no current, is a failed device.
+
+        Returns
+            {"ok":            every tested filament passed,
+             "emission_v":    the rail actually read back,
+             "expected_ma":   (|V| - Vf) / R,
+             "results":       {user_index: {"measured_ma", "expected_ma",
+                                            "ratio", "verdict", "shots",
+                                            "note"}},
+             "counts":        {"pass", "dead", "inconclusive"},
+             "problems":      [str]}
+
+        Verdicts, three of them for the same reason hv_switch_test has three: a
+        reading that is neither the expected current nor zero is not a pass and
+        not a failure, and collapsing it either way loses the one thing worth
+        knowing.
+
+            pass          within `tolerance_frac` of expected
+            dead          below _MOSFET_DEAD_FRAC of expected -- not conducting
+            inconclusive  in between, or no pulse was measured at all
+        """
+        tol = self._MOSFET_TOL_FRAC if tolerance_frac is None else float(tolerance_frac)
+        problems: list[str] = []
+        wanted = self._live_user_indices() if filaments is None else \
+            [int(f) for f in filaments]
+        wanted = [f for f in wanted if not self._is_dead(f)]
+        if not wanted:
+            return {"ok": False, "results": {}, "counts": {},
+                    "problems": ["no live filaments to test"]}
+
+        results: dict[int, dict] = {}
+        try:
+            with self.energised(*wanted):
+                # COLD, and on the iso rail. sleep_all() does both.
+                self.stop_all(wanted)
+                sl = self.sleep_all(wanted)
+                if not sl.get("ok"):
+                    problems.append(f"could not put every filament to SLEEP "
+                                    f"({self.describe(sl)[:100]}) — a filament "
+                                    f"still at STOP reads as a dead MOSFET")
+                self.set_emission_i(limit_ma)
+                self.set_emission_v(abs(emission_v))
+                self.enable_emission(True)
+                time.sleep(1.0)
+                v_read = self.read_emission_v()
+                hv = self.hv_status()
+                if not hv.get("emission_on"):
+                    return {"ok": False, "results": {}, "counts": {},
+                            "problems": ["the emission rail did not come on — "
+                                         "nothing to measure"]}
+                # Expected from the rail that is ACTUALLY there, not the one
+                # that was asked for: a rail sitting 15 V low would otherwise
+                # make every good MOSFET look 15% weak.
+                v_eff = abs(v_read) if v_read else abs(emission_v)
+                expected = self.mosfet_expected_ma(v_eff, r_ohm, vf_v)
+                if expected <= 0:
+                    return {"ok": False, "results": {}, "counts": {},
+                            "problems": [f"rail {v_eff} V is at or below the "
+                                         f"{sum(vf_v or self._MOSFET_VF_V)} V of "
+                                         f"diode drop — no current can flow "
+                                         f"through the path this test measures"]}
+                for f in wanted:
+                    fr = self.fire_single_pulse(
+                        f, num_pulses=pulses, width_us=width_us,
+                        inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
+                        total_ms=max(10000, pulses * (inter_pulse_ms + 1000)),
+                        controller=controller, trigger="sim",
+                        timeout_s=15.0 + pulses * inter_pulse_ms / 1000.0,
+                        verify=True, reuse=False, measure=True)
+                    nets = [e["plateau_net_ma"] for e in (fr.get("measured") or [])
+                            if e.get("plateau_net_ma") is not None
+                            and not e.get("empty_envelope")]
+                    row = {"measured_ma": None, "expected_ma": round(expected, 4),
+                           "ratio": None, "verdict": "inconclusive",
+                           "shots": len(nets), "note": None}
+                    if not nets:
+                        row["note"] = (fr.get("error")
+                                       or "no pulse was measured — the switch "
+                                          "was never actually exercised")
+                    else:
+                        m = sum(nets) / len(nets)
+                        row["measured_ma"] = round(m, 4)
+                        row["ratio"] = round(m / expected, 3)
+                        if abs(m - expected) <= tol * expected:
+                            row["verdict"] = "pass"
+                        elif m < self._MOSFET_DEAD_FRAC * expected:
+                            row["verdict"] = "dead"
+                            row["note"] = (f"{m:.3f} mA against {expected:.3f} mA "
+                                           f"expected — the MOSFET is not "
+                                           f"conducting")
+                        else:
+                            row["note"] = (f"{m:.3f} mA against {expected:.3f} mA "
+                                           f"expected ({m / expected:.2f}x) — "
+                                           f"neither the diode path nor zero")
+                    results[int(f)] = row
+                    if callable(progress):
+                        progress(int(f), row)
+        finally:
+            # The rail comes down whatever happened, including on Ctrl-C.
+            try:
+                self.enable_emission(False)
+            except Exception:
+                pass
+
+        counts = {"pass": 0, "dead": 0, "inconclusive": 0}
+        for row in results.values():
+            counts[row["verdict"]] += 1
+        for f, row in sorted(results.items()):
+            if row["verdict"] != "pass":
+                problems.append(f"filament {f}: {row['verdict']} — {row['note']}")
+        return {"ok": not problems and bool(results),
+                "emission_v": v_read, "expected_ma": round(expected, 4),
+                "tolerance_frac": tol, "results": results, "counts": counts,
+                "problems": problems}
+
+    def format_mosfet_test(self, r: dict) -> str:
+        """A mosfet_test() result as a readable table."""
+        if not r.get("results"):
+            return "MOSFET test: no result — " + "; ".join(
+                r.get("problems") or ["(no reason given)"])
+        out = [f"HV grid MOSFET test · rail {r.get('emission_v')} V · "
+               f"expected {r.get('expected_ma')} mA "
+               f"(±{r.get('tolerance_frac', 0) * 100:.0f}%)",
+               f"  {'filament':>8} {'measured':>10} {'ratio':>7} {'shots':>6}  verdict"]
+        for f, row in sorted(r["results"].items()):
+            m = f"{row['measured_ma']:>10.4f}" if row["measured_ma"] is not None else f"{'—':>10}"
+            ra = f"{row['ratio']:>7.3f}" if row["ratio"] is not None else f"{'—':>7}"
+            out.append(f"  {f:>8} {m} {ra} {row['shots']:>6}  {row['verdict']}"
+                       + (f"  ({row['note']})" if row["note"] else ""))
+        c = r.get("counts") or {}
+        out.append(f"  {c.get('pass', 0)} pass · {c.get('dead', 0)} dead · "
+                   f"{c.get('inconclusive', 0)} inconclusive")
+        return "\n".join(out)
+
     # ── Board self-test & I2C diagnostics ─────────────────────────────────────
     # The GUI's I2C panel, as API calls. These ask "is the hardware wired up and
     # answering", not "is the filament good" -- for the latter see the test
@@ -8597,3 +8898,34 @@ class CTClient:
                 return f"Chip not present: {r.get('error', 'the required chip is absent')}"
             return f"Failed: {r.get('error', 'unknown error')}"
         return str(r)
+
+
+# ── every public method returns a Result ────────────────────────────────────
+# The syntactic sugar, applied once here rather than as a decorator repeated on
+# 130 methods. Only the RETURN VALUE is touched, and only when it is a plain
+# dict: context managers (energised/lease/session), floats, lists and strings
+# pass through untouched, so nothing about how the client is used changes.
+#
+# Done at class level because results are built in dozens of places -- every
+# local refusal, every early return, every parsed reply. Wrapping only the HTTP
+# funnels left exactly the wrong half readable: the refusals a caller is most
+# likely to be squinting at never go near them.
+def _as_result(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        if isinstance(out, dict) and not isinstance(out, Result):
+            return Result(out)
+        return out
+    return wrapper
+
+
+for _name, _fn in list(vars(CTClient).items()):
+    # Public, plain functions only. staticmethod/classmethod/property objects
+    # are not functions here, so they are skipped -- which is what we want:
+    # they return numbers, and `filament_order` is a property whose access must
+    # not be routed through a wrapper.
+    if _name.startswith("_") or not inspect.isfunction(_fn):
+        continue
+    setattr(CTClient, _name, _as_result(_fn))
+del _name, _fn
