@@ -176,6 +176,7 @@ import enum
 import functools
 import inspect
 import math
+import sys
 import textwrap
 import threading
 import time
@@ -493,6 +494,8 @@ class CTClient:
         self._keepalive_enabled = bool(keepalive)
         self._keepalive_lock = threading.Lock()
         self._keepalive_stop = None
+        # Result of the most recent session() teardown; None until one runs.
+        self.last_teardown = None
         self._s.headers.update({
             "X-CT-Client": client_id,
             "Content-Type": "application/json",
@@ -942,18 +945,48 @@ class CTClient:
                 ct.enable_emission(True)
                 ...  # if this raises, HV still gets shut off safely
         """
+        # A context manager cannot return anything, and this client does not
+        # raise (see ERROR HANDLING), so a failed teardown step used to vanish
+        # completely: `try: fn() except Exception: pass`, where the except was
+        # dead code (these calls return ok:False, they do not raise) and the
+        # return value -- the only place the failure shows -- was discarded. An
+        # HV rail that would not turn off looked exactly like one that did.
+        #
+        # Now every step's result is checked, and a failure is reported three
+        # ways, because each one alone can be missed: printed to stderr (always
+        # visible in a script's output), kept on `self.last_teardown` (for code
+        # that wants to check), and -- if the with-block is already raising --
+        # attached to THAT exception as a note rather than replacing it, so the
+        # original error is still the one you see first.
+        body_exc = None
         try:
             yield self
+        except BaseException as exc:
+            body_exc = exc
+            raise
         finally:
             if cleanup:
-                for fn in (lambda: self.enable_emission(False),
-                          lambda: self.enable_focus(False),
-                          lambda: self.hv_grid_clear_all(),
-                          lambda: self.stop_all()):
+                steps = (("emission HV off", lambda: self.enable_emission(False)),
+                         ("focus HV off",    lambda: self.enable_focus(False)),
+                         ("HV grid clear",   lambda: self.hv_grid_clear_all()),
+                         ("STOP all",        lambda: self.stop_all()))
+                failed = {}
+                for name, fn in steps:
                     try:
-                        fn()
-                    except Exception:
-                        pass
+                        r = fn()
+                    except Exception as exc:     # defensive: should not raise
+                        failed[name] = f"raised {type(exc).__name__}: {exc}"
+                        continue
+                    if isinstance(r, dict) and not r.get("ok"):
+                        failed[name] = r.get("error") or "returned ok:False with no reason"
+                self.last_teardown = Result({"ok": not failed, "failed": failed,
+                                             "steps": [n for n, _ in steps]})
+                if failed:
+                    msg = ("ct.session() teardown FAILED — hardware may still be "
+                           "energised:\n" + "\n".join(f"  {n}: {e}" for n, e in failed.items()))
+                    print(msg, file=sys.stderr, flush=True)
+                    if body_exc is not None and hasattr(body_exc, "add_note"):
+                        body_exc.add_note(msg)
 
     # ── dead-man safety watchdog ─────────────────────────────────────────────
     # The backend walks an unattended ACTIVE filament back and drops the HV
@@ -1641,6 +1674,27 @@ class CTClient:
         # onto an otherwise-fine FID) looked exactly like
         # a backend bug until this was surfaced -- see the "why was 25
         # skipped" investigation this traced back to set_dead().
+        # DE-ENERGISING STATES ARE NEVER FILTERED. The dead mask exists to stop
+        # a faulty filament being powered, and it must never stop one being
+        # turned OFF -- a filament marked dead while hot would otherwise have
+        # no way to be stopped at all. _state_one() already honoured that
+        # (it only refuses energising states); this batch path did not, so
+        # stop_all() -- and with it session()'s teardown -- silently skipped
+        # every dead filament. The backend has the same rule and would have
+        # carried the STOP out; the client never sent it.
+        if state not in self._ENERGISING_STATES:
+            body: dict = {"state": state, "arg": arg}
+            if filaments is not None:
+                body["filaments"] = [int(self._fid_of(f)) for f in filaments]
+            # filaments None stays None on the wire: "every populated board on
+            # every CONNECTED controller". Expanding it into an explicit list
+            # of all 96 made the backend report the other controller's half as
+            # `excluded` on a one-controller bench, so a STOP that reached
+            # everything that exists came back ok:False.
+            return self._reindex_response(
+                self._post("/api/filament-prep", body, timeout=20.0),
+                keys=("applied", "failed", "excluded", "touched",
+                      "not_this_controller", "unslotted"))
         requested = [int(f) for f in filaments] if filaments is not None else list(range(96))
         dead = self.dead   # bound once — property, see _live()
         dead_skipped = [f for f in requested if f in dead]
@@ -1674,7 +1728,8 @@ class CTClient:
         return self._prep(STOP, filaments)
 
     def sleep_all(self, filaments=None) -> dict:
-        """SLEEP a BATCH of filaments, excluding the dead mask.
+        """SLEEP a BATCH of filaments. Dead filaments are INCLUDED: SLEEP removes
+        heating power, and the dead mask only ever blocks energising.
         For exactly one filament, use sleep_one()."""
         return self._prep(SLEEP, filaments)
 
