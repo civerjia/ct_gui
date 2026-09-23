@@ -343,7 +343,7 @@ ct.active_one(5, 2900)
 
 ### Constructor
 
-**`CTClient(host="localhost", port=8770, client_id="ct_simple_control", timeout=5.0)`**
+**`CTClient(host="localhost", port=8770, client_id="ct_simple_control", timeout=5.0, record=True, record_dir=None, keepalive=True)`**
 — Create a client bound to one backend instance. Creating a `CTClient` does
 NOT connect to hardware by itself — the backend must separately connect a
 controller to the ESP32 bridge (via the GUI, or `ct.connect(...)` — see
@@ -368,6 +368,14 @@ ct = CTClient(host="192.168.50.112", port=8770,
 - `timeout`: default per-request timeout in seconds; some calls
   (`fire_single_pulse`, `idle_all`, `hv_grid_set_all`) override this with
   a longer built-in timeout since they take longer on real hardware.
+- `record`: append every call this script makes, with its **full result**, to
+  `logs/client/ct_client_YYYY-MM-DD.jsonl` next to `ct_simple_control.py`
+  (`ct.record_path` is today's file). This is the only place results computed
+  here — `emission_ma`, pulse events, verdicts — are kept after the script
+  exits; `backend.log` records only what was commanded. `record_dir` moves it,
+  `record=False` turns it off. See "Logs" in [README.md](README.md).
+- `keepalive`: renew the backend's dead-man watchdog while this client has
+  something energised — see `safety()`.
 
 ### Connection
 

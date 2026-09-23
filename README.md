@@ -176,7 +176,33 @@ lines a day with a controller switched off, 99.7% of the file.)
 
 The audit records **what was commanded**. The full results — measured
 currents, pulse events, everything a script printed — are in the client's own
-log, below.
+record.
+
+**Client record: every call, with its full result.** `ct_simple_control`
+appends one JSON line per call a script makes to
+`logs/client/ct_client_YYYY-MM-DD.jsonl`, on the machine the **script** runs on
+(next to `ct_simple_control.py`): time, client id, backend, method, arguments,
+duration, `ok`, and the complete result — or the exception, if it raised. Only
+the script's own calls are recorded, not the ones a method makes internally
+(one `fire_single_pulse` polls `shv_status` throughout the shot). The same
+method, arguments and result again within 5 s is counted instead
+(`identical_before_not_recorded` on the next line written). Turn it off with
+`CTClient(record=False)`; move it with `record_dir=`.
+
+Read a run back, and print any result the way it printed live:
+
+```python
+import json
+from ct_simple_control import Result
+
+for line in open("logs/client/ct_client_2026-09-23.jsonl"):
+    rec = json.loads(line)
+    if rec["method"] == "fire_single_pulse":
+        print(rec["t"], rec["args"], rec["kwargs"])
+        print(Result(rec["result"]))
+```
+
+A record that cannot be written never fails the call; it warns once on stderr.
 
 ## Real-hardware bound schedule (download · arm · trigger · monitor)
 

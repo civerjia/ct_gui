@@ -175,12 +175,14 @@ Dependencies: pip install requests
 import enum
 import functools
 import inspect
+import json
 import math
 import sys
 import textwrap
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import NewType
 
 # FID: the canonical 0..95 filament id the backend and firmware agree on.
@@ -609,6 +611,10 @@ class CTClient:
                                        # hv_grid_set_all, present_filaments)
                                        # override this with a longer built-in
                                        # timeout since they take longer
+        record: bool = True,          # append every call and its FULL result
+                                       # to logs/client/ct_client_<date>.jsonl
+                                       # -- see _record_call(). False = off
+        record_dir: str | None = None,  # where; None = tools/ct_gui/logs/client
         keepalive: bool = True,       # renew the backend's dead-man watchdog
                                        # in the background for as long as this
                                        # client is alive and has energised
@@ -631,6 +637,12 @@ class CTClient:
         """
         self.base = f"http://{host}:{port}"
         self.client_id = client_id
+        self.record = bool(record)
+        self.record_dir = (Path(record_dir) if record_dir is not None
+                           else Path(__file__).resolve().parent / "logs" / "client")
+        self._record_lock = threading.Lock()
+        self._record_last: dict = {}      # method -> [signature, monotonic, suppressed]
+        self._record_warned = False
         self.timeout = timeout
         self._s = requests.Session()
         # Dead-man keepalive state. Armed lazily by _ensure_keepalive() the
@@ -769,6 +781,66 @@ class CTClient:
         except Exception as exc:
             return {"ok": False, "error": f"GET {path} failed: {exc}"}
         return self._parse(r, path)
+
+    # ── the call record (logs/client/*.jsonl) ─────────────────────────────────
+    # backend.log audits what was COMMANDED. The results -- measured currents,
+    # pulse events, verdicts, everything computed here in the client -- only
+    # ever existed in a script's stdout. Every public call now appends one JSON
+    # line with its arguments and its complete result, so a run can be read
+    # back afterwards:
+    #
+    #     import json; from ct_simple_control import Result
+    #     for line in open("logs/client/ct_client_2026-09-23.jsonl"):
+    #         rec = json.loads(line)
+    #         print(rec["t"], rec["method"], Result(rec["result"] or {}))
+
+    RECORD_DEDUP_S = 5.0     # same method, args and result within this: counted, not re-written
+
+    @property
+    def record_path(self) -> Path:
+        """Today's record file (it rolls over at midnight, local time)."""
+        return self.record_dir / f"ct_client_{time.strftime('%Y-%m-%d')}.jsonl"
+
+    def _record_call(self, method: str, args, kwargs, t0: float,
+                     out=None, exc: BaseException | None = None) -> None:
+        """Append one call to the record. Never raises: a record that cannot
+        be written must not take the call it describes down with it -- it
+        warns once on stderr instead."""
+        if not self.record:
+            return
+        try:
+            call = {"method": method, "args": list(args), "kwargs": dict(kwargs)}
+            if exc is not None:
+                body = {"exception": f"{type(exc).__name__}: {exc}"}
+            else:
+                body = {"ok": out.get("ok") if isinstance(out, dict) else None,
+                        "result": out}
+            sig = json.dumps({**call, **body}, default=repr, sort_keys=True,
+                             ensure_ascii=False)
+            now = time.monotonic()
+            with self._record_lock:
+                last = self._record_last.get(method)
+                if last and last[0] == sig and now - last[1] < self.RECORD_DEDUP_S:
+                    last[1] = now
+                    last[2] += 1
+                    return
+                repeats = last[2] if (last and last[0] == sig) else 0
+                self._record_last[method] = [sig, now, 0]
+                rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t0))
+                            + f".{int((t0 % 1) * 1000):03d}",
+                       "client": self.client_id, "backend": self.base,
+                       **call, "duration_s": round(time.time() - t0, 3), **body}
+                if repeats:
+                    rec["identical_before_not_recorded"] = repeats
+                self.record_dir.mkdir(parents=True, exist_ok=True)
+                with open(self.record_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, default=repr, ensure_ascii=False) + "\n")
+        except Exception as e:     # noqa: BLE001 -- see the docstring
+            if not self._record_warned:
+                self._record_warned = True
+                print(f"[ct_simple_control] call record not written ({e}); "
+                      f"further failures are silent. record=False turns it off.",
+                      file=sys.stderr)
 
     def _post(self, path: str, body: dict, timeout: float | None = None) -> dict:
         r = self._one_post(path, body, timeout)
@@ -9429,12 +9501,30 @@ class CTClient:
 # local refusal, every early return, every parsed reply. Wrapping only the HTTP
 # funnels left exactly the wrong half readable: the refusals a caller is most
 # likely to be squinting at never go near them.
+#: Call depth per thread, so only the call the SCRIPT made is recorded, not
+#: the dozens it makes internally (one fire_single_pulse polls shv_status
+#: throughout the shot).
+_CALL_DEPTH = threading.local()
+
+
 def _as_result(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        out = fn(*args, **kwargs)
+        depth = getattr(_CALL_DEPTH, "n", 0)
+        _CALL_DEPTH.n = depth + 1
+        t0 = time.time()
+        try:
+            out = fn(*args, **kwargs)
+        except BaseException as exc:
+            if depth == 0 and args and isinstance(args[0], CTClient):
+                args[0]._record_call(fn.__name__, args[1:], kwargs, t0, exc=exc)
+            raise
+        finally:
+            _CALL_DEPTH.n = depth
         if isinstance(out, dict) and not isinstance(out, Result):
-            return Result(out)
+            out = Result(out)
+        if depth == 0 and args and isinstance(args[0], CTClient):
+            args[0]._record_call(fn.__name__, args[1:], kwargs, t0, out=out)
         return out
     return wrapper
 
