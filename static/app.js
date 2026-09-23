@@ -1524,9 +1524,12 @@ async function hwSimulateScan() {
   const expect = [...new Set(schedule.map((r) => r.filament))];
   const activeMa = Math.round(Math.max(...filaments.map((f) => f.activeA || 0), 2.9) * 1000);
   try {
-    const j = await postJSON('/api/sync/simulate', { controller: 1, count, duration_s: durationS, expect, active_mA: activeMa });
+    // No controller: the backend fires the current MASTER, the head of the
+    // chain, which forwards to the other board. A fixed P1 stops being the
+    // head the moment the master moves.
+    const j = await postJSON('/api/sync/simulate', { count, duration_s: durationS, expect, active_mA: activeMa });
     if (!j.ok) { hwMsg('Simulate Scan failed: ' + (j.error || '?')); return; }
-    hwMsg(`Simulating scan: ${count} triggers over ${durationS.toFixed(1)}s (fired at chain head P1) — watch the CT plot & run status.`);
+    hwMsg(`Simulating scan: ${count} triggers over ${durationS.toFixed(1)}s (fired at chain head P${j.controller}) — watch the CT plot & run status.`);
     setViewMode('live'); startRunMonitor();   // track the schedule advancing
   } catch (e) { hwMsg('Simulate Scan failed: ' + e); }
 }
