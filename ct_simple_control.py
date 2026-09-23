@@ -7599,6 +7599,25 @@ class CTClient:
         vf = sum(vf_v if vf_v is not None else cls._MOSFET_VF_V)
         return (abs(float(emission_v)) - vf) / float(r_ohm or cls._MOSFET_R_OHM) * 1000.0
 
+    def _hv_off_problem(self) -> str | None:
+        """Turn the emission rail off. None if that worked, else what to report.
+
+        Never raises -- it runs in finally blocks, where raising would replace
+        whatever exception is already on its way out. A failure is RETURNED so
+        the caller puts it in front of the reader: a rail that may still be live
+        is the one thing a teardown must not keep quiet about. (If it goes
+        unreported anyway -- an exception propagating past the caller -- the
+        backend's dead-man watchdog drops the rail within hv_timeout_s.)
+        """
+        try:
+            r = self.enable_emission(False)
+        except Exception as exc:          # defensive: the client should not raise
+            return f"turning the emission rail OFF raised {type(exc).__name__}: {exc} — it may still be LIVE"
+        if not r.get("ok"):
+            return (f"turning the emission rail OFF failed "
+                    f"({r.get('error') or 'no reason given'}) — it may still be LIVE")
+        return None
+
     def mosfet_test(self, filaments=None,
                     emission_v: float = 100.0,
                     limit_ma: float = 5.0,
@@ -7676,15 +7695,27 @@ class CTClient:
         v_read = self.read_emission_v()
         hv = self.hv_status()
         if not hv.get("emission_on"):
-            try:
-                self.enable_emission(False)
-            except Exception:
-                pass
+            off = self._hv_off_problem()
             return {"ok": False, "results": {}, "counts": {},
                     "problems": ["the emission rail did not come on — nothing "
-                                 "to measure, and no filament was touched"]}
+                                 "to measure, and no filament was touched"]
+                                + ([off] if off else [])}
+
+        # Also decidable before anything is energised, so it lives here and not
+        # inside the try: that keeps the try free of early returns, which is
+        # what guarantees the HV-off result below always reaches the caller.
+        v_eff = abs(v_read) if v_read else abs(emission_v)
+        expected = self.mosfet_expected_ma(v_eff, r_ohm, vf_v)
+        if expected <= 0:
+            off = self._hv_off_problem()
+            return {"ok": False, "results": {}, "counts": {},
+                    "problems": [f"rail {v_eff} V is at or below the "
+                                 f"{sum(vf_v or self._MOSFET_VF_V)} V of diode "
+                                 f"drop — no current can flow through the path "
+                                 f"this test measures"] + ([off] if off else [])}
 
         results: dict[int, dict] = {}
+        hv_off = None
         try:
             with self.energised(*wanted):
                 # COLD, and on the iso rail. sleep_all() does both.
@@ -7694,17 +7725,9 @@ class CTClient:
                     problems.append(f"could not put every filament to SLEEP "
                                     f"({self.describe(sl)[:100]}) — a filament "
                                     f"still at STOP reads as a dead MOSFET")
-                # Expected from the rail that is ACTUALLY there, not the one
-                # that was asked for: a rail sitting 15 V low would otherwise
-                # make every good MOSFET look 15% weak.
-                v_eff = abs(v_read) if v_read else abs(emission_v)
-                expected = self.mosfet_expected_ma(v_eff, r_ohm, vf_v)
-                if expected <= 0:
-                    return {"ok": False, "results": {}, "counts": {},
-                            "problems": [f"rail {v_eff} V is at or below the "
-                                         f"{sum(vf_v or self._MOSFET_VF_V)} V of "
-                                         f"diode drop — no current can flow "
-                                         f"through the path this test measures"]}
+                # `expected` was computed from the rail ACTUALLY there, not the
+                # one asked for, before this block -- a rail sitting 15 V low
+                # would otherwise make every good MOSFET look 15% weak.
                 for f in wanted:
                     fr = self.fire_single_pulse(
                         f, num_pulses=pulses, width_us=width_us,
@@ -7742,12 +7765,16 @@ class CTClient:
                     if callable(progress):
                         progress(int(f), row)
         finally:
-            # The rail comes down whatever happened, including on Ctrl-C.
-            try:
-                self.enable_emission(False)
-            except Exception:
-                pass
+            # The rail comes down whatever happened, including on Ctrl-C -- and
+            # whether it DID come down is reported, not assumed. This used to be
+            # `try: enable_emission(False) except Exception: pass`, where the
+            # except was dead code (the client never raises) and the RETURN
+            # value, the only place a failed turn-off shows up, was discarded.
+            # So a rail left live read exactly like one that was turned off.
+            hv_off = self._hv_off_problem()
 
+        if hv_off:
+            problems.append(hv_off)
         counts = {"pass": 0, "dead": 0, "inconclusive": 0}
         for row in results.values():
             counts[row["verdict"]] += 1
