@@ -74,11 +74,22 @@ passes 3/3 on firmware `8ed468a`: 93/93 filaments at IDLE, 0 I2C timeouts,
   check C1's I2C cables, pull-ups and routing. A 100 kHz build on C1 would tell
   whether margin is the issue. `ccstat` shows spikes / oeRetries / ccLatches /
   pwrFails per board; `i2cstat` shows timeouts split async/sync.
-- **Batch commands still serial in the handler.** `CH_SET_POWER_STATE` masked
-  frames (0x35) configure each board's TPS one after another inside the UART
-  handler, and the bulk `CH_GET_TPS_STATUS` (0x23) reads every board serially
-  (~121 ms, blocking the CC loop meanwhile). Both should use the concurrent
-  job (docs/async_i2c/05_parallel_executor.md) — "step B".
+- **Batch commands: STANDBY and VOLTAGE still per-channel.** Step B is done
+  for the bulk `CH_GET_TPS_STATUS` (0x23, RP2350 `9ab5d49`: ~36-51 ms, was
+  113-155) and masked `CH_SET_POWER_STATE` IDLE/ACTIVE (0x35, `c57aa5e` +
+  `a62dc22`: rig-wide IDLE max ~4 s, one frame per current). STANDBY and
+  VOLTAGE masked frames still configure boards one after another in the
+  handler.
+- **C1 CH2 went dark once, cause unknown.** 2026-09-23, after a rig-wide
+  IDLE on firmware `c57aa5e`+pacing: mux and all three expanders NAK'd every
+  probe (1.1M NAKs, 0 timeouts, 0 stuck lines) until a reboot; its filaments
+  (8-11, 24-27) were unreadable, so their off state could not be confirmed
+  until then. Not reproduced in 4 runs since. If it recurs: `i2cstat` (SM +
+  pad snapshot, `nakStreak` climbing) BEFORE anything else, then
+  `i2creinit 2` -- answers again = the SM was wedged (firmware); still NAKs =
+  the board/cable. Firmware never re-inits on its own yet; a stuck channel
+  cannot turn its filaments off, so an auto-reinit on a long mux NAK streak
+  is the likely fix once the snapshot says what broke.
 - **Warm-start idle times near the test bound.** Back-to-back runs (filaments
   still hot) reach 9.6-9.7 s max against the 10 s bound: SLEEP -> IDLE uses the
   cold slew rate. Decide whether warm starts should use the warm rate, or the
