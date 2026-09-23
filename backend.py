@@ -4736,6 +4736,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 # whole entry apart for the run.
                 order = sorted((cid for cid, link in CONTROLLERS.items() if link.client.connected),
                                key=lambda cid: cid == MASTER)
+                # A run is active control of the filaments and the rails, same
+                # as the per-board arm in shv_op: renew both dead-man timers.
+                safety_touch_hv()
+                safety_touch_filaments(list(LAST_POWER_STATE.keys()))
                 results = {}
                 for cid in order:
                     link = CONTROLLERS[cid]

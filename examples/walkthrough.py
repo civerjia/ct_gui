@@ -117,7 +117,7 @@ def s4(ct, args):
     # ceiling deliberately -- fast cold ramping is exactly what trips OCP on the
     # cold-inrush. "Reset to defaults" by writing the ceilings once made cold
     # starts 5x/10x faster and tripped OCP. To restore, write SLEW_DEFAULTS:
-    #     ct.set_slew_rates(**CTClient.SLEW_DEFAULTS, controller=1)
+    #     ct.set_slew_rates(**CTClient.SLEW_DEFAULTS)   # every connected controller
 
     # ── OCP ─────────────────────────────────────────────────────────────────
     # Two unrelated mechanisms. (1) per-board TPS55289 IOUT_LIMIT, the real

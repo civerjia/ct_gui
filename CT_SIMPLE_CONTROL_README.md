@@ -1169,8 +1169,8 @@ if st["ok"] and st["fault"] != 0:
 
 ### Slew rates
 
-**`get_slew_rates(controller=1)`** / **`set_slew_rates(below, above, warm,
-controller=1)`** — how fast the CC loop may ramp the output, in mV/s. Three
+**`get_slew_rates(controller=None)`** / **`set_slew_rates(below, above, warm,
+controller=None)`** — how fast the CC loop may ramp the output, in mV/s. Three
 bands: `below`/`above` are the COLD-start rates, `warm` applies once the
 filament is hot.
 
@@ -1346,7 +1346,7 @@ print(r)   # {"ok": True, "results": {"1": {"ok": True}, "2": {"ok": True}}}
 
 ### SHV run policy & HV bit-bang diagnostics
 
-**`get_fault_policy(controller=1)`** / **`set_fault_policy(controller=1, board=None, mismatch=None)`**
+**`get_fault_policy(controller=None)`** / **`set_fault_policy(controller=None, board=None, mismatch=None)`**
 — Two independent stop/continue switches for a run that hits trouble:
 `board` (0=stop, 1=continue on a CC/OCP hardware fault) and `mismatch`
 (0=stop, 1=continue on an HC165 read-back mismatch). `set_fault_policy`
@@ -1355,13 +1355,18 @@ which boards actually faulted — the only record of that under a
 "continue" policy.
 
 ```python
-ct.set_fault_policy(1, board=1, mismatch=0)   # continue past CC/OCP faults,
-                                               # but still stop on a mismatch
-r = ct.get_fault_policy(1)
+ct.set_fault_policy(board=1, mismatch=0)   # every controller: continue past CC/OCP
+                                           # faults, but still stop on a mismatch
+r = ct.get_fault_policy()
 print(r)
 # {"ok": True, "board": 1, "mismatch": 0, "mismatchCount": 0,
 #  "faultedSlots": [...], "faultedFilaments": [...]}   # your USER_INDEX numbering
 ```
+
+> **Rig-wide by default.** With `controller` omitted these act on EVERY connected
+> controller (a two-controller schedule needs the same values on both). A read
+> reports the shared value only when every board agrees; otherwise `ok: False`
+> and each board's values. `controller=N` addresses one board.
 
 > ⚠️ **On a bench with unpopulated slots you almost certainly want
 > `board=1`.** The default (`board=0`, stop) ends the whole run at the FIRST
@@ -1389,8 +1394,13 @@ print(r)
 > this run". `faultFilament` in `shv_status` is the single filament that stopped
 > the current run — a different question again.
 
-**`get_trigger_delay(controller=1)`** / **`set_trigger_delay(delay_us, controller=1)`**
-— A small, deliberate offset (µs, uint16, 0–65535) between the SyncIn
+**`get_trigger_delay()`** / **`set_trigger_delay(delay_us)`**
+— Always the whole rig: there is no `controller` argument. The master frames
+the other board's pulses, so the two delays must be identical; the set writes
+every connected controller, the get returns `delayUs: None, ok: False` when
+they disagree, and arming is refused (`trigger_delay_mismatch`) until they
+match. Re-check after any RP2350 reset — a reset zeroes it.
+A small, deliberate offset (µs, uint16, 0–65535) between the SyncIn
 trigger edge and the RP2350 actually firing. **Always check `"applies"`**:
 a set that the live fire path (e.g. PIO precision mode) can't currently
 honour still returns `"ok": True` (the setting was stored) but
@@ -1398,7 +1408,7 @@ honour still returns `"ok": True` (the setting was stored) but
 pulses fire, without you being able to tell unless you check this field.
 
 ```python
-r = ct.set_trigger_delay(500, controller=1)   # 500 µs
+r = ct.set_trigger_delay(500)   # 500 µs, every controller
 print(r)   # {"ok": True, "delayUs": 500, "applies": True}
 if not r["applies"]:
     print("WARNING: delay set but not honoured by the live fire path")
@@ -2288,6 +2298,21 @@ if not r["ok"]:
 
 **`shv_disarm(controller=1)`** — Cancel an armed or running schedule.
 Safe to call at any time, including when already idle.
+
+**`arm_all(repeats=1)`** — Arm EVERY connected controller: the call for a
+two-controller run. Other boards first, the master last — the master forwards
+the trigger only while it is armed itself, so a trigger arriving mid-arm is
+dropped by both boards instead of counted by one (which would leave them an
+entry apart for the whole run). All-or-nothing: on a failure the master is not
+armed and every board that did arm is disarmed. Returns `{"ok", "order",
+"results": {controller: {"ok", "reject", ...}}}`.
+
+<a id="scan-report"></a>**`scan_report(controller=None, since=None, plan=None)`** — After a run:
+reads the status and pulse log of every connected controller (or one, with
+`controller=N`), merges the logs (each record tagged `controller`, sorted by
+`tOnUs`) and lists `problems`, per board (`controller N: ...`). With two boards
+it also compares their trigger-edge counts: a difference means they are out of
+step, and the master framed the other board's pulses with the wrong entries.
 
 ```python
 ct.shv_disarm(1)

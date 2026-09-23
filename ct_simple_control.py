@@ -4427,6 +4427,22 @@ class CTClient:
     def shv_disarm(self, controller: int = 1) -> dict:
         return self._shv(controller, {"op": "disarm"})
 
+    def arm_all(self, repeats: int = 1) -> dict:
+        """Arm the downloaded schedule on EVERY connected controller — the
+        call for a two-controller run (shv_arm arms one board).
+
+        The master is armed LAST, and the master forwards the trigger to the
+        other board only while it is itself armed, so a trigger arriving
+        mid-arm is dropped by both boards rather than counted by one (which
+        would leave them an entry apart for the whole run). All-or-nothing:
+        on the first failure the master is not armed and every board that
+        did arm is disarmed again. Refused while the boards' trigger delays
+        differ (`trigger_delay_mismatch`).
+
+        Returns {"ok", "order": [controller, ...], "results":
+        {controller: {"ok", "reject", "disarmed"?, "skipped"?}}}."""
+        return self._post("/api/arm", {"repeats": max(1, int(repeats))})
+
     def shv_status(self, controller: int = 1) -> dict:
         """SHV status: {state, filamentIndex, totalPulsesDone, elapsedMs, …}.
         Returns {} on failure (never raises)."""
