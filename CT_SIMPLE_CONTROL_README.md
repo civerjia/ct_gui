@@ -2195,7 +2195,7 @@ time.sleep(2)
 print("2 seconds elapsed — triggering now")
 
 # 4. Trigger — THIS call is the exact moment the pulse fires
-ct.simulate_sync(count=1, controller=1)
+ct.simulate_sync(count=1)
 
 # 5. Poll for the result
 deadline = time.monotonic() + 10
@@ -2513,7 +2513,7 @@ plan = {
 ct.download(plan)
 ct.verify_schedule(plan)
 ct.shv_arm(1, repeats=1)
-ct.simulate_sync(count=1, controller=1)   # ESP32 generates the SyncIn edge
+ct.simulate_sync(count=1)   # ESP32 generates the SyncIn edge
 status = ct.shv_status(1)
 log    = ct.shv_pulse_log(1)
 ct.shv_disarm(1)
@@ -2527,10 +2527,13 @@ monitor, or stop a simulated SyncIn train independently of the high-level
 wrapper (e.g. driving a longer sequence, or generating edges for a custom
 `download()`-based sequence like the one just above).
 
-**`simulate_sync(count=1, interval_ms=None, duration_s=None, controller=1, expect=None, active_ma=2900)`**
-— Tell the ESP32 to generate `count` SyncIn pulses. Fires from the
-head-of-chain controller; the RP2350 chain propagates the edge onward if a
-second power unit is chained.
+**`simulate_sync(count=1, interval_ms=None, duration_s=None, controller=None, expect=None, active_ma=2900)`**
+— Tell the ESP32 to generate `count` SyncIn pulses. Fires from the head of the
+chain — the **current master** when `controller` is left unset — and the
+master forwards the edge to the second power unit (only while the master is
+armed). Leave it unset: a hard-coded controller number stops being the master
+the moment the master moves, and a trigger fired at the non-master never
+reaches the master, so no envelope frames the pulse.
 
 - Pass **either** `interval_ms` (fixed gap between pulses) **or**
   `duration_s` (spread `count` pulses evenly across that many seconds) —
@@ -2542,9 +2545,9 @@ second power unit is chained.
   `{"ok": False, "error": "..."}` — call `simulate_sync_stop()` first.
 
 ```python
-ct.simulate_sync(count=1, controller=1)                       # one pulse, no delay
-ct.simulate_sync(count=5, interval_ms=200, controller=1)       # 5 pulses, 200 ms apart
-ct.simulate_sync(count=10, duration_s=3.0, controller=1)       # 10 pulses spread over 3 s
+ct.simulate_sync(count=1)                       # one pulse, no delay
+ct.simulate_sync(count=5, interval_ms=200)       # 5 pulses, 200 ms apart
+ct.simulate_sync(count=10, duration_s=3.0)       # 10 pulses spread over 3 s
 ```
 
 **`simulate_sync_stop()`** — Stop an in-progress simulated train early.
@@ -2558,7 +2561,7 @@ ct.simulate_sync_stop()
 
 ```python
 import time
-ct.simulate_sync(count=20, interval_ms=500, controller=1)
+ct.simulate_sync(count=20, interval_ms=500)
 while True:
     st = ct.simulate_sync_status()
     print(f"{st['fired']}/{st['count']} fired")

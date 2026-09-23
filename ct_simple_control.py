@@ -136,7 +136,7 @@ Usage:
         # SyncIn edge itself (internally posts to /api/sync/simulate) — no
         # external wiring needed. Equivalent standalone call, if you want to
         # trigger it yourself instead of letting fire_single_pulse do it:
-        #     ct.simulate_sync(count=1, controller=1)
+        #     ct.simulate_sync(count=1)          # fires through the master
         result = ct.fire_single_pulse(filament=5, num_pulses=1, width_us=1000,
                                       trigger="sim")
         if not result["ok"]:
@@ -4525,9 +4525,11 @@ class CTClient:
                       duration_s: float | None = None,   # spread `count` pulses
                                                           # evenly across this
                                                           # many seconds instead
-                      controller: int = 1,            # which RP2350 fires the
-                                                       # edge (chain propagates
-                                                       # it onward if chained)
+                      controller: int | None = None,  # which RP2350 fires the
+                                                       # edge; None = the current
+                                                       # MASTER, the head of the
+                                                       # chain (it forwards to
+                                                       # the other board)
                       expect=None,                    # optional [filament, ...]
                                                        # to seed the run-report's
                                                        # expected-filament
@@ -4537,8 +4539,13 @@ class CTClient:
                                                         # run-report expects
         """Start the ESP32 generating `count` SyncIn pulses.
 
-        Fires from the head-of-chain controller (`controller`); the RP2350
-        chain propagates the edge to the other power unit if chained.
+        Fires from the head of the chain: the current master unless
+        `controller` says otherwise. The master forwards the edge to the other
+        power unit (only while it is armed itself). Leave `controller` unset:
+        it defaulted to 1, which is the master only until the master moves --
+        after that the default fired the other board directly, the master never
+        saw the trigger, and its envelope never framed the pulse (the G3
+        failure). The backend resolves None to its current MASTER.
 
         Pass EITHER `interval_ms` (fixed gap between pulses) OR `duration_s`
         (spread `count` pulses evenly across this many seconds) — not both.
@@ -4552,8 +4559,9 @@ class CTClient:
 
         Returns {"ok", "count", "interval_ms", "controller"}.
         """
-        body: dict = {"count": int(count), "controller": int(controller),
-                     "active_mA": int(active_ma)}
+        body: dict = {"count": int(count), "active_mA": int(active_ma)}
+        if controller is not None:
+            body["controller"] = int(controller)
         if interval_ms is not None:
             body["interval_ms"] = float(interval_ms)
         elif duration_s is not None:
