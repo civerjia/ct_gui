@@ -2764,6 +2764,42 @@ def is_read_post(path: str, body: dict) -> bool:
     return False
 
 
+#: POSTs that only take the bench DOWN. Never refused by the lease.
+_DEENERGISE_PATHS = frozenset({
+    "/api/disarm", "/api/sync/abort", "/api/sync/simulate-stop",
+    "/api/stm32/hv-clear-target", "/api/adc/ready-disarm", "/api/adc/pulse-disarm",
+    "/api/adc/ring-stop", "/api/ringpulse/disarm", "/api/record/stop",
+})
+
+
+def is_deenergising_post(path: str, body: dict) -> bool:
+    """A POST that only turns something OFF: a STOP/SLEEP, HV off, a grid
+    clear, a disarm. The lease never refuses these -- a lease exists to keep
+    other clients from CHANGING what a run depends on, and a run can survive
+    being stopped far better than a filament can survive not being stopped.
+    Before this, a script holding the lease made the GUI's stop buttons return
+    "another client holds the write lease"."""
+    if path in _DEENERGISE_PATHS:
+        return True
+
+    def low_state(v) -> bool:
+        try:
+            return int(v) in (POWER_STATE_STOP, POWER_STATE_SLEEP)
+        except (TypeError, ValueError):
+            return False
+
+    if path in ("/api/filament-prep", "/api/filament-state"):
+        return low_state(body.get("state"))
+    if path in ("/api/cmd", "/api/power-cmd"):
+        return (str(body.get("command", "")) == "CH_SET_POWER_STATE"
+                and low_state(body.get("state")))
+    if path in ("/api/hv-grid", "/api/stm32/hv-enable"):
+        return "on" in body and not bool(body.get("on"))
+    if path == "/api/shv":
+        return body.get("op") == "disarm"
+    return False
+
+
 def _audit_skipped(path: str, body: dict) -> bool:
     if is_read_post(path, body) or path == "/api/poll-pause":
         return True
@@ -2800,7 +2836,7 @@ def _audit_outcome(resp) -> str:
     return "-> ok"
 
 
-def audit_post(path: str, client, body, resp) -> None:
+def audit_post(path: str, client, body, resp, note=None) -> None:
     """One audit line for a POST, unless it is a read or a heartbeat."""
     body = body if isinstance(body, dict) else {}
     if _audit_skipped(path, body):
@@ -2823,6 +2859,8 @@ def audit_post(path: str, client, body, resp) -> None:
             for k in sorted(_AUDIT_LAST, key=lambda k: _AUDIT_LAST[k][0])[:256]:
                 _AUDIT_LAST.pop(k, None)
     more = f"   (+{repeats} identical before this, not logged)" if repeats else ""
+    if note:
+        more += f"   [{note}]"
     level = logging.WARNING if outcome.startswith("-> FAILED") else logging.INFO
     log.log(level, "AUDIT %s POST %s %s %s%s", client or "?", path, summary, outcome, more)
 
@@ -4653,12 +4691,13 @@ class CtHandler(BaseHTTPRequestHandler):
         self._audit_body = None
         self._audit_resp = None
         self._audit_client = None
+        self._audit_note = None
         try:
             self._do_post()
         finally:
             with _suppress():
                 audit_post(self.path.split("?", 1)[0], self._audit_client,
-                           self._audit_body, self._audit_resp)
+                           self._audit_body, self._audit_resp, self._audit_note)
 
     def _do_post(self) -> None:
         global SCAN_MASK   # read (diagnosis branch) + written (channel-mask branch)
@@ -6201,7 +6240,13 @@ class CtHandler(BaseHTTPRequestHandler):
         anything that never touches the link (_UNGATED_POSTS)."""
         if path in _UNGATED_POSTS or is_read_post(path, body):
             return None
-        return _lease_blocking(client)
+        held = _lease_blocking(client)
+        if held is not None and is_deenergising_post(path, body):
+            # Let through, and say so in the audit line: the holder's run was
+            # interrupted by someone else, and that must be findable.
+            self._audit_note = f"de-energising: let through the lease held by {held['owner']}"
+            return None
+        return held
 
     def _cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")

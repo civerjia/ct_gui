@@ -333,9 +333,11 @@ logged as `AUDIT … FAILED` in `backend.log`). What it does *not* do:
 - **It de-energises nothing** and turns nothing off on exit.
   `energised()` / `session()` and the backend's dead-man watchdog (`safety()`)
   do that.
-- ⚠ **It also refuses other clients' STOP / HV-off / disarm.** While a script
-  holds the lease, the GUI's stop buttons are refused like any other write.
-  Keep the lease no longer than the run, and use a `note` that says who to ask.
+- **It never refuses turning things OFF.** STOP and SLEEP, HV off, a grid
+  clear, a disarm, stopping a simulated trigger or a measurement — from anyone,
+  lease or not. The GUI's stop buttons always work. Such a write is logged as
+  `AUDIT … [de-energising: let through the lease held by <you>]`, so a run
+  that was stopped from outside can find out who did it.
 
 ### Inside or outside
 
@@ -348,7 +350,7 @@ results, everything goes in one lease** — including setup and teardown.
 | the heating ladder (`sleep/standby/idle/active_*`, `*_all`) before a measurement | the GUI could move the filament to another state between your ladder and your shot |
 | `download` → `verify_schedule` → `arm_all` / `shv_arm` → trigger → `shv_pulse_log` / `scan_report` | a download or disarm from someone else lands between your steps |
 | `fire_single_pulse`, `mosfet_test`, `emission_vs_heating`, `emission_ramp`, `hv_switch_test` | each is itself a download–arm–fire–read sequence of many commands |
-| the teardown (`stop_all`, HV off) | outside, it can be refused if someone else took the lease in the gap |
+| the teardown (`stop_all`, HV off) | not for permission — turning off is never refused — but so it runs before the lease is let go |
 
 | fine outside | why |
 |---|---|
