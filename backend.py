@@ -2663,6 +2663,50 @@ def _lease_blocking(owner: str) -> dict[str, Any] | None:
     return snap if snap["held"] and snap["owner"] != owner else None
 
 
+# ── Bulk TPS status (CH_GET_TPS_STATUS, mask form) ──────────────────────────
+
+def read_tps_status(link: "ControllerLink", cid: int) -> dict:
+    """One bulk CH_GET_TPS_STATUS on one controller, unpacked per filament.
+
+    Returns {"ok", "filaments": {fid: {"present", "en", "fault", "struggling",
+    "oe"}}, "oe_supported"}. Only boards the firmware actually READ appear
+    (its valid mask): a board missing here was not read, which is not the same
+    as "all clear". `oe` is None where the MODE register was not read, and for
+    every board on firmware older than the OE read (57-byte reply) -- absent,
+    never False, because False would claim the output is off.
+
+    Byte layout: status@0, targeted@1, present@9, en@17, fault@25, hv@33,
+    valid@41, struggling@49, oe@57, oe_valid@65 (8 bytes each)."""
+    ft, flags, payload = build_payload("CH_GET_TPS_STATUS", {"board_mask": [0xFF] * 8})
+    resp = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
+    raw = resp.get("raw") if isinstance(resp, dict) else None
+    if not raw or raw[0] != 0 or len(raw) < 49:
+        return {"ok": False, "error": f"bad CH_GET_TPS_STATUS reply ({len(raw or [])} bytes)",
+                "filaments": {}}
+    def bit(off, ch, pos):
+        return off + 8 <= len(raw) and bool(raw[off + ch] & (1 << pos))
+    has_valid = len(raw) >= 49
+    has_struggling = len(raw) >= 57
+    has_oe = len(raw) >= 73
+    out = {}
+    for ch in range(8):
+        for pos in range(8):
+            if not bit(1, ch, pos):                       # not targeted
+                continue
+            if has_valid and not bit(41, ch, pos):        # not read
+                continue
+            f = MAPPING.filament_for_board(cid - 1, ch, pos)
+            if f is None:
+                continue
+            out[int(f)] = {
+                "present": bit(9, ch, pos), "en": bit(17, ch, pos),
+                "fault": bit(25, ch, pos),
+                "struggling": bit(49, ch, pos) if has_struggling else None,
+                "oe": (bit(57, ch, pos) if (has_oe and bit(65, ch, pos)) else None),
+            }
+    return {"ok": True, "filaments": out, "oe_supported": has_oe}
+
+
 # ── Audit log: one line per state-changing request ─────────────────────────
 # backend.log used to record almost nothing a person did: 84 shots, a MOSFET
 # test and a switch test on 2026-09-23 left 14 lines, none of them a command.
@@ -3936,6 +3980,24 @@ class CtHandler(BaseHTTPRequestHandler):
                                                   "emit_fids": sorted(LOADED_EMIT_FIDS.get(cid, ()))}
                                    for cid in sorted(set(LOADED_PLAN) | set(LOADED_EMIT_FIDS))}})
 
+        elif path == "/api/tps-status":
+            # Every connected controller's bulk TPS status, per filament (FID):
+            # present, EN pin, fault, struggling, and the output enable -- what
+            # tells STOP / SLEEP / powered apart. One bulk read per controller.
+            out: dict[str, Any] = {"ok": True, "controllers": {}}
+            for cid, link in CONTROLLERS.items():
+                if not link.client.connected:
+                    continue
+                try:
+                    out["controllers"][str(cid)] = read_tps_status(link, cid)
+                except Exception as exc:
+                    out["controllers"][str(cid)] = {"ok": False, "error": str(exc),
+                                                    "filaments": {}}
+            if not out["controllers"]:
+                out = {"ok": False, "error": "no controller connected", "controllers": {}}
+            elif not all(c.get("ok") for c in out["controllers"].values()):
+                out["ok"] = False
+            self._json(out)
         elif path == "/api/tps-struggling":
             # Which filaments the firmware cannot get STARTED: struggling is set
             # after 3 consecutive failed revives of a collapsed output and
