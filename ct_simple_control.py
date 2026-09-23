@@ -6501,7 +6501,7 @@ class CTClient:
                     "problems": problems, "ramp": ramp,
                     "pedestal_ma": pedestal_ma, "pedestal": ped}
 
-        log = [rec for rec in (self.shv_pulse_log(controller or 1) or [])
+        log = [rec for rec in (self.shv_pulse_log(self._firing_controller(fil, controller)) or [])
                if rec.get("filament") == fil]
         if len(log) != len(events):
             # Without a 1:1 pairing every emission reading would go to the
@@ -6631,6 +6631,22 @@ class CTClient:
                 "focus_v": self.read_focus_v(), "ref_mv": fired.get("ref_mv")})
         return out
 
+    def _firing_controller(self, fil: int, controller: int | None) -> int:
+        """The controller that FIRED this filament -- where its pulse log is.
+
+        The pulse log (and with it the per-pulse heating snapshot, which is the
+        x-axis of every emission curve) lives on whichever controller fired the
+        pulse, not on the master. This used to read `controller or 1`, i.e.
+        always the master: fine while only the master's pulses could be
+        measured, and wrong the moment the second controller's envelope is
+        wired in -- its snapshots would be looked for on the wrong board,
+        found missing, and every point dropped as unpairable.
+        """
+        if controller is not None:
+            return int(controller)
+        board = self.filament_to_board(fil)
+        return int(board["controller"]) if board else 1
+
     def _emission_point(self, fil: int, ma: int, *, width_us: int, pulses: int,
                         inter_pulse_ms: int, settle_s: float, timeout_s: float,
                         bg_gap_us, bg_window_us, controller,
@@ -6719,7 +6735,7 @@ class CTClient:
         # wrong pairing puts a real emission reading at the wrong heating
         # current -- the one error this whole function exists to avoid. Keep
         # the emission numbers, drop the per-pulse x, and say so.
-        log = [rec for rec in (self.shv_pulse_log(controller or 1) or [])
+        log = [rec for rec in (self.shv_pulse_log(self._firing_controller(fil, controller)) or [])
                if rec.get("filament") == fil]
         paired = len(log) == len(events)
         if not paired:
