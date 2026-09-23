@@ -133,6 +133,10 @@ STATE_DIR = Path(__file__).resolve().parent / "state"         # operator decisio
 DEAD_STATE_PATH = STATE_DIR / "dead_fids.json"
 RECORD_DIR = Path(__file__).resolve().parent / "recordings"
 
+# ── Logging ────────────────────────────────────────────────────────────────
+
+BRIDGE_DOWN_REMIND_S = 600   # while a controller stays unreachable, re-log it this often
+
 # ── Command frame pieces ───────────────────────────────────────────────────
 
 FLAG_SINGLE = 0x10  # kTargetIsSingleBoard
@@ -2438,7 +2442,17 @@ class ControllerLink:
         # Connect ("master frequently loses connection"). self.host is cleared only
         # by an explicit disconnect(), so we auto-heal on drops but stay down when
         # the user really meant to disconnect.
+        # Logged on the TRANSITIONS, not per attempt. This used to write one
+        # warning per 1 s retry: a controller left switched off produced
+        # 17-22k identical lines a day (99.7% of the file), burying everything
+        # else -- and the recovery was only printed, never logged, so the log
+        # showed an outage without an end. Now: one line when it goes down,
+        # one when it comes back (with how long and how many attempts), and a
+        # reminder every BRIDGE_DOWN_REMIND_S while it stays down.
         reconnecting = False
+        down_since = 0.0
+        attempts = 0
+        reminded = 0.0
         while self._running:
             if not self.client.connected:
                 host = self.host
@@ -2448,14 +2462,27 @@ class ControllerLink:
                 try:
                     self.client.connect(host, BRIDGE_PORT)   # connect() cleans up half-open state
                     if reconnecting:
+                        down_s = time.monotonic() - down_since
                         print(f"[{self.name}] bridge reconnected to {host}", flush=True)
+                        log.warning("%s: bridge RECONNECTED to %s after %.0f s down "
+                                    "(%d attempts)", self.name, host, down_s, attempts)
                     reconnecting = False
                     self.rp_last = 0.0
                     self.rp_rtt_ms = None
-                except Exception:
+                except Exception as exc:
+                    now = time.monotonic()
+                    attempts += 1
                     if not reconnecting:
+                        down_since = reminded = now
+                        attempts = 1
                         print(f"[{self.name}] bridge down, reconnecting to {host}…", flush=True)
-                    log.warning("%s: bridge down, reconnecting to %s", self.name, host)
+                        log.warning("%s: bridge DOWN, reconnecting to %s (%s)",
+                                    self.name, host, exc)
+                    elif now - reminded >= BRIDGE_DOWN_REMIND_S:
+                        reminded = now
+                        log.warning("%s: bridge still down — %s unreachable for %.0f s "
+                                    "(%d attempts; last: %s)", self.name, host,
+                                    now - down_since, attempts, exc)
                     reconnecting = True
                     time.sleep(1.0)
                     continue
