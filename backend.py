@@ -73,12 +73,177 @@ from net_protocol import (
     stm32_hv_clear_target,
 )
 
+# ===========================================================================
+# CONSTANTS
+#
+# Gathered here rather than left beside their first use, the way
+# ct_simple_control.py does it. They were spread over ~2000 lines, which made
+# two things harder than locality was worth: checking whether a wire opcode is
+# already defined, and seeing at a glance which values are firmware limits
+# rather than choices this file gets to make.
+#
+# ONLY THE ASSIGNMENTS MOVED. Explanatory comments stayed with the code they
+# head — the dead-filament rules, the ACTIVE ladder guard, the logging
+# rationale, the pushed-telemetry note. Dragging those here would have gathered
+# constants at the cost of leaving every one of those sections unlabelled.
+#
+# MUTABLE MODULE STATE IS DELIBERATELY ABSENT. CONTROLLERS, MAPPING,
+# DEAD_FIDS, LOADED_PLAN, FILAMENT_ORDER, MASTER, the caches and the locks all
+# stay where they were: they are rebound at runtime, some depend on classes
+# defined further down, and moving them would change initialisation order. A
+# constants section that quietly contained state would be worse than none.
+# ===========================================================================
+
+# ── Rig geometry and filament indexing ─────────────────────────────────────
+# How many filaments there are, how they map onto power slots, and the
+# default alternating-12 grouping. FILAMENT_COUNT is the GLOBAL index space
+# (FID); a client's own USER_INDEX numbering is a separate thing it owns.
+
+FILAMENTS_PER_CONTROLLER = 48     # nominal (alt-12 default: 4 groups of 12 / controller)
+SCOPE_PER_CONTROLLER = 64         # power slots per controller (8 channels x 8 positions)
+FILAMENT_COUNT = 96               # global filament indices 0..95
+POWER_SLOTS = 64                  # firmware kSimpleHvFilamentsPerController
+NO_FILAMENT = 0xFF                # active-list "unused power slot" sentinel
+DEFAULT_GROUP_SIZE = 12           # alternating-12: 0-11->P1, 12-23->P2, 24-35->P1, ...
+DEFAULT_CHANNELS = [0, 1, 2, 3, 4, 5]   # legacy default (channels now derived from MAPPING)
+GEOMETRY = {
+    "n_filaments": 96,
+    "source_diameter_mm": 436,
+    "detector_diameter_mm": 308,
+    "collimator_coverage": 35,
+    "detector_pixels": 256,
+    "detector_pixel_mm": 0.1,
+    "gantry_max_deg": 10,
+    "filament0_axis": "y+",
+    "controllers": 2,
+    "channels_used": 6,
+    "boards_per_channel": 8,
+}
+
+# ── Paths on disk ──────────────────────────────────────────────────────────
+# All resolved against this file, never the working directory: the backend is
+# started from wherever, and a relative path would scatter state across the
+# filesystem depending on how it was launched.
+
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+CALIB_DIR = Path(__file__).resolve().parent / "calibration"   # emission-current calibration records
+STATE_DIR = Path(__file__).resolve().parent / "state"         # operator decisions that must outlive a restart
+DEAD_STATE_PATH = STATE_DIR / "dead_fids.json"
+RECORD_DIR = Path(__file__).resolve().parent / "recordings"
+
+# ── Command frame pieces ───────────────────────────────────────────────────
+
+FLAG_SINGLE = 0x10  # kTargetIsSingleBoard
+ALL_BOARDS_MASK = bytes([0xFF] * 8)
+PING_TYPE = 0x01
+PING_PAYLOAD = (0xCAFEF00D).to_bytes(4, "little")
+
+# ── Wire opcodes — SHV schedule (0x70–0x82) ────────────────────────────────
+
+# Bound-schedule / config opcodes (firmware ahead of net_protocol; built here).
+SHV_SET_ACTIVE_LIST = 0x70   # payload = 64 bytes: power slot k -> global filament (0xFF unused)
+SHV_GET_ACTIVE_LIST = 0x71   # -> OK + 64-byte power->filament map
+SHV_CLEAR_TABLE = 0x72
+SHV_SET_ENTRIES = 0x73
+SHV_GET_TABLE_INFO = 0x74
+SHV_SET_CONFIG = 0x75
+SHV_GET_CONFIG = 0x76
+SHV_ARM = 0x77
+SHV_DISARM = 0x78
+SHV_GET_STATUS = 0x79
+SHV_GET_PULSE_LOG = 0x7A
+SHV_CAPABILITY = 0x7B
+SHV_HEAT_CLEAR = 0x7C
+SHV_HEAT_SET_ENTRIES = 0x7D
+SHV_HEAT_GET_INFO = 0x7E      # -> OK + u16 heatCount + u16 maxHeatEntries
+SHV_FAULT_POLICY = 0x81       # GET/SET board+mismatch policies; response has faulted-slots bitmask
+SHV_TRIGGER_DELAY = 0x82      # GET/SET SyncIn trigger delay (µs); response reports whether it applies
+
+# ── Wire opcodes — channel, HV and events ──────────────────────────────────
+
+HV_SET_SHIFT_HZ = 0x80        # SET-only: 165-readback bit-bang SCK frequency (Hz), clamped 100-2e6
+CH_FILAMENT_CURRENTS = 0x39
+CH_SET_POWER_STATE = 0x35        # ch,mux,state,arg16 (Idle/Active→mA, Voltage→mV)
+CH_SET_I2C_ENABLE_MASK = 0x34
+CH_GET_INA219 = 0x24
+HV_REFRESH_FEEDBACK = 0x14      # REALLY re-reads the 74HC165 (payload 0xFF = all 8
+CH_GET_CACHED_CURRENTS = 0x3A    # CC-loop cached currents, NO I2C (run-safe telemetry)
+CH_GET_PRESENT = 0x25            # I2C presence scan (mux/tps/ina/io per board)
+CH_GET_DIAGNOSIS = 0x2E         # deep diagnosis: addr-ACK / reg-read / operational
+CH_GET_I2C_ENABLE_MASK = 0x2F   # read the channel enable mask
+CH_RESET_MUX = 0x5F             # pulse TCA9548A reset + re-detect (power-cutting)
+CH_TCA9554_SELF_TEST = 0x60     # per-pin TCA9554 toggle test
+CH_READ_TCA9554 = 0x61          # read-only TCA9554 Config/Input/Output dump
+CH_GET_BOARD_BITMAPS = 0x26     # iso/tps enable + tps fault + hv overcurrent masks
+SET_EVENT_CONFIG = 0x06
+
+# ── Transfer sizing ────────────────────────────────────────────────────────
+# Firmware limits, not tuning knobs: an oversized frame is dropped SILENTLY,
+# so raising either of these makes a download stop part-way with nothing
+# reporting an error.
+
+SHV_EMIT_CHUNK = 64    # emission entries per frame (64*4+3 = 259 B). Bigger chunks
+SHV_HEAT_CHUNK = 56    # firmware caps ShvHeatSetEntries at 56
+
+# ── Firmware-pushed telemetry ──────────────────────────────────────────────
+
+EVENT_TELEMETRY_ENABLE_BIT = 0x08     # kEventEnableTelemetry (1<<3)
+TELEMETRY_MODE_CACHED = 2             # firmware kTelemetryModeCached
+SCAN_TELEMETRY_PERIOD_MS = 50         # ~20 fps push cadence
+
+# ── Power states, and what the numbers mean ────────────────────────────────
+# The ladder is STOP(1) → SLEEP(2) → STANDBY(3) → IDLE(4) → ACTIVE(5), with
+# VOLTAGE(6) off to the side. The *_NAMES tables exist so a raw number never
+# reaches a log line or an API reply on its own.
+#
+# The reasoning behind ENERGISING_STATES and the ACTIVE floor stays with the
+# code that enforces them — see dead_fids()/ladder_blocks_active().
+
+POWER_STATE_IDLE = 4
+POWER_STATE_ACTIVE = 5
+POWER_STATE_VOLTAGE = 6
+ENERGISING_STATES = frozenset({3, 4, 5, 6})   # STANDBY, IDLE, ACTIVE, VOLTAGE
+ACTIVE_FLOOR_MA = 1500
+POWER_STATE_NAMES = {1: "STOP", 2: "SLEEP", 3: "STANDBY", 4: "IDLE",
+                     5: "ACTIVE", 6: "VOLTAGE"}
+UART_STATUS_NAMES = {0: "Ok", 1: "BadFrame", 2: "BadArgument", 3: "Busy",
+                     4: "Unsupported", 5: "NotReady", 6: "I2cError",
+                     7: "OutOfRange", 8: "VerifyFail"}
+
+# ── HV setpoint scaling (DS3502 wipers) ────────────────────────────────────
+# Full scale per rail and which DS3502 channel drives it. The focus rail's
+# 495 V is not a typo for 1000: its divider clips well below nominal.
+
+_HV_FULL_V: dict[str, float] = {"emission": 350.0, "focus": 495.0}
+_HV_DS_CH:  dict[str, str]   = {"emission": "ev",  "focus": "fv"}
+_EM_I_FULL_MA = 85.7   # mA at wiper 127 on the "ei" DS3502 channel
+
+# ── TPS55289 OCP decode, and the diagnosis chip order ──────────────────────
+
+# TPS55289 IOUT_LIMIT register (tps55289_registers.h kIoutLimitAddr) — used to
+# read back CH_SET_TPS_OCP_THRESHOLD (0x28), which is SET-only in firmware, via
+# CH_READ_TPS_REGISTER (0x29). Decode matches the firmware's own SET-side
+# encoding (tps55289.cpp setOcpThresholdAmps/Millivolts): mA -> mV
+# (= mA * kOcpSenseResistorOhms) -> code (= round(mV / 0.5 mV LSB)), register =
+# kIoutLimitEnable(0x80) | (code & kIoutLimitMask(0x7F)).
+_TPS_IOUT_LIMIT_REG = 0x02
+_OCP_SENSE_RESISTOR_OHMS = 0.015   # tps55289_board_constants::kOcpSenseResistorOhms
+_OCP_MA_PER_CODE = 0.5 / _OCP_SENSE_RESISTOR_OHMS   # ≈ 33.33 mA/code
+_DIAG_CHIPS = ["mux", "tps", "ina", "enable_io", "fault_io", "iso_io", "hv_io"]
+
+# ── Lease and polling timing ───────────────────────────────────────────────
+
+LOCK_TTL_DEFAULT_S = 30.0
+LOCK_TTL_MAX_S = 600.0
+POLL_PAUSE_MAX_S = 15.0   # max time a background-PING pause survives without a re-arm
+
+
 # ---------------------------------------------------------------------------
 # Command frame builder — matches RP2350bFilamentController/docs/power_state_and_cc.md
 # (the firmware protocol is ahead of the WiFi GUI's net_protocol, so we build
 # these payloads here rather than via build_command_payload).
 # ---------------------------------------------------------------------------
-FLAG_SINGLE = 0x10  # kTargetIsSingleBoard
 
 
 def _u16(v: int) -> bytes:
@@ -90,7 +255,6 @@ def _u16(v: int) -> bytes:
 # so a fault that happened overnight -- or a 40 kV arc that reset the STM32 while
 # nobody was watching -- left no record at all. File-backed now, with the console
 # output preserved so nothing that used to be visible stops being visible.
-LOG_DIR = Path(__file__).resolve().parent / "logs"
 log = logging.getLogger("ct_gui")
 
 
@@ -249,13 +413,6 @@ def build_payload(command: str, b: dict):
 # alternating groups of `group_size`). See gui_operations / firmware
 # simple_hv_schedule.h.
 # ---------------------------------------------------------------------------
-FILAMENTS_PER_CONTROLLER = 48     # nominal (alt-12 default: 4 groups of 12 / controller)
-SCOPE_PER_CONTROLLER = 64         # power slots per controller (8 channels x 8 positions)
-FILAMENT_COUNT = 96               # global filament indices 0..95
-POWER_SLOTS = 64                  # firmware kSimpleHvFilamentsPerController
-NO_FILAMENT = 0xFF                # active-list "unused power slot" sentinel
-DEFAULT_GROUP_SIZE = 12           # alternating-12: 0-11->P1, 12-23->P2, 24-35->P1, ...
-DEFAULT_CHANNELS = [0, 1, 2, 3, 4, 5]   # legacy default (channels now derived from MAPPING)
 
 
 def _u32(v: int) -> bytes:
@@ -398,51 +555,9 @@ def filament_to_board(filament: int, channels=None):
     return c, ch, pos, ch * 8 + pos
 
 
-# Bound-schedule / config opcodes (firmware ahead of net_protocol; built here).
-SHV_SET_ACTIVE_LIST = 0x70   # payload = 64 bytes: power slot k -> global filament (0xFF unused)
-SHV_GET_ACTIVE_LIST = 0x71   # -> OK + 64-byte power->filament map
-SHV_CLEAR_TABLE = 0x72
-SHV_SET_ENTRIES = 0x73
-SHV_GET_TABLE_INFO = 0x74
-SHV_SET_CONFIG = 0x75
-SHV_GET_CONFIG = 0x76
-SHV_ARM = 0x77
-SHV_DISARM = 0x78
-SHV_GET_STATUS = 0x79
-SHV_GET_PULSE_LOG = 0x7A
-SHV_CAPABILITY = 0x7B
-SHV_HEAT_CLEAR = 0x7C
-SHV_HEAT_SET_ENTRIES = 0x7D
-SHV_HEAT_GET_INFO = 0x7E      # -> OK + u16 heatCount + u16 maxHeatEntries
-SHV_FAULT_POLICY = 0x81       # GET/SET board+mismatch policies; response has faulted-slots bitmask
-SHV_TRIGGER_DELAY = 0x82      # GET/SET SyncIn trigger delay (µs); response reports whether it applies
-HV_SET_SHIFT_HZ = 0x80        # SET-only: 165-readback bit-bang SCK frequency (Hz), clamped 100-2e6
-CH_FILAMENT_CURRENTS = 0x39
-CH_SET_POWER_STATE = 0x35        # ch,mux,state,arg16 (Idle/Active→mA, Voltage→mV)
-CH_SET_I2C_ENABLE_MASK = 0x34
-CH_GET_INA219 = 0x24
-HV_REFRESH_FEEDBACK = 0x14      # REALLY re-reads the 74HC165 (payload 0xFF = all 8
                                  # channels in one frame). 0x13 HV_GET_ALL_BYTES is a
                                  # CACHE COPY -- never use it to confirm a read-back.
-CH_GET_CACHED_CURRENTS = 0x3A    # CC-loop cached currents, NO I2C (run-safe telemetry)
-CH_GET_PRESENT = 0x25            # I2C presence scan (mux/tps/ina/io per board)
-CH_GET_DIAGNOSIS = 0x2E         # deep diagnosis: addr-ACK / reg-read / operational
-CH_GET_I2C_ENABLE_MASK = 0x2F   # read the channel enable mask
-CH_RESET_MUX = 0x5F             # pulse TCA9548A reset + re-detect (power-cutting)
-CH_TCA9554_SELF_TEST = 0x60     # per-pin TCA9554 toggle test
-CH_READ_TCA9554 = 0x61          # read-only TCA9554 Config/Input/Output dump
-ALL_BOARDS_MASK = bytes([0xFF] * 8)
 
-# TPS55289 IOUT_LIMIT register (tps55289_registers.h kIoutLimitAddr) — used to
-# read back CH_SET_TPS_OCP_THRESHOLD (0x28), which is SET-only in firmware, via
-# CH_READ_TPS_REGISTER (0x29). Decode matches the firmware's own SET-side
-# encoding (tps55289.cpp setOcpThresholdAmps/Millivolts): mA -> mV
-# (= mA * kOcpSenseResistorOhms) -> code (= round(mV / 0.5 mV LSB)), register =
-# kIoutLimitEnable(0x80) | (code & kIoutLimitMask(0x7F)).
-_TPS_IOUT_LIMIT_REG = 0x02
-_OCP_SENSE_RESISTOR_OHMS = 0.015   # tps55289_board_constants::kOcpSenseResistorOhms
-_OCP_MA_PER_CODE = 0.5 / _OCP_SENSE_RESISTOR_OHMS   # ≈ 33.33 mA/code
-_DIAG_CHIPS = ["mux", "tps", "ina", "enable_io", "fault_io", "iso_io", "hv_io"]
 
 
 def _popcount(mask_list) -> int:
@@ -506,7 +621,6 @@ def run_chip_health(link: "ControllerLink") -> dict:
     return out
 
 
-CH_GET_BOARD_BITMAPS = 0x26     # iso/tps enable + tps fault + hv overcurrent masks
 
 
 def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHANNELS,
@@ -1008,10 +1122,6 @@ def read_cached_telemetry_one(link: "ControllerLink", controller: int, fil: int)
 # During a scan the firmware PUSHES EVENT_TELEMETRY frames (cached currents, no
 # I2C) every ~50 ms. The host just receives them (client._events) and reads the
 # latest — no request round-trip, so the live view can update at ~20 fps.
-SET_EVENT_CONFIG = 0x06
-EVENT_TELEMETRY_ENABLE_BIT = 0x08     # kEventEnableTelemetry (1<<3)
-TELEMETRY_MODE_CACHED = 2             # firmware kTelemetryModeCached
-SCAN_TELEMETRY_PERIOD_MS = 50         # ~20 fps push cadence
 _LIVE_PUSH: set = set()               # controllers (1-based) with the push enabled
 _PUSH_SAW_RUN = False                 # push tore-down only after a run actually started
 
@@ -1115,11 +1225,9 @@ def read_pushed_telemetry(link: "ControllerLink", controller: int) -> dict:
                     "current_mA": mA if valid else None, "pushed": True}
     return out
 
-SHV_EMIT_CHUNK = 64    # emission entries per frame (64*4+3 = 259 B). Bigger chunks
                        # didn't help — the bottleneck is RP2350 per-frame service
                        # latency, not frame count (it processes a bigger frame
                        # proportionally slower while busy with I2C).
-SHV_HEAT_CHUNK = 56    # firmware caps ShvHeatSetEntries at 56
 
 
 def _status_ok(resp) -> bool:
@@ -1491,9 +1599,6 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         "rbIrqs": le32(63) if len(p) >= 67 else None,
     }
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-CALIB_DIR = Path(__file__).resolve().parent / "calibration"   # emission-current calibration records
-STATE_DIR = Path(__file__).resolve().parent / "state"         # operator decisions that must outlive a restart
 
 
 # ── Dead filaments ───────────────────────────────────────────────────────────
@@ -1516,7 +1621,6 @@ STATE_DIR = Path(__file__).resolve().parent / "state"         # operator decisio
 # client's own numbering: a faulty filament is faulty regardless of any
 # per-script remapping, and a set stored in one script's numbering would mean
 # something different to the next. Clients cross at their own boundary.
-DEAD_STATE_PATH = STATE_DIR / "dead_fids.json"
 _DEAD_LOCK = threading.Lock()
 # fid -> {"reason": str, "by": str, "at": iso8601}. Provenance is not decoration:
 # an entry that can never expire and blocks energising needs to say why, or in
@@ -1577,7 +1681,6 @@ def _dead_save() -> None:
 # STOP and SLEEP are deliberately ALWAYS allowed, even for a dead filament:
 # refusing them would make it impossible to turn a faulty filament OFF, which
 # inverts the whole point. Enforcement blocks energising, never de-energising.
-ENERGISING_STATES = frozenset({3, 4, 5, 6})   # STANDBY, IDLE, ACTIVE, VOLTAGE
 
 # ── The ACTIVE ladder guard ──────────────────────────────────────────────────
 # Jumping straight to ACTIVE (firing current) is NOT ALLOWED: it damages the
@@ -1593,20 +1696,13 @@ ENERGISING_STATES = frozenset({3, 4, 5, 6})   # STANDBY, IDLE, ACTIVE, VOLTAGE
 # the client that filters is not the only client. A bare curl or the GUI would
 # otherwise put full firing current on a cold filament and this backend would
 # carry it out.
-POWER_STATE_ACTIVE = 5
-POWER_STATE_IDLE = 4
 # For messages. A refusal that says "currently at power state 3" makes the
 # reader go look up what 3 is, which is the same bare-integer problem the SHV
 # arm reject codes had -- and this one is on the path people hit while trying to
 # heat a filament, so it should read without a lookup.
 # RP2350 UartStatusCode, for turning a bare status byte into something a
 # caller can act on. Unknown codes print as the number rather than a guess.
-UART_STATUS_NAMES = {0: "Ok", 1: "BadFrame", 2: "BadArgument", 3: "Busy",
-                     4: "Unsupported", 5: "NotReady", 6: "I2cError",
-                     7: "OutOfRange", 8: "VerifyFail"}
 
-POWER_STATE_NAMES = {1: "STOP", 2: "SLEEP", 3: "STANDBY", 4: "IDLE",
-                     5: "ACTIVE", 6: "VOLTAGE"}
 
 
 def power_state_name(state: int) -> str:
@@ -1692,14 +1788,12 @@ def order_validate(seq) -> str | None:
 # 1500 mA is the IDLE operating current this bench runs at, per the user. It is
 # not a constant read out of the firmware -- there is none -- so if the idle
 # operating point changes, change this with it.
-ACTIVE_FLOOR_MA = 1500
 
 # Schedules may not select Voltage mode: ShvHeatSetEntries rejects state 6 with
 # BadArgument and refuses the whole batch. Caught here first so the caller is
 # told WHICH entry is wrong instead of getting a batch-level reject. Direct
 # board control (CH_SET_POWER_STATE via /api/cmd) may still use Voltage -- it is
 # a bench/calibration mode, and only SCHEDULES are restricted.
-POWER_STATE_VOLTAGE = 6
 
 
 def check_heating_plan(heating) -> list[str]:
@@ -1788,9 +1882,6 @@ def _hv_lut_path(chan: str) -> Path:
 
 
 # Hardware full-scale: DS3502 wiper 127 → these output levels.
-_HV_FULL_V: dict[str, float] = {"emission": 350.0, "focus": 495.0}
-_HV_DS_CH:  dict[str, str]   = {"emission": "ev",  "focus": "fv"}
-_EM_I_FULL_MA = 85.7   # mA at wiper 127 on the "ei" DS3502 channel
 
 
 def _lut_wiper_for_v(chan: str, mag_v: float) -> tuple[int, float, str]:
@@ -1833,23 +1924,7 @@ def _lut_wiper_for_v(chan: str, mag_v: float) -> tuple[int, float, str]:
     full = _HV_FULL_V.get(chan, 350.0)
     w = max(0, min(127, round(abs(mag_v) / full * 127)))
     return w, -abs(mag_v), "linear(no-lut)"
-PING_TYPE = 0x01
-PING_PAYLOAD = (0xCAFEF00D).to_bytes(4, "little")
-POLL_PAUSE_MAX_S = 15.0   # max time a background-PING pause survives without a re-arm
 
-GEOMETRY = {
-    "n_filaments": 96,
-    "source_diameter_mm": 436,
-    "detector_diameter_mm": 308,
-    "collimator_coverage": 35,
-    "detector_pixels": 256,
-    "detector_pixel_mm": 0.1,
-    "gantry_max_deg": 10,
-    "filament0_axis": "y+",
-    "controllers": 2,
-    "channels_used": 6,
-    "boards_per_channel": 8,
-}
 
 
 
@@ -2071,8 +2146,6 @@ STAGED_SCHEDULE: list = []  # last schedule uploaded from the GUI
 # is held only the holder may write, everyone else gets 409 + who holds it.
 # The lease always expires on its own, so a client that crashes mid-run can
 # never wedge the bench.
-LOCK_TTL_DEFAULT_S = 30.0
-LOCK_TTL_MAX_S = 600.0
 
 _ACCESS_LOCK = threading.Lock()
 _LEASE: dict[str, Any] = {"owner": None, "expires": 0.0, "note": ""}
@@ -2193,7 +2266,6 @@ def _coerce_int(value: Any, default: int = 0) -> int:
 # empty pulse .csv. There is no longer a raw-ADC-waveform (.bin) recording
 # mode for the same reason.
 # ---------------------------------------------------------------------------
-RECORD_DIR = Path(__file__).resolve().parent / "recordings"
 
 # The STM32 pulse detector is ONE physical ADC shared by two independent GUI
 # controls with their own arm/disarm buttons: the Per-pulse "Stream" button
