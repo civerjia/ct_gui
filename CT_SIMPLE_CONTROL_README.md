@@ -1245,15 +1245,18 @@ ct.set_ocp_threshold_all(threshold_ma=3200)                     # every populate
 ct.set_ocp_threshold_all(filaments=[5, 10, 15], threshold_ma=3200)
 ```
 
-**`get_ocp_startup(controller=1)`** / **`set_ocp_startup(startup_ma, steady_ma=None, controller=1)`**
-— Read/write the global two-stage floor. `steady_ma` is optional on set —
+**`get_ocp_startup(controller=None)`** / **`set_ocp_startup(startup_ma, steady_ma=None, controller=None)`**
+— Read/write the global two-stage floor. Rig-wide by default, both of them:
+every connected controller, with `startup_ma`/`steady_ma` hoisted only if every
+board agrees (otherwise `ok: False` and each board's values). `controller=N`
+addresses one board. `steady_ma` is optional on set —
 omit it to leave the steady threshold unchanged and only update startup.
 
 ```python
-r = ct.get_ocp_startup(1)
-print(r)   # {"ok": True, "controller": 1, "startup_ma": 3400, "steady_ma": 3200}
+r = ct.get_ocp_startup()      # every controller
+print(r)   # {"ok": True, "startup_ma": 3400, "steady_ma": 3200, "controllers": {1: {...}, 2: {...}}}
 
-ct.set_ocp_startup(startup_ma=4000, steady_ma=3000, controller=1)
+ct.set_ocp_startup(startup_ma=4000, steady_ma=3000)   # every controller
 ```
 
 ### HV grid switch (Force toggle)
@@ -1428,17 +1431,18 @@ print(r)
 # — a mismatch flags a shift-chain or cabling problem on that channel.
 ```
 
-**`set_hv_shift_hz(hz, controller=1)`** — Set the HC165 readback bit-bang
+**`set_hv_shift_hz(hz, controller=None)`** — Set the HC165 readback bit-bang
 SCK frequency (Hz) — for signal-integrity testing on long cables (e.g. drop
 it to 1 kHz to see a spike-free waveform on a scope). **SET-only**: there's
 no separate "read current value" request — the firmware always requires a
 fresh value and echoes back the ACTUAL frequency now in effect (clamped
 100 Hz–2 MHz, so what you ask for and what you get may differ slightly).
-Survives until the next reboot.
+Survives until the next reboot. Rig-wide by default (every connected
+controller); `controller=N` for one.
 
 ```python
-r = ct.set_hv_shift_hz(1000, controller=1)
-print(r)   # {"ok": True, "controller": 1, "actualHz": 1000}
+r = ct.set_hv_shift_hz(1000)
+print(r)   # {"ok": True, "actualHz": 1000, "controllers": {1: {...}, 2: {...}}}
 ```
 
 ### HV set

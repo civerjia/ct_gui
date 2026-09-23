@@ -2820,16 +2820,31 @@ class CTClient:
                                                          # applied ~2s later, once
                                                          # inrush has settled;
                                                          # None = leave unchanged
-                        controller: int = 1) -> dict:   # 1 or 2 -- this is a
-                                                         # WHOLE-CONTROLLER
-                                                         # setting, not per-board
-        """Set the global per-controller two-stage OCP floor (NOT per-board
-        — see the note above). `steady_ma` is optional; omit to leave the
-        steady threshold unchanged and only update the startup one.
+                        controller: int | None = None) -> dict:  # None = every
+                                                         # connected controller;
+                                                         # N = one. A WHOLE-
+                                                         # CONTROLLER setting,
+                                                         # not per-board
+        """Set the two-stage OCP floor on every connected controller (or one).
+        Per controller, NOT per board — see the note above. `steady_ma` is
+        optional; omit to leave the steady threshold unchanged and only update
+        the startup one.
 
-        Returns {"ok", "controller", "startup_ma", "steady_ma"} (the values
-        now in effect, read back from the same response).
+        Rig-wide by default, like get_ocp_startup: it defaulted to controller 1
+        while the read covered both, so "set the rig's OCP" set half of it and
+        the read then reported the disagreement.
+
+        Returns {"ok", "startup_ma", "steady_ma", "controllers": {c: ...}} —
+        the values now in effect, read back from each response and hoisted only
+        if every board agrees. With `controller=N`: {"ok", "controller",
+        "startup_ma", "steady_ma"}.
         """
+        return self._rig_wide(
+            lambda c: self._set_ocp_startup_one(startup_ma, steady_ma, controller=c),
+            controller, same=("startup_ma", "steady_ma"))
+
+    def _set_ocp_startup_one(self, startup_ma: int, steady_ma: int | None = None,
+                             controller: int = 1) -> dict:
         body: dict = {"controller": int(controller), "startup_ma": int(startup_ma)}
         if steady_ma is not None:
             body["steady_ma"] = int(steady_ma)
