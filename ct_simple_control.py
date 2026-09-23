@@ -7663,6 +7663,27 @@ class CTClient:
             return {"ok": False, "results": {}, "counts": {},
                     "problems": ["no live filaments to test"]}
 
+        # THE RAIL FIRST, BEFORE ANYTHING IS ENERGISED. This used to sit
+        # inside the energised() block, after every filament had been driven to
+        # SLEEP -- so a rig with no HV drove and tore down the whole set (96 of
+        # them by default) before reporting that there was nothing to measure.
+        # A refusal that costs nothing must come before the side effects, not
+        # after them.
+        self.set_emission_i(limit_ma)
+        self.set_emission_v(abs(emission_v))
+        self.enable_emission(True)
+        time.sleep(1.0)
+        v_read = self.read_emission_v()
+        hv = self.hv_status()
+        if not hv.get("emission_on"):
+            try:
+                self.enable_emission(False)
+            except Exception:
+                pass
+            return {"ok": False, "results": {}, "counts": {},
+                    "problems": ["the emission rail did not come on — nothing "
+                                 "to measure, and no filament was touched"]}
+
         results: dict[int, dict] = {}
         try:
             with self.energised(*wanted):
@@ -7673,16 +7694,6 @@ class CTClient:
                     problems.append(f"could not put every filament to SLEEP "
                                     f"({self.describe(sl)[:100]}) — a filament "
                                     f"still at STOP reads as a dead MOSFET")
-                self.set_emission_i(limit_ma)
-                self.set_emission_v(abs(emission_v))
-                self.enable_emission(True)
-                time.sleep(1.0)
-                v_read = self.read_emission_v()
-                hv = self.hv_status()
-                if not hv.get("emission_on"):
-                    return {"ok": False, "results": {}, "counts": {},
-                            "problems": ["the emission rail did not come on — "
-                                         "nothing to measure"]}
                 # Expected from the rail that is ACTUALLY there, not the one
                 # that was asked for: a rail sitting 15 V low would otherwise
                 # make every good MOSFET look 15% weak.
