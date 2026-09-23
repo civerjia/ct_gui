@@ -58,3 +58,28 @@ not the refusal of energising states, and not the SLEEP → STOP substitution
 - Keep `/api/cmd` itself permissive: the debug path is meant to bypass the
   guards. The warning belongs in the GUI, where a person is present to answer
   it; scripts use `prep_filaments`, which enforces.
+
+## RP2350 power plane: open items after the concurrency work (2026-09-23)
+
+State: the CC loop and ramp run concurrently on all 8 channels (RP2350
+`1e08f92`, architecture.md §4.5 #11). `tests/test_idle_all_concurrency.py`
+passes 3/3 on firmware `8ed468a`: 93/93 filaments at IDLE, 0 I2C timeouts,
+0 command failures. Still open:
+
+- **Controller 1 I2C integrity.** C1 (never C2, same firmware and load)
+  intermittently returns corrupted reads: TPS MODE read-backs that differ
+  (VerifyFailed), INA readings like -4010 mA at 8256 mV on a filament at ~1 A.
+  Firmware now contains it (one counted OE retry; implausible reads treated as
+  spikes; open latch needs two agreeing reads) but the cause is hardware-side:
+  check C1's I2C cables, pull-ups and routing. A 100 kHz build on C1 would tell
+  whether margin is the issue. `ccstat` shows spikes / oeRetries / ccLatches /
+  pwrFails per board; `i2cstat` shows timeouts split async/sync.
+- **Batch commands still serial in the handler.** `CH_SET_POWER_STATE` masked
+  frames (0x35) configure each board's TPS one after another inside the UART
+  handler, and the bulk `CH_GET_TPS_STATUS` (0x23) reads every board serially
+  (~121 ms, blocking the CC loop meanwhile). Both should use the concurrent
+  job (docs/async_i2c/05_parallel_executor.md) — "step B".
+- **Warm-start idle times near the test bound.** Back-to-back runs (filaments
+  still hot) reach 9.6-9.7 s max against the 10 s bound: SLEEP -> IDLE uses the
+  cold slew rate. Decide whether warm starts should use the warm rate, or the
+  test should cool between runs.
