@@ -3691,7 +3691,9 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # a "belongs elsewhere" case like not_this_controller above.
     unslotted: list[int] = []
     if not fils:
-        return {"controller": controller, "ok": True, "applied": 0, "failed": [],
+        # ok only if nothing was refused: every filament blocked by a guard is
+        # a request that did NOT happen, not an empty success.
+        return {"controller": controller, "ok": not ladder_blocked, "applied": 0, "failed": [],
                 "state": int(state), "touched": [], "not_this_controller": not_this_controller,
                 "unslotted": unslotted, "dead_skipped": dead_skipped,
                 "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons}
@@ -3740,7 +3742,13 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # would let a failed write leave the backend believing a filament is at
     # IDLE, which is exactly the belief the ACTIVE guard depends on.
     note_power_state(landed, state)
-    return {"controller": controller, "ok": not failed and not unslotted, "applied": applied,
+    # A filament the guards refused (ladder_blocked) was asked for and not
+    # done, the same as a failed one. It used to leave ok True: an
+    # idle_all(default_ma=2500) refused every filament at the 2000 mA ceiling
+    # and came back ok:true, applied 0 -- a request that did nothing, reported
+    # as done.
+    return {"controller": controller,
+            "ok": not failed and not unslotted and not ladder_blocked, "applied": applied,
             "total": len(fils), "failed": failed, "state": int(state),
             "touched": fils, "not_this_controller": not_this_controller,
             "unslotted": unslotted, "dead_skipped": dead_skipped,
@@ -5282,9 +5290,19 @@ class CtHandler(BaseHTTPRequestHandler):
                 touched = {int(f) for r in results.values() for f in (r.get("touched") or [])}
                 excluded = ([int(f) for f in filaments if int(f) not in touched]
                             if filaments is not None else [])
-                self._json({"ok": all(r.get("ok") for r in results.values()) and not excluded,
-                            "results": results, "failed": failed, "applied": applied,
-                            "excluded": excluded})
+                blocked = sorted(int(f) for r in results.values()
+                                 for f in (r.get("ladder_blocked") or []))
+                out = {"ok": all(r.get("ok") for r in results.values()) and not excluded,
+                       "results": results, "failed": failed, "applied": applied,
+                       "excluded": excluded}
+                if blocked:
+                    reasons = {k: v for r in results.values()
+                               for k, v in (r.get("ladder_reasons") or {}).items()}
+                    out["ladder_blocked"] = blocked
+                    why = sorted(set(reasons.values()))
+                    out["error"] = (f"{len(blocked)} filament(s) refused and NOT commanded: "
+                                    + "; ".join(why[:3]) + (" …" if len(why) > 3 else ""))
+                self._json(out)
             elif path == "/api/ocp-threshold":
                 # Per-board TPS55289 IOUT_LIMIT (steady-state OCP threshold, mA)
                 # for a batch of filaments across BOTH connected controllers.

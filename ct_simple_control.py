@@ -2023,7 +2023,14 @@ class CTClient:
         # response.
         r = self._reindex_response(
             self._post("/api/filament-prep", body, timeout=20.0),
-            keys=("applied", "failed", "excluded", "touched", "not_this_controller", "unslotted"))
+            keys=("applied", "failed", "excluded", "touched", "not_this_controller",
+                  "unslotted", "ladder_blocked", "dead_skipped"))
+        # ladder_reasons is keyed by FID (as a string) -- re-key it too, or the
+        # reasons name different filaments than the list beside them.
+        for row in (r.get("results") or {}).values():
+            if isinstance(row, dict) and isinstance(row.get("ladder_reasons"), dict):
+                row["ladder_reasons"] = {str(self._user_index_of(int(k))): v
+                                         for k, v in row["ladder_reasons"].items()}
         if dead_skipped:
             r["dead_skipped"] = dead_skipped
         return r
