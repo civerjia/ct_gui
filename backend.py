@@ -133,6 +133,10 @@ STATE_DIR = Path(__file__).resolve().parent / "state"         # operator decisio
 DEAD_STATE_PATH = STATE_DIR / "dead_fids.json"
 RECORD_DIR = Path(__file__).resolve().parent / "recordings"
 
+# ── Link timeouts ──────────────────────────────────────────────────────────
+
+TPS_STATUS_TIMEOUT_S = 8.0   # bulk CH_GET_TPS_STATUS (verify only) -- see read_tps_status()
+
 # ── Logging ────────────────────────────────────────────────────────────────
 
 BRIDGE_DOWN_REMIND_S = 600   # while a controller stays unreachable, re-log it this often
@@ -2678,7 +2682,11 @@ def read_tps_status(link: "ControllerLink", cid: int) -> dict:
     Byte layout: status@0, targeted@1, present@9, en@17, fault@25, hv@33,
     valid@41, struggling@49, oe@57, oe_valid@65 (8 bytes each)."""
     ft, flags, payload = build_payload("CH_GET_TPS_STATUS", {"board_mask": [0xFF] * 8})
-    resp = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
+    # 8 s, not the 2 s /api/tps-struggling uses: this reads every board (probe,
+    # EN, fault, MODE) and was measured at 139 ms on controller 1 but 0.4-1.5 s
+    # -- once 13.6 s, just after connecting -- on controller 2's jitterier link.
+    # Only a verify calls it, never a poll, so a long wait blocks nothing.
+    resp = link.client.send_request(ft, payload, flags=flags, timeout=TPS_STATUS_TIMEOUT_S)
     raw = resp.get("raw") if isinstance(resp, dict) else None
     if not raw or raw[0] != 0 or len(raw) < 49:
         return {"ok": False, "error": f"bad CH_GET_TPS_STATUS reply ({len(raw or [])} bytes)",
