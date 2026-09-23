@@ -2708,7 +2708,103 @@ class CTClient:
                                             "not_this_controller", "unslotted",
                                             "mismatched", "unstable"))
 
-    def get_ocp_startup(self, controller: int = 1) -> dict:
+    # ── rig-wide settings ─────────────────────────────────────────────────────
+    # These are properties of the RIG, not of one board: a shared schedule runs
+    # on both controllers and has to behave the same on both halves. They used
+    # to default to controller=1, so a script that "configured the rig"
+    # configured half of it. controller=None (the default) now means every
+    # connected controller; an explicit number still addresses one board.
+    #
+    # The configured values are hoisted to the top level ONLY when every board
+    # agrees. When they differ the top level carries no value at all and ok is
+    # False: one board's setting standing in for the rig's is exactly the
+    # silent half-configuration this replaced. The per-board detail is always
+    # under "controllers".
+
+    def _connected_controllers(self) -> list[int]:
+        try:
+            st = self.status()
+        except Exception:
+            return []
+        return sorted(int(c) for c, row in (st.get("controllers") or {}).items()
+                      if row.get("connected"))
+
+    def _rig_wide(self, fn, controller, same: tuple, union: tuple = (),
+                  carry: tuple = ()) -> dict:
+        if controller is not None:
+            return fn(int(controller))
+        ctrls = self._connected_controllers()
+        if not ctrls:
+            return {"ok": False, "error": "no controller connected", "controllers": {}}
+        per = {str(c): dict(fn(c)) for c in ctrls}
+        out: dict = {"controllers": per}
+        bad = {c: (r.get("error") or "failed") for c, r in per.items() if not r.get("ok")}
+        if bad:
+            out.update(ok=False, error=f"failed on controller(s) {sorted(bad)}: {bad}")
+            return out
+        differ = {k: {c: r.get(k) for c, r in per.items()} for k in same
+                  if len({repr(r.get(k)) for r in per.values()}) > 1}
+        if differ:
+            out.update(ok=False, error=f"the controllers disagree: {differ} — a "
+                                       f"schedule running on both would behave "
+                                       f"differently on each half")
+            return out
+        first = next(iter(per.values()))
+        for k in same + carry:
+            if k in first:
+                out[k] = first[k]
+        for k in union:
+            out[k] = sorted({x for r in per.values() for x in (r.get(k) or [])})
+        out["ok"] = True
+        return out
+
+    def get_fault_policy(self, controller: int | None = None) -> dict:
+        """Fault policy on every connected controller (or one, if named).
+
+        The two policies must match across boards; `faultedFilaments` is the
+        UNION over boards (each board only knows its own). See
+        _get_fault_policy_one for the single-board shape."""
+        return self._rig_wide(self._get_fault_policy_one, controller,
+                              same=("board", "mismatch"),
+                              union=("faultedFilaments",))
+
+    def set_fault_policy(self, controller: int | None = None,
+                         board: int | None = None,
+                         mismatch: int | None = None) -> dict:
+        """Set the fault policy on every connected controller (or one)."""
+        return self._rig_wide(
+            lambda c: self._set_fault_policy_one(c, board=board, mismatch=mismatch),
+            controller, same=("board", "mismatch"), union=("faultedFilaments",))
+
+    def get_slew_rates(self, controller: int | None = None) -> dict:
+        """CC-loop slew rates on every connected controller (or one)."""
+        return self._rig_wide(self._get_slew_rates_one, controller,
+                              same=("below_mV_per_s", "above_mV_per_s", "warm_mV_per_s"))
+
+    def set_slew_rates(self, below_mV_per_s: int, above_mV_per_s: int,
+                       warm_mV_per_s: int, controller: int | None = None) -> dict:
+        """Set CC-loop slew rates on every connected controller (or one).
+        Values below the 400 mV/s floor are raised to it, as before; see
+        _set_slew_rates_one."""
+        return self._rig_wide(
+            lambda c: self._set_slew_rates_one(below_mV_per_s, above_mV_per_s,
+                                               warm_mV_per_s, controller=c),
+            controller, same=("below_mV_per_s", "above_mV_per_s", "warm_mV_per_s"),
+            carry=("clamped", "floored_to_min"))
+
+    def set_hv_shift_hz(self, hz: int, controller: int | None = None) -> dict:
+        """Set the 165 read-back bit-bang clock on every connected controller
+        (or one). `actualHz` is hoisted only if every board landed on the same
+        frequency."""
+        return self._rig_wide(lambda c: self._set_hv_shift_hz_one(hz, controller=c),
+                              controller, same=("actualHz",))
+
+    def get_ocp_startup(self, controller: int | None = None) -> dict:
+        """OCP thresholds on every connected controller (or one)."""
+        return self._rig_wide(self._get_ocp_startup_one, controller,
+                              same=("startup_ma", "steady_ma"))
+
+    def _get_ocp_startup_one(self, controller: int = 1) -> dict:
         """Read the global per-controller two-stage OCP floor.
 
         Returns {"ok", "controller", "startup_ma", "steady_ma"}.
@@ -2845,7 +2941,7 @@ class CTClient:
     # ── SHV run policy & HV bit-bang diagnostics ──────────────────────────────
 
 
-    def get_slew_rates(self, controller: int = 1) -> dict:
+    def _get_slew_rates_one(self, controller: int = 1) -> dict:
         """Read the three voltage-ramp slew rates, in mV/s.
 
         Returns {"ok", "below_mV_per_s", "above_mV_per_s", "warm_mV_per_s"}:
@@ -2881,7 +2977,7 @@ class CTClient:
     # leaves a working bench rather than a stalled one.
     _SLEW_MIN_MV_PER_S = 400
 
-    def set_slew_rates(self, below_mV_per_s: int, above_mV_per_s: int,
+    def _set_slew_rates_one(self, below_mV_per_s: int, above_mV_per_s: int,
                        warm_mV_per_s: int, controller: int = 1) -> dict:
         """Set all three slew rates (mV/s). See get_slew_rates for what each is.
 
@@ -2937,7 +3033,7 @@ class CTClient:
                 "floored_to_min": floored or None,
                 "floor_mV_per_s": self._SLEW_MIN_MV_PER_S}
 
-    def get_fault_policy(self, controller: int = 1) -> dict:
+    def _get_fault_policy_one(self, controller: int = 1) -> dict:
         """Read the per-run fault policy: two INDEPENDENT stop/continue
         switches for a run that hits trouble.
 
@@ -2970,7 +3066,7 @@ class CTClient:
             r["faultedFilaments"] = [self._user_index_of(f) for f in r["faultedFilaments"]]
         return r
 
-    def set_fault_policy(self, controller: int = 1,
+    def _set_fault_policy_one(self, controller: int = 1,
                          board: int | None = None,       # 0=stop the run,
                                                           # 1=continue, on a
                                                           # CC/OCP hardware fault
@@ -3045,7 +3141,7 @@ class CTClient:
             "test_byte": int(test_byte), "settle_ms": int(settle_ms),
         }, timeout=5.0)
 
-    def set_hv_shift_hz(self, hz: int, controller: int = 1) -> dict:
+    def _set_hv_shift_hz_one(self, hz: int, controller: int = 1) -> dict:
         """Set the HC165 readback bit-bang SCK frequency (Hz) — for
         signal-integrity testing on long cables (e.g. drop it to 1 kHz to
         see a spike-free waveform on a scope). SET-ONLY: there is no
