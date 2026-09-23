@@ -3623,7 +3623,7 @@ traffic this removes. Use `stop_one(verify=True)` for those.
 ### The dead-man safety watchdog
 
 A client that dies mid-run leaves the hardware where it was: a filament at
-ACTIVE and the HV rails enabled, with nothing left to turn them off. `session()`
+ACTIVE and HV grid MOSFETs closed, with nothing left to open them. `session()`
 and `energised()` cover a crash *inside* the process; they cannot cover
 `SIGKILL`, a hung process, or the machine dying. The lease self-expires but
 de-energises nothing — expiry frees write access, it does not touch hardware.
@@ -3634,7 +3634,13 @@ every command.
 | | default | on expiry |
 |---|---|---|
 | a filament at **ACTIVE** | 30 s | commanded to **SLEEP** (`active_fallback`) |
-| the **HV rails** | 10 s | emission and focus both **off** |
+| a closed **HV grid MOSFET** | 10 s | **every** grid MOSFET opened (`SHV_DISARM` clear-all) |
+
+The watchdog **never** turns the emission or focus rail off — that is always a
+person's decision. (Until 2026-09-23 it did, which made the GUI unable to keep
+emission on: the GUI polls, polls do not renew, so the rail went off
+`hv_timeout_s` after every turn-on.) An **armed** or running schedule holds the
+timer, since clearing the grid would disarm it.
 
 > ⚠️ **COMMANDS renew the timer. READS DO NOT.** This is the whole design. The
 > GUI polls continuously and must keep doing so — it is the monitoring

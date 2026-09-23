@@ -74,12 +74,29 @@ passes 3/3 on firmware `8ed468a`: 93/93 filaments at IDLE, 0 I2C timeouts,
   check C1's I2C cables, pull-ups and routing. A 100 kHz build on C1 would tell
   whether margin is the issue. `ccstat` shows spikes / oeRetries / ccLatches /
   pwrFails per board; `i2cstat` shows timeouts split async/sync.
-- **Batch commands: STANDBY and VOLTAGE still per-channel.** Step B is done
-  for the bulk `CH_GET_TPS_STATUS` (0x23, RP2350 `9ab5d49`: ~36-51 ms, was
-  113-155) and masked `CH_SET_POWER_STATE` IDLE/ACTIVE (0x35, `c57aa5e` +
-  `a62dc22`: rig-wide IDLE max ~4 s, one frame per current). STANDBY and
-  VOLTAGE masked frames still configure boards one after another in the
-  handler.
+- **Batch commands: done.** 0x23 bulk status (RP2350 `9ab5d49`) and masked
+  0x35 STANDBY/IDLE/ACTIVE/VOLTAGE all run concurrently on the eight channels.
+  Open: on C1, a batch command to boards whose outputs are already ON has
+  failed its first mux read-back (rc 2) on CH2/CH4/CH6 even after 2 retries --
+  but not in the last run. `ccstat` now prints `muxMiss: rb=... cached|full-select
+  step=...` for such a failure: a read-back of another port's bit means a stale
+  mux cache (firmware), no answer / garbage means the bus.
+- **C1 corrupts INA reads -- pattern known (2026-09-23).** Every recorded bad
+  read (19 in one IDLE run, all C1, none on C2) is ONE bit 0->1 in the top 3
+  bits of the FIRST data byte (0x05A5 -> 0x85A5, 0x061A -> 0x461A, bus 0x0628
+  -> 0x4628); the low byte is always right. Those are the first bits the INA
+  drives after the address ACK: a timing-margin problem at the start of the
+  read data phase on C1's wiring, not random noise. Firmware discards reads
+  outside the CC loop's bounds and keeps the raw bytes (`i2cstat`: `bad INA
+  reads`) -- but a flip in bits 8-12 (a few hundred mA) passes those bounds
+  unseen, so filtering is not a fix. Fix the timing (hardware, or the PIO
+  sample point). A 100 kHz comparison was proposed and declined.
+- **Board monitor (ring + matrix, one reader).** RP2350 idle monitor reads
+  every non-CC board at 2 Hz in the power job's idle time (0x3D, no I2C for
+  the host); off during a run, when I2C queries are refused with Busy and
+  the cache stays readable with true ages. Backend: one thread per controller
+  (`MONITOR_*` in backend.py). Known: STOP boards read not-present (their INA
+  is on the iso rail).
 - **C1 CH2 went dark once, cause unknown.** 2026-09-23, after a rig-wide
   IDLE on firmware `c57aa5e`+pacing: mux and all three expanders NAK'd every
   probe (1.1M NAKs, 0 timeouts, 0 stuck lines) until a reboot; its filaments

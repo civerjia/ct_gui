@@ -1105,8 +1105,8 @@ class CTClient:
         What this does NOT cover: the process being killed outright (SIGKILL),
         or the machine dying. Only the backend can protect against that, since
         it outlives the script -- and it now does: its dead-man watchdog walks
-        an unattended ACTIVE filament back to SLEEP and drops the HV rails (see
-        safety()). The lease still de-energises nothing; it only gates writes.
+        an unattended ACTIVE filament back to SLEEP and opens every HV grid
+        MOSFET (see safety()). It never turns the emission/focus rails off. The lease still de-energises nothing; it only gates writes.
 
         While this block is open a keepalive runs in the background, because
         the watchdog is deliberately renewed by COMMANDS and not by reads: code
@@ -1312,8 +1312,8 @@ class CTClient:
             {"ok", "enabled", "active_timeout_s", "active_fallback",
              "hv_timeout_s",
              "active_filaments": {fid: {"idle_for_s", "never_commanded"}},
-             "hv_commanded": {"emission": bool, "focus": bool},
-             "hv_idle_for_s": float | None,
+             "grid_closed": [fid, ...],   # grid MOSFETs possibly closed
+             "hv_idle_for_s": float | None, # since the last HV grid command
              "events": [ ... what it has actually had to do ... ]}
 
         `never_commanded: True` means this backend has seen no command for a
@@ -1334,8 +1334,9 @@ class CTClient:
         """Change the watchdog's rules. Returns the same shape as safety(),
         plus "changed".
 
-        Defaults: ACTIVE falls back to SLEEP after 30 s without a command, the
-        HV rails go off after 10 s.
+        Defaults: ACTIVE falls back to SLEEP after 30 s without a command; a
+        closed HV grid MOSFET with no HV command for 10 s gets every MOSFET
+        opened (clear-all). The emission/focus rails are never touched.
 
         `active_fallback` takes a PowerState, its name, or its number -- all
         three of these are the same call, and the first is the one to write:
@@ -1374,10 +1375,10 @@ class CTClient:
     def keepalive(self, filaments=None) -> dict:
         """Renew the watchdog without commanding anything.
 
-        For code that is legitimately holding ACTIVE or the HV rails while
+        For code that is legitimately holding ACTIVE or HV grid MOSFETs while
         doing its own work -- a settle, a long fit, a measurement between
         shots. `filaments` limits it to those (USER_INDEX); None renews every
-        filament the backend is tracking, and the HV rails either way.
+        filament the backend is tracking, and the HV grid timer either way.
 
         energised() runs one of these in the background for you, which is the
         right place for it. Call this directly only when holding a state
@@ -3647,21 +3648,28 @@ class CTClient:
 
         Backend loads the calibrated LUT, interpolates the DS3502 wiper, and
         writes it. Falls back to a linear approximation when no LUT is saved.
-        Returns {"ok", "wiper", "expect_v", "method"}.
+        Outside the settable range it is CLAMPED, written anyway, and the
+        result says so: {"clamped": True, "requested_v", "warning"}.
+        Returns {"ok", "wiper", "expect_v", "method"} (+ clamp fields).
         """
         return self._post("/api/hv/set-v", {"chan": "emission", "volts": abs(volts)})
 
     def set_focus_v(self, volts: float) -> dict:
-        """Set focus HV to |volts| V (output is negative).
+        """Set focus HV to |volts| V (output is negative). Clamped like
+        set_emission_v, and reported the same way.
 
-        Returns {"ok", "wiper", "expect_v", "method"}.
+        Returns {"ok", "wiper", "expect_v", "method"} (+ clamp fields).
         """
         return self._post("/api/hv/set-v", {"chan": "focus", "volts": abs(volts)})
 
     def set_emission_i(self, ma: float) -> dict:
-        """Set emission current reference (0–85.7 mA). Linear DS3502 scale.
+        """Set emission current reference in mA (0–85.7). Linear DS3502
+        scale: wiper = round(ma / 85.7 * 127).
 
-        Returns {"ok", "wiper", "expect_ma"}.
+        Above 85.7 mA it is CLAMPED to 85.7 and written anyway, and the result
+        says so: {"clamped": True, "requested_ma", "max_ma", "warning"}.
+
+        Returns {"ok", "wiper", "expect_ma"} (+ the clamp fields if clamped).
         """
         return self._post("/api/hv/set-i", {"ma": abs(ma)})
 
@@ -8277,8 +8285,8 @@ class CTClient:
         whatever exception is already on its way out. A failure is RETURNED so
         the caller puts it in front of the reader: a rail that may still be live
         is the one thing a teardown must not keep quiet about. (If it goes
-        unreported anyway -- an exception propagating past the caller -- the
-        backend's dead-man watchdog drops the rail within hv_timeout_s.)
+        unreported anyway, nothing turns the rail off by itself: the backend's
+        dead-man watchdog only opens the grid MOSFETs, never the rails.)
         """
         try:
             r = self.enable_emission(False)

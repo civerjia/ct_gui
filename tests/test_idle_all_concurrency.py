@@ -23,7 +23,8 @@ MEASURED, 93 filaments at IDLE 1000 mA from SLEEP:
 The default bounds (max 10 s, median 4 s) sit 2-3x above the concurrent
 figures and far below the serial ones.
 
-What it does, no HV at any point: SLEEP every live filament (verified), IDLE
+What it does, no HV at any point: SLEEP then STANDBY every live filament
+(verified; the power-up order never skips a step), IDLE
 them all at --idle-ma in ONE batch with verify, then STOP (verified) -- also on
 error or Ctrl-C. Exit 1 on failure.
 
@@ -62,6 +63,11 @@ def main(argv=None) -> int:
             r = ct.sleep_all(verify=True)
             if not r.get("readback", {}).get("ok"):
                 problems.append(f"SLEEP did not read back for {r.get('not_reached')}")
+            # The power-up order is STOP -> SLEEP -> STANDBY -> IDLE, never
+            # skipping a step (cold-filament inrush / OCP).
+            r = ct.standby_all(verify=True)
+            if not r.get("readback", {}).get("ok"):
+                problems.append(f"STANDBY did not read back for {r.get('not_reached')}")
             t0 = time.monotonic()
             r = ct.idle_all(default_ma=args.idle_ma, verify=True, timeout_s=args.timeout_s)
             wall = time.monotonic() - t0

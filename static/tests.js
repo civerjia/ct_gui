@@ -431,7 +431,13 @@ async function test1() {
       const m = fmap[f]; if (!m || m.ctrl !== cid) continue;
       if (prepFailed.has(f)) { items.push({ f, value: 0, cls: 'skip' }); skipped.push(`F${f}`); continue; }
       const b = byBoard[`${m.ch}.${m.pos}`]; if (!b || !b.present) continue;
-      const mA = b.current_mA || 0, V = (b.bus_mV || 0) / 1000, R = mA > 0 ? V / (mA / 1000) : Infinity;
+      // The snapshot is the firmware's board cache: a value can be missing
+      // (null) or older than the standby itself. Neither is a measurement of
+      // this standby -- skip it rather than read null as 0 V (= a "short").
+      if (b.bus_mV == null || b.current_mA == null || b.age_ms == null || b.age_ms > settle) {
+        items.push({ f, value: 0, cls: 'skip' }); skipped.push(`F${f} (no fresh reading)`); continue;
+      }
+      const mA = b.current_mA, V = b.bus_mV / 1000, R = mA > 0 ? V / (mA / 1000) : Infinity;
       let cls;
       if (b.tps_fault || R < shortR) { cls = 'short'; bad.push(`F${f}: SHORT`); }
       else if (mA < openMa) { cls = 'open'; bad.push(`F${f}: OPEN`); }

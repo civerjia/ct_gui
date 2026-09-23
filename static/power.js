@@ -23,7 +23,7 @@ const masterConnected = () => !!connectedSet[masterId()];
 // (state.scheduleRunning, set by app.js's run monitor): that already has its
 // own dedicated status polling, so the boards matrix doesn't need to chase
 // 10 Hz too and compete for the link with firing.
-const POLL_MS_FAST = 100;
+const POLL_MS_FAST = 250;   // = backend MONITOR_PERIOD_S: faster would only re-read the same snapshot
 const POLL_MS_RUN = 500;
 const pollMs = () => (state.scheduleRunning ? POLL_MS_RUN : POLL_MS_FAST);
 const pollHz = () => Math.round(1000 / pollMs());
@@ -390,8 +390,10 @@ function renderBoardGrid() {
     setDot(p.dotF, b.tps_fault, 'F', b.tps_fault, b.tps_fault_valid);
     p.dash.hidden = b.present; p.vSpan.hidden = !b.present; p.iSpan.hidden = !b.present;
     if (b.present) {
-      p.vSpan.textContent = (b.bus_mV / 1000).toFixed(2) + ' V';
-      p.iSpan.textContent = b.current_mA + ' mA';
+      // null = not a reading (aged out / not measured) -- shown as a dash,
+      // never as 0 V / 0 mA.
+      p.vSpan.textContent = b.bus_mV == null ? '— V' : (b.bus_mV / 1000).toFixed(2) + ' V';
+      p.iSpan.textContent = b.current_mA == null ? '— mA' : b.current_mA + ' mA';
     }
   }
   $p('bmSelSummary').textContent = `${boardSel.size} selected · ${present}P ${tps}T ${iso}I ${fault}F`;
@@ -409,10 +411,10 @@ function renderOneBoard() {
   badge('bmbTps', b && b.tps_enabled, false, !b || b.tps_enabled_valid);
   badge('bmbIso', b && b.iso_enabled, false, !b || b.iso_enabled_valid);
   badge('bmbFault', b && b.tps_fault, b && b.tps_fault, !b || b.tps_fault_valid);
-  const v = (b && b.present) ? b.bus_mV : 0, i = (b && b.present) ? b.current_mA : 0;
-  $p('bmOneV').textContent = (b && b.present) ? (v / 1000).toFixed(3) + ' V' : '—';
-  $p('bmOneI').textContent = (b && b.present) ? i + ' mA' : '—';
-  const P = (b && b.present && i) ? (v * i / 1e6) : null;                                       // P = V·I (W)
+  const v = (b && b.present) ? b.bus_mV : null, i = (b && b.present) ? b.current_mA : null;
+  $p('bmOneV').textContent = v != null ? (v / 1000).toFixed(3) + ' V' : '—';
+  $p('bmOneI').textContent = i != null ? i + ' mA' : '—';
+  const P = (v != null && i) ? (v * i / 1e6) : null;                                            // P = V·I (W)
   $p('bmOneP').textContent = P != null ? P.toFixed(2) + ' W' : '—';
   // Below 0.1 W the V/I resistance (and the temperature derived from it) is
   // dominated by sense noise/offset, so report Load R and Temp as invalid.
@@ -556,7 +558,7 @@ async function readStartupOcp() {
 // change rarely and come from the periodic full refresh). fast=false → full snapshot.
 let boardGen = 0;   // bumped on every refresh + controller switch; stale responses drop
 let lastKnownConn = false;   // debounces boardTargetConnected()'s transient reconnect blips
-async function refreshBoards(fast) {
+async function refreshBoards() {
   const conn = boardTargetConnected();
   if (!conn) {
     bmMsg(`Power ${pwTarget} not connected.`);
@@ -574,64 +576,18 @@ async function refreshBoards(fast) {
   lastKnownConn = true;
   const gen = ++boardGen, target = pwTarget;   // this call supersedes any in-flight one
   let j;
-  // cached=1 → zero-I2C CC-loop current cache (backend.py board_snapshot cached
-  // mode) instead of a live INA219 sweep — cheap enough to poll fast (10 Hz,
-  // see wirePowerPoll's schedule below) and safe even while a real schedule
-  // is firing.
-  try { j = await (await fetch(`/api/board-snapshot?controller=${target}${fast ? '&cached=1' : ''}`)).json(); } catch { return; }
+  // ONE source for the matrix and the ring: the backend's board monitor
+  // (firmware 0x3D cache, no I2C, nothing sent while a run owns the board).
+  // It already holds bitmap bits across a failed read, so this replaces the
+  // cache wholesale -- no merging here, and no second request type.
+  try { j = await (await fetch(`/api/board-snapshot?controller=${target}`)).json(); } catch { return; }
   // Drop the response if a newer refresh started or the user switched controllers
   // mid-flight — otherwise stale (e.g. Power 1) data lands after the switch to Power 2.
   if (gen !== boardGen || target !== pwTarget) return;
-  // ok:false is a TRANSIENT per-request failure (e.g. the RP2350 :3333 link's
-  // documented reconnect blip — link.client.connected flaps briefly, this is
-  // normal and NOT the same as the user disconnecting, which the earlier
-  // !conn check above already handles by blanking the matrix). Don't wipe
-  // boardCache here — that was the actual "whole row flickers" bug: every
-  // transient link blip blanked the entire matrix for one refresh cycle,
-  // bypassing current_mA_valid/present_valid entirely since it happens
-  // before board_snapshot() even runs. Just skip this update and retry next
-  // tick; the last known state stays on screen.
-  if (!j.ok) { if (!fast) bmMsg(j.error || 'snapshot failed'); return; }
-  const rows = (j.boards && j.boards.length) ? j.boards : emptyBoards();
-  if (fast && boardCache && boardCache.length === rows.length) {
-    // Cached mode only has current_mA (no I2C -> no bus_mV/present read at all);
-    // merge just that and keep bus_mV/present/ina_present/bitmap flags from the
-    // last full (non-cached) read — same "only the volatile field moves"
-    // pattern this merge already used for the bitmap fields.
-    const by = new Map(rows.map((b) => [`${b.channel}.${b.mux_port}`, b]));
-    for (const b of boardCache) {
-      const n = by.get(`${b.channel}.${b.mux_port}`);
-      // current_mA_valid=false means this tick's read didn't actually cover this
-      // board (link timeout/contention, or a partial cached response) — the 0 in
-      // n.current_mA is just the backend's fresh-dict default, not a real
-      // reading. Keep the last known value instead of flickering to 0 on every
-      // failed/partial tick.
-      if (n && n.current_mA_valid) b.current_mA = n.current_mA;
-    }
-  } else {
-    // Full (non-cached, live INA219) snapshot: same failure mode applies here
-    // too (a partial/timed-out link.request() leaves current_mA_valid=false
-    // for boards this call didn't actually reach) — patch those back to their
-    // last known current_mA instead of letting the wholesale replace below
-    // zero them out.
-    const prev = new Map((boardCache || []).map((b) => [`${b.channel}.${b.mux_port}`, b]));
-    for (const b of rows) {
-      const p = prev.get(`${b.channel}.${b.mux_port}`);
-      if (!p) continue;
-      if (!b.current_mA_valid) b.current_mA = p.current_mA;
-      // present_valid=false means CH_GET_PRESENT itself failed/timed out this
-      // tick — every board in the response defaults to present:false, which
-      // would blank the whole matrix's current display (both render
-      // functions gate on `present`). Keep the last known presence/bus_mV
-      // instead of flickering the entire matrix to "—" on a single failed read.
-      if (!b.present_valid) {
-        b.present = p.present; b.mux_present = p.mux_present;
-        b.tps_present = p.tps_present; b.ina_present = p.ina_present;
-        b.bus_mV = p.bus_mV;
-      }
-    }
-    boardCache = rows;
-  }
+  // ok:false = no fresh data (monitor starting, link blip, or a run with the
+  // push off): keep what is on screen and say why, rather than blanking.
+  if (!j.ok) { bmMsg(j.error || 'snapshot failed'); return; }
+  boardCache = (j.boards && j.boards.length) ? j.boards : emptyBoards();
   renderBoardGrid(); renderOneBoard();
   bmMsg(`Power ${pwTarget} — ${boardCache.filter((b) => b.present).length}/64 present · current refresh ${pollHz()} Hz.`);
 }
@@ -679,15 +635,11 @@ function wireBoards() {
     const j = await postJ('/api/channel-mask', { mask: state.channelMask });
     bmMsg(j.ok === false ? (j.error || 'set mask failed') : 'channel mask set');
   };
-  const run = async (p) => { const j = await p; bmMsg(j.ok ? 'ok' : (j.error || 'failed')); refreshBoards(true); };
-  // Read INA specifically wants the LIVE read it just triggered to actually
-  // show up: refreshBoards(true) merges only the zero-I2C CACHED-current path
-  // (0x3A), which is often empty/invalid for a board not in CC-loop Current
-  // mode (see current_mA_valid) -- so a successful "ok" response was silently
-  // followed by a refresh that could show nothing for the exact board just
-  // read. refreshBoards(false) does its own live INA219 sweep (0x24), the
-  // same data source "Read INA" itself used, so the result is never thrown away.
-  const runLive = async (p) => { const j = await p; bmMsg(j.ok ? 'ok' : (j.error || 'failed')); refreshBoards(false); };
+  const run = async (p) => { const j = await p; bmMsg(j.ok ? 'ok' : (j.error || 'failed')); refreshBoards(); };
+  // The matrix now shows the firmware's board cache for EVERY board (not only
+  // CC-regulated ones), refreshed about once a second, so a live read needs no
+  // special refresh path any more.
+  const runLive = run;
   $p('bmIsoOn').onclick = () => run(powerCmd('CH_SET_ISO_ENABLE', { ...batchExtra(), enable: true }));
   $p('bmIsoOff').onclick = () => run(powerCmd('CH_SET_ISO_ENABLE', { ...batchExtra(), enable: false }));
   $p('bmTpsOn').onclick = () => run(powerCmd('CH_SET_TPS_ENABLE', { ...batchExtra(), enable: true }));
@@ -711,7 +663,7 @@ function wireBoards() {
       ? Math.min(cap, Math.max(0, +$p('bmStateArg').value)) : 0;
     const j = await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', channel: boardPrimary.channel, mux_port: boardPrimary.mux_port, state: bmState, arg });
     bmMsg(j.ok ? `state ${bmState}${arg ? ' @ ' + arg : ''} set` : (j.error || 'state failed'));
-    refreshBoards(true);
+    refreshBoards();
   };
   reflectStateArg();
   // Batch power state — applies the chosen state to every selected board (loops
@@ -734,7 +686,7 @@ function wireBoards() {
     if (btn) btn.disabled = false;
     bmMsg(j.ok ? `state ${bmBatchState}${arg ? ' @ ' + arg : ''} → ${keys.length} board(s)`
               : (j.error || `state ${bmBatchState} failed`));
-    refreshBoards(true);
+    refreshBoards();
   };
   reflectBatchStateArg();
   $p('bmOneVoutSr').onclick = async () => {
@@ -2366,7 +2318,7 @@ async function selectController(n, btn) {
   if (pollBusy) return;        // a sweep is running; it'll target the new controller on its next tick
   pollBusy = true;
   try {
-    await refreshBoards(false);   // full snapshot first → matrix fills immediately
+    await refreshBoards();        // monitor snapshot first → matrix fills immediately
     await refreshHv(true);
     await readHvStatus(true);
     await readTpsRegs(true);
@@ -2377,7 +2329,7 @@ async function selectController(n, btn) {
 let pollBusy = false;
 let prevConn = false;
 let pollTick = 0;
-const POLL_PHASES = 5;   // full/presence refresh every ~500ms (2 Hz) -- hard requirement
+const POLL_PHASES = 5;   // HV grid bits every 5th tick
 // True only when the matrix is actually on screen. When it's not (different tab /
 // backgrounded), skip its reads so the single-client link stays free for the CT
 // geometry live view. Robust check: checkVisibility() where available, else box size.
@@ -2389,19 +2341,15 @@ function powerPanelVisible() {
   const r = el.getBoundingClientRect();
   return r.width > 0 && r.height > 0;
 }
-// Every fast tick does the cheap cached-current V/I merge, so the matrix
-// numbers stay live. The presence/enable/fault snapshot (phase 0, CH_GET_PRESENT
-// + CH_GET_BOARD_BITMAPS) and the HV grid (phase 2) are on their own tick within
-// the same POLL_PHASES cycle -- currently 5, i.e. 2 Hz, a hard requirement (not
-// a tuning knob) even though CH_GET_PRESENT alone costs ~54ms of real I2C on a
-// 48-port mask. The other two fixes from the same investigation (33-entry pages,
-// idle Ring telemetry moved to the cached path -- see cross-session thread with
-// rp2350bfilamentcontroller-39) cut enough load off the shared RP2350 link that
-// 2 Hz presence should no longer reproduce the ~10s on-demand /api/cmd lag this
-// was chasing; re-verify under real concurrent use if that regresses. TPS
-// OCP/delay/slew are debug config that don't change during a run, so they are
-// NOT polled — they're read on demand only (selecting a board / switching
-// controllers).
+// Every tick reads /api/board-snapshot, which the backend serves from its
+// board monitor -- the SAME snapshot the CT ring shows (/api/telemetry), read
+// from the firmware's no-I2C board cache (0x3D). So this poll puts nothing on
+// the RP2350 link; the old full snapshot (CH_GET_PRESENT + a live INA sweep
+// every 5th tick) that competed with the ring and the CC loop is gone. The HV
+// grid bits (cached on the RP2350, no bus) still refresh every POLL_PHASES
+// ticks. While a schedule is armed/running the backend sends nothing but a
+// 1 Hz status read -- a run is deterministic -- and the matrix shows the
+// firmware's telemetry push if it is on, otherwise its last values age out.
 async function pollPower() {
   if (pollBusy) return;          // never overlap — reads serialize on the single link
   if (state.testRunning) { updateTargetStatus(); return; }   // pause during a Cal & Test
@@ -2418,7 +2366,7 @@ async function pollPower() {
     prevConn = conn;
     if (!powerPanelVisible()) return;          // matrix off-screen → yield the link to geometry
     const phase = pollTick++ % POLL_PHASES;
-    await refreshBoards(phase !== 0);          // phase 0 = full snapshot; every other tick = fast V/I merge
+    await refreshBoards();                     // backend monitor snapshot: no link traffic of its own
     if (phase === 2) await refreshHv();        // HV grid on its own tick (bits change on action, not continuously)
   } catch { /* keep last */ } finally { pollBusy = false; }
 }

@@ -178,6 +178,7 @@ CH_SET_I2C_ENABLE_MASK = 0x34
 CH_GET_INA219 = 0x24
 HV_REFRESH_FEEDBACK = 0x14      # REALLY re-reads the 74HC165 (payload 0xFF = all 8
 CH_GET_CACHED_CURRENTS = 0x3A    # CC-loop cached currents, NO I2C (run-safe telemetry)
+CH_GET_BOARD_CACHE = 0x3D        # every board's cached V/I/presence, NO I2C (RP2350 fw: idle monitor)
 CH_GET_PRESENT = 0x25            # I2C presence scan (mux/tps/ina/io per board)
 CH_GET_DIAGNOSIS = 0x2E         # deep diagnosis: addr-ACK / reg-read / operational
 CH_GET_I2C_ENABLE_MASK = 0x2F   # read the channel enable mask
@@ -292,7 +293,7 @@ _DIAG_CHIPS = ["mux", "tps", "ina", "enable_io", "fault_io", "iso_io", "hv_io"]
 
 # ── Dead-man safety watchdog ───────────────────────────────────────────────
 # A client that dies mid-run leaves the hardware where it was: a filament at
-# ACTIVE and the HV rails enabled, with nothing left to turn them off. Nothing
+# ACTIVE and HV grid MOSFETs closed, with nothing left to open them. Nothing
 # in the lease covers this -- the lease expires, but expiry only frees WRITE
 # ACCESS; it has never de-energised anything.
 #
@@ -311,7 +312,14 @@ SAFETY_ACTIVE_FALLBACK = 2        # ...to SLEEP. Not STOP: a re-warm is slow,
                                    # and SLEEP already removes the current.
                                    # Must be a non-energising state or the
                                    # timer would "fire" into another hazard.
-SAFETY_HV_TIMEOUT_S = 10.0        # HV enabled with nobody commanding -> off
+SAFETY_HV_TIMEOUT_S = 10.0        # HV grid MOSFET closed with nobody commanding
+                                   # -> every MOSFET opened (SHV_DISARM clear-all).
+                                   # The watchdog NEVER touches the emission or
+                                   # focus rails: turning HV off is the
+                                   # operator's decision, never a timer's. It
+                                   # used to drop both rails, so with the GUI
+                                   # only polling, emission went off by itself
+                                   # hv_timeout_s after every turn-on.
 SAFETY_TICK_S = 1.0               # how often the timer is checked
 
 # ── Lease and polling timing ───────────────────────────────────────────────
@@ -703,6 +711,253 @@ def run_chip_health(link: "ControllerLink") -> dict:
     return out
 
 
+
+
+# ── Board monitor: ONE reader per controller for the ring AND the matrix ────
+# The ring (/api/telemetry) and the boards matrix (/api/board-snapshot) used to
+# poll the RP2350 separately -- the matrix with live I2C (CH_GET_PRESENT, a
+# paged live INA sweep) every ~500 ms, the ring with its own status + cached
+# reads -- queueing on one link, timing each other out, and filling the gaps
+# with 0 V. Now a single thread per controller reads the firmware's board cache
+# (0x3D: no I2C -- the firmware's own power job keeps it, concurrently) and both
+# endpoints serve from what it last read.
+#
+# A RUN IS DETERMINISTIC, and the cache must still be readable during it. While
+# a schedule is armed or running the monitor drops to 1 Hz: SHV_GET_STATUS plus
+# one 0x3D -- both no-I2C, but each reply costs the RP2350 core-0 UART time, so
+# not at the idle rate -- and no bitmaps (TCA I2C; the firmware answers Busy to
+# them during a run anyway). When the firmware's telemetry push is on, its
+# newer values are laid over the 0x3D ones. Boards the run is not driving keep
+# their last monitor reading, with its real age (firmware: the idle monitor is
+# off during a run and does not expire them then).
+MONITOR_PERIOD_S = 0.25          # 0x3D read cadence when idle
+MONITOR_RUN_STATUS_S = 1.0       # status + 0x3D cadence while a run owns the board
+MONITOR_BITMAP_PERIOD_S = 2.0    # iso/tps-enable/fault bitmaps (TCA reads), idle only
+MONITOR_STALE_S = 2.0            # a snapshot older than this is not served as data
+MONITOR_BITMAP_HOLD_S = 10.0     # a bitmap bit keeps its last GOOD value this long
+MONITOR_ARM_HINT_S = 2.0         # an SHV_ARM this recent counts as a run already
+
+_BOARD_MON_LOCK = threading.Lock()
+_BOARD_MON: dict[int, dict] = {}   # controller (1-based) -> latest snapshot
+
+
+def read_board_cache(link: "ControllerLink", channels) -> dict | None:
+    """Paged 0x3D read over `channels`: {(ch, mux): board dict}, or None if the
+    read failed (never a half-filled dict reported as complete).
+
+    Entry (10 bytes): channel, mux, flags, powerState, current_mA i16,
+    bus_mV u16, age_ms u16. flags: bit0 present, bit1 current valid, bit2 bus
+    valid, bit3 from CC loop, bit4 TPS known, bit5 TPS answered, bit6 TPS OE,
+    bit7 channel not ready. An invalid value is None here, never 0."""
+    mask = bytearray(8)
+    for c in channels:
+        if 0 <= int(c) < 8:
+            mask[int(c)] = 0xFF
+    out: dict[tuple, dict] = {}
+    page_start, guard = 0, 0
+    while guard < 16:
+        guard += 1
+        resp = link.request(CH_GET_BOARD_CACHE, bytes(mask) + bytes([page_start & 0xFF, 64]),
+                            flags=0, timeout=1.5)
+        raw = (resp.get("raw") if isinstance(resp, dict) else None) or []
+        if len(raw) < 4 or raw[0] != 0:
+            return None
+        total, returned = raw[1], raw[3]
+        if len(raw) < 4 + returned * 10:
+            return None
+        for i in range(returned):
+            e = raw[4 + i * 10: 14 + i * 10]
+            flags = e[2]
+            cur = int.from_bytes(bytes(e[4:6]), "little", signed=True)
+            bus = int.from_bytes(bytes(e[6:8]), "little")
+            age = int.from_bytes(bytes(e[8:10]), "little")
+            not_ready = bool(flags & 0x80)
+            tps_known = bool(flags & 0x10) and not not_ready
+            out[(e[0], e[1])] = {
+                "known": not not_ready,
+                "present": bool(flags & 0x01) and not not_ready,
+                "current_mA": cur if flags & 0x02 else None,
+                "bus_mV": bus if flags & 0x04 else None,
+                "from_cc_loop": bool(flags & 0x08),
+                "tps_present": bool(flags & 0x20) if tps_known else None,
+                "oe": bool(flags & 0x40) if tps_known else None,
+                "power_state": e[3],
+                "age_ms": None if age == 0xFFFF else age,
+            }
+        if returned == 0 or page_start + returned >= total:
+            break
+        page_start += returned
+    return out
+
+
+def _pushed_boards(link: "ControllerLink") -> dict:
+    """Board-keyed newest values from the firmware's telemetry push (no request).
+    Sentinels (0xFFF0..0xFFFF) are None -- see read_pushed_telemetry."""
+    TELEMETRY_INVALID_MIN = 0xFFF0
+    board: dict[tuple, dict] = {}
+    try:
+        events = link.client.events()
+    except Exception:
+        events = []
+    for ev in events:
+        if ev.get("type") != "EVENT_TELEMETRY":
+            continue
+        for e in (ev.get("decoded") or {}).get("entries", []):
+            mA, mv = e.get("current_mA", 0), e.get("bus_mV", 0)
+            valid = mA < TELEMETRY_INVALID_MIN
+            board[(e.get("channel"), e.get("mux_port"))] = {
+                "known": True, "present": valid,
+                "current_mA": mA if valid else None,
+                "bus_mV": mv if mv < TELEMETRY_INVALID_MIN else None,
+                "from_cc_loop": True, "tps_present": None, "oe": None,
+                "power_state": None, "age_ms": None, "pushed": True}
+    return board
+
+
+def _read_bitmaps(link: "ControllerLink") -> dict | None:
+    """CH_GET_BOARD_BITMAPS -> {(ch, mux): {field: value or None}}; None on failure."""
+    # Scan channels only (CH1-6 by default): CH7/CH8 are never used.
+    used = set(_scan_channels())
+    mask = bytes(0xFF if c in used else 0 for c in range(8))
+    resp = link.client.send_request(CH_GET_BOARD_BITMAPS, mask, timeout=3.0)
+    if resp.get("status_code") != 0x00:
+        return None
+    raw = resp.get("raw") or []
+    out: dict[tuple, dict] = {}
+
+    def bit(start, ch, mux):
+        return bool(raw[start + ch] & (1 << mux)) if len(raw) >= start + 8 else None
+    for ch in range(8):
+        for mux in range(8):
+            row = {}
+            for name, vstart, validstart in (("iso_enabled", 9, 41), ("tps_enabled", 17, 49),
+                                             ("tps_fault", 25, 57), ("hv_overcurrent", 33, 65)):
+                valid = bit(validstart, ch, mux)
+                row[name] = bit(vstart, ch, mux) if valid else None
+            out[(ch, mux)] = row
+    return out
+
+
+def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict) -> dict:
+    snap = dict(prev) if prev else {"boards": {}, "boards_at": 0.0, "bitmaps": {},
+                                    "bitmaps_at": 0.0, "status": None, "status_at": 0.0}
+    hint = getattr(link, "arm_hint_at", 0.0)
+    owns = (now - hint) < MONITOR_ARM_HINT_S or bool(snap.get("run_owns"))
+    # Status: every tick while idle (cheap, no I2C), 1 Hz while a run owns it.
+    if not owns or (now - snap["status_at"]) >= MONITOR_RUN_STATUS_S:
+        try:
+            st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+        except Exception:
+            st = None
+        if st is not None:
+            snap["status"], snap["status_at"] = st, now
+            owns = st.get("state") in (1, 2) or (now - hint) < MONITOR_ARM_HINT_S
+    snap["run_owns"] = owns
+    if owns:
+        # 1 Hz cache read (no I2C), then the push on top when it is on. No
+        # bitmaps: that is I2C, and it belongs to the run.
+        if (now - snap.get("run_cache_at", 0.0)) >= MONITOR_RUN_STATUS_S:
+            snap["run_cache_at"] = now
+            try:
+                cache = read_board_cache(link, _scan_channels())
+            except Exception:
+                cache = None
+            if cache is not None:
+                snap["boards"], snap["boards_at"], snap["source"] = cache, now, "cache(run)"
+        if cid in _LIVE_PUSH:
+            pushed = _pushed_boards(link)
+            if pushed:
+                merged = dict(snap.get("boards") or {})
+                for key, b in pushed.items():
+                    old = merged.get(key)
+                    # The push carries V/I only; keep the cache's TPS/state fields.
+                    merged[key] = {**old, **{k: b[k] for k in ("present", "current_mA", "bus_mV")},
+                                   "pushed": True} if old else b
+                snap["boards"], snap["boards_at"], snap["source"] = merged, now, "cache+push(run)"
+        return snap
+    cache = read_board_cache(link, _scan_channels())
+    if cache is not None:
+        snap["boards"], snap["boards_at"], snap["source"] = cache, now, "cache"
+    if (now - snap["bitmaps_at"]) >= MONITOR_BITMAP_PERIOD_S:
+        try:
+            bm = _read_bitmaps(link)
+        except Exception:
+            bm = None
+        # Sticky per bit: a failed or invalid read keeps the last GOOD value for
+        # MONITOR_BITMAP_HOLD_S, so one NAK on a noisy bus does not blink a dot.
+        held = dict(snap.get("bitmaps") or {})
+        for key, row in (bm or {}).items():
+            cur = dict(held.get(key) or {})
+            for name, v in row.items():
+                if v is not None:
+                    cur[name] = (v, now)
+            held[key] = cur
+        snap["bitmaps"], snap["bitmaps_at"] = held, now
+    return snap
+
+
+def _board_monitor_loop() -> None:
+    while True:
+        t0 = time.monotonic()
+        for cid, link in list(CONTROLLERS.items()):
+            try:
+                if not link.client.connected:
+                    with _BOARD_MON_LOCK:
+                        _BOARD_MON.pop(cid, None)
+                    continue
+                with _BOARD_MON_LOCK:
+                    prev = _BOARD_MON.get(cid)
+                snap = _board_monitor_tick(cid, link, time.monotonic(), prev)
+                with _BOARD_MON_LOCK:
+                    _BOARD_MON[cid] = snap
+            except Exception as exc:
+                log.debug("board monitor controller %s: %s", cid, exc)
+        time.sleep(max(0.02, MONITOR_PERIOD_S - (time.monotonic() - t0)))
+
+
+def board_monitor_snapshot(cid: int) -> dict | None:
+    """The monitor's latest snapshot for one controller, or None."""
+    with _BOARD_MON_LOCK:
+        snap = _BOARD_MON.get(cid)
+        return dict(snap) if snap else None
+
+
+def monitor_board_rows(cid: int) -> tuple[list, dict]:
+    """64 board dicts in /api/board-snapshot's shape, from the monitor. Values
+    that are not readings are None (bus_mV/current_mA) or flagged invalid --
+    never 0. Also returns a meta dict (age, source, run_owns)."""
+    snap = board_monitor_snapshot(cid) or {}
+    now = time.monotonic()
+    boards = snap.get("boards") or {}
+    fresh = bool(boards) and (now - snap.get("boards_at", 0.0)) <= MONITOR_STALE_S
+    bitmaps = snap.get("bitmaps") or {}
+    rows = []
+    for ch in range(8):
+        for mux in range(8):
+            b = boards.get((ch, mux)) if fresh else None
+            bm = bitmaps.get((ch, mux)) or {}
+            row = {"channel": ch, "mux_port": mux, "label": f"CH{ch + 1}.{mux + 1}",
+                   "present": bool(b and b.get("present")),
+                   "ina_present": bool(b and b.get("present")),
+                   "tps_present": b.get("tps_present") if b else None,
+                   "oe": b.get("oe") if b else None,
+                   "mux_present": bool(b and b.get("known")),
+                   "bus_mV": b.get("bus_mV") if b else None,
+                   "current_mA": b.get("current_mA") if b else None,
+                   "age_ms": b.get("age_ms") if b else None,
+                   "from_cc_loop": bool(b and b.get("from_cc_loop")),
+                   "present_valid": bool(b and b.get("known")),
+                   "current_mA_valid": bool(b) and b.get("current_mA") is not None}
+            for name in ("iso_enabled", "tps_enabled", "tps_fault", "hv_overcurrent"):
+                v = bm.get(name)
+                ok = v is not None and (now - v[1]) <= MONITOR_BITMAP_HOLD_S
+                row[name] = bool(v[0]) if ok else False
+                row[f"{name}_valid"] = ok
+            rows.append(row)
+    meta = {"age_ms": round((now - snap.get("boards_at", 0.0)) * 1000) if boards else None,
+            "source": snap.get("source"), "run_owns": bool(snap.get("run_owns")),
+            "fresh": fresh}
+    return rows, meta
 
 
 def board_snapshot(link: "ControllerLink", controller: int, channels=DEFAULT_CHANNELS,
@@ -2019,7 +2274,10 @@ _SAFETY_TOUCH_HV: float = 0.0
 # reading it every tick is an I2C round trip on the shared link; the commanded
 # state is enough to decide whether a timeout has anything to act on, and the
 # off command it issues is idempotent if it turns out there was nothing on.
-_HV_COMMANDED: dict[str, bool] = {"emission": False, "focus": False}
+# FIDs whose grid MOSFET was last commanded closed (or whose open could not be
+# confirmed). Not read back: the watchdog's clear-all is idempotent, so acting
+# on "maybe closed" costs nothing and missing a closed one costs a lot.
+_GRID_CLOSED: set[int] = set()
 # What the watchdog has done, for /api/safety and the log. A count that never
 # moves is how you know it has never had to act.
 _SAFETY_EVENTS: list[dict] = []
@@ -2034,17 +2292,24 @@ def safety_touch_filaments(fids, when: float | None = None) -> None:
 
 
 def safety_touch_hv(when: float | None = None) -> None:
-    """Renew the dead-man timer for the HV rails. COMMANDS ONLY."""
+    """Renew the dead-man timer for the HV grid MOSFETs. COMMANDS ONLY."""
     global _SAFETY_TOUCH_HV
     with _SAFETY_LOCK:
         _SAFETY_TOUCH_HV = when if when is not None else time.monotonic()
 
 
-def note_hv_commanded(ch: str, on: bool) -> None:
-    """Record a commanded rail state, and renew its timer."""
+def note_grid_commanded(on: bool, fids=None, clear_all: bool = False) -> None:
+    """Record grid MOSFETs commanded closed/open, and renew the timer.
+
+    on=True: `fids` may now be closed. on=False: `fids` are open. clear_all:
+    every MOSFET was cleared (SHV_DISARM)."""
     with _SAFETY_LOCK:
-        if str(ch) in _HV_COMMANDED:
-            _HV_COMMANDED[str(ch)] = bool(on)
+        if clear_all:
+            _GRID_CLOSED.clear()
+        elif on:
+            _GRID_CLOSED.update(int(f) for f in fids or ())
+        else:
+            _GRID_CLOSED.difference_update(int(f) for f in fids or ())
     safety_touch_hv()
 
 
@@ -2053,7 +2318,7 @@ def safety_snapshot() -> dict:
     with _SAFETY_LOCK:
         cfg = dict(_SAFETY)
         hv_age = (now - _SAFETY_TOUCH_HV) if _SAFETY_TOUCH_HV else None
-        hv_cmd = dict(_HV_COMMANDED)
+        grid_closed = sorted(_GRID_CLOSED)
         events = list(_SAFETY_EVENTS[-20:])
         touch = dict(_SAFETY_TOUCH_FIL)
     active = {}
@@ -2071,7 +2336,7 @@ def safety_snapshot() -> dict:
     cfg["active_fallback_name"] = power_state_name(cfg["active_fallback"])
     return {"ok": True, **cfg,
             "active_filaments": active,
-            "hv_commanded": hv_cmd,
+            "grid_closed": grid_closed,
             "hv_idle_for_s": round(hv_age, 1) if hv_age is not None else None,
             "events": events}
 
@@ -2110,24 +2375,34 @@ def _safety_fallback_filaments(fids: list[int], state: int) -> None:
             _safety_record("fallback_error", {"filaments": group, "error": str(exc)})
 
 
-def _safety_disable_hv() -> None:
-    host, err = None, None
-    link = CONTROLLERS.get(MASTER)
-    if link and link.client.connected:
-        host = link.host
-    if not host:
-        _safety_record("hv_off_unreachable",
-                       {"error": "master not connected — could not turn HV off"})
-        return
-    for ch in ("emission", "focus"):
-        try:
-            stm32_hv_enable_set(host, ch, False)
-        except Exception as exc:
-            _safety_record("hv_off_error", {"ch": ch, "error": str(exc)})
+def _safety_open_grid() -> None:
+    """Open EVERY HV grid MOSFET on every connected controller: SHV_DISARM,
+    which the firmware turns into the 74HC595 /SRCLR clear-all. The emission
+    and focus rails are NOT touched -- see SAFETY_HV_TIMEOUT_S."""
     with _SAFETY_LOCK:
-        for ch in _HV_COMMANDED:
-            _HV_COMMANDED[ch] = False
-    _safety_record("hv_off", {"reason": "no HV command within the timeout"})
+        closed = sorted(_GRID_CLOSED)
+    results, all_ok = {}, True
+    for cid, link in sorted(CONTROLLERS.items()):
+        if not link or not link.client.connected:
+            results[str(cid)] = {"ok": False, "error": "not connected"}
+            all_ok = False
+            continue
+        try:
+            ok = _status_ok(link.request(SHV_DISARM, b"", flags=0))
+        except Exception as exc:
+            results[str(cid)] = {"ok": False, "error": str(exc)}
+            all_ok = False
+            continue
+        results[str(cid)] = {"ok": ok}
+        all_ok = all_ok and ok
+    if all_ok:
+        with _SAFETY_LOCK:
+            _GRID_CLOSED.clear()
+    # Not cleared on failure: the timer was renewed by the caller, so the
+    # clear is retried after another hv_timeout_s instead of being forgotten.
+    _safety_record("grid_off" if all_ok else "grid_off_failed",
+                   {"reason": "no HV grid command within the timeout",
+                    "filaments": closed, "results": results})
 
 
 def _safety_schedule_running() -> tuple[bool, str | None]:
@@ -2152,7 +2427,9 @@ def _safety_schedule_running() -> tuple[bool, str | None]:
             st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
         except Exception as exc:
             return False, f"controller {cid}: {exc}"
-        if st and st.get("state") == 2:      # 2 = running
+        if st and st.get("state") in (1, 2):   # 1 = armed, 2 = running
+            # Armed counts: an armed schedule waiting for its trigger is
+            # deliberate control, and clearing the grid would disarm it.
             return True, None
     return False, None
 
@@ -2179,7 +2456,7 @@ def _safety_loop() -> None:
                 hv_to = float(_SAFETY["hv_timeout_s"])
                 touch = dict(_SAFETY_TOUCH_FIL)
                 hv_last = _SAFETY_TOUCH_HV
-                hv_on = any(_HV_COMMANDED.values())
+                hv_on = bool(_GRID_CLOSED)
             stale = []
             for fid, (st, _w) in list(LAST_POWER_STATE.items()):
                 if st != POWER_STATE_ACTIVE:
@@ -2232,7 +2509,7 @@ def _safety_loop() -> None:
             if hv_stale:
                 with _SAFETY_LOCK:
                     _SAFETY_TOUCH_HV = now
-                _safety_disable_hv()
+                _safety_open_grid()
         except Exception as exc:          # never let the watchdog die
             log.exception("safety-watchdog tick failed: %s", exc)
 
@@ -2335,9 +2612,11 @@ def _lut_wiper_for_v(chan: str, mag_v: float) -> tuple[int, float, str]:
                 max_seen = p["m"]
         sign = -1.0 if float(lut["points"][0]["v"]) < 0 else 1.0
         T = abs(mag_v)
-        if T <= mono[0]["m"]:
+        if T < mono[0]["m"]:
+            return mono[0]["w"], sign * mono[0]["m"], "lut(clamped)"
+        if T == mono[0]["m"]:
             return mono[0]["w"], sign * mono[0]["m"], "lut"
-        if T >= mono[-1]["m"]:
+        if T > mono[-1]["m"]:
             return mono[-1]["w"], sign * mono[-1]["m"], "lut(clamped)"
         for i in range(len(mono) - 1):
             a, b = mono[i], mono[i + 1]
@@ -2347,7 +2626,10 @@ def _lut_wiper_for_v(chan: str, mag_v: float) -> tuple[int, float, str]:
                 return w, sign * T, "lut"
     full = _HV_FULL_V.get(chan, 350.0)
     w = max(0, min(127, round(abs(mag_v) / full * 127)))
-    return w, -abs(mag_v), "linear(no-lut)"
+    # expect_v from the wiper actually written, not the request -- they differ
+    # when the request was out of range.
+    return w, -(w / 127 * full), ("linear(no-lut,clamped)" if abs(mag_v) > full
+                                  else "linear(no-lut)")
 
 
 
@@ -2421,6 +2703,10 @@ class ControllerLink:
         """Send one framed command and return the decoded response (raises if down)."""
         if not self.client.connected:
             raise RuntimeError(f"{self.name} not connected")
+        if frame_type == SHV_ARM:
+            # The board monitor stops requesting the moment a run is armed,
+            # before its next status read confirms it (see _board_monitor_tick).
+            self.arm_hint_at = time.monotonic()
         return self.client.send_request(frame_type, payload, flags=flags, timeout=timeout)
 
     def _stop_poll(self) -> None:
@@ -3721,11 +4007,11 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
              "unslotted": unslotted, "dead_skipped": dead_skipped,
              "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons},
             dead_stopped)
-    # One frame per CURRENT, covering every channel: the firmware runs a
-    # multi-channel IDLE/ACTIVE mask on all eight I2C buses concurrently
-    # (RP2350 setPowerStateBroadcast), so a frame per channel would serialise
-    # exactly what it parallelises. STOP/SLEEP/STANDBY/VOLTAGE are handled per
-    # channel inside the firmware either way; the frame shape is the same.
+    # One frame per argument (current, or mV for VOLTAGE), covering every
+    # channel: the firmware runs a multi-channel STANDBY/IDLE/ACTIVE/VOLTAGE
+    # mask on all eight I2C buses concurrently (RP2350 setPowerStateBroadcast),
+    # so a frame per channel would serialise exactly what it parallelises.
+    # STOP/SLEEP are expander writes, batched per channel in the firmware.
     groups: dict = {}   # arg -> bytearray(8) channel masks
     members: dict = {}  # arg -> [filament]
     for f in fils:
@@ -4223,39 +4509,33 @@ class CtHandler(BaseHTTPRequestHandler):
             for cid, link in CONTROLLERS.items():
                 if not link.client.connected:
                     continue
-                running = False
-                try:
-                    st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
-                    if st:
-                        run_state[str(cid)] = st
-                        running = st.get("state") == 2
-                        fi = st.get("filamentIndex")
-                        if running and fi is not None and fi != 0xFF and fi < FILAMENT_COUNT:
-                            # firmware filamentIndex IS the global filament 0-95
-                            firing.append(fi)
-                except Exception:
-                    pass
-                # Always read the CC-loop CACHED currents (0x3A, no I2C) here, not
-                # the live INA sweep. While firing this avoids sharing the I2C bus
-                # and stalling pulses (the original reason for this branch); at
-                # idle, the live sweep's own cost (CH_GET_PRESENT-equivalent probe
-                # + several paged round-trips every ~1s poll) was the single
-                # biggest consumer of the shared RP2350 link -- see the cross-
-                # session thread with rp2350bfilamentcontroller-39 on the ~10s
-                # /api/cmd lag this caused. present now reflects CC-loop
-                # regulation state (mode != 0), not raw I2C presence, so a board
-                # that's plugged in but idle/voltage-mode shows as not-present
-                # here -- same tradeoff already accepted for the "running" case,
-                # now applied uniformly. The Boards matrix's own CH_GET_PRESENT
-                # (a separate, slower-cadence poll) is still the source of truth
-                # for physical presence.
-                try:
-                    if want_live and not running:
+                # Served from the board monitor -- the one reader shared with the
+                # boards matrix -- so this endpoint sends nothing of its own.
+                snap = board_monitor_snapshot(cid) or {}
+                st = snap.get("status")
+                running = bool(st) and st.get("state") == 2
+                if st:
+                    run_state[str(cid)] = st
+                    fi = st.get("filamentIndex")
+                    if running and fi is not None and fi != 0xFF and fi < FILAMENT_COUNT:
+                        firing.append(fi)   # firmware filamentIndex IS the global filament
+                if want_live and not snap.get("run_owns"):
+                    # Scripts asking for a live INA voltage (read_filament_voltage).
+                    try:
                         rows.update(read_telemetry(link, cid - 1))
-                    else:
-                        rows.update(read_cached_telemetry(link, cid - 1))
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                    continue
+                board_rows, meta = monitor_board_rows(cid)
+                if not meta["fresh"]:
+                    continue      # no reading is no row -- never a row of zeros
+                for b in board_rows:
+                    fil = MAPPING.filament_for_board(cid - 1, b["channel"], b["mux_port"])
+                    if fil is None:
+                        continue
+                    rows[fil] = {"index": fil, "present": b["present"],
+                                 "bus_mV": b["bus_mV"], "current_mA": b["current_mA"],
+                                 "age_ms": b["age_ms"], "cached": True}
             # Feed the run recorder so an end-of-run report can confirm each active
             # filament actually reached its target current. Auto start on the first
             # running poll (if a sim didn't already start it with the scheduled set)
@@ -4287,15 +4567,28 @@ class CtHandler(BaseHTTPRequestHandler):
                         vi_only = kv.split("=", 1)[1] in ("1", "true", "yes")
                     elif kv.startswith("cached="):
                         cached = kv.split("=", 1)[1] in ("1", "true", "yes")
+            live = "live=1" in (q[1] if len(q) > 1 else "")
             link = CONTROLLERS.get(cid)
             if not link or not link.client.connected:
                 self._json({"ok": False, "error": "controller not connected", "boards": []})
-            else:
+            elif live:
+                # Debug only: the old direct read (live I2C), idle only -- the
+                # firmware answers Busy to its I2C queries during a run.
                 try:
-                    self._json({"ok": True, "vi_only": vi_only, "cached": cached,
-                                "boards": board_snapshot(link, cid - 1, vi_only=vi_only, cached=cached)})
+                    self._json({"ok": True, "live": True,
+                                "boards": board_snapshot(link, cid - 1)})
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc), "boards": []})
+            else:
+                # From the board monitor -- the same data the ring shows, with no
+                # request of its own (see MONITOR_*). vi_only/cached are accepted
+                # for old callers and change nothing: every field is cached now.
+                rows, meta = monitor_board_rows(cid)
+                if meta["fresh"]:
+                    self._json({"ok": True, "boards": rows, **meta})
+                else:
+                    self._json({"ok": False, "error": "the board monitor has no fresh data",
+                                "boards": rows, **meta})
         elif path == "/api/present-filaments":
             # Which GLOBAL filament indices have a physically-present board, across
             # all connected controllers. The GUI uses this to one-click disable the
@@ -5096,6 +5389,8 @@ class CtHandler(BaseHTTPRequestHandler):
                         results[str(cid)] = {"ok": _status_ok(link.request(SHV_DISARM, b"", flags=0))}
                     except Exception as exc:
                         results[str(cid)] = {"ok": False, "error": str(exc)}
+                if results and all(r.get("ok") for r in results.values()):
+                    note_grid_commanded(False, clear_all=True)
                 self._json({"ok": True, "results": results})
             elif path == "/api/safety":
                 # Dead-man watchdog: read the state, or change the rules.
@@ -5492,6 +5787,13 @@ class CtHandler(BaseHTTPRequestHandler):
                        "excluded": excluded}
                 if mismatched:
                     out["mismatched"] = mismatched
+                # Dead-man timer. A close that failed or did not verify may
+                # still have closed, so it counts as closed; an open counts
+                # only where it applied.
+                if on:
+                    note_grid_commanded(True, applied + failed + mismatched)
+                else:
+                    note_grid_commanded(False, [f for f in applied if f not in mismatched])
                 self._json(out)
             elif path == "/api/calibration/save":
                 # Persist an emission-current calibration to the host disk (JSON +
@@ -6033,6 +6335,12 @@ class CtHandler(BaseHTTPRequestHandler):
                 ok = r.get("ok", False)
                 out: dict = {"ok": ok, "chan": chan, "wiper": wiper,
                              "expect_v": round(expect_v, 1), "method": method}
+                # Out of range: clamped, written anyway, and SAID so -- the
+                # project's rule for every clamp.
+                if "clamped" in method:
+                    out.update(clamped=True, requested_v=round(mag_v, 1),
+                               warning=f"{chan} {mag_v:g} V is outside the settable "
+                                       f"range; set to {abs(expect_v):.1f} V")
                 if not ok:
                     out["error"] = r.get("error") or "DS3502 write failed"
                     # Carry the REASON through, don't flatten it into a generic
@@ -6041,7 +6349,6 @@ class CtHandler(BaseHTTPRequestHandler):
                     # failed", which is what it looked like before this.
                     if r.get("reason"):
                         out["reason"] = r["reason"]
-                safety_touch_hv()     # adjusting a rail is HV control
                 self._json(out)
             elif path == "/api/hv/set-i":
                 # Linear emission-current set: ma=target mA (0–85.7).
@@ -6058,11 +6365,18 @@ class CtHandler(BaseHTTPRequestHandler):
                 ok = r.get("ok", False)
                 out2: dict = {"ok": ok, "wiper": wiper,
                               "expect_ma": round(wiper / 127 * _EM_I_FULL_MA, 2)}
+                # Out of range: clamped to full scale, written anyway, and
+                # reported -- never silently.
+                if ma > _EM_I_FULL_MA:
+                    out2.update(clamped=True, requested_ma=round(ma, 2),
+                                max_ma=_EM_I_FULL_MA,
+                                warning=f"emission current {ma:g} mA exceeds the "
+                                        f"{_EM_I_FULL_MA} mA maximum; set to "
+                                        f"{_EM_I_FULL_MA} mA")
                 if not ok:
                     out2["error"] = r.get("error") or "DS3502 write failed"
                     if r.get("reason"):
                         out2["reason"] = r["reason"]     # see set-v above
-                safety_touch_hv()     # adjusting a rail is HV control
                 self._json(out2)
             elif path == "/api/stm32/hv-enable":
                 # Proxy to `/stm32/hv_enable` — toggles the HV enable GPIO for
@@ -6073,12 +6387,9 @@ class CtHandler(BaseHTTPRequestHandler):
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 _hv_ch, _hv_on = str(body.get("ch", "emission")), bool(body.get("on"))
-                _hv_r = stm32_hv_enable_set(host, _hv_ch, _hv_on)
-                # Record what was commanded so the watchdog knows whether a
-                # rail is worth turning off, and renew its timer.
-                if _hv_r.get("ok", True):
-                    note_hv_commanded(_hv_ch, _hv_on)
-                self._json(_hv_r)
+                # Not watched by the dead-man timer: the rails are only ever
+                # turned off by a person (see SAFETY_HV_TIMEOUT_S).
+                self._json(stm32_hv_enable_set(host, _hv_ch, _hv_on))
             elif path == "/api/stm32/hv-set-target":
                 # Proxy to `/stm32/hv_set_target` — starts the STM32's closed
                 # HV loop for one channel: it steps the DS3502 wiper by
@@ -6408,6 +6719,8 @@ def main() -> None:
     # Daemon: it must never hold the process open, and it has no state worth
     # draining on the way out.
     threading.Thread(target=_safety_loop, name="safety_watchdog", daemon=True).start()
+    # One reader per controller for the ring and the matrix (see MONITOR_*).
+    threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
     log.info("safety watchdog: ACTIVE -> %s after %.0fs, HV off after %.0fs "
              "(commands renew; reads do not)",
              power_state_name(SAFETY_ACTIVE_FALLBACK), SAFETY_ACTIVE_TIMEOUT_S,

@@ -744,7 +744,8 @@ let lastRunActive = false;   // set by pollTelemetry from the run state
 // Adaptive cadence: while a schedule is RUNNING the firmware PUSHES cached
 // currents (~20 fps, no I2C, no request), and the backend serves them from the
 // received stream — so we poll at 50 ms (20 fps) to SEE the power sequence
-// advance smoothly. Idle uses the heavier live INA read at 1 s.
+// advance smoothly. Idle reads the backend's board monitor (the same snapshot
+// as the boards matrix, no link traffic of its own) at 1 s.
 const TELE_FAST_MS = 50, TELE_IDLE_MS = 1000;
 function startLiveTelemetry() {
   if (liveTelemetryTimer || liveTelemetryStop === 'running') return;
