@@ -3721,8 +3721,13 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
              "unslotted": unslotted, "dead_skipped": dead_skipped,
              "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons},
             dead_stopped)
-    groups: dict = {}   # (channel, arg) -> OR'd mask byte for that channel
-    members: dict = {}  # (channel, arg) -> [filament]
+    # One frame per CURRENT, covering every channel: the firmware runs a
+    # multi-channel IDLE/ACTIVE mask on all eight I2C buses concurrently
+    # (RP2350 setPowerStateBroadcast), so a frame per channel would serialise
+    # exactly what it parallelises. STOP/SLEEP/STANDBY/VOLTAGE are handled per
+    # channel inside the firmware either way; the frame shape is the same.
+    groups: dict = {}   # arg -> bytearray(8) channel masks
+    members: dict = {}  # arg -> [filament]
     for f in fils:
         _, ch, pos, _ = filament_to_board(f)
         if ch is None:            # unslotted/overflow filament (past slot 63, or a
@@ -3730,14 +3735,13 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
             continue
         v = currents.get(str(f), currents.get(f, default_arg))
         arg = int(v if v is not None else default_arg)   # tolerate an explicit null
-        groups[(ch, arg)] = groups.get((ch, arg), 0) | (1 << pos)
-        members.setdefault((ch, arg), []).append(f)
+        m = groups.setdefault(arg, bytearray(8))
+        m[ch] = (m[ch] | (1 << pos)) & 0xFF
+        members.setdefault(arg, []).append(f)
     reqs, keys = [], []
-    for (ch, arg), chmask in groups.items():
-        m = bytearray(8)
-        m[ch] = chmask & 0xFF
+    for arg, m in groups.items():
         reqs.append((CH_SET_POWER_STATE, bytes(m) + bytes([int(state) & 0xFF]) + _u16(arg), 0))
-        keys.append((ch, arg))
+        keys.append(arg)
     # Few frames (<=8, one per channel) and each is ~instant on the RP2350, so send
     # them serially via the reliable single-request path. _pipeline_reliable's
     # pipeline phase was spending ~5 s PER frame here (a 0.2 s op became 30 s) --
@@ -3752,11 +3756,10 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     applied, failed = 0, []
     landed: list[int] = []
     for key, r in zip(keys, results):
-        ch, _arg = key
         raw = r.get("raw") if isinstance(r, dict) else None
-        appl = raw[9 + ch] if (raw and len(raw) >= 9 + ch + 1) else 0
         for f in members[key]:
-            _, _fch, fpos, _ = filament_to_board(f)
+            _, fch, fpos, _ = filament_to_board(f)
+            appl = raw[9 + fch] if (raw and len(raw) >= 9 + fch + 1) else 0
             if appl & (1 << fpos):
                 applied += 1
                 landed.append(int(f))
