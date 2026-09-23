@@ -2689,8 +2689,14 @@ _AUDIT_LAST: dict = {}       # (client, path, body-json) -> [monotonic, suppress
 _AUDIT_LOCK = threading.Lock()
 
 
-def _audit_skipped(path: str, body: dict) -> bool:
-    if path in AUDIT_SKIP_PATHS:
+def is_read_post(path: str, body: dict) -> bool:
+    """A POST that only READS the hardware. Shared by the lease (reads are
+    never gated: a lease reserves the right to CHANGE the bench, not to look at
+    it) and the audit log (reads are not audited). One definition, because two
+    drifted: the lease used to refuse shv_status / pulse_log / trigger-delay
+    reads from anyone but the holder, so the GUI's SHV panel went blind for as
+    long as a script held the lease."""
+    if path in AUDIT_SKIP_PATHS and path != "/api/poll-pause":
         return True
     if path == "/api/shv":
         op = body.get("op")
@@ -2701,6 +2707,22 @@ def _audit_skipped(path: str, body: dict) -> bool:
             return True
         if op == "trigger_delay" and body.get("delay_us", body.get("delayUs")) is None:
             return True
+    if path in ("/api/cmd", "/api/power-cmd"):
+        cmd = str(body.get("command", ""))
+        if _is_read_command(cmd):
+            return True
+        # One opcode for both directions, told apart by the payload exactly as
+        # build_command_payload does: no value = GET.
+        if cmd == "CH_SLEW_RATE" and body.get("below_mV_per_s") is None:
+            return True
+        if cmd == "CH_STARTUP_OCP" and not body.get("set"):
+            return True
+    return False
+
+
+def _audit_skipped(path: str, body: dict) -> bool:
+    if is_read_post(path, body) or path == "/api/poll-pause":
+        return True
     if path == "/api/lock" and str(body.get("action", "acquire")).lower() in ("renew", "status"):
         return True
     if path == "/api/safety" and set(body) <= {"keepalive", "filaments", "client"}:
@@ -6113,16 +6135,11 @@ class CtHandler(BaseHTTPRequestHandler):
 
     def _lease_guard(self, path: str, body: dict[str, Any], client: str):
         """None when this POST may proceed, else the blocking lease snapshot.
-        Only WRITES are gated: /api/cmd and /api/power-cmd carrying a read-only
-        command pass, as does anything that never touches the link."""
-        if path in _UNGATED_POSTS:
+        Only WRITES are gated: every read (is_read_post) passes, as does
+        anything that never touches the link (_UNGATED_POSTS)."""
+        if path in _UNGATED_POSTS or is_read_post(path, body):
             return None
-        held = _lease_blocking(client)
-        if held is None:
-            return None
-        if path in ("/api/cmd", "/api/power-cmd") and _is_read_command(body.get("command", "")):
-            return None
-        return held
+        return _lease_blocking(client)
 
     def _cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
