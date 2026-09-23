@@ -3828,7 +3828,7 @@ class CTClient:
             "_peak_active": self._peak_for_lead(runs, length, lead, hold_bursts),
         }
 
-    def scan_report(self, controller: int = 1, since: int | None = None,
+    def scan_report(self, controller: int | None = None, since: int | None = None,
                     plan: dict | None = None) -> dict:
         """Assemble a post-run report from everything the hardware recorded.
 
@@ -3856,8 +3856,20 @@ class CTClient:
         ramp being sampled. `fired_cold` picks out the pulses that landed below
         their setpoint.
         """
-        st = self.shv_status(controller) or {}
-        logs = self.shv_pulse_log(controller) or []
+        # EVERY CONNECTED CONTROLLER by default. A two-controller run has two
+        # pulse logs and two statuses; reading one reported half the run and
+        # called the other half missing. controller=N still narrows it to one.
+        ctrls = ([int(controller)] if controller is not None
+                 else (self._connected_controllers() or [1]))
+        st_by = {c: (self.shv_status(c) or {}) for c in ctrls}
+        logs = []
+        for c in ctrls:
+            for rec in (self.shv_pulse_log(c) or []):
+                logs.append({**rec, "controller": c})
+        # One timeline. tOnUs is relative to each board's first trigger, and
+        # both boards take their first trigger from the same edge (~1-2 us
+        # apart via SyncOut), so the two logs interleave on it.
+        logs.sort(key=lambda r: (r.get("tOnUs") or 0, r.get("controller")))
         ev = self.pulse_events_ma(since if since is not None else 0)
         events = ev.get("events") or []
 
@@ -3874,29 +3886,51 @@ class CTClient:
         # Anything that makes the run untrustworthy, named rather than left for
         # the reader to notice in a table of counters.
         problems = []
-        done, irq = st.get("totalPulsesDone"), st.get("rbIrqs")
-        if done is not None and irq is not None and done != irq:
-            problems.append(f"totalPulsesDone {done} != rbIrqs {irq} — the host's "
-                            f"bookkeeping disagrees with what the hardware fired")
-        if st.get("unsafeSlots"):
-            u = st["unsafeSlots"]
-            slots = [i for i in range(64) if (u >> i) & 1]
-            problems.append(f"arm SKIPPED power slots {slots} as unsafe — those "
-                            f"filaments did not fire even though the run looks normal")
-        if st.get("uncounted"):
-            problems.append(f"uncounted={st['uncounted']} — pulses fired that the "
-                            f"edge counter missed"
-                            + ("" if not st.get("rbSaturated") else
-                               " (rbSaturated>0, so this is a LOWER BOUND)"))
-        if st.get("underfed"):
-            problems.append(f"underfed={st['underfed']} — triggers arrived with "
-                            f"nothing staged")
-        if st.get("off_mismatches"):
-            problems.append(f"off_mismatches={st['off_mismatches']} — THE HV DID "
-                            f"NOT TURN OFF on that many pulses")
-        if st.get("rbDropped"):
-            problems.append(f"rbDropped={st['rbDropped']} — read-back ring "
-                            f"overran, verification data was lost")
+        for c, st in st_by.items():
+            tag = f"controller {c}: " if len(st_by) > 1 else ""
+            done, irq = st.get("totalPulsesDone"), st.get("rbIrqs")
+            if done is not None and irq is not None and done != irq:
+                problems.append(tag + f"totalPulsesDone {done} != rbIrqs {irq} — the host's "
+                                f"bookkeeping disagrees with what the hardware fired")
+            if st.get("unsafeSlots"):
+                u = st["unsafeSlots"]
+                slots = [i for i in range(64) if (u >> i) & 1]
+                problems.append(tag + f"arm SKIPPED power slots {slots} as unsafe — those "
+                                f"filaments did not fire even though the run looks normal")
+            if st.get("uncounted"):
+                problems.append(tag + f"uncounted={st['uncounted']} — pulses fired that the "
+                                f"edge counter missed"
+                                + ("" if not st.get("rbSaturated") else
+                                   " (rbSaturated>0, so this is a LOWER BOUND)"))
+            if st.get("underfed"):
+                problems.append(tag + f"underfed={st['underfed']} — triggers arrived with "
+                                f"nothing staged")
+            if st.get("off_mismatches"):
+                problems.append(tag + f"off_mismatches={st['off_mismatches']} — THE HV DID "
+                                f"NOT TURN OFF on that many pulses")
+            if st.get("rbDropped"):
+                problems.append(tag + f"rbDropped={st['rbDropped']} — read-back ring "
+                                f"overran, verification data was lost")
+
+        # THE CROSS-CHECK ONLY TWO BOARDS CAN MAKE. Both count every trigger
+        # (another controller's entry still advances the index), so their edge
+        # counts must agree. A difference means one board missed or gained a
+        # trigger -- e.g. one arrived while only one of them was armed -- and
+        # from that point the master's envelopes frame the WRONG pulse on the
+        # other board. Every measurement after it is suspect, and it would
+        # otherwise look like a dead MOSFET.
+        if len(st_by) > 1:
+            edges = {c: v.get("triggerEdges") for c, v in st_by.items()}
+            if None not in edges.values() and len(set(edges.values())) > 1:
+                problems.append(
+                    f"the controllers counted different numbers of triggers "
+                    f"{edges} — they are out of step, so the master's envelope "
+                    f"does not line up with the other board's pulses after the "
+                    f"divergence")
+        # Rebuilt here, not reused: the loop above rebinds `st` per board, so
+        # after it `st` is just the LAST board's status.
+        st = (st_by[ctrls[0]] if len(st_by) == 1
+              else {str(c): v for c, v in st_by.items()})
         stuck = sorted({r["filament"] for r in logs if r.get("hv_stuck_on")})
         if stuck:
             problems.append(f"HV did not turn off on filament(s) {stuck}")
