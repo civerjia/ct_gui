@@ -2000,7 +2000,7 @@ class CTClient:
             return self._reindex_response(
                 self._post("/api/filament-prep", body, timeout=20.0),
                 keys=("applied", "failed", "excluded", "touched",
-                      "not_this_controller", "unslotted"))
+                      "not_this_controller", "unslotted", "dead_stopped"))
         requested = [int(f) for f in filaments] if filaments is not None else list(range(96))
         dead = self.dead   # bound once — property, see _live()
         dead_skipped = [f for f in requested if f in dead]
@@ -2055,6 +2055,12 @@ class CTClient:
 
         Outcome under r["readback"]; the stragglers in r["not_reached"]."""
         commanded = self._commanded_filaments(r)
+        # Dead filaments in a SLEEP batch were sent STOP instead (the backend's
+        # DEAD_SLEEP_IS_STOP), so they are held to STOP's test, not SLEEP's.
+        as_stop = sorted({int(f) for row in (r.get("results") or {}).values()
+                          if isinstance(row, dict)
+                          for f in (row.get("dead_stopped") or [])}) if state == SLEEP else []
+        commanded = sorted(set(commanded) | set(as_stop))
         if not commanded:
             return r
         name = {STOP: "STOP", SLEEP: "SLEEP", STANDBY: "STANDBY"}[state]
@@ -2077,7 +2083,7 @@ class CTClient:
                 v = last.get(f)
                 if v is None:
                     continue
-                if state == STOP:
+                if state == STOP or f in as_stop:
                     done = (v.get("en") is False) and v.get("oe") is not True
                 elif state == SLEEP:
                     done = v.get("oe") is False
@@ -2086,6 +2092,8 @@ class CTClient:
                             and modes.get(f) == 0)
                 if done:
                     results[f] = {"ok": True, "en": v.get("en"), "oe": v.get("oe")}
+                    if f in as_stop:
+                        results[f]["dead_stopped"] = True
                     if state == STANDBY:
                         results[f]["cc_mode"] = modes.get(f)
                     pending.discard(f)
@@ -2096,7 +2104,7 @@ class CTClient:
             v = last.get(f)
             if v is None:
                 why = "its board was not read by the bulk TPS status"
-            elif state == STOP:
+            elif state == STOP or f in as_stop:
                 why = f"EN pin still {'on' if v.get('en') else '?'}" + \
                       (", output enable ON" if v.get("oe") else "")
             elif v.get("oe") is None:
@@ -2142,9 +2150,15 @@ class CTClient:
     def sleep_all(self, filaments=None,
                   verify: bool = False,     # confirm every output is off
                   timeout_s: float = 5.0) -> dict:  # only used if verify=True
-        """SLEEP a BATCH of filaments. Dead filaments are INCLUDED: SLEEP removes
-        heating power, and the dead mask only ever blocks energising.
-        For exactly one filament, use sleep_one().
+        """SLEEP a BATCH of filaments. For exactly one filament, use sleep_one().
+
+        DEAD FILAMENTS ARE STOPPED, NOT SLEPT. SLEEP is not heating, but it
+        turns the board's isolated 12 V rail and TPS EN pin on -- it powers the
+        board. A dead filament is one that must not be used, so the backend
+        sends it STOP instead (lower, and fully off -- skipping it would leave
+        a dead filament at whatever it was, ACTIVE included) and names it in
+        the per-controller `dead_stopped`. verify=True holds those to STOP's
+        test (EN off).
 
         verify=True: as stop_all's, but SLEEP keeps the EN pin on -- it is
         "output enable off" -- so what is read back is the TPS output enable.
@@ -2859,8 +2873,9 @@ class CTClient:
                  verify: bool = False,      # confirm current drops to ~0 mA
                                              # afterward (real feedback, see docstring)
                  timeout_s: float = 5.0) -> dict:  # only used if verify=True
-        """SLEEP a single filament. Returns {"ok": False, "dead": True, ...}
-        if the filament is dead — does not raise.
+        """SLEEP a single filament. A dead filament is STOPped instead (SLEEP
+        would power its rail -- see sleep_all); the result then carries
+        "dead_stopped": True and the state actually sent. Does not raise.
 
         verify=True: same real-current feedback as stop_one(verify=True).
         """

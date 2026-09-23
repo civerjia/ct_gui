@@ -3614,6 +3614,20 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         if dead_skipped:
             log.warning("prep_filaments: refused to energise dead filaments %s "
                         "(state=%d, controller=%d)", dead_skipped, state, controller)
+    # DEAD_SLEEP_IS_STOP. SLEEP is not heating, but it is not off either: it
+    # turns the board's isolated 12 V rail and the TPS EN pin ON. So it is not
+    # in ENERGISING_STATES and a dead filament used to pass -- sleep_all(), and
+    # the dead-man watchdog's ACTIVE->SLEEP fallback, powered the rail of every
+    # filament the operator had marked "do not use". Skipping it is no better:
+    # a dead filament left at ACTIVE would stay there. STOP is the one state
+    # that is both lower and fully off, so a dead filament asked for SLEEP gets
+    # STOP, and is named in dead_stopped.
+    dead_stopped: dict = {}
+    if int(state) == POWER_STATE_SLEEP:
+        fils, dead_sleep = split_dead(fils)
+        if dead_sleep:
+            dead_stopped = prep_filaments(link, controller, int(POWER_STATE_STOP),
+                                          dead_sleep, channels=channels)
     # ACTIVE only from IDLE — see the ladder guard. Filtered, not rejected, so a
     # batch ladder that legitimately walks most boards up is not blocked by one
     # straggler; the blocked ones are NAMED so it cannot pass silently.
@@ -3701,10 +3715,12 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     if not fils:
         # ok only if nothing was refused: every filament blocked by a guard is
         # a request that did NOT happen, not an empty success.
-        return {"controller": controller, "ok": not ladder_blocked, "applied": 0, "failed": [],
-                "state": int(state), "touched": [], "not_this_controller": not_this_controller,
-                "unslotted": unslotted, "dead_skipped": dead_skipped,
-                "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons}
+        return _with_dead_stopped(
+            {"controller": controller, "ok": not ladder_blocked, "applied": 0, "failed": [],
+             "state": int(state), "touched": [], "not_this_controller": not_this_controller,
+             "unslotted": unslotted, "dead_skipped": dead_skipped,
+             "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons},
+            dead_stopped)
     groups: dict = {}   # (channel, arg) -> OR'd mask byte for that channel
     members: dict = {}  # (channel, arg) -> [filament]
     for f in fils:
@@ -3755,12 +3771,27 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # idle_all(default_ma=2500) refused every filament at the 2000 mA ceiling
     # and came back ok:true, applied 0 -- a request that did nothing, reported
     # as done.
-    return {"controller": controller,
-            "ok": not failed and not unslotted and not ladder_blocked, "applied": applied,
-            "total": len(fils), "failed": failed, "state": int(state),
-            "touched": fils, "not_this_controller": not_this_controller,
-            "unslotted": unslotted, "dead_skipped": dead_skipped,
-            "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons}
+    return _with_dead_stopped(
+        {"controller": controller,
+         "ok": not failed and not unslotted and not ladder_blocked, "applied": applied,
+         "total": len(fils), "failed": failed, "state": int(state),
+         "touched": fils, "not_this_controller": not_this_controller,
+         "unslotted": unslotted, "dead_skipped": dead_skipped,
+         "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons},
+        dead_stopped)
+
+
+def _with_dead_stopped(out: dict, stopped: dict) -> dict:
+    """Fold the STOP sent to dead filaments (see DEAD_SLEEP_IS_STOP) into a
+    SLEEP batch's result: they are listed apart in dead_stopped, and a STOP
+    that did not land fails the batch like any other failure."""
+    if not stopped:
+        return out
+    out["dead_stopped"] = list(stopped.get("touched") or [])
+    out["failed"] = list(out.get("failed") or []) + list(stopped.get("failed") or [])
+    out["applied"] = int(out.get("applied") or 0) + int(stopped.get("applied") or 0)
+    out["ok"] = bool(out.get("ok")) and bool(stopped.get("ok"))
+    return out
 
 
 def hv_grid_set(link: "ControllerLink", controller: int, filaments,
@@ -5160,6 +5191,10 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "dead": True, "filament": filament,
                                        "error": f"filament {filament} is marked dead", "marked": why},
                                       HTTPStatus.OK)
+                # SLEEP on a dead filament becomes STOP -- see DEAD_SLEEP_IS_STOP.
+                dead_stopped = state == POWER_STATE_SLEEP and filament in dead_fids()
+                if dead_stopped:
+                    state, arg = int(POWER_STATE_STOP), 0
                 # ACTIVE only from IDLE — see the ladder guard. Refused, not
                 # filtered: a single-filament call has nothing to fall back to.
                 if state == POWER_STATE_ACTIVE and arg < ACTIVE_FLOOR_MA:
@@ -5239,9 +5274,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 applied = bool(raw and len(raw) >= 4 and raw[3] == 1)
                 if applied:
                     note_power_state([filament], state)
-                self._json({"ok": _status_ok(resp) and applied, "filament": filament,
-                            "controller": cid, "channel": ch, "mux_port": pos,
-                            "state": state, "arg": arg})
+                out = {"ok": _status_ok(resp) and applied, "filament": filament,
+                       "controller": cid, "channel": ch, "mux_port": pos,
+                       "state": state, "arg": arg}
+                if dead_stopped:
+                    out["dead_stopped"] = True
+                    out["note"] = (f"filament {filament} is marked dead: STOPped "
+                                   f"instead of SLEEP, which would power its rail")
+                self._json(out)
             elif path == "/api/filament-prep":
                 # CT-scan prep ladder — apply one PowerState to a batch of
                 # filaments across BOTH connected controllers. Refused while a
@@ -5295,7 +5335,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 # bug being fixed here -- a caller could request N filaments, have
                 # fewer than N actually attempted, and still see ok:true with no
                 # indication anything was skipped.
-                touched = {int(f) for r in results.values() for f in (r.get("touched") or [])}
+                touched = {int(f) for r in results.values()
+                           for f in (r.get("touched") or []) + (r.get("dead_stopped") or [])}
                 excluded = ([int(f) for f in filaments if int(f) not in touched]
                             if filaments is not None else [])
                 blocked = sorted(int(f) for r in results.values()

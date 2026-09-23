@@ -1135,6 +1135,13 @@ STOP: isolated rail and EN pin on, **TPS output enable off** — biased, no
 heating current. The state to use for a cold filament that must stay
 armable (a STOPped filament's rail is off, so ShvArm skips it).
 
+**A dead filament is STOPped, not slept.** SLEEP powers the board (rail and EN
+on), and a dead filament is one that must not be used. The backend sends it
+STOP instead — lower and fully off; skipping it would leave a dead filament at
+whatever it was, ACTIVE included — and lists it per controller in
+`dead_stopped`. The same applies to `sleep_one`, and to the dead-man
+watchdog's ACTIVE → SLEEP fallback.
+
 ```python
 ct.sleep_all(verify=True)
 ```
