@@ -947,6 +947,27 @@ print(r["heating"])   # {"ok": True, "measured_ma": 0.0, "elapsed_s": 0.2, ...}
 — Idle exactly one filament at `current_ma` mA (warm pool, ready to promote
 to ACTIVE quickly).
 
+> ⚠️ **IDLE has a 2000 mA ceiling, and it is not enforced the way the ACTIVE
+> floor is.** The two bounds live in different places and used to behave
+> differently:
+>
+> | bound | value | defined in | over/under |
+> |---|---|---|---|
+> | ACTIVE floor | 1500 mA | `backend.py` `ACTIVE_FLOOR_MA` | **refused**, with the reason |
+> | IDLE ceiling | 2000 mA | RP2350 `kIdleMaxMilliamps` | **silently clamped** by the firmware |
+>
+> A silent clamp means `idle_one(f, 2500)` returned `ok`, ran at 2000 mA, and
+> left `verify=True` waiting for a current that was never going to arrive —
+> with nothing at any layer saying it had been clamped. The ceiling is now
+> mirrored host-side (`_IDLE_CEILING_MA`, `IDLE_CEILING_MA`) and **refused**
+> instead, at all three entry points: the single-filament call, the batch prep
+> (per filament, so a `currents` override is checked too, not just the batch
+> default), and schedule validation.
+>
+> The two numbers are **not** a dividing line: 1500 is also the firmware's
+> `kIdleCurrentMaDefault`, so 1500–2000 mA is legal for IDLE and for ACTIVE
+> both. Need more than 2000 mA? That is what ACTIVE is for.
+
 ```python
 ct.idle_one(5, current_ma=1500)
 

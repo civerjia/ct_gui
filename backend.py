@@ -205,6 +205,16 @@ POWER_STATE_ACTIVE = 5
 POWER_STATE_VOLTAGE = 6
 ENERGISING_STATES = frozenset({3, 4, 5, 6})   # STANDBY, IDLE, ACTIVE, VOLTAGE
 ACTIVE_FLOOR_MA = 1500
+# The RP2350's own IDLE ceiling (tps55289_board_constants.h kIdleMaxMilliamps).
+# Mirrored here to REFUSE, because the firmware CLAMPS: setPowerState() does
+#     if (state == Idle && targetMa > kIdleMaxMilliamps) targetMa = kIdleMax...
+# silently, so an IDLE 2500 mA request comes back ok, runs at 2000, and a
+# verify=True wait for 2500 never arrives with nothing anywhere saying why.
+# A refusal names the limit; a clamp hides it behind a legal-looking value.
+#
+# Note the two bounds are NOT a dividing line: 1500 is also the firmware's
+# kIdleCurrentMaDefault, so 1500-2000 mA is legal for IDLE and for ACTIVE both.
+IDLE_CEILING_MA = 2000
 POWER_STATE_NAMES = {1: "STOP", 2: "SLEEP", 3: "STANDBY", 4: "IDLE",
                      5: "ACTIVE", 6: "VOLTAGE"}
 UART_STATUS_NAMES = {0: "Ok", 1: "BadFrame", 2: "BadArgument", 3: "Busy",
@@ -1813,6 +1823,11 @@ def check_heating_plan(heating) -> list[str]:
         if st == POWER_STATE_ACTIVE and arg < ACTIVE_FLOOR_MA:
             problems.append(f"heating[{n}] (filament {fil}): ACTIVE {arg} mA is "
                             f"below the {ACTIVE_FLOOR_MA} mA floor")
+        if st == POWER_STATE_IDLE and arg > IDLE_CEILING_MA:
+            problems.append(f"heating[{n}] (filament {fil}): IDLE {arg} mA is above "
+                            f"the {IDLE_CEILING_MA} mA ceiling — the RP2350 clamps "
+                            f"it silently, so the schedule would run at "
+                            f"{IDLE_CEILING_MA} mA and nothing would say so")
     return problems
 
 
@@ -2982,6 +2997,27 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
                         ACTIVE_FLOOR_MA, under)
             ladder_blocked.extend(under)
             fils = [f for f in fils if int(f) not in set(under)]
+    # IDLE ceiling, the mirror of the floor above and filtered the same way.
+    # Refused rather than passed through because the RP2350 CLAMPS this one
+    # silently (kIdleMaxMilliamps): the batch would report these filaments as
+    # applied, they would run at IDLE_CEILING_MA, and any wait for the current
+    # that was asked for would never finish with nothing saying why. Per
+    # filament, since `currents` can carry an override that the batch default
+    # does not show.
+    if int(state) == POWER_STATE_IDLE:
+        over = []
+        for f in fils:
+            ma = int(currents.get(f, currents.get(str(f), default_arg)) or 0)
+            if ma > IDLE_CEILING_MA:
+                over.append(int(f))
+                ladder_reasons[str(int(f))] = (
+                    f"IDLE {ma} mA is above the {IDLE_CEILING_MA} mA ceiling — "
+                    f"the RP2350 would clamp it silently and report success")
+        if over:
+            log.warning("prep_filaments: refused IDLE above %d mA for %s",
+                        IDLE_CEILING_MA, over)
+            ladder_blocked.extend(over)
+            fils = [f for f in fils if int(f) not in set(over)]
     if int(state) == POWER_STATE_ACTIVE:
         # ONE paged bulk 0x3A for every board, not a per-filament loop -- see
         # read_cached_telemetry's docstring.
@@ -4352,6 +4388,22 @@ class CtHandler(BaseHTTPRequestHandler):
                                        f"{ACTIVE_FLOOR_MA} mA floor (the idle "
                                        f"operating current) — promoting to ACTIVE "
                                        f"must not lower the current"},
+                                      HTTPStatus.OK)
+                # The mirror of the floor above, and the reason it is a refusal
+                # rather than a clamp: the firmware already clamps this one
+                # SILENTLY, so passing it through returns ok for a current that
+                # will never be reached.
+                if state == POWER_STATE_IDLE and arg > IDLE_CEILING_MA:
+                    return self._json({"ok": False, "above_idle_ceiling": True,
+                                       "filament": filament,
+                                       "idle_ceiling_mA": IDLE_CEILING_MA, "error":
+                                       f"IDLE {arg} mA is above the "
+                                       f"{IDLE_CEILING_MA} mA ceiling — the RP2350 "
+                                       f"would silently clamp it to "
+                                       f"{IDLE_CEILING_MA} and report success, so a "
+                                       f"wait for {arg} mA would never finish. Ask "
+                                       f"for {IDLE_CEILING_MA} or less, or use "
+                                       f"ACTIVE if you need more"},
                                       HTTPStatus.OK)
                 if state == POWER_STATE_ACTIVE:
                     # One cheap single-board 0x3A (the CC cache, no I2C) so the

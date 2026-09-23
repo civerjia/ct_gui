@@ -1430,7 +1430,30 @@ class CTClient:
     # disconnected controller, or a board that simply didn't ACK all come
     # back as {"ok": False, "error": "...", ...} — check "ok" yourself.
 
+    def _idle_ceiling_refusal(self, filament, arg: int) -> dict | None:
+        """The refusal an over-ceiling IDLE gets, or None if it is in range.
+
+        Local so a script gets the same answer whether or not the backend is
+        reachable, and so the number that is wrong is named rather than
+        silently replaced -- which is exactly what the firmware does to it.
+        """
+        if int(arg) <= self._IDLE_CEILING_MA:
+            return None
+        return {"ok": False, "above_idle_ceiling": True,
+                "filament": filament,
+                "idle_ceiling_mA": self._IDLE_CEILING_MA,
+                "error": f"IDLE {int(arg)} mA is above the "
+                         f"{self._IDLE_CEILING_MA} mA ceiling — the RP2350 "
+                         f"would clamp it to {self._IDLE_CEILING_MA} and report "
+                         f"success, so a verify would wait for a current that "
+                         f"never arrives. Ask for {self._IDLE_CEILING_MA} or "
+                         f"less, or use active_one() if you need more"}
+
     def _state_one(self, filament: int, state: int, arg: int, op: str) -> dict:
+        if state == IDLE:
+            refusal = self._idle_ceiling_refusal(int(filament), int(arg))
+            if refusal:
+                return refusal
         # Block energising, never de-energising: STOP/SLEEP on a dead filament
         # must go through, or marking one dead would leave it with no way to be
         # turned off -- the opposite of the point. Same rule as the backend's.
@@ -5501,6 +5524,18 @@ class CTClient:
     # so a sweep whose whole range is under the floor says so before it heats
     # anything, rather than failing on the first point.
     _ACTIVE_FLOOR_MA = 1500
+
+    # The IDLE ceiling, and the reason it needs mirroring MORE than the floor
+    # does. The two bounds live in different places and behave differently:
+    # the backend REFUSES an ACTIVE below the floor, but the RP2350 firmware
+    # CLAMPS an over-ceiling IDLE silently (tps55289_board_constants.h
+    # kIdleMaxMilliamps), so idle_one(f, 2500) used to come back ok, run at
+    # 2000, and leave verify=True waiting for a current that was never going
+    # to arrive -- with nothing at any layer saying it had been clamped.
+    #
+    # Not a dividing line: 1500 is also the firmware's kIdleCurrentMaDefault,
+    # so 1500-2000 mA is legal for IDLE and for ACTIVE both.
+    _IDLE_CEILING_MA = 2000
 
     #: end_state values emission_vs_heating() will leave a filament in. ACTIVE
     #: is deliberately absent: the whole point of an end state is that the
