@@ -34,3 +34,27 @@ is the per-board polling that starves the shared link.
   checks the value in bulk, and every cached read — `idle_all`'s verify
   included — can carry voltage and resistance. Preferred, but a firmware
   change on both RP2350s.
+
+## GUI debug page: warn before powering a dead filament (2026-09-23)
+
+**Decided:** the GUI's Power debug page may operate a dead filament — it is a
+debug tool, and a repaired board has to be exercised before it is unmarked —
+but it must **warn** first.
+
+**What is wrong now.** The debug page sends `CH_SET_POWER_STATE` straight
+through `/api/cmd` (`static/power.js` — the single-board setter around line
+712 and the board-mask batch around 733). That path bypasses
+`prep_filaments` and `/api/filament-state`, so none of the dead rules apply:
+not the refusal of energising states, and not the SLEEP → STOP substitution
+(`7b846a5`). Nothing tells the operator the board is marked dead.
+
+**To do.**
+
+- Before sending any state that powers the board (SLEEP and above) to a
+  filament in the dead mask, show a confirmation naming the filament and the
+  reason it was marked dead (`GET /api/dead-fids` carries it). For the
+  board-mask batch, list every dead filament in the mask.
+- STOP needs no warning — turning a dead filament off is always fine.
+- Keep `/api/cmd` itself permissive: the debug path is meant to bypass the
+  guards. The warning belongs in the GUI, where a person is present to answer
+  it; scripts use `prep_filaments`, which enforces.
