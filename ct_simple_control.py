@@ -5564,6 +5564,10 @@ class CTClient:
         if not r.get("ok"):
             return r
         ref_mv = self.get_ads1115_ref_mv()
+        # One rail read for the whole batch, like the reference above. None if
+        # it could not be read -- the events then carry no emission_ma at all,
+        # rather than an uncorrected number wearing the right name.
+        diode_ma = self.diode_path_ma().get("ma")
         # Resolve the fallback ONCE here and always pass a real number to
         # pulse_ma() below — passing None would make IT fetch its own live
         # reading per event, defeating the one-shared-reading point of
@@ -5599,6 +5603,15 @@ class CTClient:
                     e[f"{key}_net_ma"] = round(
                         self.pulse_ma(e[key], resolved_ref_mv)
                         - self.pulse_ma(bg_raw, resolved_ref_mv), 3)
+            # ...and the emission proper. plateau_net_ma is still not it: the
+            # same MOSFET that gates the emission puts the sub-board's two
+            # diodes and 100 kOhm across the rail for the duration of the
+            # pulse, so every shot carries (|V| - 2.82)/100k on top -- ~1 mA at
+            # 100 V, ~2 mA at 200 V, which is the WHOLE signal at the cold end
+            # of a curve. Computed from the rail, see diode_path_ma().
+            if diode_ma is not None and e.get("plateau_net_ma") is not None:
+                e["diode_ma"] = diode_ma
+                e["emission_ma"] = round(e["plateau_net_ma"] - diode_ma, 3)
                 # else: NO field at all. A net current with no background to
                 # subtract is not a measurement, and 0.0 would read as one.
             self._add_charge(e, resolved_ref_mv, r.get("integral_signed"),
@@ -5686,7 +5699,11 @@ class CTClient:
         net = e.get("plateau_net_ma")
         if net is not None:
             out.append(f"    {'plateau − bg':<{W}}{'':>9}  {net:>9.3f} mA"
-                       f"   <- the pulse's own current")
+                       f"   grid diode path still included")
+        if e.get("emission_ma") is not None:
+            out.append(f"    {'  − diode':<{W}}{'':>9}  "
+                       f"{e['emission_ma']:>9.3f} mA   <- emission "
+                       f"(diode path {e.get('diode_ma')} mA removed)")
         else:
             out.append(f"    {'plateau − bg':<{W}}{'':>9}  {'—':>12}"
                        f"   no background to subtract")
@@ -5872,7 +5889,11 @@ class CTClient:
         controller: int | None = None,
         progress=None,                     # callable(point_dict) after each point
         save_as: str | None = None,        # write the curve to the backend's disk
-        pedestal_ma: float | None = None,  # None = measure it; 0.0 = don't subtract
+        pedestal_ma=None,                  # None = compute from the rail (the
+                                            # grid's own diode path);
+                                            # "measure" = fire and measure it;
+                                            # a float = use that; 0.0 = subtract
+                                            # nothing
     ) -> dict:
         """PRECISE MEASUREMENT of one filament's emission against its heating current.
 
@@ -6019,20 +6040,20 @@ class CTClient:
         # not emission (~2 mA at -200 V on this bench). Measured by default,
         # because leaving it in is a 20-130% error on the numbers this function
         # exists to produce, and it hides under a curve that still looks clean.
-        ped = None
+        pedestal_ma, ped = self._resolve_pedestal(pedestal_ma, fil, idle_ma,
+                                                  controller)
         if pedestal_ma is None:
-            ped = self.measure_emission_pedestal(fil, heat_ma=idle_ma,
-                                                 controller=controller)
-            pedestal_ma = ped.get("pedestal_ma")
-            if pedestal_ma is None:
-                return {"ok": False, "filament": fil, "points": [],
-                        "end_state": end_state, "active_s": 0.0, "ref_mv": None,
-                        "pedestal": ped, "problems": [
-                            "could not measure the emission pedestal: "
-                            + "; ".join(ped.get("warnings") or ["unknown"])
-                            + ". Pass pedestal_ma=0.0 to sweep without the "
-                              "correction, knowing the numbers include it"]}
-            problems.extend(ped.get("warnings") or [])
+            return {"ok": False, "filament": fil, "points": [],
+                    "end_state": end_state, "active_s": 0.0, "ref_mv": None,
+                    "pedestal": ped, "problems": [
+                        f"could not determine what to subtract "
+                        f"({ped.get('source')}): "
+                        + (ped.get("error") or
+                           "; ".join(ped.get("warnings") or ["unknown"]))
+                        + ". Pass pedestal_ma=0.0 to sweep without the "
+                          "correction, knowing every point is then high by the "
+                          "grid's own diode current"]}
+        problems.extend(ped.get("warnings") or [])
 
         points: list[dict] = []
         ref_mv = None
@@ -6168,7 +6189,7 @@ class CTClient:
         width_us: int = 1000,
         idle_ma: int = 1400,
         end_state: str = "stop",
-        pedestal_ma: float | None = None,
+        pedestal_ma=None,                  # see emission_vs_heating()
         bg_gap_us: float | None = None,
         bg_window_us: float | None = None,
         controller: int | None = None,
@@ -6259,17 +6280,16 @@ class CTClient:
                 "the emission rail is OFF — every pulse would measure "
                 "background only"]}
 
-        ped = None
+        pedestal_ma, ped = self._resolve_pedestal(pedestal_ma, fil, idle_ma,
+                                                  controller)
         if pedestal_ma is None:
-            ped = self.measure_emission_pedestal(fil, heat_ma=idle_ma,
-                                                 controller=controller)
-            pedestal_ma = ped.get("pedestal_ma")
-            if pedestal_ma is None:
-                return {"ok": False, "filament": fil, "points": [],
-                        "pedestal": ped, "problems": [
-                            "could not measure the emission pedestal: "
-                            + "; ".join(ped.get("warnings") or ["unknown"])]}
-            problems.extend(ped.get("warnings") or [])
+            return {"ok": False, "filament": fil, "points": [],
+                    "pedestal": ped, "problems": [
+                        f"could not determine what to subtract "
+                        f"({ped.get('source')}): "
+                        + (ped.get("error") or
+                           "; ".join(ped.get("warnings") or ["unknown"]))]}
+        problems.extend(ped.get("warnings") or [])
 
         ramp = {"from_ma": int(from_ma), "to_ma": int(to_ma),
                 "commanded_at_s": None,
@@ -6636,6 +6656,76 @@ class CTClient:
     #
     # The DC background is a separate, deliberate part of the design and is not
     # this: it cancels out of `net` on its own.
+
+    def _resolve_pedestal(self, pedestal_ma, fil: int, idle_ma: int,
+                          controller) -> tuple[float | None, dict]:
+        """Decide what to subtract from every pulse, and say where it came from.
+
+            None        compute it from the live rail (the default, and free)
+            "measure"   fire at a cold filament and measure it, the old way
+            a float     use this, no questions
+
+        Returns (value, info). `value` None means it could not be resolved --
+        the caller refuses rather than subtracting 0, because subtracting 0 is
+        indistinguishable from a correct subtraction in the output and leaves
+        every point ~1-2 mA high.
+        """
+        if isinstance(pedestal_ma, (int, float)):
+            return float(pedestal_ma), {"source": "given",
+                                        "pedestal_ma": float(pedestal_ma)}
+        if pedestal_ma == "measure":
+            ped = self.measure_emission_pedestal(fil, heat_ma=idle_ma,
+                                                 controller=controller)
+            return ped.get("pedestal_ma"), {"source": "measured", **dict(ped)}
+        d = self.diode_path_ma()
+        return d.get("ma"), {"source": "diode_formula", **dict(d)}
+
+    def diode_path_ma(self, emission_v: float | None = None,
+                      r_ohm: float | None = None, vf_v=None) -> dict:
+        """The current the HV grid's own diode path passes at this rail voltage.
+
+        Every fired pulse carries this on top of the emission, because the same
+        MOSFET that gates the emission also puts the sub-board's two diodes and
+        its 100 kOhm resistor across the rail for the duration of the pulse:
+
+            I = (|V| - Vf1 - Vf2) / R      0.972 mA at 100 V
+
+        It is NOT emission and has to come off before a pulse current means
+        anything. It was originally measured per run (see
+        measure_emission_pedestal), which cost four extra firings and a minute;
+        it is a deterministic function of the rail, so it is computed now and
+        the measurement kept as the cross-check. The two agreed to within 3% at
+        50, 100, 150 and 200 V on this bench.
+
+        `emission_v` None reads the rail live -- the voltage ACTUALLY there,
+        not the one that was commanded, because a rail sitting low would
+        under-subtract by exactly its error.
+
+        Returns {"ok", "ma", "emission_v", "r_ohm", "vf_total_v", "error"}.
+        `ma` is None when the rail could not be read or is below the diode
+        drop -- never 0.0, which would silently mean "nothing to subtract".
+        """
+        v = emission_v
+        if v is None:
+            v = self.read_emission_v()
+        vf = sum(vf_v if vf_v is not None else self._MOSFET_VF_V)
+        r = float(r_ohm or self._MOSFET_R_OHM)
+        out = {"ok": False, "ma": None, "emission_v": v,
+               "r_ohm": r, "vf_total_v": vf, "error": None}
+        if v is None:
+            out["error"] = ("could not read the emission rail, so the diode "
+                            "current cannot be computed — a pulse current "
+                            "reported without it is high by up to ~2 mA")
+            return out
+        if abs(v) <= vf:
+            out["error"] = (f"rail {v} V is at or below the {vf} V of diode "
+                            f"drop, so no current flows through this path")
+            out["ma"] = 0.0          # a real zero here, not a missing value
+            out["ok"] = True
+            return out
+        out["ma"] = round((abs(float(v)) - vf) / r * 1000.0, 4)
+        out["ok"] = True
+        return out
 
     def measure_emission_pedestal(self, filament: int,
                                   heat_ma: int = 1400,      # too cool to emit

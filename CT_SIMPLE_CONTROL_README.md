@@ -3269,7 +3269,46 @@ instant before the trigger. The only place a caller can start something that
 must be *concurrent* with the firing. An exception from it disarms and fires
 nothing.
 
-### The pedestal — subtract it before believing any emission number
+### The grid's own diode current — subtract it, by formula
+
+A fired pulse's net current is **not** emission. The same MOSFET that gates the
+emission also puts the sub-board's two diodes and its 100 kΩ resistor across the
+rail for the duration of the pulse, so every shot carries
+
+```
+I_diode = (|V| − Vf₁ − Vf₂) / R = (|V| − 2.82) / 100 kΩ
+        = 0.972 mA at 100 V,  1.982 mA at 200 V
+```
+
+on top of whatever the filament emitted. At the cold end of a curve that is the
+*entire* signal: between 1500 and 2100 mA of heating, net sat at 2.0 mA while
+the filament crossed several hundred K.
+
+**`diode_path_ma(emission_v=None, ...)`** computes it. `emission_v=None` reads
+the rail **live** — the voltage actually there, not the one commanded, since a
+rail sitting low would under-subtract by exactly its error. `ma` is `None` when
+the rail cannot be read, never `0.0`, which would silently mean "nothing to
+subtract".
+
+It is applied automatically:
+
+- **`pulse_events_ma()`** gives every event `diode_ma` and `emission_ma`
+  (= `plateau_net_ma − diode_ma`), and `print_pulse_events()` shows the
+  subtraction as its own line.
+- **`emission_vs_heating()` / `emission_ramp()`** default `pedestal_ma=None` to
+  this formula. `"measure"` fires at a cold filament and measures it instead (a
+  minute and four extra firings), a float overrides, `0.0` subtracts nothing.
+  `pedestal["source"]` records which was used.
+
+> **The formula and the measurement agree.** Measured 0.488 / 1.004 / 1.533 /
+> 1.979 mA at 50 / 100 / 150 / 200 V against 0.472 / 0.972 / 1.472 / 1.972
+> computed — mean ratio 1.028. Replaying a real −201 V sweep, the formula gives
+> 1.982 mA where the measurement that day gave 2.035: a **constant 0.053 mA
+> offset**, 0.6% at the hot end of the curve and visible only at the cold end.
+> The formula is the default because it is free, deterministic, and cannot be
+> contaminated by a filament that was already emitting when it was measured.
+
+### The measured pedestal — the cross-check
 
 **`measure_emission_pedestal(filament, heat_ma=1400, widths_us=(1000, 10000), ...)`**
 — A fired pulse's net current is not all emission: heating-supply noise
