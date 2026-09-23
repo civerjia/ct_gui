@@ -1113,21 +1113,45 @@ All batch methods accept `filaments=None` (every populated board minus the
 dead mask) or an explicit list of 0–95 filament indices — dead ones are
 always silently removed.
 
-**`stop_all(filaments=None)`** — Fully de-energize a batch: HV off, heating
-off. The safe resting state; always call this when you're done.
+**`stop_all(filaments=None, verify=False, timeout_s=5)`** — Fully de-energise
+a batch's **heating**: TPS output off, EN pin off, isolated 12 V rail off. The
+safe resting state; always call this when you're done. It does not touch the
+emission/focus HV rails — those are `enable_emission(False)` /
+`enable_focus(False)`, or `session()`, which does both. Dead filaments are
+included: the dead mask only ever blocks energising.
 
 ```python
 ct.stop_all()                    # every populated filament
 ct.stop_all(filaments=[5, 6, 7]) # just these three
+r = ct.stop_all(verify=True)     # ...and read back that they are off
+if r.get("not_reached"):
+    print("still on:", r["not_reached"], r["off"])
 ```
 
-**`sleep_all(filaments=None)`** — Low-power resting state for a batch, one
-step above STOP. Rarely used directly; mostly a transitional state in the
-ladder.
+**`sleep_all(filaments=None, verify=False, timeout_s=5)`** — One step above
+STOP: isolated rail and EN pin on, **TPS output enable off** — biased, no
+heating current. The state to use for a cold filament that must stay
+armable (a STOPped filament's rail is off, so ShvArm skips it).
 
 ```python
-ct.sleep_all()
+ct.sleep_all(verify=True)
 ```
+
+**`verify=True`** on either reads back, for every filament that was actually
+commanded, what the state *means* in hardware — one bulk TPS status read per
+controller per poll (`GET /api/tps-status`), never a per-board loop — and puts
+the outcome under `off`: per filament `{"ok", "en", "oe", "error"?}`, the
+stragglers in `not_reached` (printed right under `ok`). The top-level `ok`
+still means "the command was accepted".
+
+| state | confirmed when | not confirmable |
+|---|---|---|
+| STOP | EN pin off, output enable not seen on | the board was not read |
+| SLEEP | output enable **read back** and off (EN stays on) | output enable not read — RP2350 firmware before `f08faa7`, or the MODE read failed |
+
+A current reading cannot confirm either: an output that is off has no
+measurement, and a missing measurement is not evidence of anything. An
+unconfirmable filament is reported as such, never as off.
 
 **`standby_all(filaments=None)`** — Powered but not heating, for a batch.
 Use between scans when you want to keep boards ready without drawing idle

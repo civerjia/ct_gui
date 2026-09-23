@@ -2028,16 +2028,99 @@ class CTClient:
             r["dead_skipped"] = dead_skipped
         return r
 
-    def stop_all(self, filaments=None) -> dict:
-        """STOP a BATCH of filaments (all populated boards, or `filaments`),
-        excluding the dead mask. For exactly one filament, use stop_one()."""
-        return self._prep(STOP, filaments)
+    def _verify_off(self, r: dict, state: int, timeout_s: float,
+                    poll_interval_s: float = 0.5) -> dict:
+        """verify=True for stop_all/sleep_all: confirm from the hardware that
+        every commanded filament's output is off, with one bulk TPS status read
+        per controller per poll (/api/tps-status) -- never a per-board loop.
 
-    def sleep_all(self, filaments=None) -> dict:
+        What counts as confirmed is the state's own definition:
+            STOP   EN pin off (and the output enable not seen on)
+            SLEEP  output enable READ BACK and off; the EN pin stays on
+        A current reading cannot do this: an output that is off has no
+        measurement, and "no measurement" is not evidence of anything. A SLEEP
+        whose output enable was not read (firmware without the OE read, or the
+        MODE read failed) is reported as unconfirmed, never as off."""
+        commanded = self._commanded_filaments(r)
+        if not commanded:
+            return r
+        name = "STOP" if state == STOP else "SLEEP"
+        start = time.monotonic()
+        pending = set(commanded)
+        results: dict[int, dict] = {}
+        polls = 0
+        last: dict[int, dict] = {}
+        while True:
+            st = self._get("/api/tps-status", timeout=10.0)
+            polls += 1
+            for _cid, row in (st.get("controllers") or {}).items():
+                for fid, v in ((row or {}).get("filaments") or {}).items():
+                    last[self._user_index_of(int(fid))] = v
+            for f in sorted(pending):
+                v = last.get(f)
+                if v is None:
+                    continue
+                if state == STOP:
+                    done = (v.get("en") is False) and v.get("oe") is not True
+                else:
+                    done = v.get("oe") is False
+                if done:
+                    results[f] = {"ok": True, "en": v.get("en"), "oe": v.get("oe")}
+                    pending.discard(f)
+            if not pending or time.monotonic() - start >= timeout_s:
+                break
+            time.sleep(poll_interval_s)
+        for f in sorted(pending):
+            v = last.get(f)
+            if v is None:
+                why = "its board was not read by the bulk TPS status"
+            elif state == SLEEP and v.get("oe") is None:
+                why = ("output enable not read back (firmware without the OE "
+                       "read, or the MODE read failed) — SLEEP cannot be confirmed")
+            elif state == STOP:
+                why = f"EN pin still {'on' if v.get('en') else '?'}" + \
+                      (", output enable ON" if v.get("oe") else "")
+            else:
+                why = "output enable still ON"
+            results[f] = {"ok": False, "en": (v or {}).get("en"),
+                          "oe": (v or {}).get("oe"), "error": why}
+        h = Result({"ok": not pending, "state": name, "results": results,
+                    "pending": sorted(pending),
+                    "elapsed_s": round(time.monotonic() - start, 3), "polls": polls})
+        out = {**r, "off": h}
+        if pending:
+            out["not_reached"] = sorted(pending)
+        return out
+
+    def stop_all(self, filaments=None,
+                 verify: bool = False,      # confirm every output is off -- see
+                                             # _verify_off()
+                 timeout_s: float = 5.0) -> dict:  # only used if verify=True
+        """STOP a BATCH of filaments (all populated boards, or `filaments`).
+        Dead filaments are INCLUDED: the dead mask only ever blocks energising.
+        For exactly one filament, use stop_one().
+
+        verify=True: read back, in bulk, that every commanded filament's TPS
+        EN pin is off, and put the outcome under result["off"] ({"ok",
+        "results": {filament: {"ok", "en", "oe", "error"?}}, "pending"}); the
+        ones still on are in `not_reached`, printed right under ok. The
+        top-level "ok" is still "the command was accepted"."""
+        r = self._prep(STOP, filaments)
+        return self._verify_off(r, STOP, timeout_s) if verify else r
+
+    def sleep_all(self, filaments=None,
+                  verify: bool = False,     # confirm every output is off
+                  timeout_s: float = 5.0) -> dict:  # only used if verify=True
         """SLEEP a BATCH of filaments. Dead filaments are INCLUDED: SLEEP removes
         heating power, and the dead mask only ever blocks energising.
-        For exactly one filament, use sleep_one()."""
-        return self._prep(SLEEP, filaments)
+        For exactly one filament, use sleep_one().
+
+        verify=True: as stop_all's, but SLEEP keeps the EN pin on -- it is
+        "output enable off" -- so what is read back is the TPS output enable.
+        Needs RP2350 firmware with the OE read (f08faa7); on older firmware
+        every filament comes back unconfirmed, not off."""
+        r = self._prep(SLEEP, filaments)
+        return self._verify_off(r, SLEEP, timeout_s) if verify else r
 
     def standby_all(self, filaments=None) -> dict:
         """STANDBY a BATCH of filaments, excluding the dead mask.
