@@ -2407,16 +2407,24 @@ equally serious:
 
 | bit | field | meaning |
 |---|---|---|
-| `0x01` | `on_mismatch` | the ON read-back did not equal the commanded byte |
+| `0x01` | **`on_mismatch`** | **the ON read-back did not equal the commanded byte — the switch did not close** |
 | `0x02` | **`hv_stuck_on`** | **the OFF read-back was non-zero — the HV did not turn off** |
 | `0x04` | `unverified` | a read-back was unavailable: the pulse fired, the firmware has no evidence either way |
 
-> ⚠️ **`hv_stuck_on` is the one that is about the PULSE.** The other two are
-> about the *verification* of it. A non-zero OFF read-back means the grid switch
+> ⚠️ **`hv_stuck_on` is the most dangerous of the three.** A non-zero OFF read-back means the grid switch
 > may still be closed with HV on the filament after the pulse, so
 > `fire_single_pulse` fails on it and names the filament. It was invisible
 > before: `flags` was a raw byte nobody decoded, so this could occur and be
 > reported as a fully successful shot.
+
+> ⚠️ **`on_mismatch` fails the shot too.** The switch the pulse was meant to
+> close was not closed, but the trigger was still counted and the envelope still
+> opened, so fired=1 and the measured event look like a normal shot — of a pulse
+> that never reached the filament. `fire_single_pulse` returns `ok: False` with
+> `on_mismatch: [filament, ...]`, and `mosfet_test` reports such a filament as
+> `inconclusive` rather than `dead`: the MOSFET was never put across the rail,
+> so ≈0 mA says nothing about it. (Filament 50, 2026-09-23: read165=0, ≈0 mA,
+> previously reported `ok: True`.)
 
 `unverified` does **not** clear `ok` — the pulse fired, and the firmware's own
 mismatch counter deliberately skips it. It is reported separately so you can

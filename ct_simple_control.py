@@ -5256,6 +5256,25 @@ class CTClient:
                                     f"read-back was non-zero, so the grid switch "
                                     f"may still be closed. Check before firing "
                                     f"again.")
+                # HV DID NOT TURN ON (flags bit 0x01): the ON read-back did not
+                # match the commanded byte, so the switch the pulse was meant
+                # to close was not closed. The trigger was counted and the
+                # envelope opened, so everything else -- fired=1, a measured
+                # event, a heating current -- looks like a normal shot, and the
+                # measured current is of a pulse that never reached the
+                # filament. Measured 2026-09-23: filament 50, read165=0,
+                # ≈0 mA, reported ok=True.
+                no_on = [r for r in fired if r.get("on_mismatch")]
+                if no_on:
+                    out["on_mismatch"] = sorted({r.get("filament") for r in no_on})
+                    out["ok"] = False
+                    rb = ", ".join(f"filament {r.get('filament')} read back "
+                                   f"{r.get('read165')}" for r in no_on)
+                    out["error"] = ((out["error"] + "; ") if out.get("error") else "") + (
+                        f"HV DID NOT TURN ON: the ON read-back did not match the "
+                        f"commanded switch ({rb}) — the grid switch was not closed, "
+                        f"so no HV reached the filament and any measured current "
+                        f"is not this filament's")
                 # Unverified (0x04) is NOT a failure: the pulse fired, the
                 # firmware just has no read-back evidence about it. Reported so
                 # a caller can tell "verified good" from "no evidence", which
@@ -8092,6 +8111,13 @@ class CTClient:
                         row["note"] = (fr.get("error")
                                        or "no pulse was measured — the switch "
                                           "was never actually exercised")
+                    elif fr.get("on_mismatch"):
+                        # The switch never closed, so the MOSFET was never put
+                        # across the rail: ≈0 mA here says nothing about it,
+                        # and calling it dead would send someone to the wrong
+                        # part. The switch fault itself is the finding.
+                        row["measured_ma"] = round(sum(nets) / len(nets), 4)
+                        row["note"] = fr.get("error")
                     else:
                         m = sum(nets) / len(nets)
                         row["measured_ma"] = round(m, 4)
