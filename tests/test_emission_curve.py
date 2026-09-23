@@ -119,7 +119,7 @@ def main(argv=None) -> int:
                         progress=show)
                     results[f] = r
                     print()
-                    print(ct.format_emission_curve(r))
+                    print(r)
             finally:
                 ct.enable_emission(False)
                 ct.enable_focus(False)

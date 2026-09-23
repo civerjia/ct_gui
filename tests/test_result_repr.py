@@ -87,6 +87,72 @@ SYNTHETIC = {
     "wide-record": {"ok": True, "points": [
         {f"field_{i}": i * 1.5 for i in range(20)}]},
     "list-of-lists": {"ok": True, "grid": [[1, 2], [3, 4]]},
+    # A real two-controller shot, field for field: filament 81, 2026-09-23 --
+    # a C1 filament, so no envelope_from; the ~53 mA artefact with a suspect
+    # background, which is exactly the case where a reader must find
+    # background_suspect without hunting for it.
+    "fire-measured": {
+        "ok": True, "fired": 1,
+        "records": [{"filament": 81, "flags": 0, "seq": 0, "tOnUs": 0,
+                     "durationUs": 1000, "read165": 32, "on_mismatch": False,
+                     "hv_stuck_on": False, "unverified": False,
+                     "heat_meas_mA": 780, "heat_meas_unavailable": None,
+                     "heat_target_mA": 1700, "heat_target_unavailable": None}],
+        "status": {"state": 3, "stopReason": 1, "entryIndex": 1,
+                   "filamentIndex": 255, "totalPulsesTarget": 1,
+                   "totalPulsesDone": 1, "triggerEdges": 1, "capabilityFlags": 15},
+        "schedule": "downloaded:plan-changed",
+        "measured": [{"id": 91, "t_us": 1561250884, "on_us": 1000, "peak": 2400,
+                      "bg": 1038, "bg_sigma4": 29, "plateau": 2308,
+                      "post_bg": 619, "integral": 1269751, "background_n": 50,
+                      "background_gap": 100, "rate_hz": 1000000,
+                      "recv_ms": 5865898, "empty_envelope": False,
+                      "peak_ma": 68.496, "plateau_ma": 64.649, "bg_ma": 11.538,
+                      "post_bg_ma": -5.985, "peak_net_ma": 56.958,
+                      "plateau_net_ma": 53.111, "diode_ma": 1.9818,
+                      "emission_ma": 51.129, "background_windowing": True,
+                      "integral_saturated": False, "background_partial": False,
+                      "background_pre_post_delta": 419,
+                      "background_suspect": True,
+                      "background_note": "pre-pulse background is +419.0 "
+                          "counts off the post-pulse one (57.8 sigma). The PRE "
+                          "window has no settle guard, so it is the suspect "
+                          "one — and the charge depends on it.",
+                      "integral_mams": 53.1003, "duration_saturated": False,
+                      "integral_mams_sigma": 0.00958774,
+                      "emission_mams": 51.1185}],
+        "ref_mv": 1228.3},
+    # mosfet_test, 2026-09-23 (59 and 68 dead). Its table printer was removed:
+    # this is now the only rendering.
+    "mosfet-test": {
+        "ok": False, "emission_v": -101, "expected_ma": 0.9818,
+        "tolerance_frac": 0.35,
+        "results": {
+            50: {"measured_ma": 1.0177, "expected_ma": 0.9818, "ratio": 1.037,
+                 "verdict": "pass", "shots": 3, "note": None},
+            59: {"measured_ma": -0.0417, "expected_ma": 0.9818, "ratio": -0.042,
+                 "verdict": "dead", "shots": 3,
+                 "note": "-0.042 mA against 0.982 mA expected — the MOSFET is "
+                         "not conducting"}},
+        "counts": {"pass": 1, "dead": 1, "inconclusive": 0},
+        "problems": ["filament 59: dead — -0.042 mA against 0.982 mA expected "
+                     "— the MOSFET is not conducting"]},
+    # fit_richardson's shape, values from the 2026-09-22 bench fit.
+    "richardson-fit": {
+        "ok": True, "trustworthy": False, "n_points": 10, "r_squared": 0.99854,
+        "work_function_eV": 3.646, "r_lead_ohm": 0.2, "r_lead_fitted": False,
+        "r_cold_ohm": 0.257, "richardson_a_eff_ma_per_k2": 1.2e-3,
+        "temperature_span_K": 297,
+        "sensitivity_to_r_lead": {"d_work_function_eV_per_ohm": -2.28,
+                                  "d_mean_T_K_per_ohm": -590},
+        "points": [{"heat_mA": 2470.0, "commanded_ma": 2500, "r_total_ohm": 2.9512,
+                    "r_fil_ohm": 2.7512, "r_ratio": 10.705, "T_K": 2038.2,
+                    "net_ma": 3.374, "emission_ma": 1.401,
+                    "inv_T": 0.00049063, "ln_i_over_t2": -14.8021,
+                    "residual": 0.0132}],
+        "dropped": [{"heat_mA": 2270.0, "emission_ma": 0.015}],
+        "warnings": ["r_lead_ohm was given, not fitted — the emission curve "
+                     "cannot determine it; take it from the I-V side"]},
 }
 
 #: Read-only and fast. Deliberately NOT every zero-argument method: several of

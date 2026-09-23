@@ -303,7 +303,7 @@ def check_pulse(ct, rep, args, f: int) -> None:
         return
 
     print()
-    print(ct.format_pulse_events(events))
+    print(r)
     print()
 
     for e in events:

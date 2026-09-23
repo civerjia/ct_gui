@@ -208,9 +208,15 @@ class Result(dict):
     EVERYTHING IS SHOWN. Nothing is folded, summarised away or truncated: these
     results are what you reason about a run from, and a reader cannot know in
     advance which field turns out to matter. What changes is the SHAPE -- one
-    field per line, nested structures indented, lists of records one row each
-    with their columns aligned -- so a 25-field result is scannable instead of
-    being a single 2000-character line.
+    field per line, nested structures indented, records in a list grouped one
+    labelled line per group (see _ROW_LAYOUTS), a dict of small records as a
+    table, a list of sentences one per line -- so a 35-field pulse event is
+    scannable instead of a single 2000-character line.
+
+    This IS the printer. There are no format_*/print_* companions: they were
+    removed once every result printed readably by itself, so a reader never
+    has to know which helper goes with which call. describe() is different --
+    it squeezes a result into ONE sentence for a log line or an error message.
 
     The verdict leads, then the reason, then the rest. That ordering is the
     only editorial judgement here, and it hides nothing.
@@ -222,6 +228,54 @@ class Result(dict):
     _LEAD = ("ok", "error", "reason", "filament", "filaments", "state",
              "state_name", "verdict", "fired", "measured_ma", "arrival")
     _WIDTH = 78
+
+    #: How a RECORD in a list is laid out: one labelled line per group, in
+    #: order. A pulse event carries ~35 fields, and as one wrapped run of k=v
+    #: pairs the answer (emission_ma) sat in the middle of raw ADC counts.
+    #: Grouping changes only the layout: a field in no group goes on the final
+    #: `other` line, so nothing is dropped. The first group is the record's
+    #: identity and is printed on the [n] line itself, unlabelled.
+    #:
+    #: One layout per KIND of record; a record takes the first layout that
+    #: places most of its fields (see _group_record), else no grouping.
+    #: Pulse events and pulse-log rows:
+    _PULSE_GROUPS = (
+        ("", ("id", "filament", "controller", "seq", "tOnUs", "on_us",
+              "durationUs", "empty_envelope")),
+        ("emission", ("emission_ma", "emission_mams", "diode_ma")),
+        ("net", ("plateau_net_ma", "peak_net_ma", "integral_mams",
+                 "integral_mams_sigma", "integral_mams_unavailable")),
+        ("absolute", ("plateau_ma", "peak_ma", "bg_ma", "bg_sigma_ma",
+                      "post_bg_ma")),
+        ("counts", ("plateau", "peak", "bg", "post_bg", "integral", "bg_sigma4",
+                    "background_n", "background_gap")),
+        ("checks", ("background_suspect", "background_pre_post_delta",
+                    "background_partial", "background_windowing",
+                    "integral_saturated", "duration_saturated",
+                    "background_note")),
+        ("verify", ("on_mismatch", "hv_stuck_on", "unverified", "read165",
+                    "flags")),
+        ("heating", ("heat_meas_mA", "heat_target_mA", "heat_meas_unavailable",
+                     "heat_target_unavailable")),
+    )
+    #: Emission-curve points (emission_vs_heating / emission_ramp) and their
+    #: per-shot rows:
+    _CURVE_GROUPS = (
+        ("", ("shot", "seq", "commanded_ma", "usable", "cold", "n_used",
+              "n_fired", "n_cold", "empty_envelope")),
+        ("emission", ("emission_ma", "emission_mams", "pedestal_ma")),
+        ("net", ("net_ma", "net_ma_sd", "charge_mams", "on_us")),
+        ("heating", ("heat_mA", "heat_target_mA", "settled_ma",
+                     "heat_unavailable")),
+        ("resistance", ("r_total_ohm", "r_fil_ohm", "r_ratio", "r_drift_frac",
+                        "bus_mV", "vi_current_mA")),
+        ("temperature", ("T_K", "residual", "inv_T", "ln_i_over_t2")),
+        ("noise", ("bg_ma", "sigma_ma")),
+    )
+    _ROW_LAYOUTS = (_PULSE_GROUPS, _CURVE_GROUPS)
+    _GROUP_LABEL_W = 12
+    _GROUP_MIN_FRAC = 0.6
+    _GROUP_MIN_FIELDS = 6       # below this one line reads fine ungrouped
 
     def raw(self) -> dict:
         """The plain dict. `dict(r)` does the same."""
@@ -247,11 +301,106 @@ class Result(dict):
                          if not isinstance(v, (dict, list, tuple))) or "(nested)"
 
     @classmethod
+    def _lead_first(cls, flat: dict) -> dict:
+        """The same fields, the _LEAD ones (verdict, ok, error...) first."""
+        head = {k: flat[k] for k in cls._LEAD if k in flat}
+        return {**head, **{k: v for k, v in flat.items() if k not in head}}
+
+    @classmethod
+    def _is_table(cls, v: dict) -> bool:
+        """A dict keyed by id whose every value is a small flat record -- a
+        mosfet_test `results`, a per-controller readback. Printed one row per
+        key, like a list of records: a field per line made a 96-filament
+        result 670 lines long."""
+        return (len(v) >= 2 and all(
+            isinstance(x, dict) and x
+            and all(not isinstance(y, (dict, list, tuple)) for y in x.values())
+            for x in v.values()))
+
+    @classmethod
+    def _group_record(cls, flat: dict):
+        """[(label, [k=v, ...]), ...] under the first layout that fits this
+        record, or None for a record no layout describes, which then keeps the
+        plain wrapped layout."""
+        for layout in cls._ROW_LAYOUTS:
+            g = cls._group_with(layout, flat)
+            if g is not None:
+                return g
+        return None
+
+    @classmethod
+    def _group_with(cls, layout, flat: dict):
+        placed: set = set()
+        groups = []
+        for label, keys in layout:
+            pairs = [f"{k}={cls._scalar(flat[k])}" for k in keys if k in flat]
+            placed.update(k for k in keys if k in flat)
+            if pairs:
+                groups.append((label, pairs))
+        # A layout fits only a record it was written FOR: most of the fields
+        # must land in a group. An emission-curve point carries emission_ma
+        # and heat_target_mA among twenty others, and the pulse layout put two
+        # of them on labelled lines and eighteen under `other` -- worse than
+        # not grouping at all.
+        if (len(flat) < cls._GROUP_MIN_FIELDS
+                or sum(1 for label, _ in groups if label) < 2
+                or len(placed) < cls._GROUP_MIN_FRAC * len(flat)):
+            return None
+        rest = [f"{k}={cls._scalar(x)}" for k, x in flat.items() if k not in placed]
+        if rest:
+            groups.append(("other", rest))
+        if groups[0][0]:
+            groups.insert(0, ("", []))
+        return groups
+
+    @classmethod
+    def _wrap_pairs(cls, pairs: list, first: str, cont: str, out: list) -> None:
+        """Lay k=v pairs out after `first`, continuing under `cont`. Wrapped on
+        the pair boundaries, never inside one: a pair split across lines is
+        unreadable. A single pair wider than the whole line on its own -- a
+        free-text `note=` runs to 130 characters -- is wrapped inside itself
+        instead, rather than emitted as one long line and called wrapped."""
+        # `first` and `cont` are the same width at every call site, so "has
+        # this line got any pairs yet" is just "is it longer than its prefix".
+        line = first
+        for pair in pairs:
+            if len(cont) + len(pair) > cls._WIDTH:
+                # Starts on the current line if nothing is on it yet, so a
+                # group label is never left alone above its only field.
+                if len(line) > len(cont):
+                    out.append(line.rstrip())
+                    line = cont
+                parts = textwrap.wrap(
+                    pair, width=cls._WIDTH - len(cont),
+                    subsequent_indent="    ",
+                    break_long_words=False,
+                    break_on_hyphens=False)
+                out.append(line + parts[0])
+                out.extend(cont + part for part in parts[1:])
+                line = cont
+                continue
+            if len(line) > len(cont) and len(line) + len(pair) > cls._WIDTH:
+                out.append(line.rstrip())
+                line = cont
+            line += pair + "  "
+        if line.strip():
+            out.append(line.rstrip())
+
+    @classmethod
     def _render(cls, key, v, indent: int, out: list) -> None:
         pad = " " * indent
         if isinstance(v, dict):
             if not v:
                 out.append(f"{pad}{key}: {{}}")
+                return
+            if cls._is_table(v):
+                out.append(f"{pad}{key}:")
+                w = max(len(str(k)) for k in v) + 2
+                for k2, rec in v.items():
+                    head = f"{pad}  {str(k2) + ':':<{w}}"
+                    pairs = [f"{k}={cls._scalar(x)}"
+                             for k, x in cls._lead_first(rec).items()]
+                    cls._wrap_pairs(pairs, head, " " * len(head), out)
                 return
             out.append(f"{pad}{key}:")
             for k2, v2 in v.items():
@@ -260,6 +409,18 @@ class Result(dict):
         if isinstance(v, (list, tuple)):
             if not v:
                 out.append(f"{pad}{key}: []")
+                return
+            if (all(isinstance(x, str) for x in v)
+                    and any(len(x) + indent + 4 > cls._WIDTH for x in v)):
+                # Sentences: one per line. Joined with ", " they ran together
+                # -- the sentences have commas of their own, so where one item
+                # ended could not be seen.
+                out.append(f"{pad}{key}: [{len(v)} items]")
+                for x in v:
+                    out.append(textwrap.fill(
+                        x, width=cls._WIDTH, initial_indent=f"{pad}  - ",
+                        subsequent_indent=f"{pad}    ",
+                        break_long_words=False, break_on_hyphens=False))
                 return
             if all(cls._is_flat(x) for x in v):
                 line = ", ".join(cls._scalar(x) for x in v)
@@ -273,39 +434,24 @@ class Result(dict):
             out.append(f"{pad}{key}: [{len(v)} items]")
             for n, item in enumerate(v):
                 if isinstance(item, dict):
-                    # Wrapped on the k=v boundaries, never inside one: a record
-                    # of 18 fields is 300 characters and still a wall on one
-                    # line, but a pair split across lines is unreadable.
                     head = f"{pad}  [{n}] "
                     cont = " " * len(head)
-                    pairs = [f"{k}={cls._scalar(x)}" for k, x in item.items()
-                             if not isinstance(x, (dict, list, tuple))]
-                    line = head
-                    for pair in pairs:
-                        # A single pair can be wider than the whole line on its
-                        # own -- a free-text `note=` runs to 130 characters --
-                        # and pair-boundary wrapping cannot help that. Wrap
-                        # inside it instead, rather than emitting one long line
-                        # and calling the record "wrapped".
-                        if len(cont) + len(pair) > cls._WIDTH:
-                            if line.strip():
-                                out.append(line.rstrip())
-                                line = cont
-                            for part in textwrap.wrap(
-                                    pair, width=cls._WIDTH - len(cont),
-                                    subsequent_indent="    ",
-                                    break_long_words=False,
-                                    break_on_hyphens=False):
-                                out.append(cont + part)
-                            continue
-                        if len(line) + len(pair) + 2 > cls._WIDTH and line.strip():
-                            out.append(line.rstrip())
-                            line = cont
-                        line += pair + "  "
-                    if line.strip():
-                        out.append(line.rstrip())
-                    elif not pairs:
-                        out.append(head + "(nested)")
+                    flat = {k: x for k, x in item.items()
+                            if not isinstance(x, (dict, list, tuple))}
+                    grouped = cls._group_record(flat)
+                    if grouped is None:
+                        pairs = [f"{k}={cls._scalar(x)}"
+                                 for k, x in cls._lead_first(flat).items()]
+                        cls._wrap_pairs(pairs, head, cont, out)
+                        if not pairs:
+                            out.append(head + "(nested)")
+                    else:
+                        for label, pairs in grouped:
+                            if not label:
+                                cls._wrap_pairs(pairs, head, cont, out)
+                                continue
+                            lead = cont + f"{label:<{cls._GROUP_LABEL_W}}"
+                            cls._wrap_pairs(pairs, lead, " " * len(lead), out)
                     # Nested containers inside a record still get their own
                     # lines -- a record is not allowed to swallow its children.
                     for k2, v2 in item.items():
@@ -5979,11 +6125,22 @@ class CTClient:
         Both are ABSENT (not 0.0, not None) when there is no background to
         subtract, for the same reason the _ma fields are: a net current with
         no background behind it is not a measurement.
-        integral_mams is already net — do not subtract from it as well.
+        integral_mams is already net of the BACKGROUND — do not subtract that
+        from it again. The diode path is still in it, as it is in
+        plateau_net_ma:
 
-        Use print_pulse_events() rather than printing these by hand; it
-        groups absolute against net so the two cannot be confused at a
-        glance.
+            "emission_ma"     plateau_net_ma - diode_ma    <- emission current
+            "emission_mams"   integral_mams - diode_ma * on_us / 1000
+                                                           <- emission charge
+            "diode_ma"        the diode-path current that was removed
+
+        All three are ABSENT when the rail could not be read (no diode_ma) or
+        their input is missing — never an uncorrected number under the
+        corrected name.
+
+        print() the result: each event prints grouped (emission / net /
+        absolute / counts / checks), so absolute and net cannot be confused
+        at a glance.
 
         A field that was not measured stays None and gets NO _ma companion --
         post_bg_ma is simply absent on such an event, rather than carrying a
@@ -6026,6 +6183,12 @@ class CTClient:
             # it by ~57%). Subtract once, here. Raw counts first: bg and
             # plateau are integers, and taking the difference before the
             # conversion keeps its large offset from cancelling inexactly.
+            # The background's noise in mA, next to bg_ma. bg_sigma4 is 4*sigma
+            # in ADC counts, which cannot be compared with any current here.
+            if e.get("bg_sigma4"):
+                slope = (self.pulse_ma(1.0, resolved_ref_mv)
+                         - self.pulse_ma(0.0, resolved_ref_mv))
+                e["bg_sigma_ma"] = round(e["bg_sigma4"] / 4.0 * slope, 4)
             bg_raw = e.get("bg")
             for key in ("peak", "plateau"):
                 if e.get(key) is not None and bg_raw is not None:
@@ -6045,6 +6208,18 @@ class CTClient:
                 # subtract is not a measurement, and 0.0 would read as one.
             self._add_charge(e, resolved_ref_mv, r.get("integral_signed"),
                              r.get("background_windowing"))
+            # The charge, likewise: integral_mams is net of the BACKGROUND only,
+            # so the diode path is still in it -- ~2 mA*ms of a 1 ms pulse at
+            # 200 V, the whole reading for a cold filament. The diode current
+            # is a constant DC for as long as the switch is closed, so its
+            # charge is diode_ma * width, taken over the envelope's own measured
+            # width. integral_mams_sigma applies unchanged: the subtraction is
+            # a formula, it adds no scatter. Absent, like emission_ma, whenever
+            # any of the three inputs is.
+            emis_q = self._emission_charge(e.get("integral_mams"), diode_ma,
+                                           e.get("on_us"))
+            if emis_q is not None:
+                e["emission_mams"] = emis_q
         r["ref_mv"] = ref_mv
         return r
 
@@ -6056,162 +6231,6 @@ class CTClient:
     # emission -- is invisible, and the flags scroll past unread. These
     # render it grouped instead, so ABSOLUTE and NET cannot be mistaken
     # for each other and an unusable event says so on its own line.
-
-    def format_pulse_event(self, e: dict, ref_mv: float | None = None) -> str:
-        """One event (from pulse_events_ma()) as a readable block. See
-        print_pulse_events() for the whole batch and for what the layout
-        means. Pass the batch's `ref_mv` so the count->mA scale shown for
-        sigma matches the one the event's own fields were converted with;
-        without it a live reading is fetched (one HTTP round trip)."""
-        if ref_mv is None:
-            ref_mv = self.get_ads1115_ref_mv() or 1200.0
-        slope = self.pulse_ma(1.0, ref_mv) - self.pulse_ma(0.0, ref_mv)
-        out: list[str] = []
-        W = 14        # label column
-        def row(label, raw, ma, note=""):
-            raw_s = f"{raw:>6} ct" if raw is not None else "     — ct"
-            ma_s = f"{ma:>9.3f} mA" if ma is not None else "        — mA"
-            out.append(f"    {label:<{W}}{raw_s}  {ma_s}" + (f"   {note}" if note else ""))
-
-        rate = e.get("rate_hz")
-        on_us = e.get("on_us")
-        head = f"#{e.get('id')}"
-        head += f"  width {on_us} us" if on_us is not None else "  width —"
-        head += f"   {rate / 1000.0:.1f} kSPS" if rate else "   rate UNKNOWN"
-        bg_n, bg_gap = e.get("background_n"), e.get("background_gap")
-        if bg_n is not None:
-            head += f"   bg n={bg_n}"
-            if bg_gap is not None:
-                head += f" gap={bg_gap}"
-        out.append(head)
-
-        # Unusable events first and alone: on a zero-length envelope every
-        # level below is the field's initial value, not a measurement, and
-        # a reader who has already seen numbers will not go back up.
-        if e.get("empty_envelope"):
-            out.append("    !! EMPTY ENVELOPE — rise and fall on the same sample "
-                       "(a PA4 glitch, not a pulse).")
-            out.append("       peak/plateau/integral are initial values, not "
-                       "measurements. Discard this event.")
-            if e.get("bg") is not None:
-                row("bg", e.get("bg"), e.get("bg_ma"), "(this one IS real)")
-            return "\n".join(out)
-
-        out.append("  ABSOLUTE — background still included")
-        row("peak", e.get("peak"), e.get("peak_ma"),
-            "single sample: circuit noise, not the pulse level")
-        row("plateau", e.get("plateau"), e.get("plateau_ma"),
-            "mean over the whole envelope, ramps included")
-        sigma4 = e.get("bg_sigma4")
-        sig_note = ""
-        if e.get("bg") is None:
-            # No window at all. "zero spread" would read as a verdict on a
-            # measurement that was never taken -- a different fault entirely
-            # (dead front end) from "no background was windowed".
-            sig_note = "!! no pre-pulse background was measured"
-        elif e.get("background_flat"):
-            sig_note = "!! zero spread — input stuck or unpowered"
-        elif sigma4:
-            sig_note = f"sigma {sigma4 / 4.0:.2f} ct = {sigma4 / 4.0 * slope:.3f} mA"
-        row("bg (pre)", e.get("bg"), e.get("bg_ma"), sig_note)
-        delta = e.get("background_pre_post_delta")
-        post_note = ""
-        if delta is not None:
-            post_note = f"pre−post {delta:+.1f} ct"
-            if sigma4:
-                post_note += f" ({abs(delta) / (sigma4 / 4.0):.1f} sigma)"
-            if e.get("background_suspect"):
-                post_note = "!! " + post_note + " — PRE window suspect"
-        row("post_bg", e.get("post_bg"), e.get("post_bg_ma"), post_note)
-
-        out.append("  NET — background removed")
-        net = e.get("plateau_net_ma")
-        if net is not None:
-            out.append(f"    {'plateau − bg':<{W}}{'':>9}  {net:>9.3f} mA"
-                       f"   grid diode path still included")
-        if e.get("emission_ma") is not None:
-            out.append(f"    {'  − diode':<{W}}{'':>9}  "
-                       f"{e['emission_ma']:>9.3f} mA   <- emission "
-                       f"(diode path {e.get('diode_ma')} mA removed)")
-        else:
-            out.append(f"    {'plateau − bg':<{W}}{'':>9}  {'—':>12}"
-                       f"   no background to subtract")
-        charge = e.get("integral_mams")
-        if charge is None:
-            why = e.get("integral_mams_unavailable") or "unknown"
-            out.append(f"    {'charge':<{W}}{'':>9}  {'—':>12}   !! not available: {why}")
-        else:
-            csig = e.get("integral_mams_sigma")
-            note = f"+/- {csig:.3f}" if csig is not None else "sigma unavailable"
-            if csig is not None and abs(charge) <= csig:
-                note = f"!! |charge| <= sigma ({csig:.3f}) — NOT distinguished from noise"
-            out.append(f"    {'charge':<{W}}{'':>9}  {charge:>9.3f} mA·ms   {note}")
-            if on_us:
-                out.append(f"    {'charge/width':<{W}}{'':>9}"
-                           f"  {charge / (on_us / 1000.0):>9.3f} mA"
-                           f"   cross-check against plateau − bg")
-        if e.get("integral_saturated"):
-            out.append("    !! integral SATURATED — clamped, the true charge is larger")
-        if e.get("duration_saturated"):
-            out.append("    !! duration SATURATED — sigma cannot be scaled")
-        if e.get("background_partial"):
-            out.append(f"    !! {e.get('background_n_note')}")
-        return "\n".join(out)
-
-    def format_pulse_events(self, r) -> str:
-        """A whole pulse_events_ma() result (or a bare list of its events)
-        as one readable report. See print_pulse_events()."""
-        # A bare list carries no ref_mv because the shape has nowhere to put
-        # one -- which is NOT the same as a batch whose live read failed and
-        # fell back to ~1200 mV. Only the latter makes the mA approximate, so
-        # only the latter gets the warning.
-        if isinstance(r, dict):
-            if not r.get("ok", True):
-                return f"pulse events unavailable: {r.get('error') or r}"
-            events, ref_mv = r.get("events") or [], r.get("ref_mv")
-            ref_note = (f"ref {ref_mv:.1f} mV (live ADS1115)" if ref_mv is not None
-                        else "!! ref UNKNOWN — the live read failed and the "
-                             "~1200 mV fallback was used, so every mA below is "
-                             "approximate")
-        else:
-            events, ref_mv = list(r or []), None
-            ref_note = "ref not carried by this list — mA came from its own batch"
-        head = f"{len(events)} pulse event(s)   {ref_note}"
-        if not events:
-            return head + "\n    (none — the detector produced no event for this fire)"
-        resolved = ref_mv if ref_mv is not None else (self.get_ads1115_ref_mv() or 1200.0)
-        blocks = [self.format_pulse_event(e, resolved) for e in events]
-        return head + "\n\n" + "\n\n".join(blocks)
-
-    def print_pulse_events(self, since: int = 0) -> dict:
-        """Fetch pulse events and print them grouped, instead of as a wall
-        of numbers. Returns the same dict pulse_events_ma() does, so it can
-        stand in for that call:
-
-            since = ct.pulse_cursor()
-            ct.fire_single_pulse(8, num_pulses=1, width_us=5000)
-            r = ct.print_pulse_events(since)
-
-        Printed per event:
-
-            ABSOLUTE      peak / plateau / bg / post_bg — raw levels with
-                          the standing emission STILL IN THEM
-            NET           plateau − bg (the pulse's own current), charge,
-                          and charge/width as a cross-check on it
-
-        The split is the point: quoting an ABSOLUTE figure as "the pulse
-        current" is the easiest mistake to make with this data and the
-        hardest to notice, because the number looks perfectly reasonable —
-        it is just the pulse plus however much the filament was already
-        emitting. Anything marked `!!` is not a measurement; read that line
-        before reading the numbers above it.
-
-        For a whole fire+measure in one call see fire_single_pulse(
-        measure=True) and pass its "measured" list to
-        format_pulse_events()."""
-        r = self.pulse_events_ma(since)
-        print(self.format_pulse_events(r))
-        return r
 
     def measure_pulse_current(
         self,
@@ -6409,10 +6428,14 @@ class CTClient:
              "heat_unavailable":  reason string, or None,
              "net_ma":      mean net emission current (plateau - bg), or None,
              "net_ma_sd":   spread across the point's pulses (0.0 for one),
-             "charge_mams": mean charge, or None,
+             "charge_mams": mean charge, or None -- net of the background
+                            only, the diode path still in it,
+             "emission_mams": mean charge with the diode path's
+                            (pedestal_ma * on_us) removed, or None,
              "n_used", "n_fired", "n_cold",
              "usable":      bool,
-             "pulses":      [ per-shot {heat_mA, net_ma, charge_mams, on_us,
+             "pulses":      [ per-shot {heat_mA, net_ma, emission_ma,
+                              charge_mams, emission_mams, on_us,
                               bg_ma, sigma_ma, cold} ]}
         """
         fil = int(filament)
@@ -6649,7 +6672,7 @@ class CTClient:
         the log rather than out of a setpoint that was waited for.
 
             r = ct.emission_ramp(8, from_ma=1500, to_ma=2800)
-            print(ct.format_emission_curve(r))     # ~3 s at ACTIVE
+            print(r)                               # ~3 s at ACTIVE
 
         WHY THIS IS AS VALID AS THE STEPPED SWEEP. Richardson is an
         instantaneous relation: a shot's emission and the current it fired at
@@ -6814,6 +6837,8 @@ class CTClient:
                 "pedestal_ma": round(float(pedestal_ma), 3),
                 "net_ma": net, "emission_ma": emis, "net_ma_sd": None,
                 "charge_mams": e.get("integral_mams"),
+                "emission_mams": self._emission_charge(
+                    e.get("integral_mams"), pedestal_ma, e.get("on_us")),
                 "on_us": e.get("on_us"),
                 "bg_ma": e.get("bg_ma"),
                 "sigma_ma": round((sigma4 / 4.0) * slope, 4) if sigma4 else None,
@@ -6934,6 +6959,7 @@ class CTClient:
               "bus_mV": None, "vi_current_mA": None, "r_total_ohm": None,
               "r_drift_frac": None,
               "net_ma": None, "net_ma_sd": None, "charge_mams": None,
+              "emission_mams": None,
               "pedestal_ma": round(float(pedestal_ma), 3), "emission_ma": None,
               "n_used": 0, "n_fired": 0, "n_cold": 0, "usable": False,
               "pulses": [], "note": None}
@@ -7022,7 +7048,7 @@ class CTClient:
 
         slope = (self.pulse_ma(1.0, fr.get("ref_mv") or 1200.0)
                  - self.pulse_ma(0.0, fr.get("ref_mv") or 1200.0))
-        nets, charges, heats = [], [], []
+        nets, charges, emis_charges, heats = [], [], [], []
         for i, e in enumerate(events):
             rec = log[i] if paired else {}
             heat = rec.get("heat_meas_mA")
@@ -7044,6 +7070,10 @@ class CTClient:
                     "empty_envelope": bool(e.get("empty_envelope"))}
             if shot["net_ma"] is not None:
                 shot["emission_ma"] = round(shot["net_ma"] - pedestal_ma, 3)
+            emis_q = self._emission_charge(shot["charge_mams"], pedestal_ma,
+                                           shot["on_us"])
+            if emis_q is not None:
+                shot["emission_mams"] = emis_q
             pt["pulses"].append(shot)
             if cold:
                 pt["n_cold"] += 1
@@ -7053,6 +7083,8 @@ class CTClient:
             nets.append(shot["net_ma"])
             if shot["charge_mams"] is not None:
                 charges.append(shot["charge_mams"])
+            if shot.get("emission_mams") is not None:
+                emis_charges.append(shot["emission_mams"])
             if heat is not None:
                 heats.append(heat)
 
@@ -7071,6 +7103,8 @@ class CTClient:
             pt["usable"] = True
         if charges:
             pt["charge_mams"] = round(sum(charges) / len(charges), 4)
+        if emis_charges:
+            pt["emission_mams"] = round(sum(emis_charges) / len(emis_charges), 4)
         if heats:
             pt["heat_mA"] = round(sum(heats) / len(heats), 1)
         elif pt["usable"] and pt["heat_unavailable"] is None and paired:
@@ -7124,6 +7158,16 @@ class CTClient:
             return ped.get("pedestal_ma"), {"source": "measured", **dict(ped)}
         d = self.diode_path_ma()
         return d.get("ma"), {"source": "diode_formula", **dict(d)}
+
+    @staticmethod
+    def _emission_charge(charge_mams, diode_ma, on_us):
+        """charge_mams with the diode path's charge removed: diode_ma is a
+        constant DC for as long as the switch is closed, so its charge is
+        diode_ma * on_us / 1000 (mA*ms). None if any input is -- never the
+        uncorrected charge under the corrected name."""
+        if charge_mams is None or diode_ma is None or not on_us:
+            return None
+        return round(charge_mams - diode_ma * on_us / 1000.0, 6)
 
     def diode_path_ma(self, emission_v: float | None = None,
                       r_ohm: float | None = None, vf_v=None) -> dict:
@@ -7593,7 +7637,7 @@ class CTClient:
 
             r = ct.emission_vs_heating(8, start_ma=2200, step_ma=50)
             f = ct.fit_richardson(r)
-            print(ct.format_richardson(f))
+            print(f)
 
         HOW. Each point gives a measured R_total = V_bus/I_heat, which is the
         filament in series with its leads. For a trial R_lead:
@@ -7864,92 +7908,6 @@ class CTClient:
                 "points": rows,
                 "scan": scan}
 
-    def format_richardson(self, f: dict) -> str:
-        """A fit_richardson() result as a readable block."""
-        if not f.get("ok"):
-            return "Richardson fit failed:\n" + "\n".join(
-                f"  !! {w}" for w in (f.get("warnings") or ["(no reason given)"]))
-        out = [f"Richardson-Dushman fit · {f['n_points']} points · "
-               f"r^2 {f['r_squared']:.5f}",
-               f"  lead resistance   {f['r_lead_ohm']:.4f} ohm"
-               + ("  (fitted)" if f["r_lead_fitted"] else "  (given, not fitted)")
-               + (f", within-1% band {f['r_lead_plateau_ohm']:.4f} ohm"
-                  if f.get("r_lead_plateau_ohm") is not None else ""),
-               f"  cold resistance   {f['r_cold_ohm']:.4f} ohm (assumed)",
-               f"  work function     {f['work_function_eV']:.3f} eV",
-               f"  A_eff             {f['richardson_a_eff_ma_per_k2']:.4g} mA/K^2",
-               f"  temperature span  {f['temperature_span_K']:.0f} K",
-               ]
-        s = f.get("sensitivity_to_r_lead") or {}
-        if s:
-            # The coupling to the I-V side: what an extra 0.1 ohm of lead
-            # resistance does to the two answers above.
-            out.append(f"  per +0.1 ohm lead  work function "
-                       f"{s['d_work_function_eV_per_ohm'] * 0.1:+.3f} eV, "
-                       f"mean T {s['d_mean_T_K_per_ohm'] * 0.1:+.0f} K")
-        if f.get("dropped"):
-            out.append(f"  dropped           {len(f['dropped'])} point(s) below "
-                       f"the pedestal noise (cold end, not emitting yet)")
-        out += ["",
-               f"  {'heat mA':>8} {'R_tot':>8} {'R_fil':>8} {'R/R0':>7} "
-               f"{'T (K)':>8} {'Ie mA':>8} {'resid':>9}"]
-        for p in f["points"]:
-            heat = p["heat_mA"] if p["heat_mA"] is not None else p["commanded_ma"]
-            out.append(f"  {heat:>8} {p['r_total_ohm']:>8.4f} {p['r_fil_ohm']:>8.4f} "
-                       f"{p['r_ratio']:>7.3f} {p['T_K']:>8.1f} {p['emission_ma']:>8.3f} "
-                       f"{p['residual']:>9.4f}")
-        if f["warnings"]:
-            out.append("")
-            for w in f["warnings"]:
-                out.append(f"  !! {w}")
-        else:
-            out.append("\n  no warnings — the fit is bounded and physical")
-        return "\n".join(out)
-
-    def format_emission_curve(self, r: dict) -> str:
-        """An emission_vs_heating() result as a readable table."""
-        if not r.get("points"):
-            return (f"filament {r.get('filament')}: no points — "
-                    + "; ".join(r.get("problems") or ["(no reason given)"]))
-        out = [f"filament {r.get('filament')} · emission vs heating current"
-               f"   (pedestal {r.get('pedestal_ma')} mA removed, "
-               f"{r.get('active_s')} s at ACTIVE"
-               + (f", ref {r['ref_mv']:.1f} mV" if r.get("ref_mv") else "")
-               + ")",
-               f"  {'cmd mA':>7} {'settled':>8} {'at pulse':>9} {'R tot':>7} "
-               f"{'net mA':>8} {'emis mA':>8} {'sd':>6} {'n':>5}  note"]
-        for p in r["points"]:
-            # The x-axis is `at pulse`. A point with none is printed with a
-            # dash there rather than borrowing the commanded value.
-            heat = f"{p['heat_mA']:>9.1f}" if p["heat_mA"] is not None else f"{'—':>9}"
-            net = f"{p['net_ma']:>8.3f}" if p["net_ma"] is not None else f"{'—':>8}"
-            sd = f"{p['net_ma_sd']:>6.3f}" if p["net_ma_sd"] is not None else f"{'—':>6}"
-            emis = (f"{p['emission_ma']:>8.3f}" if p.get("emission_ma") is not None
-                    else f"{'—':>8}")
-            rtot = (f"{p['r_total_ohm']:>7.4f}" if p.get("r_total_ohm") is not None
-                    else f"{'—':>7}")
-            note = p.get("note") or ("" if p["usable"] else "unusable")
-            if p.get("heat_unavailable"):
-                note = f"no snapshot ({p['heat_unavailable']}); " + note
-            # A ramp point has no setpoint at all -- it fired wherever the CC
-            # loop happened to be -- so the first column carries its shot index
-            # instead. Formatting these as numbers regardless is what made this
-            # crash on a ramp result: `None` has no format spec.
-            cmd = (f"{p['commanded_ma']:>7}" if p.get("commanded_ma") is not None
-                   else f"#{p.get('shot', '?')}".rjust(7))
-            settled = (f"{p['settled_ma']:>8.0f}" if p.get("settled_ma") is not None
-                       else f"{'—':>8}")
-            out.append(f"  {cmd} {settled} "
-                       f"{heat} {rtot} {net} {emis} {sd} "
-                       f"{p['n_used']}/{max(len(p['pulses']), p.get('n_fired', 0)):<3}  {note}")
-        for prob in r.get("problems") or []:
-            out.append(f"  !! {prob}")
-        # Notes are not failures -- they describe what a ramp inherently is.
-        # Printed under their own marker so the two never read alike.
-        for note in r.get("notes") or []:
-            out.append(f"  -- {note}")
-        return "\n".join(out)
-
     # ── HV grid MOSFET test (via a real SHV pulse) ───────────────────────────
     # hv_switch_test() drives the switch and reads the 74HC165 sense back: it
     # proves the CONTROL path reached the gate. It cannot prove the MOSFET
@@ -8020,7 +7978,7 @@ class CTClient:
         """Prove each HV grid MOSFET actually CONDUCTS, by firing through it.
 
             r = ct.mosfet_test([0, 1, 2], emission_v=100)
-            print(ct.format_mosfet_test(r))
+            print(r)
 
         Fires a real pulse per filament with every filament COLD, and measures
         the current. Cold is what makes it a MOSFET test rather than an
@@ -8180,25 +8138,6 @@ class CTClient:
                 "emission_v": v_read, "expected_ma": round(expected, 4),
                 "tolerance_frac": tol, "results": results, "counts": counts,
                 "problems": problems}
-
-    def format_mosfet_test(self, r: dict) -> str:
-        """A mosfet_test() result as a readable table."""
-        if not r.get("results"):
-            return "MOSFET test: no result — " + "; ".join(
-                r.get("problems") or ["(no reason given)"])
-        out = [f"HV grid MOSFET test · rail {r.get('emission_v')} V · "
-               f"expected {r.get('expected_ma')} mA "
-               f"(±{r.get('tolerance_frac', 0) * 100:.0f}%)",
-               f"  {'filament':>8} {'measured':>10} {'ratio':>7} {'shots':>6}  verdict"]
-        for f, row in sorted(r["results"].items()):
-            m = f"{row['measured_ma']:>10.4f}" if row["measured_ma"] is not None else f"{'—':>10}"
-            ra = f"{row['ratio']:>7.3f}" if row["ratio"] is not None else f"{'—':>7}"
-            out.append(f"  {f:>8} {m} {ra} {row['shots']:>6}  {row['verdict']}"
-                       + (f"  ({row['note']})" if row["note"] else ""))
-        c = r.get("counts") or {}
-        out.append(f"  {c.get('pass', 0)} pass · {c.get('dead', 0)} dead · "
-                   f"{c.get('inconclusive', 0)} inconclusive")
-        return "\n".join(out)
 
     # ── Board self-test & I2C diagnostics ─────────────────────────────────────
     # The GUI's I2C panel, as API calls. These ask "is the hardware wired up and

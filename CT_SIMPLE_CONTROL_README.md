@@ -3079,63 +3079,64 @@ since = ct.pulse_cursor()                           # cursor, no history
 # fires, and tears both down -- the grid stays off, which is the point.
 ct.fire_single_pulse(5, width_us=1000, measure=True)
 
-r = ct.print_pulse_events(since)    # grouped ABSOLUTE vs NET -- see below
+r = ct.pulse_events_ma(since)
+print(r)                            # grouped per event -- see below
 
 # ...or by hand, if you need the numbers rather than a report:
 for e in r["events"]:
-    print(f"pulse {e.get('plateau_net_ma')} mA net "          # NOT plateau_ma
-          f"(plateau {e.get('plateau_ma')} over bg {e.get('bg_ma')})")
-    mas = e.get("integral_mams")
-    if mas is None:
+    print(f"emission {e.get('emission_ma')} mA, {e.get('emission_mams')} mA*ms "
+          f"(net {e.get('plateau_net_ma')} mA incl. the diode path; "  # NOT plateau_ma
+          f"plateau {e.get('plateau_ma')} over bg {e.get('bg_ma')})")
+    if e.get("integral_mams") is None:
         print(f"  charge unavailable: {e.get('integral_mams_unavailable')}")
-    else:
-        sigma = e.get("integral_mams_sigma")
-        flag = "" if sigma is None or abs(mas) > sigma else "  <- within noise"
-        print(f"  charge {mas} mA*ms  (sigma {sigma} mA*ms"
-              f" @ {e['rate_hz']} Hz){flag}")
 ```
 
-**`print_pulse_events(since=0)`** — Fetch pulse events and print them
-**grouped**, instead of as a wall of numbers. Returns exactly what
-`pulse_events_ma()` does, so it can stand in for that call.
-
-An event carries ~25 fields — half absolute levels, half background-subtracted,
-plus six different "this number is not a measurement" flags. Printed flat, the
-distinction that matters (which figures still contain the standing emission) is
-invisible and the flags scroll past unread. This splits them:
+**Printing.** There is no separate print function: print the result. Each
+event is laid out one labelled line per group, every field present:
 
 ```
-5 pulse event(s)   ref 1227.8 mV (live ADS1115)
-
-#21  width 4993 us   1000.0 kSPS   bg n=50 gap=800
-  ABSOLUTE — background still included
-    peak            1355 ct     24.808 mA   single sample: circuit noise, not the pulse level
-    plateau         1142 ct     15.900 mA   mean over the whole envelope, ramps included
-    bg (pre)         899 ct      5.738 mA   sigma 8.25 ct = 0.345 mA
-    post_bg          901 ct      5.822 mA   pre−post -2.0 ct (0.2 sigma)
-  NET — background removed
-    plateau − bg                10.162 mA   <- the pulse's own current
-    charge                      50.786 mA·ms   +/- 0.024
-    charge/width                10.171 mA   cross-check against plateau − bg
+Result(ok)
+  events: [1 items]
+    [0] id=91  on_us=1000  empty_envelope=False
+        emission  emission_ma=51.129  emission_mams=51.1185  diode_ma=1.9818
+        net       plateau_net_ma=53.111  peak_net_ma=56.958
+                  integral_mams=53.1003  integral_mams_sigma=0.00958774
+        absolute  plateau_ma=64.649  peak_ma=68.496  bg_ma=11.538
+                  bg_sigma_ma=0.2997  post_bg_ma=-5.985
+        counts    plateau=2308  peak=2400  bg=1038  post_bg=619
+                  integral=1269751  bg_sigma4=29  background_n=50
+                  background_gap=100
+        checks    background_suspect=True  background_pre_post_delta=419
+                  background_partial=False  background_windowing=True
+                  integral_saturated=False  duration_saturated=False
+                  background_note=pre-pulse background is +419.0 counts off
+                      the post-pulse one (57.8 sigma). The PRE window has no
+                      settle guard, so it is the suspect one — and the charge
+                      depends on it.
+        other     t_us=1561250884  rate_hz=1000000  recv_ms=5865898
+  ref_mv: 1228.3
 ```
 
-Quoting an ABSOLUTE figure as "the pulse current" is the easiest mistake to
-make with this data and the hardest to notice, because the number looks
-perfectly reasonable — it is just the pulse *plus* whatever the filament was
-already emitting. Anything marked `!!` is not a measurement; read that line
-before reading the numbers above it.
+| group | what is in it | subtracted |
+|---|---|---|
+| (first line) | which event: `id`, `on_us` (envelope width), `empty_envelope` | — |
+| `emission` | **the answer**: `emission_ma` (current), `emission_mams` (charge), and the `diode_ma` that was removed | background **and** diode path |
+| `net` | `plateau_net_ma`, `peak_net_ma`, `integral_mams` (+ its sigma) | background only — the diode path (~2 mA at 200 V) is still in these |
+| `absolute` | `plateau_ma`, `peak_ma`, `bg_ma`, `bg_sigma_ma`, `post_bg_ma` | nothing — the standing emission is still in them |
+| `counts` | the same levels in raw ADC counts, the integral, the background window | — |
+| `checks` | anything that says a number is not a measurement: `background_suspect`, saturation, partial window, `background_note` | — |
+| `other` | every field not in a group — nothing is dropped | — |
 
-`charge/width` is printed as a cross-check, not as a second result: with
-`plateau_margin` at 0 the plateau mean and the integral cover the **same**
-span, so they agree to ~0.1% on this bench. That confirms both paths used the
-same background — it is not independent confirmation of the level.
+Quoting an `absolute` figure as "the pulse current" is the easiest mistake to
+make with this data and the hardest to notice: the number looks perfectly
+reasonable, it is just the pulse *plus* whatever the filament was already
+emitting. Read `checks` before trusting the lines above it — in the example,
+`background_suspect=True` with `post_bg_ma` 6 mA *below* the baseline marks
+the 51 mA as an artefact.
 
-**`format_pulse_events(r)` / `format_pulse_event(e, ref_mv=None)`** — the same
-rendering as a string instead of printed, for a whole result (or a bare list of
-events, e.g. `fire_single_pulse(measure=True)`'s `"measured"`) and for a single
-event respectively. Pass the batch's `ref_mv` to the single-event form so the
-count→mA scale shown for σ matches the one the event's fields were converted
-with; without it, one live reading is fetched.
+`emission_mams = integral_mams − diode_ma × on_us / 1000`: the diode path is a
+constant DC while the switch is closed. `integral_mams_sigma` applies to both
+charges unchanged — the subtraction adds no scatter.
 
 **`measure_pulse_current(filament, num_pulses=1, width_us=1000, rate_hz=1000000, ...)`**
 — Identical work to `fire_single_pulse(..., measure=True)`, which is the
@@ -3182,16 +3183,28 @@ ladder, walks ACTIVE from `start_ma` up to `max_ma`, fires and measures
 ```python
 ct.set_emission_v(200); ct.set_focus_v(350); ct.enable_emission(True)
 r = ct.emission_vs_heating(8, save_as="emission_vs_heating")
-print(ct.format_emission_curve(r))
+print(r)
 ```
 
 ```
-filament 8 · emission vs heating current   (32.6 s at ACTIVE, ref 1227.9 mV)
-   cmd mA  settled  at pulse   net mA     sd    charge     n  note
-     2500     2476    2470.0    3.374  0.039     3.367 3/3
-     2600     2575    2570.7    4.739  0.039     4.711 3/3
-     2700     2670    2683.7    7.249  0.079     7.236 3/3
-     2800     2778    2774.3   10.469  0.052    10.451 3/3
+Result(ok)
+  filament: 8
+  points: [2 items]
+    [0] commanded_ma=2300  settled_ma=2275  heat_mA=2272  heat_target_mA=2300
+        heat_unavailable=None  bus_mV=6326  vi_current_mA=2270
+        r_total_ohm=2.7868  r_drift_frac=0.02717  net_ma=2.676
+        net_ma_sd=0.042  charge_mams=2.6677  pedestal_ma=1.973
+        emission_ma=0.703  n_used=2  n_fired=2  n_cold=0  usable=True
+        note=resistance moved +2.7% across this point's own shots — it is
+            still heating, so its temperature is a mean over a moving target
+    [1] commanded_ma=2350  settled_ma=2325  heat_mA=2321.5
+        heat_target_mA=2350  heat_unavailable=None  bus_mV=6778
+        vi_current_mA=2327.5  r_total_ohm=2.91201  r_drift_frac=0.0201
+        net_ma=2.969  net_ma_sd=0  charge_mams=2.9824  pedestal_ma=1.973
+        emission_ma=0.996  n_used=2  n_fired=2  n_cold=0  usable=True
+        note=resistance moved +2.0% across this point's own shots — it is
+            still heating, so its temperature is a mean over a moving target
+      ...
 ```
 
 > ⚠️ **The x-axis is `heat_mA`, not `commanded_ma`.** Each point carries three
@@ -3248,7 +3261,6 @@ comparison is *between* filaments. `emission_vs_heating(save_as=...)` calls it
 for a single curve. A failed save does not fail the measurement; it is reported
 under the result's `saved` key.
 
-**`format_emission_curve(r)`** — the table above, as a string.
 
 ### The fast way — one ramp, no settling
 
@@ -3333,8 +3345,10 @@ subtract".
 It is applied automatically:
 
 - **`pulse_events_ma()`** gives every event `diode_ma` and `emission_ma`
-  (= `plateau_net_ma − diode_ma`), and `print_pulse_events()` shows the
-  subtraction as its own line.
+  (= `plateau_net_ma − diode_ma`), and `emission_mams` for the charge
+  (= `integral_mams − diode_ma × on_us/1000`); printed, they sit on their own
+  `emission` line, apart from the `net` values that still contain the diode
+  path.
 - **`emission_vs_heating()` / `emission_ramp()`** default `pedestal_ma=None` to
   this formula. `"measure"` fires at a cold filament and measures it instead (a
   minute and four extra firings), a float overrides, `0.0` subtracts nothing.
@@ -3411,7 +3425,9 @@ Richardson line; a float pins it.
 `sensitivity_to_r_lead` is the number that couples the two measurements:
 
 ```
-per +0.1 ohm lead  work function -0.228 eV, mean T -59 K
+sensitivity_to_r_lead:
+  d_work_function_eV_per_ohm: -2.28      # per +0.1 ohm: -0.228 eV
+  d_mean_T_K_per_ohm: -590               # per +0.1 ohm: -59 K
 ```
 
 **Bench result** (filament 8, −201 V, 1 ms pulses, `r_lead_ohm=0.20`):
@@ -3436,7 +3452,6 @@ unconstrained or edge-pinned `R_lead`; a work function outside 1.5–6.0 eV
 melting point; a temperature span under 200 K; r² under 0.98; and a curve with
 no pedestal correction at all.
 
-**`format_richardson(f)`** — the fit block above, as a string.
 
 **`tungsten_resistivity(T)` / `tungsten_temperature(ratio, t_ref_k=293)`** —
 the thermometry, usable on their own. Resistivity is the Desai *et al.* (J.
@@ -3673,21 +3688,48 @@ work as before); only `repr()` differs, which is what a REPL and a bare
 **Everything is shown.** Nothing is folded away, summarised or truncated — you
 cannot know in advance which field turns out to matter, and a formatter that
 decides for you is one that will eventually hide the fault you were looking
-for. What changes is the *shape*: one field per line, nested structures
-indented, lists of records one row each.
+for. What changes is the *shape*. **There are no separate print or format
+functions: print the result.**
+
+- **One field per line, nested structures indented.** The verdict leads (`ok`,
+  `error`, `verdict`, …), then everything else in the order it was built.
+- **Records in a list are grouped, one labelled line per group.** A pulse event
+  has ~35 fields; as one wrapped run, the answer sat among raw ADC counts.
+  Pulse events and pulse-log rows are grouped as `emission` / `net` /
+  `absolute` / `counts` / `checks` / `verify` / `heating`; emission-curve and
+  fit points as `emission` / `net` / `heating` / `resistance` / `temperature`.
+  A field in no group goes on the last line, `other` — nothing is dropped. A
+  record only gets grouped when most of its fields belong to a group and it
+  has at least 6 fields; otherwise it prints as one wrapped row.
+- **A dict of small records prints as a table**, one row per key, the verdict
+  first — `mosfet_test`'s `results`, the per-controller readbacks of the
+  rig-wide calls. Two controllers' values line up one above the other.
+- **Lists of sentences** (`problems`, `warnings`) print one per line with a
+  `-`, since the sentences have commas of their own.
 
 ```
 Result(ok)
   filament: 8
-  points: [15 items]
-    [0] commanded_ma=2100  settled_ma=2073  heat_mA=2078
-        heat_target_mA=2100  bus_mV=5280  r_total_ohm=2.53481
-        net_ma=2.091  emission_ma=0.056  n_used=3  usable=True
-        pulses: [3 items]
-          [0] heat_mA=2083  net_ma=2.133  on_us=999  bg_ma=5.738
-  pedestal:
-    source: diode_formula
-    ma: 1.9818
+  points: [1 items]
+    [0] commanded_ma=2300  usable=True  n_used=2  n_fired=2  n_cold=0
+        emission    emission_ma=0.703  pedestal_ma=1.973
+        net         net_ma=2.676  net_ma_sd=0.042  charge_mams=2.6677
+        heating     heat_mA=2272  heat_target_mA=2300  settled_ma=2275
+                    heat_unavailable=None
+        resistance  r_total_ohm=2.7868  r_drift_frac=0.02717  bus_mV=6326
+                    vi_current_mA=2270
+```
+
+```
+Result(FAILED)
+  results:
+    50: verdict=pass  measured_ma=1.0177  expected_ma=0.9818  ratio=1.037
+        shots=3  note=None
+    59: verdict=dead  measured_ma=-0.0417  expected_ma=0.9818  ratio=-0.042
+        shots=3  note=None
+  problems: [1 items]
+    - filament 59: dead — -0.042 mA against 0.982 mA expected — the MOSFET is
+      not conducting
 ```
 
 Lines wrap on `k=v` boundaries, and inside a pair when one field is wider than
@@ -3701,7 +3743,7 @@ actually produces — recorded runs from `calibration/`, live read-only calls
 nesting, 96-element arrays, unicode, and a fire result carrying `hv_stuck_on`.
 The invariant it enforces is that **every top-level key appears in the output**,
 plus a bounded line length so "print everything" is not satisfied by dumping the
-dict. 70/70 at the time of writing.
+dict. 73/73 (with `--live`) at the time of writing.
 
 ### HV grid MOSFET test — does the switch actually conduct?
 
@@ -3725,8 +3767,6 @@ Seeing that current means the device conducted. Near zero means it did not.
 > still records a shot. A STOPped filament would therefore read ~0 mA and be
 > reported as a **dead MOSFET when nothing was ever tried**. SLEEP raises the
 > rail without any heating current.
-
-**`format_mosfet_test(r)`** renders the result as a table.
 
 This **complements** `hv_switch_test()` rather than replacing it. That one reads
 the 74HC165 sense back and proves the *control path* reached the gate — which a
@@ -3911,12 +3951,13 @@ calling script: the backend owns the disk here.
 
 ### Human-readable results
 
-Every method above returns a plain dict — convenient for scripting, but not
-something you'd want to eyeball in a log.
+To read a result, print it — see [Reading a result](#reading-a-result).
+`describe()` is for the other job: fitting a result into **one line**, of a log
+or of another message (the client itself uses it to quote a failed step inside
+an error).
 
 **`describe(result)`** — Turn any result dict this client returns into one
-short English sentence, for a `print()`/log line instead of dumping raw
-JSON. Best-effort: it recognizes a result **shape** (which keys are
+short English sentence. Best-effort: it recognizes a result **shape** (which keys are
 present), not which method produced it — so it works on a dict you've
 stashed/reloaded too — and falls back to a short generic ok/error summary
 for anything it doesn't recognize. Never raises.
