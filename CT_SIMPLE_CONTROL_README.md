@@ -1127,7 +1127,7 @@ ct.stop_all()                    # every populated filament
 ct.stop_all(filaments=[5, 6, 7]) # just these three
 r = ct.stop_all(verify=True)     # ...and read back that they are off
 if r.get("not_reached"):
-    print("still on:", r["not_reached"], r["off"])
+    print("still on:", r["not_reached"], r["readback"])
 ```
 
 **`sleep_all(filaments=None, verify=False, timeout_s=5)`** — One step above
@@ -1139,29 +1139,32 @@ armable (a STOPped filament's rail is off, so ShvArm skips it).
 ct.sleep_all(verify=True)
 ```
 
-**`verify=True`** on either reads back, for every filament that was actually
-commanded, what the state *means* in hardware — one bulk TPS status read per
-controller per poll (`GET /api/tps-status`), never a per-board loop — and puts
-the outcome under `off`: per filament `{"ok", "en", "oe", "error"?}`, the
-stragglers in `not_reached` (printed right under `ok`). The top-level `ok`
-still means "the command was accepted".
+**`standby_all(filaments=None, verify=False, timeout_s=5)`** — Powered but not
+heating, for a batch: output on at the fixed 0.8 V voltage-mode floor. Use
+between scans when you want to keep boards ready without drawing idle current.
+
+```python
+ct.standby_all(filaments=[0, 1, 2, 3], verify=True)
+```
+
+**`verify=True`** on `stop_all`, `sleep_all` and `standby_all` reads back, for
+every filament that was actually commanded, what the state *means* in
+hardware — one bulk TPS status read per controller per poll (`GET
+/api/tps-status`), never a per-board loop, plus one bulk cached read for
+STANDBY — and puts the outcome under `readback`: per filament `{"ok", "en",
+"oe", "cc_mode"?, "error"?}`, the stragglers in `not_reached` (printed right
+under `ok`). The top-level `ok` still means "the command was accepted".
 
 | state | confirmed when | not confirmable |
 |---|---|---|
 | STOP | EN pin off, output enable not seen on | the board was not read |
 | SLEEP | output enable **read back** and off (EN stays on) | output enable not read — RP2350 firmware before `f08faa7`, or the MODE read failed |
+| STANDBY | EN on, output enable **read back** on, **and** the CC loop in voltage mode (`cc_mode` 0) — IDLE/ACTIVE have EN and OE on too, and differ only in regulating current | output enable not read, or no cached CC-loop row |
 
-A current reading cannot confirm either: an output that is off has no
+A current reading cannot confirm an off state: an output that is off has no
 measurement, and a missing measurement is not evidence of anything. An
-unconfirmable filament is reported as such, never as off.
-
-**`standby_all(filaments=None)`** — Powered but not heating, for a batch.
-Use between scans when you want to keep boards ready without drawing idle
-current.
-
-```python
-ct.standby_all(filaments=[0, 1, 2, 3])
-```
+unconfirmable filament is reported as such, never as reached. IDLE and ACTIVE
+are confirmed by their current instead — see `idle_all(verify=True)` below.
 
 **`idle_all(filaments=None, currents=None, default_ma=0, verify=False, tolerance_ma=150, timeout_s=20)`**
 — Warm pool for a BATCH of filaments at once. See the dedicated section below.

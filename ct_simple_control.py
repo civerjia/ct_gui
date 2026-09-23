@@ -2035,44 +2035,59 @@ class CTClient:
             r["dead_skipped"] = dead_skipped
         return r
 
-    def _verify_off(self, r: dict, state: int, timeout_s: float,
-                    poll_interval_s: float = 0.5) -> dict:
-        """verify=True for stop_all/sleep_all: confirm from the hardware that
-        every commanded filament's output is off, with one bulk TPS status read
-        per controller per poll (/api/tps-status) -- never a per-board loop.
+    def _verify_state(self, r: dict, state: int, timeout_s: float,
+                      poll_interval_s: float = 0.5) -> dict:
+        """verify=True for stop_all/sleep_all/standby_all: read back, from the
+        hardware, that every commanded filament is in the state asked for.
+        One bulk TPS status read per controller per poll (/api/tps-status) --
+        never a per-board loop -- plus, for STANDBY, one bulk cached read.
 
         What counts as confirmed is the state's own definition:
-            STOP   EN pin off (and the output enable not seen on)
-            SLEEP  output enable READ BACK and off; the EN pin stays on
-        A current reading cannot do this: an output that is off has no
-        measurement, and "no measurement" is not evidence of anything. A SLEEP
-        whose output enable was not read (firmware without the OE read, or the
-        MODE read failed) is reported as unconfirmed, never as off."""
+            STOP     EN pin off (and the output enable not seen on)
+            SLEEP    output enable READ BACK and off; the EN pin stays on
+            STANDBY  EN on, output enable read back ON, and the CC loop in
+                     VOLTAGE mode (cc_mode 0) -- IDLE/ACTIVE have EN and OE on
+                     too, and differ only in regulating current (cc_mode 1)
+        A current reading cannot confirm an OFF state: an output that is off has
+        no measurement, and "no measurement" is not evidence of anything. A
+        state whose deciding bit was not read (no OE read-back, no cached row)
+        is reported unconfirmed, never as reached.
+
+        Outcome under r["readback"]; the stragglers in r["not_reached"]."""
         commanded = self._commanded_filaments(r)
         if not commanded:
             return r
-        name = "STOP" if state == STOP else "SLEEP"
+        name = {STOP: "STOP", SLEEP: "SLEEP", STANDBY: "STANDBY"}[state]
         start = time.monotonic()
         pending = set(commanded)
         results: dict[int, dict] = {}
         polls = 0
         last: dict[int, dict] = {}
+        modes: dict[int, object] = {}
         while True:
             st = self._get("/api/tps-status", timeout=10.0)
             polls += 1
             for _cid, row in (st.get("controllers") or {}).items():
                 for fid, v in ((row or {}).get("filaments") or {}).items():
                     last[self._user_index_of(int(fid))] = v
+            if state == STANDBY:
+                for f, v in self.read_filament_current_cached(sorted(pending)).items():
+                    modes[int(f)] = (v or {}).get("cc_mode")
             for f in sorted(pending):
                 v = last.get(f)
                 if v is None:
                     continue
                 if state == STOP:
                     done = (v.get("en") is False) and v.get("oe") is not True
-                else:
+                elif state == SLEEP:
                     done = v.get("oe") is False
+                else:
+                    done = (v.get("en") is True and v.get("oe") is True
+                            and modes.get(f) == 0)
                 if done:
                     results[f] = {"ok": True, "en": v.get("en"), "oe": v.get("oe")}
+                    if state == STANDBY:
+                        results[f]["cc_mode"] = modes.get(f)
                     pending.discard(f)
             if not pending or time.monotonic() - start >= timeout_s:
                 break
@@ -2081,39 +2096,48 @@ class CTClient:
             v = last.get(f)
             if v is None:
                 why = "its board was not read by the bulk TPS status"
-            elif state == SLEEP and v.get("oe") is None:
-                why = ("output enable not read back (firmware without the OE "
-                       "read, or the MODE read failed) — SLEEP cannot be confirmed")
             elif state == STOP:
                 why = f"EN pin still {'on' if v.get('en') else '?'}" + \
                       (", output enable ON" if v.get("oe") else "")
-            else:
+            elif v.get("oe") is None:
+                why = (f"output enable not read back (firmware without the OE "
+                       f"read, or the MODE read failed) — {name} cannot be confirmed")
+            elif state == SLEEP:
                 why = "output enable still ON"
+            elif not v.get("en") or not v.get("oe"):
+                why = f"output not on (EN {v.get('en')}, output enable {v.get('oe')})"
+            elif modes.get(f) is None:
+                why = "no cached CC-loop row — voltage mode cannot be confirmed"
+            else:
+                why = (f"CC loop in mode {modes.get(f)}, not voltage mode (0) — "
+                       f"still regulating current, i.e. not at STANDBY")
             results[f] = {"ok": False, "en": (v or {}).get("en"),
                           "oe": (v or {}).get("oe"), "error": why}
+            if state == STANDBY:
+                results[f]["cc_mode"] = modes.get(f)
         h = Result({"ok": not pending, "state": name, "results": results,
                     "pending": sorted(pending),
                     "elapsed_s": round(time.monotonic() - start, 3), "polls": polls})
-        out = {**r, "off": h}
+        out = {**r, "readback": h}
         if pending:
             out["not_reached"] = sorted(pending)
         return out
 
     def stop_all(self, filaments=None,
                  verify: bool = False,      # confirm every output is off -- see
-                                             # _verify_off()
+                                             # _verify_state()
                  timeout_s: float = 5.0) -> dict:  # only used if verify=True
         """STOP a BATCH of filaments (all populated boards, or `filaments`).
         Dead filaments are INCLUDED: the dead mask only ever blocks energising.
         For exactly one filament, use stop_one().
 
         verify=True: read back, in bulk, that every commanded filament's TPS
-        EN pin is off, and put the outcome under result["off"] ({"ok",
+        EN pin is off, and put the outcome under result["readback"] ({"ok",
         "results": {filament: {"ok", "en", "oe", "error"?}}, "pending"}); the
         ones still on are in `not_reached`, printed right under ok. The
         top-level "ok" is still "the command was accepted"."""
         r = self._prep(STOP, filaments)
-        return self._verify_off(r, STOP, timeout_s) if verify else r
+        return self._verify_state(r, STOP, timeout_s) if verify else r
 
     def sleep_all(self, filaments=None,
                   verify: bool = False,     # confirm every output is off
@@ -2127,12 +2151,22 @@ class CTClient:
         Needs RP2350 firmware with the OE read (f08faa7); on older firmware
         every filament comes back unconfirmed, not off."""
         r = self._prep(SLEEP, filaments)
-        return self._verify_off(r, SLEEP, timeout_s) if verify else r
+        return self._verify_state(r, SLEEP, timeout_s) if verify else r
 
-    def standby_all(self, filaments=None) -> dict:
+    def standby_all(self, filaments=None,
+                    verify: bool = False,    # confirm every output is on at
+                                              # the 0.8 V voltage-mode floor
+                    timeout_s: float = 5.0) -> dict:  # only used if verify=True
         """STANDBY a BATCH of filaments, excluding the dead mask.
-        For exactly one filament, use standby_one()."""
-        return self._prep(STANDBY, filaments)
+        For exactly one filament, use standby_one().
+
+        verify=True: as stop_all's -- one bulk read-back per poll, outcome under
+        result["readback"], stragglers in `not_reached`. STANDBY is confirmed
+        by EN on, the output enable read back ON, and the CC loop in voltage
+        mode (cc_mode 0): IDLE/ACTIVE also have EN and OE on, and differ only
+        in regulating current. Needs RP2350 firmware with the OE read (f08faa7)."""
+        r = self._prep(STANDBY, filaments)
+        return self._verify_state(r, STANDBY, timeout_s) if verify else r
 
     def _commanded_filaments(self, r: dict) -> list[int]:
         """The filaments a batch command actually reached: every controller's
