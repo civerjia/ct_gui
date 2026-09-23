@@ -4777,6 +4777,48 @@ class CTClient:
                 time.sleep(next(naps))
         return measured, ref_mv
 
+    def _envelope_companion(self, controller: int) -> int | None:
+        """The controller that must ALSO run a plan so the STM32 sees its pulse.
+
+        That is the master -- the only board whose RP2350 envelope reaches the
+        STM32 -- whenever the pulse is fired somewhere else. None when the
+        pulse is on the master already, or when the master is not connected
+        (nothing can frame it then; the fire still goes ahead, unmeasured).
+        """
+        try:
+            st = self.status()
+        except Exception:
+            return None
+        master = st.get("master")
+        if master is None or int(master) == int(controller):
+            return None
+        row = (st.get("controllers") or {}).get(str(master)) or {}
+        return int(master) if row.get("connected") else None
+
+    def _disarm_all(self, controllers) -> None:
+        for c in controllers:
+            try:
+                self.shv_disarm(c)
+            except Exception:
+                pass    # best effort: a disarm that fails leaves an armed engine
+                        # waiting for a trigger, which the next arm resets
+
+    def _companion_check(self, companion: int, want: int) -> dict:
+        """Confirm the master actually ran the plan -- i.e. that a window was
+        opened for every pulse. A master that missed a trigger produced no
+        envelope for it, and the STM32 would have nothing to frame; reporting
+        that as an ordinary unmeasured pulse would send someone looking for a
+        fault on the wrong board."""
+        st = self.shv_status(companion) or {}
+        done = st.get("totalPulsesDone")
+        out = {"envelope_triggers": done}
+        if done is not None and int(done) != int(want):
+            out["envelope_mismatch"] = (
+                f"the master (controller {companion}) counted {done} trigger(s) "
+                f"for {want} pulse(s) -- the STM32 had no window for the rest, "
+                f"so a missing measurement there is not evidence about the pulse")
+        return out
+
     def _fire_core(
         self,
         filament: int,
@@ -4830,10 +4872,23 @@ class CTClient:
         if err:
             return {"ok": False, "error": err, "fired": 0, "records": [], "status": {}}
 
-        self.shv_disarm(controller)   # cheap (1 frame); resets engine state to
-                                       # Idle WITHOUT touching the schedule table
-                                       # — safe to call unconditionally even when
-                                       # reuse is about to skip the download.
+        # TWO CONTROLLERS. Only the master has the STM32, and the only envelope
+        # it sees is its OWN RP2350's ReadyOut. A pulse on another controller is
+        # framed by the master running the SAME one-entry plan: that entry is
+        # "another controller's filament" to the master, so its PIO runs the
+        # full pulse cycle with mask 0x00 -- nothing latches, no HV, but ReadyOut
+        # rises and falls for the entry's width (docs/two_controller_operation.md
+        # §3). download() already puts the plan on every connected controller;
+        # what used to be missing is that only the filament's own controller was
+        # ARMED and TRIGGERED, so for a controller-2 filament the master never
+        # ran it and the STM32 got no window. That, not a controller-2 fault, is
+        # why controller-2 filaments produced no events.
+        companion = self._envelope_companion(controller)
+        armed_set = [controller] + ([companion] if companion else [])
+        self._disarm_all(armed_set)   # cheap (1 frame each); resets engine state
+                                      # to Idle WITHOUT touching the schedule
+                                      # table -- safe even when reuse is about
+                                      # to skip the download.
 
         plan = {
             # With trigger="sim" THIS CLIENT drives both the trigger and the
@@ -4921,6 +4976,25 @@ class CTClient:
                     "error": f"arm rejected (code {code}): {why}",
                     "arm_reject": code, "arm_reject_name": why,
                     "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
+        if companion:
+            # The master LAST. It is the head of the trigger chain: once armed,
+            # the next edge fires its (empty) pulse and is forwarded on SyncOut
+            # to this controller. Arming it first would let an edge in between
+            # advance the master past entry 0 while the target was still
+            # disarmed -- the two would then disagree about which entry every
+            # later trigger belongs to.
+            c_arm = self.shv_arm(companion, repeats=1)
+            if not c_arm.get("ok"):
+                self._disarm_all(armed_set)
+                code = c_arm.get("reject")
+                why = self._SHV_REJECT_NAMES.get(code, "unknown reject code")
+                return {"ok": False,
+                        "error": f"the master (controller {companion}) could not be "
+                                 f"armed to frame this pulse: arm rejected (code "
+                                 f"{code}): {why}. Without it the STM32 gets no "
+                                 f"envelope for controller {controller}'s pulse",
+                        "arm_reject": code, "arm_reject_name": why,
+                        "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
 
         # A SUCCESSFUL arm can still have silently dropped this filament. Under
         # the CONTINUE fault policy, arm skips a filament that fails its safety
@@ -4938,7 +5012,7 @@ class CTClient:
         site = self.filament_to_board(filament)
         slot = (site or {}).get("slot")
         if unsafe and slot is not None and (unsafe >> int(slot)) & 1:
-            self.shv_disarm(controller)
+            self._disarm_all(armed_set)
             return {"ok": False, "fired": 0, "records": [], "status": st_after,
                     "schedule": reuse_note, "skipped_unsafe": True,
                     "error": f"arm accepted the schedule but SKIPPED filament "
@@ -4965,7 +5039,7 @@ class CTClient:
             try:
                 on_armed()
             except BaseException as exc:
-                self.shv_disarm(controller)
+                self._disarm_all(armed_set)
                 self.ready_disarm()
                 return {"ok": False, "fired": 0, "records": [], "status": {},
                         "error": f"on_armed raised before the trigger "
@@ -4973,13 +5047,17 @@ class CTClient:
                                  f"without firing"}
 
         if trigger == "sim":
+            # Through the HEAD of the chain. The master's ReadyIn ISR fires the
+            # master and forwards the edge on SyncOut, exactly like an external
+            # trigger; aimed at the target controller directly, the master
+            # would never see it and never open the window.
             r = self._post("/api/sync/simulate", {
                 "count": int(num_pulses),
                 "interval_ms": float(max(inter_pulse_ms, 10)),
-                "controller": int(controller),
+                "controller": int(companion or controller),
             }, timeout=10.0)
             if not r.get("ok"):
-                self.shv_disarm(controller)
+                self._disarm_all(armed_set)
                 return {"ok": False, "error": f"could not start SyncIn simulation: "
                                               f"{r.get('error', r)}",
                         "fired": 0, "records": [], "status": {}}
@@ -4997,6 +5075,7 @@ class CTClient:
             st = self.shv_status(controller)
             state = st.get("state", SHV_IDLE)
             if state == SHV_FAULT:
+                self._disarm_all(armed_set)
                 return {"ok": False,
                         "error": f"SHV fault on controller {controller}: "
                                 f"filament {st.get('faultFilament')}, reason "
@@ -5032,10 +5111,14 @@ class CTClient:
                 unver = [r.get("filament") for r in fired if r.get("unverified")]
                 if unver:
                     out["unverified"] = sorted(set(unver))
+                if companion:
+                    out["envelope_from"] = companion
+                    out.update(self._companion_check(companion, int(num_pulses)))
+                    self._disarm_all([companion])
                 return out
             time.sleep(next(naps))
 
-        self.shv_disarm(controller)
+        self._disarm_all(armed_set)
         return {"ok": False, "timeout": True,
                 "error": f"timed out after {timeout_s} s (state={state})",
                 "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
