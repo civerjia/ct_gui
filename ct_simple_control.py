@@ -227,7 +227,7 @@ class Result(dict):
     #: Shown first, in this order, when present -- the fields that answer
     #: "what happened". Everything else follows in the order the result
     #: carries it, which is usually the order the code that built it chose.
-    _LEAD = ("ok", "error", "reason", "filament", "filaments", "state",
+    _LEAD = ("ok", "error", "not_reached", "reason", "filament", "filaments", "state",
              "state_name", "verdict", "fired", "measured_ma", "arrival")
     _WIDTH = 78
 
@@ -2044,18 +2044,65 @@ class CTClient:
         For exactly one filament, use standby_one()."""
         return self._prep(STANDBY, filaments)
 
+    def _commanded_filaments(self, r: dict) -> list[int]:
+        """The filaments a batch command actually reached: every controller's
+        `touched`, minus `failed`. None of the requested-but-dead, unslotted or
+        other-controller ones -- those were never commanded, so there is
+        nothing of theirs to wait for."""
+        touched: set[int] = set()
+        for row in (r.get("results") or {}).values():
+            if isinstance(row, dict):
+                touched.update(int(f) for f in (row.get("touched") or []))
+        return sorted(touched - {int(f) for f in (r.get("failed") or [])})
+
+    def _verify_batch(self, r: dict, currents: dict | None, default_ma: float,
+                      tolerance_ma: float, timeout_s: float) -> dict:
+        """verify=True for idle_all/active_all: wait for every commanded
+        filament at once and merge the outcome under r["heating"], the same
+        place idle_one/active_one put theirs. One bulk read per poll for the
+        whole batch (wait_for_currents), never one loop per filament."""
+        commanded = self._commanded_filaments(r)
+        if not commanded:
+            return r              # nothing was commanded: nothing to wait for
+        per = {int(k): float(v) for k, v in (currents or {}).items()}
+        targets = {f: per.get(f, float(default_ma)) for f in commanded}
+        zero = sorted(f for f, ma in targets.items() if abs(ma) <= tolerance_ma)
+        rest = {f: ma for f, ma in targets.items() if f not in zero}
+        h = (self.wait_for_currents(rest, tolerance_ma=tolerance_ma, timeout_s=timeout_s)
+             if rest else {"ok": True, "results": {}, "pending": []})
+        if zero:
+            # Commanded to ~0 mA -- usually default_ma left at 0. Not
+            # confirmable by the bulk read, and NOT counted as arrived.
+            h = {**h, "ok": False, "zero_target": zero,
+                 "error": ((h.get("error") + "; ") if h.get("error") else "")
+                          + f"{len(zero)} filament(s) were commanded to ~0 mA "
+                            f"(no `currents` entry and default_ma "
+                            f"{default_ma:g}) — nothing to verify"}
+        not_reached = {int(f) for f, row in (h.get("results") or {}).items()
+                       if not row.get("ok")}
+        out = {**r, "heating": Result(h)}
+        if not_reached or zero:
+            out["not_reached"] = sorted(not_reached | set(zero))
+        return out
+
     def idle_all(self,
                 filaments=None,               # None = every populated board
                                                # (minus dead mask); or an
                                                # explicit list of indices
                 currents: dict | None = None,   # {filament: mA} -- explicit
                                                  # PER-FILAMENT override
-                default_ma: float = 0) -> dict:  # mA for any filament NOT in
+                default_ma: float = 0,        # mA for any filament NOT in
                                                   # `currents` above -- ⚠ NO
                                                   # firmware-side default: a
                                                   # filament with neither an
                                                   # entry here nor in
                                                   # `currents` idles at 0 mA
+                verify: bool = False,          # wait until every commanded
+                                                # filament has settled -- see
+                                                # _verify_batch()
+                tolerance_ma: float = 150.0,   # only used if verify=True
+                timeout_s: float = 20.0) -> dict:  # only used if verify=True;
+                                                    # IDLE from cold takes ~15 s
         """IDLE a BATCH of filaments, excluding the dead mask.
         For exactly one filament, use idle_one() instead — it's clearer and
         avoids the "everyone else falls back to default_ma" footgun below.
@@ -2065,25 +2112,44 @@ class CTClient:
         (including every filament, if `currents` is omitted entirely).
         There is no firmware-side default — omitting both leaves every
         filament idling at 0 mA.
+
+        verify=True: wait, in ONE bulk polling loop, until every filament that
+        was actually commanded has settled at its current, and merge the
+        outcome under result["heating"] ({"ok", "results": {filament:
+        <idle_one's heating shape>}, "pending", ...}). `not_reached` lists the
+        ones that did not -- including any commanded to ~0 mA, which cannot be
+        confirmed. The top-level "ok" is still "the command was accepted", as
+        for idle_one; check heating["ok"] for arrival.
         """
-        return self._prep(IDLE, filaments, currents, arg=int(default_ma))
+        r = self._prep(IDLE, filaments, currents, arg=int(default_ma))
+        return (self._verify_batch(r, currents, default_ma, tolerance_ma, timeout_s)
+                if verify else r)
 
     def active_all(self,
                    filaments=None,               # None = every populated
                                                   # board (minus dead mask)
                    currents: dict | None = None,   # {filament: mA} -- explicit
                                                     # PER-FILAMENT override
-                   default_ma: float = 0) -> dict:  # mA for any filament NOT
+                   default_ma: float = 0,        # mA for any filament NOT
                                                      # in `currents` -- same
                                                      # "no default" footgun as
                                                      # idle_all, see above
+                   verify: bool = False,          # wait until every commanded
+                                                   # filament has settled
+                   tolerance_ma: float = 150.0,   # only used if verify=True
+                   timeout_s: float = 10.0) -> dict:  # only used if verify=True
         """ACTIVE a BATCH of filaments, excluding the dead mask.
         For exactly one filament, use active_one() instead.
 
         currents: {filament: mA} — per-filament active current override.
         default_ma: current used for any filament NOT listed in `currents`.
+
+        verify=True: as idle_all's -- one bulk wait for the whole batch, the
+        outcome under result["heating"], the stragglers in `not_reached`.
         """
-        return self._prep(ACTIVE, filaments, currents, arg=int(default_ma))
+        r = self._prep(ACTIVE, filaments, currents, arg=int(default_ma))
+        return (self._verify_batch(r, currents, default_ma, tolerance_ma, timeout_s)
+                if verify else r)
 
     def voltage_all(self,
                     filaments=None,               # None = every populated
@@ -2579,7 +2645,7 @@ class CTClient:
             return {"ok": ok, "filament": f, "target_ma": live[f],
                     "measured_ma": float(raw) if raw is not None else 0.0,
                     "measured_valid": raw is not None, "measured_from": "cached",
-                    "elapsed_s": time.monotonic() - start,
+                    "elapsed_s": round(time.monotonic() - start, 3),
                     "present": bool(data.get("present", False)),
                     "cc_mode": data.get("cc_mode"),
                     "arrival": data.get("arrival"), "faulted": False, **extra}
@@ -2646,7 +2712,7 @@ class CTClient:
                                           f"{timeout_s} s")
         return {"ok": all(r.get("ok") for r in results.values()),
                 "results": results, "pending": sorted(pending),
-                "elapsed_s": time.monotonic() - start, "polls": polls}
+                "elapsed_s": round(time.monotonic() - start, 3), "polls": polls}
 
     def stop_one(self, filament: int,
                 verify: bool = False,      # confirm current drops to ~0 mA

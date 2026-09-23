@@ -1137,17 +1137,30 @@ current.
 ct.standby_all(filaments=[0, 1, 2, 3])
 ```
 
-**`idle_all(filaments=None, currents=None, default_ma=0)`** — Warm pool for
-a BATCH of filaments at once. See the dedicated section below.
+**`idle_all(filaments=None, currents=None, default_ma=0, verify=False, tolerance_ma=150, timeout_s=20)`**
+— Warm pool for a BATCH of filaments at once. See the dedicated section below.
 
-**`active_all(filaments=None, currents=None, default_ma=0)`** — Promote a
-BATCH of filaments to ACTIVE at once. Same `currents` / `default_ma` shape
-as `idle_all`. Less common than firing filaments one at a time via
-`active_one` — mainly useful for multi-filament group tests.
+**`active_all(filaments=None, currents=None, default_ma=0, verify=False, tolerance_ma=150, timeout_s=10)`**
+— Promote a BATCH of filaments to ACTIVE at once. Same `currents` /
+`default_ma` shape as `idle_all`. Less common than firing filaments one at a
+time via `active_one` — mainly useful for multi-filament group tests. Only
+from IDLE, like `active_one`.
 
 ```python
-ct.active_all(filaments=[0, 1, 2], default_ma=2900)
+r = ct.active_all(filaments=[0, 1, 2], default_ma=2900, verify=True)
+if r.get("not_reached"):
+    print("did not settle:", r["not_reached"], r["heating"])
 ```
+
+**`verify=True`** on either waits until every filament that was actually
+commanded has settled at its own current — one bulk polling loop for the
+whole batch (`wait_for_currents`), never one loop per filament — and puts the
+outcome under `heating`, shaped like `idle_one`'s. `not_reached` (printed right
+under `ok`) lists the stragglers, plus any filament commanded to ~0 mA, which
+the bulk read cannot confirm and which is therefore never counted as arrived.
+The top-level `ok` still means "the command was accepted", as for `idle_one`;
+arrival is `heating["ok"]`. Filaments that were dead, unslotted or failed to
+command are not waited for — they were never commanded.
 
 **`voltage_all(filaments=None, millivolts=None, default_mv=800)`** — Drive a
 BATCH of filaments to manual VOLTAGE mode at once. Same
@@ -1185,9 +1198,9 @@ ct.idle_all(filaments=list(IDLE_MA), currents=IDLE_MA)
 
 # 5. Ramp one filament's idle current up in steps (e.g. thermal soak test)
 import time
-for ma in (500, 1000, 1500, 2000, 2500):
-    ct.idle_all(filaments=[7], currents={7: ma})
-    time.sleep(2)
+for ma in (500, 1000, 1500, 2000):        # IDLE is capped at 2000 mA
+    r = ct.idle_all(filaments=[7], currents={7: ma}, verify=True)
+    print(ma, r["heating"]["ok"], r.get("not_reached"))
 
 # 6. CAUTION: calling idle_all() with no arguments idles every filament
 #    at 0 mA — it will NOT warm anything up. Always pass default_ma or a
