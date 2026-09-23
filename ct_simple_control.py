@@ -896,18 +896,44 @@ class CTClient:
         back mid-run by the very thing protecting it.
         """
         stop_keepalive = self._start_keepalive(filaments)
+        body_exc = None
         try:
             yield self
+        except BaseException as exc:
+            body_exc = exc
+            raise
         finally:
             stop_keepalive()
             # Deliberately not conditional on success, and each filament is
             # attempted even if an earlier one errors: the whole point is that
             # this path runs when something has already gone wrong.
+            #
+            # And each result is CHECKED. This was `try: stop_one() except
+            # Exception: pass` -- dead code (stop_one returns, it does not
+            # raise) wrapped around a discarded return value, so a filament
+            # that would not stop read exactly like one that had. Two ways to
+            # fail, both reported: the STOP never landed (ok:False), or it
+            # landed and the current did not come down (verify's heating.ok
+            # False) -- the second is the dangerous one, because everything
+            # upstream believes the filament is off.
+            failed = {}
             for f in filaments:
+                name = f"filament {int(f)}"
                 try:
-                    self.stop_one(int(f), verify=verify)
-                except Exception:
-                    pass
+                    r = self.stop_one(int(f), verify=verify)
+                except Exception as exc:          # defensive: should not raise
+                    failed[name] = f"raised {type(exc).__name__}: {exc}"
+                    continue
+                if not r.get("ok"):
+                    failed[name] = f"STOP did not land — {r.get('error') or 'no reason given'}"
+                    continue
+                h = r.get("heating")
+                if verify and isinstance(h, dict) and not h.get("ok"):
+                    failed[name] = (f"STOP landed but the current did not come down "
+                                    f"({h.get('measured_ma')} mA, arrival="
+                                    f"{h.get('arrival')}) — it may still be heating")
+            self._report_teardown("energised()", failed,
+                                  [f"filament {int(f)}" for f in filaments], body_exc)
 
     @contextmanager
     def lease(self, ttl: float = 60.0, note: str = ""):
@@ -923,6 +949,26 @@ class CTClient:
             self.release_lease()
 
     # ── session — guaranteed safe teardown ────────────────────────────────────
+
+    def _report_teardown(self, who: str, failed: dict, steps, body_exc) -> None:
+        """Record a teardown's outcome, and make a failure impossible to miss.
+
+        Used by session() and energised(). A context manager cannot return
+        anything and this client does not raise, so a failure goes three ways:
+        stderr (always visible in a script's output), `self.last_teardown` (for
+        code that checks), and -- when the with-block is already raising -- a
+        note on THAT exception rather than a replacement for it, so the
+        original error is still the one seen first.
+        """
+        self.last_teardown = Result({"ok": not failed, "by": who,
+                                     "failed": failed, "steps": list(steps)})
+        if not failed:
+            return
+        msg = (f"ct.{who} teardown FAILED — hardware may still be energised:\n"
+               + "\n".join(f"  {n}: {e}" for n, e in failed.items()))
+        print(msg, file=sys.stderr, flush=True)
+        if body_exc is not None and hasattr(body_exc, "add_note"):
+            body_exc.add_note(msg)
 
     @contextmanager
     def session(self, cleanup: bool = True):
@@ -979,14 +1025,8 @@ class CTClient:
                         continue
                     if isinstance(r, dict) and not r.get("ok"):
                         failed[name] = r.get("error") or "returned ok:False with no reason"
-                self.last_teardown = Result({"ok": not failed, "failed": failed,
-                                             "steps": [n for n, _ in steps]})
-                if failed:
-                    msg = ("ct.session() teardown FAILED — hardware may still be "
-                           "energised:\n" + "\n".join(f"  {n}: {e}" for n, e in failed.items()))
-                    print(msg, file=sys.stderr, flush=True)
-                    if body_exc is not None and hasattr(body_exc, "add_note"):
-                        body_exc.add_note(msg)
+                self._report_teardown("session()", failed,
+                                      [n for n, _ in steps], body_exc)
 
     # ── dead-man safety watchdog ─────────────────────────────────────────────
     # The backend walks an unattended ACTIVE filament back and drops the HV
