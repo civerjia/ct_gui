@@ -3424,6 +3424,57 @@ traffic this removes. Use `stop_one(verify=True)` for those.
 > A `SIGKILL` still cannot be caught by anything in this process — only a
 > backend-side watchdog could cover that, and there isn't one yet.
 
+### The dead-man safety watchdog
+
+A client that dies mid-run leaves the hardware where it was: a filament at
+ACTIVE and the HV rails enabled, with nothing left to turn them off. `session()`
+and `energised()` cover a crash *inside* the process; they cannot cover
+`SIGKILL`, a hung process, or the machine dying. The lease self-expires but
+de-energises nothing — expiry frees write access, it does not touch hardware.
+
+So the **backend** holds a dead-man timer. It outlives every client and sees
+every command.
+
+| | default | on expiry |
+|---|---|---|
+| a filament at **ACTIVE** | 30 s | commanded to **SLEEP** (`active_fallback`) |
+| the **HV rails** | 10 s | emission and focus both **off** |
+
+> ⚠️ **COMMANDS renew the timer. READS DO NOT.** This is the whole design. The
+> GUI polls continuously and must keep doing so — it is the monitoring
+> interface and has to coexist with any script — so if a read renewed the
+> timer, an open browser tab in another room would hold a filament at firing
+> current indefinitely. Only something that asks the hardware to *do* something
+> renews it.
+
+**`energised()` runs a keepalive for you**, and that is the right place for it:
+code that legitimately sits at ACTIVE for a minute without commanding anything
+— a settle, a long fit, a measurement between shots — would otherwise be walked
+back mid-run by the very thing protecting it. Call **`keepalive(filaments=None)`**
+directly only when holding a state outside that block.
+
+**`safety()`** reads it: the config, which filaments it considers ACTIVE and how
+long each has gone uncommanded, the commanded rail states, and `events` — what
+it has actually had to do. An empty `events` is the healthy answer; a non-empty
+one is a record of the hardware being walked back with nobody asking, worth
+reading after a run that ended badly.
+
+`never_commanded: True` on a filament means this backend has seen no command
+for one it believes is ACTIVE — normally because it restarted while the
+filament was already hot. That counts as **expired**, not as fresh: it is
+exactly the case the watchdog exists for.
+
+**`safety_config(enabled=, active_timeout_s=, active_fallback=, hv_timeout_s=)`**
+changes the rules. Two refusals are deliberate:
+
+- `active_fallback` must be **de-energising** (STOP or SLEEP). A watchdog that
+  fired from one energised state into another would be firing into a second
+  hazard.
+- a **zero or negative timeout** is refused. Switching the watchdog off goes
+  through `enabled=False`, so turning off the thing that protects an unattended
+  filament is a visible decision in the log rather than a number someone set
+  to 0.
+
 ### Board self-test and I²C diagnostics
 
 "Is the hardware wired up and answering" — a different question from "is the

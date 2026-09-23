@@ -173,6 +173,7 @@ Dependencies: pip install requests
 """
 
 import math
+import threading
 import time
 from contextlib import contextmanager
 from typing import NewType
@@ -682,12 +683,21 @@ class CTClient:
 
         What this does NOT cover: the process being killed outright (SIGKILL),
         or the machine dying. Only the backend can protect against that, since
-        it outlives the script — there is no such watchdog yet, and the lease
-        (which does self-expire) only gates writes, it de-energises nothing.
+        it outlives the script -- and it now does: its dead-man watchdog walks
+        an unattended ACTIVE filament back to SLEEP and drops the HV rails (see
+        safety()). The lease still de-energises nothing; it only gates writes.
+
+        While this block is open a keepalive runs in the background, because
+        the watchdog is deliberately renewed by COMMANDS and not by reads: code
+        that legitimately sits at ACTIVE for a minute without commanding
+        anything -- a settle, a long measurement -- would otherwise be walked
+        back mid-run by the very thing protecting it.
         """
+        stop_keepalive = self._start_keepalive(filaments)
         try:
             yield self
         finally:
+            stop_keepalive()
             # Deliberately not conditional on success, and each filament is
             # attempted even if an earlier one errors: the whole point is that
             # this path runs when something has already gone wrong.
@@ -745,6 +755,119 @@ class CTClient:
                         fn()
                     except Exception:
                         pass
+
+    # ── dead-man safety watchdog ─────────────────────────────────────────────
+    # The backend walks an unattended ACTIVE filament back and drops the HV
+    # rails on its own -- it outlives the client, which is the only place that
+    # protection can live. See safety() for the rules; the one that shapes
+    # everything else is that COMMANDS renew the timer and READS do not, so the
+    # GUI polling in another window cannot hold a filament at firing current.
+
+    #: How often _start_keepalive() renews. A third of the tightest default
+    #: (HV, 10 s) so two renewals can be lost to a slow link and the timer
+    #: still does not expire under a caller that is very much alive.
+    _KEEPALIVE_PERIOD_S = 3.0
+
+    def safety(self) -> dict:
+        """Read the backend's dead-man watchdog.
+
+            {"ok", "enabled", "active_timeout_s", "active_fallback",
+             "hv_timeout_s",
+             "active_filaments": {fid: {"idle_for_s", "never_commanded"}},
+             "hv_commanded": {"emission": bool, "focus": bool},
+             "hv_idle_for_s": float | None,
+             "events": [ ... what it has actually had to do ... ]}
+
+        `never_commanded: True` means this backend has seen no command for a
+        filament it believes is ACTIVE -- normally because it restarted while
+        the filament was already hot. That is counted as expired, not as fresh:
+        it is exactly the case the watchdog exists for.
+
+        `events` empty is the healthy answer. A non-empty one is a record of
+        the hardware being walked back without anyone asking, which is worth
+        reading after a run that ended badly.
+        """
+        return self._get("/api/safety", timeout=5.0)
+
+    def safety_config(self, enabled: bool | None = None,
+                      active_timeout_s: float | None = None,
+                      active_fallback: int | None = None,
+                      hv_timeout_s: float | None = None) -> dict:
+        """Change the watchdog's rules. Returns the same shape as safety(),
+        plus "changed".
+
+        Defaults: ACTIVE falls back to SLEEP after 30 s without a command, the
+        HV rails go off after 10 s.
+
+        `active_fallback` must be a DE-ENERGISING state (STOP or SLEEP) and the
+        backend refuses anything else -- a watchdog that fired from one
+        energised state into another would be firing into a second hazard.
+
+        A zero or negative timeout is refused too: switching the watchdog off
+        goes through `enabled=False`, so that turning off the thing that
+        protects an unattended filament is a visible decision in the log rather
+        than a number someone set to 0.
+        """
+        body: dict = {}
+        if enabled is not None:
+            body["enabled"] = bool(enabled)
+        if active_timeout_s is not None:
+            body["active_timeout_s"] = float(active_timeout_s)
+        if active_fallback is not None:
+            body["active_fallback"] = int(active_fallback)
+        if hv_timeout_s is not None:
+            body["hv_timeout_s"] = float(hv_timeout_s)
+        return self._post("/api/safety", body, timeout=5.0)
+
+    def keepalive(self, filaments=None) -> dict:
+        """Renew the watchdog without commanding anything.
+
+        For code that is legitimately holding ACTIVE or the HV rails while
+        doing its own work -- a settle, a long fit, a measurement between
+        shots. `filaments` limits it to those (USER_INDEX); None renews every
+        filament the backend is tracking, and the HV rails either way.
+
+        energised() runs one of these in the background for you, which is the
+        right place for it. Call this directly only when holding a state
+        outside that block.
+        """
+        body: dict = {"keepalive": True}
+        if filaments is not None:
+            body["filaments"] = [int(self._fid_of(f)) for f in filaments]
+        return self._post("/api/safety", body, timeout=5.0)
+
+    def _start_keepalive(self, filaments=None):
+        """Renew in the background until the returned callable is invoked.
+
+        Never raises and never blocks the caller: a keepalive that could take
+        the run down with it would be worse than the timeout it prevents. A
+        failed renewal is simply not a renewal -- if the backend really is
+        unreachable, the watchdog firing is the correct outcome.
+        """
+        stop = threading.Event()
+        fids = None
+        if filaments:
+            try:
+                fids = [int(self._fid_of(f)) for f in filaments]
+            except Exception:
+                fids = None
+
+        def _run():
+            while not stop.wait(self._KEEPALIVE_PERIOD_S):
+                body: dict = {"keepalive": True}
+                if fids:
+                    body["filaments"] = fids
+                try:
+                    self._post("/api/safety", body, timeout=3.0)
+                except Exception:
+                    pass
+        t = threading.Thread(target=_run, name="ct_keepalive", daemon=True)
+        t.start()
+
+        def _stop():
+            stop.set()
+            t.join(timeout=1.0)
+        return _stop
 
     # ── dead mask ─────────────────────────────────────────────────────────────
     # The mask lives in the BACKEND now, not here. It used to die with the

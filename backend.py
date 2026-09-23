@@ -242,6 +242,30 @@ _OCP_SENSE_RESISTOR_OHMS = 0.015   # tps55289_board_constants::kOcpSenseResistor
 _OCP_MA_PER_CODE = 0.5 / _OCP_SENSE_RESISTOR_OHMS   # ≈ 33.33 mA/code
 _DIAG_CHIPS = ["mux", "tps", "ina", "enable_io", "fault_io", "iso_io", "hv_io"]
 
+# ── Dead-man safety watchdog ───────────────────────────────────────────────
+# A client that dies mid-run leaves the hardware where it was: a filament at
+# ACTIVE and the HV rails enabled, with nothing left to turn them off. Nothing
+# in the lease covers this -- the lease expires, but expiry only frees WRITE
+# ACCESS; it has never de-energised anything.
+#
+# So the backend, which outlives the client and sees every command, holds a
+# dead-man timer. Miss it and the hardware is walked back on its own.
+#
+# WHAT COUNTS AS BEING CONTROLLED: commands, never reads. This is the whole
+# design and it is not negotiable -- the GUI polls continuously and must keep
+# doing so (it is the monitoring interface and has to coexist with any script),
+# so if a read renewed the timer an open browser tab would hold a filament at
+# firing current indefinitely with nobody in the room. Only something that
+# ASKS the hardware to do something renews, plus an explicit keepalive for a
+# caller that is legitimately holding a state while doing its own work.
+SAFETY_ACTIVE_TIMEOUT_S = 30.0    # ACTIVE with nobody commanding -> fall back
+SAFETY_ACTIVE_FALLBACK = 2        # ...to SLEEP. Not STOP: a re-warm is slow,
+                                   # and SLEEP already removes the current.
+                                   # Must be a non-energising state or the
+                                   # timer would "fire" into another hazard.
+SAFETY_HV_TIMEOUT_S = 10.0        # HV enabled with nobody commanding -> off
+SAFETY_TICK_S = 1.0               # how often the timer is checked
+
 # ── Lease and polling timing ───────────────────────────────────────────────
 
 LOCK_TTL_DEFAULT_S = 30.0
@@ -1342,6 +1366,10 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                     "totalMs": _le(raw, 7, 4), "triggerEdge": raw[11]}
         return {"ok": False}
     if op == "arm":
+        # A run in progress is active control of both the filaments and the
+        # rails -- that is what a run IS -- so arming renews both timers.
+        safety_touch_hv()
+        safety_touch_filaments(list(LAST_POWER_STATE.keys()))
         resp = link.request(SHV_ARM, _u16(max(1, int(body.get("repeats", 1)))))
         raw = resp.get("raw") or []
         reject = raw[1] if len(raw) > 1 else None
@@ -1831,10 +1859,178 @@ def check_heating_plan(heating) -> list[str]:
     return problems
 
 
+# ── Dead-man safety watchdog — state and machinery ──────────────────────────
+# See SAFETY_* in the constants section for the rules. State, not constants, so
+# it lives here with the code that owns it.
+_SAFETY_LOCK = threading.Lock()
+_SAFETY = {
+    "enabled": True,
+    "active_timeout_s": SAFETY_ACTIVE_TIMEOUT_S,
+    "active_fallback": SAFETY_ACTIVE_FALLBACK,
+    "hv_timeout_s": SAFETY_HV_TIMEOUT_S,
+}
+# Last COMMAND that touched each thing, monotonic. Reads never write these.
+_SAFETY_TOUCH_FIL: dict[int, float] = {}
+_SAFETY_TOUCH_HV: float = 0.0
+# What the backend last COMMANDED the rails to. The STM32 pin is the truth, but
+# reading it every tick is an I2C round trip on the shared link; the commanded
+# state is enough to decide whether a timeout has anything to act on, and the
+# off command it issues is idempotent if it turns out there was nothing on.
+_HV_COMMANDED: dict[str, bool] = {"emission": False, "focus": False}
+# What the watchdog has done, for /api/safety and the log. A count that never
+# moves is how you know it has never had to act.
+_SAFETY_EVENTS: list[dict] = []
+
+
+def safety_touch_filaments(fids, when: float | None = None) -> None:
+    """Renew the dead-man timer for these filaments. COMMANDS ONLY."""
+    t = when if when is not None else time.monotonic()
+    with _SAFETY_LOCK:
+        for f in fids or ():
+            _SAFETY_TOUCH_FIL[int(f)] = t
+
+
+def safety_touch_hv(when: float | None = None) -> None:
+    """Renew the dead-man timer for the HV rails. COMMANDS ONLY."""
+    global _SAFETY_TOUCH_HV
+    with _SAFETY_LOCK:
+        _SAFETY_TOUCH_HV = when if when is not None else time.monotonic()
+
+
+def note_hv_commanded(ch: str, on: bool) -> None:
+    """Record a commanded rail state, and renew its timer."""
+    with _SAFETY_LOCK:
+        if str(ch) in _HV_COMMANDED:
+            _HV_COMMANDED[str(ch)] = bool(on)
+    safety_touch_hv()
+
+
+def safety_snapshot() -> dict:
+    now = time.monotonic()
+    with _SAFETY_LOCK:
+        cfg = dict(_SAFETY)
+        hv_age = (now - _SAFETY_TOUCH_HV) if _SAFETY_TOUCH_HV else None
+        hv_cmd = dict(_HV_COMMANDED)
+        events = list(_SAFETY_EVENTS[-20:])
+        touch = dict(_SAFETY_TOUCH_FIL)
+    active = {}
+    for fid, (st, _when) in list(LAST_POWER_STATE.items()):
+        if st != POWER_STATE_ACTIVE:
+            continue
+        t = touch.get(int(fid))
+        # No touch recorded is NOT "just renewed" -- it means this backend has
+        # never seen a command for it (e.g. it restarted while the filament was
+        # already hot), which is precisely when the watchdog matters most.
+        active[int(fid)] = {"idle_for_s": round(now - t, 1) if t else None,
+                            "never_commanded": t is None}
+    return {"ok": True, **cfg,
+            "active_filaments": active,
+            "hv_commanded": hv_cmd,
+            "hv_idle_for_s": round(hv_age, 1) if hv_age is not None else None,
+            "events": events}
+
+
+def _safety_record(kind: str, detail: dict) -> None:
+    ev = {"kind": kind, "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), **detail}
+    with _SAFETY_LOCK:
+        _SAFETY_EVENTS.append(ev)
+        del _SAFETY_EVENTS[:-100]
+    log.warning("safety-watchdog: %s %s", kind, detail)
+
+
+def _safety_fallback_filaments(fids: list[int], state: int) -> None:
+    """Walk these filaments back, grouped per controller like every other
+    batch write here. Best effort and logged either way: a watchdog that
+    raises is a watchdog that stops watching."""
+    by_ctrl: dict[int, list[int]] = {}
+    for f in fids:
+        c0 = filament_to_board(f)[0]
+        if c0 is not None:
+            by_ctrl.setdefault(int(c0), []).append(int(f))
+    for c0, group in by_ctrl.items():
+        link = CONTROLLERS.get(c0 + 1)
+        if not link or not link.client.connected:
+            _safety_record("fallback_unreachable",
+                           {"filaments": group, "controller": c0 + 1,
+                            "error": "controller not connected — could not walk "
+                                     "these back"})
+            continue
+        try:
+            r = prep_filaments(link, c0, int(state), group, default_arg=0)
+            _safety_record("fallback", {"filaments": group, "state": int(state),
+                                        "applied": r.get("applied"),
+                                        "failed": r.get("failed")})
+        except Exception as exc:
+            _safety_record("fallback_error", {"filaments": group, "error": str(exc)})
+
+
+def _safety_disable_hv() -> None:
+    host, err = None, None
+    link = CONTROLLERS.get(MASTER)
+    if link and link.client.connected:
+        host = link.host
+    if not host:
+        _safety_record("hv_off_unreachable",
+                       {"error": "master not connected — could not turn HV off"})
+        return
+    for ch in ("emission", "focus"):
+        try:
+            stm32_hv_enable_set(host, ch, False)
+        except Exception as exc:
+            _safety_record("hv_off_error", {"ch": ch, "error": str(exc)})
+    with _SAFETY_LOCK:
+        for ch in _HV_COMMANDED:
+            _HV_COMMANDED[ch] = False
+    _safety_record("hv_off", {"reason": "no HV command within the timeout"})
+
+
+def _safety_loop() -> None:
+    # Assigned below when a timer fires, so it has to be declared -- without
+    # this the whole tick raises UnboundLocalError and the watchdog logs an
+    # exception every second while watching nothing.
+    global _SAFETY_TOUCH_HV
+    while True:
+        time.sleep(SAFETY_TICK_S)
+        try:
+            now = time.monotonic()
+            with _SAFETY_LOCK:
+                if not _SAFETY["enabled"]:
+                    continue
+                a_to = float(_SAFETY["active_timeout_s"])
+                fallback = int(_SAFETY["active_fallback"])
+                hv_to = float(_SAFETY["hv_timeout_s"])
+                touch = dict(_SAFETY_TOUCH_FIL)
+                hv_last = _SAFETY_TOUCH_HV
+                hv_on = any(_HV_COMMANDED.values())
+            stale = []
+            for fid, (st, _w) in list(LAST_POWER_STATE.items()):
+                if st != POWER_STATE_ACTIVE:
+                    continue
+                t = touch.get(int(fid))
+                if t is None or (now - t) > a_to:
+                    stale.append(int(fid))
+            if stale:
+                # Clear the touch first so a controller that cannot be reached
+                # does not make this fire again every tick.
+                with _SAFETY_LOCK:
+                    for f in stale:
+                        _SAFETY_TOUCH_FIL[f] = now
+                _safety_fallback_filaments(stale, fallback)
+            if hv_on and (hv_last == 0.0 or (now - hv_last) > hv_to):
+                with _SAFETY_LOCK:
+                    _SAFETY_TOUCH_HV = now
+                _safety_disable_hv()
+        except Exception as exc:          # never let the watchdog die
+            log.exception("safety-watchdog tick failed: %s", exc)
+
+
 def note_power_state(fids, state: int) -> None:
     now = time.monotonic()
     for f in fids:
         LAST_POWER_STATE[int(f)] = (int(state), now)
+    # Every power-state COMMAND funnels through here, which makes it the one
+    # place the dead-man timer has to be renewed from. Reads do not reach it.
+    safety_touch_filaments(fids, now)
 
 
 def ladder_blocks_active(fid: int, arrival: str | None = None,
@@ -2173,6 +2369,11 @@ _UNGATED_POSTS = {
     "/api/master",            # which controller is master: host-side routing only
     "/api/schedule",          # stages the plan in this process
     "/api/poll-pause",        # heartbeat hint, self-expiring, no hardware write
+    "/api/safety",            # dead-man watchdog: read it, renew it, configure
+                               # it. Ungated on purpose -- a keepalive from a
+                               # client that does NOT hold the lease is still
+                               # evidence that somebody is present, which is the
+                               # only question this watchdog asks.
     "/api/calibration/save",  # writes a host file
     "/api/hv-lut/save",       # writes a host file
     # Read-only hardware queries that happen to be POSTs. A lease reserves the
@@ -3471,6 +3672,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 clients = [dict(r, idle_s=round(time.time() - r["last_seen"], 1)) for r in clients]
             self._json({"ok": True, "you": self._client(), "clients": clients,
                         "lock": _lease_snapshot()})
+        elif path == "/api/safety":
+            self._json(safety_snapshot())
         elif path == "/api/status":
             # Session snapshot: each controller's cached connection state
             # (ControllerLink.status(), no live hardware read), the current
@@ -4343,6 +4546,69 @@ class CtHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         results[str(cid)] = {"ok": False, "error": str(exc)}
                 self._json({"ok": True, "results": results})
+            elif path == "/api/safety":
+                # Dead-man watchdog: read the state, or change the rules.
+                # POST with any of enabled / active_timeout_s /
+                # active_fallback / hv_timeout_s to change them; POST {} or GET
+                # just reads. "keepalive": true renews without commanding
+                # anything, for a caller legitimately holding a state while it
+                # does its own work.
+                changed = {}
+                if body.get("keepalive"):
+                    fids = body.get("filaments")
+                    safety_touch_filaments([int(f) for f in fids] if fids
+                                           else list(LAST_POWER_STATE.keys()))
+                    safety_touch_hv()
+                    changed["keepalive"] = True
+                bad = []
+                with _SAFETY_LOCK:
+                    if "enabled" in body:
+                        _SAFETY["enabled"] = bool(body["enabled"])
+                        changed["enabled"] = _SAFETY["enabled"]
+                    for key in ("active_timeout_s", "hv_timeout_s"):
+                        if key in body:
+                            try:
+                                v = float(body[key])
+                            except (TypeError, ValueError):
+                                bad.append(f"{key} must be a number, got {body[key]!r}")
+                                continue
+                            if v <= 0:
+                                bad.append(f"{key} must be positive, got {v} — "
+                                           f"use enabled:false to switch the "
+                                           f"watchdog off, so that turning it "
+                                           f"off is a visible decision")
+                                continue
+                            _SAFETY[key] = v
+                            changed[key] = v
+                    if "active_fallback" in body:
+                        try:
+                            st = int(body["active_fallback"])
+                        except (TypeError, ValueError):
+                            bad.append(f"active_fallback must be a power state "
+                                       f"number, got {body['active_fallback']!r}")
+                            st = None
+                        if st is not None:
+                            # The fallback must REMOVE power. Allowing an
+                            # energising state here would make the watchdog fire
+                            # from one hazard into another, which is worse than
+                            # not firing at all.
+                            if st in ENERGISING_STATES or st not in POWER_STATE_NAMES:
+                                bad.append(
+                                    f"active_fallback {st} "
+                                    f"({power_state_name(st)}) is not a "
+                                    f"de-energising state — the watchdog may "
+                                    f"only fall back to STOP(1) or SLEEP(2)")
+                            else:
+                                _SAFETY["active_fallback"] = st
+                                changed["active_fallback"] = st
+                if bad:
+                    # Snapshot FIRST: it carries its own "ok": True, and
+                    # spreading it after the refusal overwrote it -- the reply
+                    # said ok=True and carried the reason it had refused.
+                    return self._json({**safety_snapshot(), "ok": False,
+                                       "error": "; ".join(bad),
+                                       "changed": changed}, HTTPStatus.OK)
+                self._json({**safety_snapshot(), "changed": changed})
             elif path == "/api/filament-state":
                 # TRUE single-board CH_SET_POWER_STATE (0x35, FLAG_SINGLE) — one
                 # filament, one frame, no masking/grouping machinery. This is the
@@ -5206,6 +5472,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     # failed", which is what it looked like before this.
                     if r.get("reason"):
                         out["reason"] = r["reason"]
+                safety_touch_hv()     # adjusting a rail is HV control
                 self._json(out)
             elif path == "/api/hv/set-i":
                 # Linear emission-current set: ma=target mA (0–85.7).
@@ -5226,6 +5493,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     out2["error"] = r.get("error") or "DS3502 write failed"
                     if r.get("reason"):
                         out2["reason"] = r["reason"]     # see set-v above
+                safety_touch_hv()     # adjusting a rail is HV control
                 self._json(out2)
             elif path == "/api/stm32/hv-enable":
                 # Proxy to `/stm32/hv_enable` — toggles the HV enable GPIO for
@@ -5235,7 +5503,13 @@ class CtHandler(BaseHTTPRequestHandler):
                 host, err = self._master_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
-                self._json(stm32_hv_enable_set(host, str(body.get("ch", "emission")), bool(body.get("on"))))
+                _hv_ch, _hv_on = str(body.get("ch", "emission")), bool(body.get("on"))
+                _hv_r = stm32_hv_enable_set(host, _hv_ch, _hv_on)
+                # Record what was commanded so the watchdog knows whether a
+                # rail is worth turning off, and renew its timer.
+                if _hv_r.get("ok", True):
+                    note_hv_commanded(_hv_ch, _hv_on)
+                self._json(_hv_r)
             elif path == "/api/stm32/hv-set-target":
                 # Proxy to `/stm32/hv_set_target` — starts the STM32's closed
                 # HV loop for one channel: it steps the DS3502 wiper by
@@ -5551,6 +5825,14 @@ def main() -> None:
     port = int(os.environ.get("CT_GUI_PORT", "8770"))
     _setup_logging()
     log.info("=== backend start — listening on http://%s:%d ===", host, port)
+    # The dead-man watchdog starts with the server and outlives every client.
+    # Daemon: it must never hold the process open, and it has no state worth
+    # draining on the way out.
+    threading.Thread(target=_safety_loop, name="safety_watchdog", daemon=True).start()
+    log.info("safety watchdog: ACTIVE -> %s after %.0fs, HV off after %.0fs "
+             "(commands renew; reads do not)",
+             power_state_name(SAFETY_ACTIVE_FALLBACK), SAFETY_ACTIVE_TIMEOUT_S,
+             SAFETY_HV_TIMEOUT_S)
     server = ThreadingHTTPServer((host, port), CtHandler)
     print(f"CT GUI server listening on http://{host}:{port}  (log: {LOG_DIR}/backend.log)")
     if host == "0.0.0.0":
