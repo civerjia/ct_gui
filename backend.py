@@ -2663,6 +2663,104 @@ def _lease_blocking(owner: str) -> dict[str, Any] | None:
     return snap if snap["held"] and snap["owner"] != owner else None
 
 
+# ── Audit log: one line per state-changing request ─────────────────────────
+# backend.log used to record almost nothing a person did: 84 shots, a MOSFET
+# test and a switch test on 2026-09-23 left 14 lines, none of them a command.
+# Every POST that CHANGES something now leaves one line -- who, what, and
+# whether it worked -- including writes the lease refused. Reads that happen to
+# be POSTs, and the renew heartbeats, are skipped: logged, they would bury the
+# commands exactly as the per-retry reconnect warnings did.
+
+#: POSTs that only read, or are heartbeats. Not audited.
+AUDIT_SKIP_PATHS = frozenset({
+    "/api/adc/ready-status", "/api/adc/ready-renew", "/api/diagnosis",
+    "/api/present", "/api/tca9554-read", "/api/verify-schedule",
+    "/api/poll-pause",
+})
+#: /api/shv ops that only read.
+AUDIT_SKIP_SHV_OPS = frozenset({
+    "get_active_list", "table_info", "heat_info", "get_config", "status",
+    "pulse_log", "capability",
+})
+AUDIT_DEDUP_S = 5.0          # identical request from the same client within this: counted, not re-logged
+AUDIT_BODY_MAX = 300         # characters of request summary per line
+AUDIT_ERROR_MAX = 200        # characters of error per line
+_AUDIT_LAST: dict = {}       # (client, path, body-json) -> [monotonic, suppressed count]
+_AUDIT_LOCK = threading.Lock()
+
+
+def _audit_skipped(path: str, body: dict) -> bool:
+    if path in AUDIT_SKIP_PATHS:
+        return True
+    if path == "/api/shv":
+        op = body.get("op")
+        if op in AUDIT_SKIP_SHV_OPS:
+            return True
+        # fault_policy / trigger_delay without a value to set are reads
+        if op == "fault_policy" and body.get("board") is None and body.get("mismatch") is None:
+            return True
+        if op == "trigger_delay" and body.get("delay_us", body.get("delayUs")) is None:
+            return True
+    if path == "/api/lock" and str(body.get("action", "acquire")).lower() in ("renew", "status"):
+        return True
+    if path == "/api/safety" and set(body) <= {"keepalive", "filaments", "client"}:
+        return True
+    return False
+
+
+def _audit_summary(v, depth: int = 0) -> str:
+    """Compact, bounded rendering of a request body: scalars in full, long
+    lists by length -- a schedule download carries hundreds of entries."""
+    if isinstance(v, dict):
+        if depth >= 2:
+            return f"{{{len(v)} keys}}"
+        return "{" + ", ".join(f"{k}: {_audit_summary(x, depth + 1)}" for k, x in v.items()
+                               if k != "client") + "}"
+    if isinstance(v, (list, tuple)):
+        if len(v) > 8 or any(isinstance(x, (dict, list)) for x in v):
+            return f"[{len(v)} items]"
+        return "[" + ", ".join(_audit_summary(x, depth + 1) for x in v) + "]"
+    return json.dumps(v, ensure_ascii=False) if isinstance(v, str) else str(v)
+
+
+def _audit_outcome(resp) -> str:
+    if not isinstance(resp, dict):
+        return "-> no reply" if resp is None else "-> replied"
+    if resp.get("ok") is False or resp.get("error"):
+        err = str(resp.get("error") or "failed")
+        if len(err) > AUDIT_ERROR_MAX:
+            err = err[:AUDIT_ERROR_MAX] + "…"
+        return f"-> FAILED: {err}"
+    return "-> ok"
+
+
+def audit_post(path: str, client, body, resp) -> None:
+    """One audit line for a POST, unless it is a read or a heartbeat."""
+    body = body if isinstance(body, dict) else {}
+    if _audit_skipped(path, body):
+        return
+    summary = _audit_summary(body)
+    if len(summary) > AUDIT_BODY_MAX:
+        summary = summary[:AUDIT_BODY_MAX] + "…"
+    outcome = _audit_outcome(resp)
+    key = (client, path, summary, outcome)
+    now = time.monotonic()
+    with _AUDIT_LOCK:
+        last = _AUDIT_LAST.get(key)
+        if last is not None and now - last[0] < AUDIT_DEDUP_S:
+            last[1] += 1
+            last[0] = now
+            return
+        repeats = last[1] if last else 0
+        _AUDIT_LAST[key] = [now, 0]
+        if len(_AUDIT_LAST) > 512:          # bounded: forget the oldest
+            for k in sorted(_AUDIT_LAST, key=lambda k: _AUDIT_LAST[k][0])[:256]:
+                _AUDIT_LAST.pop(k, None)
+    more = f"   (+{repeats} identical before this, not logged)" if repeats else ""
+    level = logging.WARNING if outcome.startswith("-> FAILED") else logging.INFO
+    log.log(level, "AUDIT %s POST %s %s %s%s", client or "?", path, summary, outcome, more)
+
+
 def _note_client(client: str, addr: str, path: str) -> None:
     with _ACCESS_LOCK:
         rec = _CLIENTS.setdefault(client, {"id": client, "requests": 0})
@@ -4464,10 +4562,26 @@ class CtHandler(BaseHTTPRequestHandler):
 
     # --- POST ---------------------------------------------------------------
     def do_POST(self) -> None:
+        # Every POST goes through the audit line in the finally -- including
+        # the ones refused by the lease and the ones that raise, which are the
+        # ones a post-mortem most needs. _read_json/_json note the request and
+        # the reply on self; see audit_post().
+        self._audit_body = None
+        self._audit_resp = None
+        self._audit_client = None
+        try:
+            self._do_post()
+        finally:
+            with _suppress():
+                audit_post(self.path.split("?", 1)[0], self._audit_client,
+                           self._audit_body, self._audit_resp)
+
+    def _do_post(self) -> None:
         global SCAN_MASK   # read (diagnosis branch) + written (channel-mask branch)
         path = self.path.split("?", 1)[0]
         body = self._read_json()
         client = self._client(body)
+        self._audit_client = client
         _note_client(client, self.client_address[0], path)
         held = self._lease_guard(path, body, client)
         if held is not None:
@@ -6048,11 +6162,14 @@ class CtHandler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(n) if n else b""
-            return json.loads(raw or b"{}")
+            body = json.loads(raw or b"{}")
         except (ValueError, json.JSONDecodeError):
-            return {}
+            body = {}
+        self._audit_body = body
+        return body
 
     def _json(self, obj, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self._audit_resp = obj
         data = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")

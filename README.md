@@ -141,6 +141,43 @@ finally:
 The GUI plays by the same rules: each tab has its own client id and takes the
 lease around a schedule download and a Cal & Test run (`static/client.js`).
 
+## Logs
+
+`logs/backend.log`, rotated daily (`backend.log.YYYY-MM-DD`).
+
+**Audit: one line per command.** Every POST that changes something is logged
+with who sent it (the client id), a bounded summary of the request, and the
+outcome — `-> ok` at INFO, `-> FAILED: <reason>` at WARNING. Writes refused by
+the lease are logged too. Grep for them:
+
+```bash
+grep AUDIT logs/backend.log                  # everything that was commanded
+grep "AUDIT.*FAILED" logs/backend.log        # everything that did not work
+grep "AUDIT liuxing" logs/backend.log        # one client's commands
+```
+
+```
+AUDIT test-script POST /api/filament-state {controller: 1, filament: 81, state: 5, arg: 1700} -> FAILED: filament 81 may not go to ACTIVE: …
+AUDIT other-client POST /api/filament-state {…} -> FAILED: another client holds the write lease: test-script
+AUDIT test-script POST /api/filament-state {…} -> FAILED: …   (+3 identical before this, not logged)
+```
+
+Not audited, because they would bury the commands: POSTs that only read
+(`verify-schedule`, `present`, `diagnosis`, `/api/shv` status/pulse_log/…,
+fault_policy and trigger_delay without a value), and heartbeats (lease renew,
+safety keepalive, ready-renew). GETs are never audited — every GUI poll is a
+GET. The same request from the same client within 5 s is counted instead of
+re-logged, and the count rides on the next line that is logged.
+
+**Controller outages** are logged on the transitions: `bridge DOWN` with the
+error, `bridge RECONNECTED … after N s down (M attempts)`, and `bridge still
+down` every 10 minutes in between. (It used to log every 1 s retry — 17–22k
+lines a day with a controller switched off, 99.7% of the file.)
+
+The audit records **what was commanded**. The full results — measured
+currents, pulse events, everything a script printed — are in the client's own
+log, below.
+
 ## Real-hardware bound schedule (download · arm · trigger · monitor)
 
 The firmware executes the bound schedule **autonomously** (PIO/ISR, sub-µs);
