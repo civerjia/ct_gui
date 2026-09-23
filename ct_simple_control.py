@@ -279,6 +279,12 @@ class CTClient:
                                        # hv_grid_set_all, present_filaments)
                                        # override this with a longer built-in
                                        # timeout since they take longer
+        keepalive: bool = True,       # renew the backend's dead-man watchdog
+                                       # in the background for as long as this
+                                       # client is alive and has energised
+                                       # something. See _ensure_keepalive();
+                                       # False means you renew it yourself, or
+                                       # accept the fallback firing mid-run.
     ):
         """Connect to a running backend.py instance.
 
@@ -297,6 +303,13 @@ class CTClient:
         self.client_id = client_id
         self.timeout = timeout
         self._s = requests.Session()
+        # Dead-man keepalive state. Armed lazily by _ensure_keepalive() the
+        # first time this client energises anything, then left running: it is
+        # one small POST every few seconds, and the alternative is remembering
+        # to renew in every long-running flow.
+        self._keepalive_enabled = bool(keepalive)
+        self._keepalive_lock = threading.Lock()
+        self._keepalive_stop = None
         self._s.headers.update({
             "X-CT-Client": client_id,
             "Content-Type": "application/json",
@@ -1420,6 +1433,7 @@ class CTClient:
 
     def _prep(self, state: int, filaments=None,
               currents: dict | None = None, arg: int = 0) -> dict:
+        self._ensure_keepalive(state)
         # USER_INDEX values this call actually asked for that the dead mask
         # drops BEFORE anything is sent — _live()'s filtering is invisible
         # to the caller otherwise. A filament silently vanishing here (e.g.
@@ -1572,7 +1586,33 @@ class CTClient:
                          f"never arrives. Ask for {self._IDLE_CEILING_MA} or "
                          f"less, or use active_one() if you need more"}
 
+    def _ensure_keepalive(self, state: int) -> None:
+        """Arm the background keepalive the first time this client energises
+        anything, and leave it running for the life of the client.
+
+        THE GENERAL FIX, rather than a keepalive bolted onto each long
+        operation. Long holds are everywhere -- a voltage sweep, a 40 s
+        wait_for_current (polls, and polls deliberately do not renew), a
+        thermal settle, a schedule, or any user script that commands ACTIVE and
+        then spends a minute on its own arithmetic. Patching them one at a time
+        guarantees the one that gets missed is the one that trips.
+
+        WHAT THIS MEANS FOR THE GUARANTEE, stated plainly: the watchdog
+        protects against the CLIENT PROCESS DYING, which is the failure it was
+        asked for -- the thread is a daemon, so it stops the instant the
+        process does and the backend's timer starts running. It does NOT
+        protect against a live client that has simply been abandoned (an
+        interactive session someone walked away from). If that matters, pass
+        keepalive=False and renew explicitly.
+        """
+        if state not in self._ENERGISING_STATES or not self._keepalive_enabled:
+            return
+        with self._keepalive_lock:
+            if self._keepalive_stop is None:
+                self._keepalive_stop = self._start_keepalive()
+
     def _state_one(self, filament: int, state: int, arg: int, op: str) -> dict:
+        self._ensure_keepalive(state)
         if state == IDLE:
             refusal = self._idle_ceiling_refusal(int(filament), int(arg))
             if refusal:

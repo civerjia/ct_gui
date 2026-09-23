@@ -1984,11 +1984,43 @@ def _safety_disable_hv() -> None:
     _safety_record("hv_off", {"reason": "no HV command within the timeout"})
 
 
+def _safety_schedule_running() -> tuple[bool, str | None]:
+    """(a schedule is running somewhere, or why that could not be determined).
+
+    A RUN IS ACTIVE CONTROL. The host pre-heats, arms, and then the firmware
+    drives the plan for minutes with no further host command -- the client is
+    only polling, and polls do not renew by design. Without this the watchdog
+    would walk the filaments back MID-RUN, and it would do it by calling
+    prep_filaments() directly, which bypasses the "running -- disarm first"
+    guard that the single-filament endpoint applies for exactly this reason.
+    So the run would be corrupted while HV was firing.
+
+    Checked only when a timer has already expired, not every tick: one
+    SHV_GET_STATUS per connected controller at the moment of decision costs
+    far less than the same read at 1 Hz forever on the shared link.
+    """
+    for cid, link in sorted(CONTROLLERS.items()):
+        if not link or not link.client.connected:
+            continue
+        try:
+            st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+        except Exception as exc:
+            return False, f"controller {cid}: {exc}"
+        if st and st.get("state") == 2:      # 2 = running
+            return True, None
+    return False, None
+
+
 def _safety_loop() -> None:
     # Assigned below when a timer fires, so it has to be declared -- without
     # this the whole tick raises UnboundLocalError and the watchdog logs an
     # exception every second while watching nothing.
     global _SAFETY_TOUCH_HV
+    # Latches so a held-off or unconfirmable state is recorded once, not every
+    # tick -- an event log that repeats the same line 60 times a minute is one
+    # nobody reads.
+    _safety_held_for_run = False
+    _safety_unknown_run = False
     while True:
         time.sleep(SAFETY_TICK_S)
         try:
@@ -2009,6 +2041,41 @@ def _safety_loop() -> None:
                 t = touch.get(int(fid))
                 if t is None or (now - t) > a_to:
                     stale.append(int(fid))
+            hv_stale = hv_on and (hv_last == 0.0 or (now - hv_last) > hv_to)
+            if stale or hv_stale:
+                running, unknown = _safety_schedule_running()
+                if running:
+                    # Renew both and say nothing: a run is the hardware being
+                    # driven on purpose, and it ends on its own (the firmware
+                    # enforces the plan's own totalMs).
+                    with _SAFETY_LOCK:
+                        for f in stale:
+                            _SAFETY_TOUCH_FIL[f] = now
+                        _SAFETY_TOUCH_HV = now
+                    if not _safety_held_for_run:
+                        _safety_record("held_for_run",
+                                       {"filaments": stale, "hv": bool(hv_stale),
+                                        "note": "a schedule is running — a run is "
+                                                "active control, so the timers are "
+                                                "renewed rather than fired"})
+                        _safety_held_for_run = True
+                    continue
+                if unknown is not None:
+                    # Could not confirm no run is in progress. Do NOT act
+                    # blind: writing power states into a live run is the worse
+                    # of the two failures, and a link too sick to answer this
+                    # is a link the fallback could not be written over anyway.
+                    # Recorded once, retried next tick.
+                    if not _safety_unknown_run:
+                        _safety_record("deferred_unknown_run",
+                                       {"error": unknown,
+                                        "note": "cannot confirm no schedule is "
+                                                "running — not touching the "
+                                                "hardware until it answers"})
+                        _safety_unknown_run = True
+                    continue
+                _safety_held_for_run = False
+                _safety_unknown_run = False
             if stale:
                 # Clear the touch first so a controller that cannot be reached
                 # does not make this fire again every tick.
@@ -2016,7 +2083,7 @@ def _safety_loop() -> None:
                     for f in stale:
                         _SAFETY_TOUCH_FIL[f] = now
                 _safety_fallback_filaments(stale, fallback)
-            if hv_on and (hv_last == 0.0 or (now - hv_last) > hv_to):
+            if hv_stale:
                 with _SAFETY_LOCK:
                     _SAFETY_TOUCH_HV = now
                 _safety_disable_hv()

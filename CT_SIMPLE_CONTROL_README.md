@@ -3447,11 +3447,32 @@ every command.
 > current indefinitely. Only something that asks the hardware to *do* something
 > renews it.
 
-**`energised()` runs a keepalive for you**, and that is the right place for it:
-code that legitimately sits at ACTIVE for a minute without commanding anything
-— a settle, a long fit, a measurement between shots — would otherwise be walked
-back mid-run by the very thing protecting it. Call **`keepalive(filaments=None)`**
-directly only when holding a state outside that block.
+**It will not interrupt normal work.** Long holds are everywhere — a voltage
+sweep, a 40 s `wait_for_current` (polls, and polls deliberately do not renew), a
+thermal settle, a schedule that the firmware drives for minutes, or any script
+that commands ACTIVE and then spends a minute on its own arithmetic. Two things
+cover all of them, rather than a keepalive bolted onto each one:
+
+- **The client renews itself.** The first time it energises anything it arms a
+  background keepalive and leaves it running. `CTClient(keepalive=False)` opts
+  out; `keepalive(filaments=None)` renews by hand.
+- **A running schedule holds the watchdog off.** A run *is* active control, and
+  it ends on its own. Checked only when a timer has already expired — one
+  `SHV_GET_STATUS` at the moment of decision, not a poll at 1 Hz forever on the
+  shared link.
+
+> ⚠️ **What the guarantee actually is:** this protects against the **client
+> process dying** — the keepalive thread is a daemon, so it stops the instant
+> the process does and the backend's timer starts running. It does **not**
+> protect against a live client that has simply been abandoned, such as an
+> interactive session someone walked away from. That is the trade for never
+> interrupting a legitimate long run.
+
+If the backend cannot confirm whether a schedule is running, it **defers** and
+retries rather than acting blind: writing power states into a live run is the
+worse of the two failures, and a link too sick to answer that is a link the
+fallback could not be written over anyway. The deferral is recorded in
+`events`.
 
 **`safety()`** reads it: the config, which filaments it considers ACTIVE and how
 long each has gone uncommanded, the commanded rail states, and `events` — what
