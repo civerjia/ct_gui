@@ -172,6 +172,7 @@ Usage:
 Dependencies: pip install requests
 """
 
+import enum
 import math
 import threading
 import time
@@ -217,14 +218,46 @@ SHV_FAULT    = 4
 
 # ── power state constants ─────────────────────────────────────────────────────
 
-STOP    = 1
-SLEEP   = 2
-STANDBY = 3
-IDLE    = 4
-ACTIVE  = 5
-VOLTAGE = 6
+class PowerState(enum.IntEnum):
+    """The power ladder, as an enum rather than six loose integers.
 
-_STATE_NAMES = {1: "STOP", 2: "SLEEP", 3: "STANDBY", 4: "IDLE", 5: "ACTIVE", 6: "VOLTAGE"}
+    IntEnum, not Enum: these travel over the wire and through JSON as plain
+    numbers and an IntEnum member IS that number -- `PowerState.SLEEP == 2` is
+    True and json.dumps emits `2`. So the module-level STOP/SLEEP/... below are
+    these same members, every existing caller keeps working, and nothing on the
+    protocol changes.
+
+    Nothing should be spelled as a bare digit again. A state written as `2` in
+    a script, a config or a log line is one nobody can check without going to
+    find the table.
+    """
+    STOP = 1
+    SLEEP = 2
+    STANDBY = 3
+    IDLE = 4
+    ACTIVE = 5
+    VOLTAGE = 6
+
+    @property
+    def energising(self) -> bool:
+        """True if this state puts power ON the filament. STANDBY counts: it
+        enables the output at the firmware's 0.8 V floor (~0.9 A into a real
+        filament). STOP and SLEEP leave it off."""
+        return self >= PowerState.STANDBY
+
+    def __str__(self) -> str:
+        return f"{self.name}({self.value})"
+
+
+STOP    = PowerState.STOP
+SLEEP   = PowerState.SLEEP
+STANDBY = PowerState.STANDBY
+IDLE    = PowerState.IDLE
+ACTIVE  = PowerState.ACTIVE
+VOLTAGE = PowerState.VOLTAGE
+
+# Derived: two hand-maintained copies of one ladder is how one ends up wrong.
+_STATE_NAMES = {int(s): s.name for s in PowerState}
 _FAULT_NAMES = {0: "none", 1: "open", 2: "OCP/SCP"}
 
 
@@ -804,7 +837,7 @@ class CTClient:
 
     def safety_config(self, enabled: bool | None = None,
                       active_timeout_s: float | None = None,
-                      active_fallback: int | None = None,
+                      active_fallback=None,          # PowerState, name or number
                       hv_timeout_s: float | None = None) -> dict:
         """Change the watchdog's rules. Returns the same shape as safety(),
         plus "changed".
@@ -812,9 +845,18 @@ class CTClient:
         Defaults: ACTIVE falls back to SLEEP after 30 s without a command, the
         HV rails go off after 10 s.
 
-        `active_fallback` must be a DE-ENERGISING state (STOP or SLEEP) and the
-        backend refuses anything else -- a watchdog that fired from one
-        energised state into another would be firing into a second hazard.
+        `active_fallback` takes a PowerState, its name, or its number -- all
+        three of these are the same call, and the first is the one to write:
+
+            ct.safety_config(active_fallback=STOP)
+            ct.safety_config(active_fallback="stop")
+            ct.safety_config(active_fallback=1)
+
+        It must be a DE-ENERGISING state (STOP or SLEEP) and the backend
+        refuses anything else -- a watchdog that fired from one energised state
+        into another would be firing into a second hazard. The result carries
+        `active_fallback_name` beside the number so a caller never has to keep
+        its own copy of the ladder.
 
         A zero or negative timeout is refused too: switching the watchdog off
         goes through `enabled=False`, so that turning off the thing that
@@ -827,7 +869,12 @@ class CTClient:
         if active_timeout_s is not None:
             body["active_timeout_s"] = float(active_timeout_s)
         if active_fallback is not None:
-            body["active_fallback"] = int(active_fallback)
+            # A PowerState, its name, or its number -- passed through as given
+            # so the backend does the parsing and owns the error message, which
+            # keeps one definition of what a legal fallback is.
+            body["active_fallback"] = (active_fallback.name
+                                       if isinstance(active_fallback, PowerState)
+                                       else active_fallback)
         if hv_timeout_s is not None:
             body["hv_timeout_s"] = float(hv_timeout_s)
         return self._post("/api/safety", body, timeout=5.0)

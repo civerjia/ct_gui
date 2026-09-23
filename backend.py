@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import enum
 import datetime
 import json
 import logging
@@ -200,10 +201,51 @@ SCAN_TELEMETRY_PERIOD_MS = 50         # ~20 fps push cadence
 # The reasoning behind ENERGISING_STATES and the ACTIVE floor stays with the
 # code that enforces them — see dead_fids()/ladder_blocks_active().
 
-POWER_STATE_IDLE = 4
-POWER_STATE_ACTIVE = 5
-POWER_STATE_VOLTAGE = 6
-ENERGISING_STATES = frozenset({3, 4, 5, 6})   # STANDBY, IDLE, ACTIVE, VOLTAGE
+class PowerState(enum.IntEnum):
+    """The power ladder, as an enum rather than six loose integers.
+
+    IntEnum, not Enum: every one of these already travels over the wire and
+    through JSON as a plain number, and an IntEnum member IS that number --
+    `PowerState.SLEEP == 2` is True and json.dumps emits `2`. So this is a
+    readability change with no protocol change, and the existing
+    POWER_STATE_* spellings below keep working unchanged.
+
+    Nothing here should be spelled as a bare digit again. A fallback state
+    written as `2` in a config, a log line or a docstring is one nobody can
+    check without going to find the table.
+    """
+    STOP = 1
+    SLEEP = 2
+    STANDBY = 3
+    IDLE = 4
+    ACTIVE = 5
+    VOLTAGE = 6
+
+    @property
+    def energising(self) -> bool:
+        """True if this state puts power ON the filament.
+
+        STANDBY counts: it enables the output at the firmware's 0.8 V floor
+        (~0.9 A into a real filament), so it is NOT a no-power state. STOP and
+        SLEEP leave the output off.
+        """
+        return self >= PowerState.STANDBY
+
+    def __str__(self) -> str:          # "SLEEP(2)" everywhere one is printed
+        return f"{self.name}({self.value})"
+
+
+# Long-standing spellings, kept so nothing downstream has to change at once.
+POWER_STATE_STOP = PowerState.STOP
+POWER_STATE_SLEEP = PowerState.SLEEP
+POWER_STATE_STANDBY = PowerState.STANDBY
+POWER_STATE_IDLE = PowerState.IDLE
+POWER_STATE_ACTIVE = PowerState.ACTIVE
+POWER_STATE_VOLTAGE = PowerState.VOLTAGE
+ENERGISING_STATES = frozenset(s for s in PowerState if s.energising)
+# Derived, not written out a second time: two hand-maintained copies of the
+# same ladder is how one of them ends up wrong.
+POWER_STATE_NAMES = {int(s): s.name for s in PowerState}
 ACTIVE_FLOOR_MA = 1500
 # The RP2350's own IDLE ceiling (tps55289_board_constants.h kIdleMaxMilliamps).
 # Mirrored here to REFUSE, because the firmware CLAMPS: setPowerState() does
@@ -215,8 +257,6 @@ ACTIVE_FLOOR_MA = 1500
 # Note the two bounds are NOT a dividing line: 1500 is also the firmware's
 # kIdleCurrentMaDefault, so 1500-2000 mA is legal for IDLE and for ACTIVE both.
 IDLE_CEILING_MA = 2000
-POWER_STATE_NAMES = {1: "STOP", 2: "SLEEP", 3: "STANDBY", 4: "IDLE",
-                     5: "ACTIVE", 6: "VOLTAGE"}
 UART_STATUS_NAMES = {0: "Ok", 1: "BadFrame", 2: "BadArgument", 3: "Busy",
                      4: "Unsupported", 5: "NotReady", 6: "I2cError",
                      7: "OutOfRange", 8: "VerifyFail"}
@@ -1743,6 +1783,37 @@ def _dead_save() -> None:
 
 
 
+def parse_power_state(value) -> tuple["PowerState | None", str]:
+    """Accept a PowerState, its number, or its name. Returns (state, why).
+
+    Names are case-insensitive. On failure the state is None and `why` lists
+    what WOULD have been accepted -- an error that names the field but not its
+    legal values makes the reader go find the table, which is the thing an
+    enum is supposed to have ended.
+    """
+    if isinstance(value, PowerState):
+        return value, ""
+    if isinstance(value, str):
+        key = value.strip().upper()
+        for st in PowerState:
+            if st.name == key:
+                return st, ""
+        if not key.lstrip("+-").isdigit():
+            return None, (f"{value!r} is not a power state — expected one of "
+                          f"{', '.join(s.name for s in PowerState)}")
+        value = key
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None, (f"{value!r} is not a power state — expected a name "
+                      f"({', '.join(s.name for s in PowerState)}) or its number")
+    try:
+        return PowerState(n), ""
+    except ValueError:
+        return None, (f"{n} is not a power state — the ladder is "
+                      f"{', '.join(str(s) for s in PowerState)}")
+
+
 def power_state_name(state: int) -> str:
     """"STANDBY(3)" for a known state, "3" for anything else. Never invents a
     name for a value the ladder does not define."""
@@ -1923,6 +1994,9 @@ def safety_snapshot() -> dict:
         # already hot), which is precisely when the watchdog matters most.
         active[int(fid)] = {"idle_for_s": round(now - t, 1) if t else None,
                             "never_commanded": t is None}
+    # The number stays for anything that was already reading it; the name goes
+    # beside it so nothing downstream has to own a copy of the table.
+    cfg["active_fallback_name"] = power_state_name(cfg["active_fallback"])
     return {"ok": True, **cfg,
             "active_filaments": active,
             "hv_commanded": hv_cmd,
@@ -4648,26 +4722,24 @@ class CtHandler(BaseHTTPRequestHandler):
                             _SAFETY[key] = v
                             changed[key] = v
                     if "active_fallback" in body:
-                        try:
-                            st = int(body["active_fallback"])
-                        except (TypeError, ValueError):
-                            bad.append(f"active_fallback must be a power state "
-                                       f"number, got {body['active_fallback']!r}")
-                            st = None
-                        if st is not None:
+                        # A NAME or a number. "sleep" is self-checking in a
+                        # config file and a log line; 2 is not, and this field
+                        # decides what an unattended filament gets dropped to.
+                        st, why = parse_power_state(body["active_fallback"])
+                        if st is None:
+                            bad.append(f"active_fallback: {why}")
+                        elif st.energising:
                             # The fallback must REMOVE power. Allowing an
                             # energising state here would make the watchdog fire
                             # from one hazard into another, which is worse than
                             # not firing at all.
-                            if st in ENERGISING_STATES or st not in POWER_STATE_NAMES:
-                                bad.append(
-                                    f"active_fallback {st} "
-                                    f"({power_state_name(st)}) is not a "
-                                    f"de-energising state — the watchdog may "
-                                    f"only fall back to STOP(1) or SLEEP(2)")
-                            else:
-                                _SAFETY["active_fallback"] = st
-                                changed["active_fallback"] = st
+                            bad.append(
+                                f"active_fallback {st} is not a de-energising "
+                                f"state — the watchdog may only fall back to "
+                                f"{PowerState.STOP} or {PowerState.SLEEP}")
+                        else:
+                            _SAFETY["active_fallback"] = int(st)
+                            changed["active_fallback"] = st.name
                 if bad:
                     # Snapshot FIRST: it carries its own "ok": True, and
                     # spreading it after the refusal overwrote it -- the reply

@@ -3486,11 +3486,33 @@ filament was already hot. That counts as **expired**, not as fresh: it is
 exactly the case the watchdog exists for.
 
 **`safety_config(enabled=, active_timeout_s=, active_fallback=, hv_timeout_s=)`**
-changes the rules. Two refusals are deliberate:
+changes the rules.
+
+`active_fallback` takes a **`PowerState`**, its name, or its number — these are
+the same call, and the first is the one to write:
+
+```python
+from ct_simple_control import STOP, SLEEP, PowerState
+ct.safety_config(active_fallback=STOP)      # PowerState.STOP
+ct.safety_config(active_fallback="stop")    # case-insensitive
+ct.safety_config(active_fallback=1)         # still accepted
+```
+
+`PowerState` is an `IntEnum`, so `PowerState.SLEEP == 2` and JSON still carries
+a plain `2` — the protocol did not change, only what you have to write and
+read. The module-level `STOP`/`SLEEP`/`STANDBY`/`IDLE`/`ACTIVE`/`VOLTAGE` *are*
+those members, `str()` gives `SLEEP(2)`, and `PowerState.X.energising` answers
+whether a state puts power on the filament (STANDBY counts — it enables the
+output at the firmware's 0.8 V floor). Every reply carries
+`active_fallback_name` beside the number so nothing downstream keeps its own
+copy of the ladder.
+
+Two refusals are deliberate:
 
 - `active_fallback` must be **de-energising** (STOP or SLEEP). A watchdog that
   fired from one energised state into another would be firing into a second
-  hazard.
+  hazard. The refusal names the ladder rather than the number that was
+  rejected.
 - a **zero or negative timeout** is refused. Switching the watchdog off goes
   through `enabled=False`, so turning off the thing that protects an unattended
   filament is a visible decision in the log rather than a number someone set
