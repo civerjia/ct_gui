@@ -3630,25 +3630,38 @@ changes (`r["ok"]`, `r.get()`, `json.dumps(r)`, `**r`, `isinstance(r, dict)` all
 work as before); only `repr()` differs, which is what a REPL and a bare
 `print()` use.
 
+**Everything is shown.** Nothing is folded away, summarised or truncated — you
+cannot know in advance which field turns out to matter, and a formatter that
+decides for you is one that will eventually hide the fault you were looking
+for. What changes is the *shape*: one field per line, nested structures
+indented, lists of records one row each.
+
 ```
->>> ct.idle_one(8, 2500)
-Result(FAILED)
-  error: IDLE 2500 mA is above the 2000 mA ceiling — the RP2350 would clamp
-        it to 2000 and report success, so a verify would wait for a current
-        that never arrives. Ask for 2000 or less, or use active_one() if you
-        need more
+Result(ok)
   filament: 8
-  above_idle_ceiling: True
-  idle_ceiling_mA: 2000
+  points: [15 items]
+    [0] commanded_ma=2100  settled_ma=2073  heat_mA=2078
+        heat_target_mA=2100  bus_mV=5280  r_total_ohm=2.53481
+        net_ma=2.091  emission_ma=0.056  n_used=3  usable=True
+        pulses: [3 items]
+          [0] heat_mA=2083  net_ma=2.133  on_us=999  bg_ma=5.738
+  pedestal:
+    source: diode_formula
+    ma: 1.9818
 ```
 
-The verdict leads, then the reason **in full** — `error` and `reason` are never
-truncated, since truncating the one field that says *why* makes a summary
-useless exactly when it is needed. Then the fields that were actually measured.
-Fields that are `None` (not measured) and bulk payloads (`events`, `points`,
-`records`, `measured`, …) are folded away and **named** on the last line, not
-just counted: "+3 more" would not tell you whether the thing you are looking for
-is in there. `dict(r)` or `r.raw()` gives the original, unabridged.
+Lines wrap on `k=v` boundaries, and inside a pair when one field is wider than
+the line on its own. **Paths and URLs are never broken** — a wrapped path
+cannot be copied, which is worse than a long line. `dict(r)` or `r.raw()` gives
+the plain dict.
+
+**`tests/test_result_repr.py`** checks this against every structure the client
+actually produces — recorded runs from `calibration/`, live read-only calls
+(`--live`), and synthetic edge cases: empty dicts, dicts with no `ok` key, deep
+nesting, 96-element arrays, unicode, and a fire result carrying `hv_stuck_on`.
+The invariant it enforces is that **every top-level key appears in the output**,
+plus a bounded line length so "print everything" is not satisfied by dumping the
+dict. 70/70 at the time of writing.
 
 ### HV grid MOSFET test — does the switch actually conduct?
 

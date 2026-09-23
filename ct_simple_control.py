@@ -204,86 +204,143 @@ class Result(dict):
     `isinstance(r, dict)` all work as before. Only `repr()` differs, which is
     what a REPL and a bare `print()` use.
 
-    The problem it solves: these dicts carry 10-25 fields and the two that
-    matter -- did it work, and if not why -- were buried among the ones that
-    are None, absent, or identical on every call. Reading a result meant
-    scanning a wall of keys for the one word that was different.
+    EVERYTHING IS SHOWN. Nothing is folded, summarised away or truncated: these
+    results are what you reason about a run from, and a reader cannot know in
+    advance which field turns out to matter. What changes is the SHAPE -- one
+    field per line, nested structures indented, lists of records one row each
+    with their columns aligned -- so a 25-field result is scannable instead of
+    being a single 2000-character line.
 
-    So the repr leads with the verdict and the reason, then the fields worth
-    seeing, then a count of what was folded away. Nothing is hidden: `dict(r)`
-    or `r.raw()` gives the original, unabridged, and the fold line says how
-    many keys it is holding back so it can never read as "that was all of it".
+    The verdict leads, then the reason, then the rest. That ordering is the
+    only editorial judgement here, and it hides nothing.
     """
 
-    #: Shown first, in this order, when present. Everything else follows
-    #: alphabetically. These are the fields that answer "what happened".
+    #: Shown first, in this order, when present -- the fields that answer
+    #: "what happened". Everything else follows in the order the result
+    #: carries it, which is usually the order the code that built it chose.
     _LEAD = ("ok", "error", "reason", "filament", "filaments", "state",
-             "state_name", "fired", "measured_ma", "arrival", "verdict")
-    #: Never worth a line of their own in a summary -- either noise or better
-    #: rendered by a dedicated formatter (see print_pulse_events etc.).
-    _FOLD = ("records", "events", "points", "pulses", "measured", "curve",
-             "raw", "scan", "status", "results", "heating_at_pulse")
-    _MAX_INLINE = 68          # longer values are summarised, not wrapped
+             "state_name", "verdict", "fired", "measured_ma", "arrival")
+    _WIDTH = 78
 
     def raw(self) -> dict:
-        """The plain dict, unabridged. `dict(r)` does the same."""
+        """The plain dict. `dict(r)` does the same."""
         return dict(self)
 
+    # ---- rendering -------------------------------------------------------
     @staticmethod
-    def _short(v) -> str:
+    def _scalar(v) -> str:
         if isinstance(v, float):
             return f"{v:.6g}"
-        # Length decides, not type. A 2-key dict of 2-key dicts is short by
-        # every structural measure and 400 characters on screen -- which is
-        # exactly the wall of text this class exists to stop.
-        if isinstance(v, (list, tuple)):
-            t = repr(list(v))
-            return t if len(t) <= Result._MAX_INLINE else f"[{len(v)} items]"
+        if isinstance(v, str):
+            return v                      # unquoted: these are read, not eval'd
+        return repr(v)
+
+    @classmethod
+    def _is_flat(cls, v) -> bool:
+        return not isinstance(v, (dict, list, tuple))
+
+    @classmethod
+    def _row(cls, d: dict) -> str:
+        """One record of a list-of-dicts, as aligned `k=v` pairs."""
+        return "  ".join(f"{k}={cls._scalar(v)}" for k, v in d.items()
+                         if not isinstance(v, (dict, list, tuple))) or "(nested)"
+
+    @classmethod
+    def _render(cls, key, v, indent: int, out: list) -> None:
+        pad = " " * indent
         if isinstance(v, dict):
-            t = repr(v)
-            return t if len(t) <= Result._MAX_INLINE else (
-                f"{{{len(v)} keys: {', '.join(map(str, list(v)[:4]))}"
-                + (", …}" if len(v) > 4 else "}"))
-        t = repr(v)
-        return t if len(t) <= Result._MAX_INLINE else t[:Result._MAX_INLINE - 3] + "..."
+            if not v:
+                out.append(f"{pad}{key}: {{}}")
+                return
+            out.append(f"{pad}{key}:")
+            for k2, v2 in v.items():
+                cls._render(k2, v2, indent + 2, out)
+            return
+        if isinstance(v, (list, tuple)):
+            if not v:
+                out.append(f"{pad}{key}: []")
+                return
+            if all(cls._is_flat(x) for x in v):
+                line = ", ".join(cls._scalar(x) for x in v)
+                if len(line) + len(key) + indent <= cls._WIDTH:
+                    out.append(f"{pad}{key}: [{line}]")
+                else:
+                    out.append(f"{pad}{key}: [{len(v)} items]")
+                    for chunk in textwrap.wrap(line, width=cls._WIDTH - indent - 2):
+                        out.append(f"{pad}  {chunk}")
+                return
+            out.append(f"{pad}{key}: [{len(v)} items]")
+            for n, item in enumerate(v):
+                if isinstance(item, dict):
+                    # Wrapped on the k=v boundaries, never inside one: a record
+                    # of 18 fields is 300 characters and still a wall on one
+                    # line, but a pair split across lines is unreadable.
+                    head = f"{pad}  [{n}] "
+                    cont = " " * len(head)
+                    pairs = [f"{k}={cls._scalar(x)}" for k, x in item.items()
+                             if not isinstance(x, (dict, list, tuple))]
+                    line = head
+                    for pair in pairs:
+                        # A single pair can be wider than the whole line on its
+                        # own -- a free-text `note=` runs to 130 characters --
+                        # and pair-boundary wrapping cannot help that. Wrap
+                        # inside it instead, rather than emitting one long line
+                        # and calling the record "wrapped".
+                        if len(cont) + len(pair) > cls._WIDTH:
+                            if line.strip():
+                                out.append(line.rstrip())
+                                line = cont
+                            for part in textwrap.wrap(
+                                    pair, width=cls._WIDTH - len(cont),
+                                    subsequent_indent="    ",
+                                    break_long_words=False,
+                                    break_on_hyphens=False):
+                                out.append(cont + part)
+                            continue
+                        if len(line) + len(pair) + 2 > cls._WIDTH and line.strip():
+                            out.append(line.rstrip())
+                            line = cont
+                        line += pair + "  "
+                    if line.strip():
+                        out.append(line.rstrip())
+                    elif not pairs:
+                        out.append(head + "(nested)")
+                    # Nested containers inside a record still get their own
+                    # lines -- a record is not allowed to swallow its children.
+                    for k2, v2 in item.items():
+                        if isinstance(v2, (dict, list, tuple)) and v2:
+                            cls._render(k2, v2, indent + 6, out)
+                else:
+                    cls._render(f"[{n}]", item, indent + 2, out)
+            return
+        if isinstance(v, str) and len(v) + len(key) + indent > cls._WIDTH:
+            # break_long_words=False so a path or a URL overflows its line
+            # instead of being cut in half. A wrapped path cannot be copied,
+            # which makes it worse than a long line, not better.
+            out.append(textwrap.fill(v, width=cls._WIDTH,
+                                     initial_indent=f"{pad}{key}: ",
+                                     subsequent_indent=pad + "    ",
+                                     break_long_words=False,
+                                     break_on_hyphens=False))
+            return
+        out.append(f"{pad}{key}: {cls._scalar(v)}")
 
     def __repr__(self) -> str:
         if not self:
             return "Result({})"
         head = "ok" if self.get("ok") else ("FAILED" if "ok" in self else "")
-        lines = []
-        shown = set()
+        out: list[str] = []
+        done = {"ok"}
         for k in self._LEAD:
-            if k in self and k not in ("ok",):
-                # error/reason are never truncated. Truncating the one field
-                # that says WHY is how a summary becomes useless exactly when
-                # it is needed; they are wrapped instead.
-                if k in ("error", "reason") and isinstance(self[k], str):
-                    body = textwrap.fill(self[k], width=76,
-                                         initial_indent=f"  {k}: ",
-                                         subsequent_indent="        ")
-                    lines.append(body)
-                else:
-                    lines.append(f"  {k}: {self._short(self[k])}")
-                shown.add(k)
-        for k in sorted(self):
-            if k in shown or k == "ok" or k in self._FOLD:
+            if k in self and k not in done:
+                self._render(k, self[k], 2, out)
+                done.add(k)
+        for k, v in self.items():
+            if k in done:
                 continue
-            # A field that is None almost always means "not measured" and is
-            # the normal case -- it belongs in the fold, not in the summary.
-            if self[k] is None:
-                continue
-            lines.append(f"  {k}: {self._short(self[k])}")
-            shown.add(k)
-        folded = [k for k in self if k not in shown and k != "ok"]
-        out = f"Result({head})" if head else "Result"
-        if lines:
-            out += "\n" + "\n".join(lines)
-        if folded:
-            # Named, not just counted: "+3 more" tells you nothing about
-            # whether the thing you are looking for is in there.
-            out += "\n  … " + ", ".join(sorted(folded)) + "  (use dict(r) or r.raw())"
-        return out
+            self._render(k, v, 2, out)
+            done.add(k)
+        return (f"Result({head})" if head else "Result") + ("\n" + "\n".join(out) if out else "")
 
 
 class CTError(Exception):
