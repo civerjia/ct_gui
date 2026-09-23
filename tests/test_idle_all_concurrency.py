@@ -14,7 +14,14 @@ Run it after ANY change to the RP2350 power service, before calling the change
 done:
 
     python3 tests/test_idle_all_concurrency.py            # every live filament
-    python3 tests/test_idle_all_concurrency.py --idle-ma 1000 --max-s 15
+    python3 tests/test_idle_all_concurrency.py --idle-ma 1000 --max-s 10
+
+MEASURED, 93 filaments at IDLE 1000 mA from SLEEP:
+    concurrent (RP2350 1e08f92)   93/93 settled, median 1.4 s, max 4.4 s, 6.2 s wall
+    serial     (RP2350 856a5fa)   90 settled,    median 28 s,  max 39 s,  41 s wall
+    serial     (before 856a5fa)   83 of 83 stuck at ~700 mA of 1500 -- never settled
+The default bounds (max 10 s, median 4 s) sit 2-3x above the concurrent
+figures and far below the serial ones.
 
 What it does, no HV at any point: SLEEP every live filament (verified), IDLE
 them all at --idle-ma in ONE batch with verify, then STOP (verified) -- also on
@@ -42,9 +49,9 @@ def main(argv=None) -> int:
                     help="IDLE current for every filament (mA, <= 2000)")
     ap.add_argument("--timeout-s", type=float, default=60.0,
                     help="how long verify waits before a filament counts as not settled")
-    ap.add_argument("--max-s", type=float, default=15.0,
+    ap.add_argument("--max-s", type=float, default=10.0,
                     help="FAIL if the slowest filament takes longer than this")
-    ap.add_argument("--median-s", type=float, default=8.0,
+    ap.add_argument("--median-s", type=float, default=4.0,
                     help="FAIL if the median filament takes longer than this")
     args = ap.parse_args(argv)
 
