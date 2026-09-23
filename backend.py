@@ -1350,6 +1350,68 @@ def _unpack_spi_shot(raw: bytes, n: int, bits: int) -> list[int]:
     return [raw[i] | (raw[i + 1] << 8) for i in range(0, len(raw) - 1, 2)]
 
 
+def _trigger_delay_one(link: "ControllerLink", delay_us=None) -> dict:
+    payload = _u16(int(delay_us)) if delay_us is not None else b""
+    raw = link.request(SHV_TRIGGER_DELAY, payload).get("raw") or []
+    # response: [status, us_lo, us_hi, applies] = 4 bytes
+    if raw and raw[0] == 0 and len(raw) >= 4:
+        return {"ok": True, "delayUs": _le(raw, 1, 2), "applies": bool(raw[3])}
+    return {"ok": False, "error": "no valid trigger-delay reply"}
+
+
+def trigger_delay_all(delay_us=None) -> dict:
+    """GET or SET the trigger delay on EVERY connected controller, as one value.
+
+    There is deliberately no per-controller form. The master's envelope frames
+    the other controller's pulses (docs/two_controller_operation.md §3), and the
+    two only line up if both apply the same delay: master at 3000 us and
+    controller 2 at 0 puts a 1 ms controller-2 pulse entirely outside the
+    window, where it reads as a dead MOSFET. So a SET writes all of them, and
+    every call reads all of them back and compares.
+
+    `delayUs` is the common value, or None when they disagree -- never one
+    board's number standing in for the rig's. An RP2350 reset zeroes its delay,
+    so a disagreement after a set usually means a board restarted since.
+    """
+    per = {}
+    for cid, link in sorted(CONTROLLERS.items()):
+        if not link.client.connected:
+            continue
+        try:
+            per[str(cid)] = _trigger_delay_one(link, delay_us)
+        except Exception as exc:
+            per[str(cid)] = {"ok": False, "error": str(exc)}
+    if not per:
+        return {"ok": False, "error": "no controller connected", "controllers": {}}
+    bad = {c: r.get("error", "failed") for c, r in per.items() if not r.get("ok")}
+    values = {r.get("delayUs") for r in per.values() if r.get("ok")}
+    out = {"controllers": per,
+           "applies": all(r.get("applies") for r in per.values() if r.get("ok")),
+           "consistent": not bad and len(values) == 1}
+    out["delayUs"] = next(iter(values)) if out["consistent"] else None
+    if bad:
+        out.update(ok=False, error=f"trigger delay could not be read/written on "
+                                   f"controller(s) {sorted(bad)}: {bad}")
+    elif len(values) != 1:
+        shown = {c: r["delayUs"] for c, r in per.items()}
+        out.update(ok=False, error=f"controllers disagree on the trigger delay "
+                                   f"{shown} — the master's envelope will not line up "
+                                   f"with the other board's pulses. A board that "
+                                   f"reset reads 0. Set it again (it writes all).")
+    else:
+        out["ok"] = True
+    return out
+
+
+def trigger_delay_mismatch() -> str | None:
+    """Why arming now would be wrong, or None. Only meaningful with more than
+    one controller connected; with one there is nothing to disagree with."""
+    if sum(1 for l in CONTROLLERS.values() if l.client.connected) < 2:
+        return None
+    r = trigger_delay_all()
+    return None if r.get("ok") else r.get("error")
+
+
 def shv_op(link: "ControllerLink", body: dict) -> dict:
     """Dispatch one Simple-HV-schedule operation on a controller (ShV panel)."""
     op = body.get("op")
@@ -1406,6 +1468,13 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                     "totalMs": _le(raw, 7, 4), "triggerEdge": raw[11]}
         return {"ok": False}
     if op == "arm":
+        # Two boards on one schedule must agree on the trigger delay, or the
+        # master frames the other board's pulses in the wrong place. Checked at
+        # arm, not only at set, because an RP2350 reset zeroes it in between.
+        why = trigger_delay_mismatch()
+        if why:
+            return {"ok": False, "error": f"arm refused: {why}",
+                    "trigger_delay_mismatch": True}
         # A run in progress is active control of both the filaments and the
         # rails -- that is what a run IS -- so arming renews both timers.
         safety_touch_hv()
@@ -1520,16 +1589,11 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                     "faultedFilaments": faulted_filaments}
         return {"ok": False}
     if op == "trigger_delay":
-        # GET or SET the SyncIn->fire trigger delay (µs). Request body:
-        # delay_us (optional). Response: {ok, delayUs, applies} -- "applies"
-        # is False when the live fire path (e.g. PIO precision mode) can't
-        # honour the delay, so a set can't silently do nothing.
-        payload = _u16(int(body["delay_us"])) if "delay_us" in body else b""
-        raw = link.request(SHV_TRIGGER_DELAY, payload).get("raw") or []
-        # response: [status, us_lo, us_hi, applies] = 4 bytes
-        if raw and raw[0] == 0 and len(raw) >= 4:
-            return {"ok": True, "delayUs": _le(raw, 1, 2), "applies": bool(raw[3])}
-        return {"ok": False}
+        # GET or SET the SyncIn->fire trigger delay (µs), ALWAYS on every
+        # connected controller -- the `controller` in the request is ignored on
+        # purpose; see trigger_delay_all(). "applies" is False when the live
+        # fire path can't honour the delay, so a set can't silently do nothing.
+        return trigger_delay_all(int(body["delay_us"]) if "delay_us" in body else None)
     return {"ok": False, "error": "unknown op"}
 
 
@@ -4635,6 +4699,10 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 self._json({"ok": all(r.get("match") for r in results.values()), "results": results})
             elif path == "/api/arm":
+                why = trigger_delay_mismatch()
+                if why:
+                    return self._json({"ok": False, "error": f"arm refused: {why}",
+                                       "trigger_delay_mismatch": True}, HTTPStatus.OK)
                 # Arm the bound Simple-HV schedule on EVERY connected controller
                 # (SHV_ARM, 0x77). body: {repeats}. Firmware validates the
                 # loaded table (active-list coverage vs. board presence) before
@@ -5767,6 +5835,12 @@ class CtHandler(BaseHTTPRequestHandler):
                 # fault policy, trigger delay) on ONE controller. body:
                 # {controller, op, ...op-specific fields} — see shv_op() for
                 # the exact wire format and response shape per op.
+                if body.get("op") == "trigger_delay":
+                    # Rig-wide by design (trigger_delay_all): it must not depend
+                    # on which controller the caller happened to name, or on
+                    # that one being connected.
+                    return self._json(trigger_delay_all(
+                        int(body["delay_us"]) if "delay_us" in body else None))
                 link = CONTROLLERS.get(int(body.get("controller", 0)))
                 if not link or not link.client.connected:
                     return self._json({"ok": False, "error": "controller not connected"}, HTTPStatus.OK)

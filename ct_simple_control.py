@@ -2990,19 +2990,25 @@ class CTClient:
             r["faultedFilaments"] = [self._user_index_of(f) for f in r["faultedFilaments"]]
         return r
 
-    def get_trigger_delay(self, controller: int = 1) -> dict:
-        """Read the SyncIn->fire trigger delay (µs) — a small, deliberate
-        offset between the trigger edge and the RP2350 actually firing.
+    def get_trigger_delay(self) -> dict:
+        """Read the trigger delay from EVERY connected controller, as one value.
 
-        Returns {"ok", "delayUs": int, "applies": bool}. `applies` is False
-        when the live fire path (e.g. PIO precision mode) can't currently
-        honour a nonzero delay — check it after a set(), since a value that
-        "applies"=False for is silently not taking effect on real hardware.
+        Returns {"ok", "delayUs", "applies", "consistent", "controllers": {
+        "1": {...}, "2": {...}}}. `delayUs` is the common value, or None when
+        the boards disagree -- ok is then False, because a rig whose two halves
+        apply different delays frames the second controller's pulses in the
+        wrong place. An RP2350 reset zeroes its delay, so a disagreement usually
+        means a board restarted; set_trigger_delay() again to fix it.
         """
-        return self._shv(controller, {"op": "trigger_delay"})
+        return self._shv(1, {"op": "trigger_delay"})
 
-    def set_trigger_delay(self, delay_us: int, controller: int = 1) -> dict:
-        """Set the SyncIn->fire trigger delay (µs); uint16, 0-65535.
+    def set_trigger_delay(self, delay_us: int) -> dict:
+        """Set the SyncIn->fire trigger delay (µs), uint16 0-65535, on EVERY
+        connected controller at once. There is no per-controller form, on
+        purpose: the master's envelope frames the second controller's pulses,
+        and the two only line up if both apply the same delay. The backend
+        writes all of them, reads all of them back, and refuses to arm while
+        they disagree. Returns the same shape as get_trigger_delay().
 
         Returns {"ok", "delayUs": int, "applies": bool} — ALWAYS check
         "applies": a set that isn't honoured by the live fire path still
@@ -3013,7 +3019,7 @@ class CTClient:
         err = self._range_error("delay_us", int(delay_us), self._U16_MAX)
         if err:
             return {"ok": False, "error": err}
-        return self._shv(controller, {"op": "trigger_delay", "delay_us": int(delay_us)})
+        return self._shv(1, {"op": "trigger_delay", "delay_us": int(delay_us)})
 
     def read_hv_diag165(self, controller: int = 1,
                         channel: int = 0,          # 0-7, which HV channel's
