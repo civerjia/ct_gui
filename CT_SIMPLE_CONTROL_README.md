@@ -313,29 +313,73 @@ with ct.session():
 
 The GUI and your script share the same backend and can run simultaneously.
 
-**Reads** (telemetry, HV readbacks, status polls) are always allowed and
-never blocked — the GUI's live view keeps updating even while your script runs.
+### What the lease is for
 
-**Writes** are coordinated by a **lease**. Take a lease around any critical
-multi-step sequence to prevent the GUI from interfering mid-way:
+Several programs drive the bench through one backend — the GUI, your script,
+somebody else's script. Every command goes through one serialised link, so two
+programs can never corrupt a frame; but without a lease their **writes
+interleave command by command**. Nothing stops the GUI from changing a
+filament's state, re-downloading the schedule, changing the trigger delay or
+disarming halfway through your sequence — and your script would carry on as if
+it had not happened.
+
+**While you hold the lease, every other client's write is refused** (`ok:
+False`, `error: "another client holds the write lease: <you> (<note>)"`, and
+logged as `AUDIT … FAILED` in `backend.log`). What it does *not* do:
+
+- **Reads are never refused** — status, telemetry, pulse logs, HV readback,
+  `shv_status`, trigger-delay and fault-policy reads. The GUI keeps monitoring.
+- **It gates only OTHERS.** Your own calls are neither ordered nor slowed.
+- **It de-energises nothing** and turns nothing off on exit.
+  `energised()` / `session()` and the backend's dead-man watchdog (`safety()`)
+  do that.
+- ⚠ **It also refuses other clients' STOP / HV-off / disarm.** While a script
+  holds the lease, the GUI's stop buttons are refused like any other write.
+  Keep the lease no longer than the run, and use a `note` that says who to ask.
+
+### Inside or outside
+
+**Rule: from the first command that changes the bench to the last read of the
+results, everything goes in one lease** — including setup and teardown.
+
+| inside the lease | why |
+|---|---|
+| filament order / dead list, trigger delay, fault policy, slew rates, OCP, HV set-points and enables | a change by someone else mid-run silently retargets or retimes what follows |
+| the heating ladder (`sleep/standby/idle/active_*`, `*_all`) before a measurement | the GUI could move the filament to another state between your ladder and your shot |
+| `download` → `verify_schedule` → `arm_all` / `shv_arm` → trigger → `shv_pulse_log` / `scan_report` | a download or disarm from someone else lands between your steps |
+| `fire_single_pulse`, `mosfet_test`, `emission_vs_heating`, `emission_ramp`, `hv_switch_test` | each is itself a download–arm–fire–read sequence of many commands |
+| the teardown (`stop_all`, HV off) | outside, it can be refused if someone else took the lease in the gap |
+
+| fine outside | why |
+|---|---|
+| every read: `status`, `hv_status`, `read_emission_v`, `shv_status`, `get_*`, `diode_path_ma`, `pulse_events_ma`, `ready_status` | reads are never gated |
+| backend configuration: `safety_config`, `keepalive`, `save_emission_curves` (and the GUI's master selection, schedule staging, LUT save) | changes the backend's own settings and files, never the hardware — **never gated**, even while someone else holds the lease |
+| a single write while you are alone at the bench (a quick `idle_one` from the REPL, `connect`) | nothing to interleave with — but, being a write, it is refused if someone else holds the lease |
+
+Nest the teardown **inside** the lease, so it runs before the lease is let go:
 
 ```python
-with ct.lease(ttl=60, note="auto scan"):
-    # GUI write buttons are blocked while this block runs
-    ct.shv_arm(1)
-    result = ct.fire_single_pulse(filament=0, num_pulses=1, width_us=1000)
-# lease released — GUI resumes full control
+with ct.lease(note="liuxing scan — ask Shuang"):
+    with ct.session():                  # teardown runs first, lease still held
+        ct.set_trigger_delay(3000)
+        ct.set_emission_v(200); ct.enable_emission(True)
+        for f in filaments:
+            ct.idle_one(f, 1000, verify=True)
+            ct.active_one(f, 1700, verify=True)
+            print(ct.fire_single_pulse(f, measure=True))
+            ct.idle_one(f, 1000)
+# lease released here, after the teardown
 ```
 
-Without a lease, writes from the script and GUI are serialized at the UART
-level (safe, no corruption) but have no semantic ordering guarantee. For a
-simple pre-heat followed by a GUI-driven scan, no lease is needed:
+### How long
 
-```python
-ct.idle_all()          # pre-heat via script
-ct.active_one(5, 2900)
-# hand off — operator clicks Arm in the GUI
-```
+`with ct.lease(ttl=60)` **renews itself in the background** (every ttl/3) for
+as long as the block runs, however long that is. `ttl` is how long the lease
+outlives your process if it dies without releasing it — keep it short; the
+backend caps it at 600 s. If a renewal finds the lease taken (someone used
+`steal`), it prints to stderr and sets `ct.lease_lost`; check it after a long
+run. `acquire_lease()` / `renew_lease()` are the manual form, and do **not**
+renew themselves.
 
 ---
 
@@ -681,8 +725,8 @@ don't currently hold it (no-op).
 ct.release_lease()
 ```
 
-**`renew_lease(ttl=60.0)`** — Extend the lease before it expires, e.g. inside
-a long-running loop.
+**`renew_lease(ttl=60.0)`** — Extend a lease taken with `acquire_lease()`
+before it expires. Not needed with `with ct.lease()`, which renews itself.
 
 ```python
 import time
@@ -695,8 +739,10 @@ ct.release_lease()
 ```
 
 **`with ct.lease(ttl=60.0, note=""):`** — Context manager: acquires on enter,
-always releases on exit (even if an exception is raised inside the block).
-This is the recommended way to use the lease.
+**renews in the background while the block runs**, always releases on exit
+(even if an exception is raised inside the block). This is the recommended way
+to use the lease; see [What the lease is for](#what-the-lease-is-for) for what
+belongs inside it.
 
 ```python
 with ct.lease(ttl=60, note="firing sequence"):
@@ -717,20 +763,19 @@ what people usually assume:
 | **`ready_relay` arm TTL** | ESP32 firmware | 60 s (`kDefaultArmTtlMs`) | `disarm()` — stops relaying the pulse envelope, releases the STM32 CS claim |
 | **poll-pause** | backend | 15 s | Background PING polling **resumes** |
 
-**None of them de-energises a filament.** There is no watchdog anywhere that
-turns heating off — which is exactly why a killed script can leave a filament
-powered (see the `energised()` warning under *Waiting on state*). Restating
-because it cuts both ways: an expiry can never *interrupt* your heating, and it
-can never *protect* you either.
+**None of these three de-energises a filament.** That is the job of the
+backend's dead-man watchdog (`safety()`): ACTIVE with no command for 30 s falls
+back to SLEEP, HV with no command for 10 s is turned off, and a running
+schedule holds both off. It covers a script killed outright, which
+`energised()` cannot.
 
 Read the failure direction of each before worrying about it:
 
 - **Lease** — the risk is the opposite of "it turned my stuff off": if a long
   operation stops renewing, another client may begin writing while you are
-  mid-run. Reads are never gated at all (every `GET`/`READ` command, plus
-  presence/diagnosis/verify-schedule, stay allowed while someone holds it — a
-  lease reserves the right to *change* the hardware, not to *look* at it). Use
-  `with ct.lease(ttl=...)`, or `renew_lease()` inside a long loop.
+  mid-run. Reads are never gated at all — a lease reserves the right to
+  *change* the hardware, not to *look* at it. `with ct.lease()` renews itself;
+  with `acquire_lease()`, call `renew_lease()` inside a long loop.
 - **`ready_relay` TTL** — the only one that actively does something, and its
   blast radius is just *pulse measurement*: it does not fire, power, or stop
   anything, so the worst case is a later pulse going unmeasured. It exists

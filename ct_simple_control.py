@@ -654,6 +654,7 @@ class CTClient:
         self._keepalive_stop = None
         # Result of the most recent session() teardown; None until one runs.
         self.last_teardown = None
+        self.lease_lost = None       # set by lease() if a renewal found it taken
         self._s.headers.update({
             "X-CT-Client": client_id,
             "Content-Type": "application/json",
@@ -1155,15 +1156,62 @@ class CTClient:
 
     @contextmanager
     def lease(self, ttl: float = 60.0, note: str = ""):
-        """Context manager: acquire lease on enter, release on exit.
+        """Hold the bench's write lease for the whole `with` block.
 
-        Raises CTLeaseError on enter if another client holds it — see
-        acquire_lease(). Always releases on exit, including on error.
+            with ct.lease(note="emission sweep"):
+                ct.download(plan); ct.arm_all(); ct.simulate_sync(count=N)
+
+        WHAT IT IS FOR. Several programs share the bench through one backend --
+        the GUI, this script, somebody else's script. Without a lease their
+        WRITES interleave command by command: nothing stops the GUI from
+        changing a filament's state, re-downloading a table or disarming in
+        the middle of your sequence. While you hold the lease, every other
+        client's write is refused (it gets "another client holds the write
+        lease: <you>"); reads are never refused, so the GUI keeps monitoring.
+
+        It is cooperative and gates only OTHERS. It does not make anything
+        safer by itself, stop anything on exit, or slow your own calls --
+        energised()/session() are what de-energise.
+
+        Raises CTLeaseError on enter if another client holds it. Always
+        releases on exit, including on error.
+
+        RENEWED IN THE BACKGROUND for as long as the block runs, every ttl/3.
+        `ttl` is therefore how long the lease outlives THIS PROCESS if it dies
+        without releasing -- not how long the block may take. It used to be the
+        latter: a 15-minute run under `lease(ttl=120)` lost its lease after two
+        minutes and ran the rest unprotected without a word. If a renewal finds
+        the lease taken (another client used steal), that is printed to stderr
+        and `self.lease_lost` is set; the block is not interrupted.
         """
         self.acquire_lease(ttl=ttl, note=note)
+        self.lease_lost = None
+        stop = threading.Event()
+        period = max(1.0, float(ttl) / 3.0)
+
+        def _renew():
+            while not stop.wait(period):
+                r = self._post("/api/lock", {"action": "acquire", "ttl": ttl, "note": note})
+                if r.get("ok") or r.get("connection_error"):
+                    # A backend that cannot be reached cannot hand the lease
+                    # to anyone else either; the next renewal will tell.
+                    continue
+                snap = r.get("lock") or {}
+                self.lease_lost = Result({"at": time.strftime("%H:%M:%S"),
+                                          "holder": snap.get("owner"),
+                                          "error": r.get("error")})
+                print(f"ct.lease: LOST the write lease to '{snap.get('owner')}' "
+                      f"— from now on other clients can write to the bench "
+                      f"while this block runs", file=sys.stderr, flush=True)
+                return
+
+        t = threading.Thread(target=_renew, name="ct_lease_renew", daemon=True)
+        t.start()
         try:
             yield self
         finally:
+            stop.set()
+            t.join(timeout=5.0)
             self.release_lease()
 
     # ── session — guaranteed safe teardown ────────────────────────────────────
