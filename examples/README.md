@@ -1,5 +1,19 @@
 # Examples
 
+## `external_trigger.py` — fire on an external trigger, and know when to send it
+
+```bash
+python3 external_trigger.py --host 192.168.8.165 -f 8                  # one pulse
+python3 external_trigger.py --host 192.168.8.165 -f 8 --pulses 3        # three
+```
+
+Heats filament F up the ladder (STOP → SLEEP → STANDBY → IDLE → ACTIVE), turns
+HV on, then arms with `trigger="ext"`. It prints **READY** from the `on_armed`
+callback at the moment everything is armed — send the external trigger then;
+an edge sent earlier is lost. Always ends with HV off and filament F at STOP.
+The callback and its timing rules are documented in `fire_single_pulse`'s
+docstring ("EXTERNAL TRIGGER").
+
 ## `walkthrough.py` — the whole API, in runnable sections
 
 ```bash

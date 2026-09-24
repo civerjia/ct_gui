@@ -1260,7 +1260,9 @@ class _ScheduleMixin:
                             `filament` via the active-list mapping — see
                             "why controller exists at all" above.
             trigger:        "sim" — ESP32 generates SyncIn pulse(s);
-                            "ext" — caller supplies the external SyncIn edge.
+                            "ext" — caller supplies the external SyncIn edge,
+                            and must not send it before on_armed is called --
+                            see "EXTERNAL TRIGGER" below.
                             Either way this fires on the RISING edge —
                             triggerEdge is hardcoded 0 here (unlike
                             shv_set_config's `trigger_edge`, which this
@@ -1276,10 +1278,60 @@ class _ScheduleMixin:
                             as its own gate.
             reuse:          skip re-download when unchanged — see above.
                             Default False; opt in only under a held lease.
+            on_armed:       a function taking NO arguments, called once at the
+                            moment the system is READY for the trigger -- see
+                            "EXTERNAL TRIGGER" below.
 
         Returns:
             {"ok": bool, "fired": int, "records": [...], "status": {...},
              "error": str}   # "error" present only when "ok" is False
+
+        EXTERNAL TRIGGER -- when to send it (on_armed)
+
+        With trigger="ext" the pulse fires on YOUR edge, so you need to know
+        when the system is ready for it. on_armed is called exactly once, at
+        that moment: after the schedule is downloaded and verified, the STM32
+        detector armed (measure=True), this filament's controller armed (and
+        the master, last), and the check that the filament was not skipped as
+        unsafe. An edge sent BEFORE that is lost. After on_armed returns, this
+        call waits for the run to finish.
+
+        Same script, a person or another instrument sends the edge:
+
+            import time
+
+            def on_armed():
+                print(f"[{time.strftime('%H:%M:%S')}] READY -- send the external trigger now")
+
+            r = ct.fire_single_pulse(filament=8, width_us=1000, trigger="ext",
+                                     total_ms=30000,   # edge + whole run within 30 s of ARMING
+                                     timeout_s=35.0,   # this script waits a bit longer
+                                     measure=True, on_armed=on_armed)   # the function, no ()
+            print(r)
+
+        Your own code sends the edge, from another thread:
+
+            import threading
+
+            ready = threading.Event()
+
+            def trigger_source():
+                if ready.wait(timeout=60):          # blocks until armed
+                    send_my_trigger()               # your code that makes the edge
+
+            threading.Thread(target=trigger_source, daemon=True).start()
+            r = ct.fire_single_pulse(filament=8, trigger="ext", total_ms=30000,
+                                     timeout_s=35.0, measure=True,
+                                     on_armed=ready.set)   # already a no-argument function
+
+        on_armed runs in THIS thread, between arming and waiting: return
+        quickly (print, set an Event, notify another program). If it raises,
+        the schedule is disarmed and nothing fires ({"ok": False, "error": ...}).
+        Timing: total_ms counts from ARMING and bounds both the wait for your
+        edge and the whole run (firmware TotalTimeout); inter_pulse_ms only
+        applies between pulses once firing has started; timeout_s counts from
+        when on_armed returns and should be longer than total_ms.
+        examples/external_trigger.py is a complete script.
 
 
         measure=True -- ALSO measure the current of every pulse
