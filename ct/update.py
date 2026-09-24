@@ -1,6 +1,6 @@
 """Self-update from GitHub, at startup only.
 
-    import ct_update; ct_update.check_and_update()
+    from ct import update; update.check_and_update()
 
 ct_simple_control and backend.py call this once, when they start -- BEFORE
 anything talks to hardware. If this directory is a git clone whose upstream
@@ -31,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_DIR = Path(__file__).resolve().parent
+REPO_DIR = Path(__file__).resolve().parents[1]   # the repository root (this file is ct/update.py)
 FETCH_TIMEOUT_S = 5.0
 
 

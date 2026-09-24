@@ -1,7 +1,7 @@
 """Plot an emission_vs_heating() run, and leave the figures on disk with it.
 
-    python3 emission_plot.py calibration/richardson_20260922_140130.json
-    python3 emission_plot.py --r-lead 0.20 --latest
+    python3 -m ct.analysis.emission_plot calibration/richardson_20260922_140130.json
+    python3 -m ct.analysis.emission_plot --r-lead 0.20 --latest   (from the repository root)
 
 The figures are part of the RECORD, not a viewer: they are written next to the
 JSON/CSV the run already produced, at the same basename, so a result and its
@@ -32,7 +32,8 @@ try:
 except ImportError:                  # pragma: no cover - reported, not raised
     plt = None
 
-from ct_simple_control import CTClient
+from ct.client import CTClient
+from ct.paths import CALIB_DIR
 
 
 # Palette from the subject: the filament's own incandescence over the measured
@@ -367,7 +368,7 @@ def main(argv=None) -> int:
     ap.add_argument("json", nargs="?", help="a save_emission_curves() JSON")
     ap.add_argument("--latest", action="store_true",
                     help="use the newest JSON in calibration/ instead")
-    ap.add_argument("--dir", default="calibration")
+    ap.add_argument("--dir", default=str(CALIB_DIR))   # <repo>/calibration, from any cwd
     ap.add_argument("--r-lead", type=float, default=0.20,
                     help="assumed lead resistance, Ω (default: 0.20). The "
                          "emission curve cannot determine this — take it from "

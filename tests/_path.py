@@ -1,4 +1,4 @@
-"""Makes `ct_simple_control` / `net_protocol` importable from this directory.
+"""Makes `ct_simple_control` and the `ct` package importable from this directory.
 
 These scripts used to sit next to those modules, so a bare
 `from ct_simple_control import CTClient` resolved via the script's own

@@ -54,7 +54,7 @@ PD_BG_WINDOW, PD_MIN_DUR, PD_K_SIGMA, PD_GAP, PD_LOCAL, PD_RATIO = 20, 64, 3, 0,
 
 
 def emission_ma(raw, ref_v):
-    # Same formula as static/power.js's emissionMa() / tests.js's
+    # Same formula as web/power.js's emissionMa() / tests.js's
     # peakToMa() -- see those files' comments. raw is the STM32's own
     # 12-bit ADC code (VDDA=3.3V ref), not an ESP32 ADC_ATTEN_12 reading;
     # R_sense=10ohm, G=8.2 (AMC3301). ref_v is the external differential

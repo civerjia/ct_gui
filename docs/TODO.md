@@ -42,7 +42,7 @@ debug tool, and a repaired board has to be exercised before it is unmarked —
 but it must **warn** first.
 
 **What is wrong now.** The debug page sends `CH_SET_POWER_STATE` straight
-through `/api/cmd` (`static/power.js` — the single-board setter around line
+through `/api/cmd` (`web/power.js` — the single-board setter around line
 712 and the board-mask batch around 733). That path bypasses
 `prep_filaments` and `/api/filament-state`, so none of the dead rules apply:
 not the refusal of energising states, and not the SLEEP → STOP substitution

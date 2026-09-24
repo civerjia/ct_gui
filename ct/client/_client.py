@@ -189,7 +189,8 @@ from typing import NewType
 # clone that is behind fast-forwards and this script restarts on the new code.
 # Only ever at start-up -- never while a script is controlling hardware.
 # CT_NO_AUTO_UPDATE=1 turns it off.
-import ct_update
+from ct import update as ct_update
+from ct.paths import CLIENT_LOG_DIR
 ct_update.check_and_update()
 
 # FID: the canonical 0..95 filament id the backend and firmware agree on.
@@ -621,7 +622,7 @@ class CTClient:
         record: bool = True,          # append every call and its FULL result
                                        # to logs/client/ct_client_<date>.jsonl
                                        # -- see _record_call(). False = off
-        record_dir: str | None = None,  # where; None = tools/ct_gui/logs/client
+        record_dir: str | None = None,  # where; None = <repo>/logs/client (ct.paths)
         keepalive: bool = True,       # renew the backend's dead-man watchdog
                                        # in the background for as long as this
                                        # client is alive and has energised
@@ -646,7 +647,7 @@ class CTClient:
         self.client_id = client_id
         self.record = bool(record)
         self.record_dir = (Path(record_dir) if record_dir is not None
-                           else Path(__file__).resolve().parent / "logs" / "client")
+                           else CLIENT_LOG_DIR)
         self._record_lock = threading.Lock()
         self._record_last: dict = {}      # method -> [signature, monotonic, suppressed]
         self._record_warned = False
@@ -4157,7 +4158,7 @@ class CTClient:
 
     # ── Building a full scan plan ────────────────────────────────────────
     # download() takes a plan; it does not build one. The GUI's builder lives
-    # in JavaScript (buildSchedule / planHeating / buildPlan in static/app.js),
+    # in JavaScript (buildSchedule / planHeating / buildPlan in web/app.js),
     # so until now a script had to hand-assemble the dict and re-derive the
     # heating window from reading that JS. build_scan_plan() is that algorithm
     # in Python, so the two produce the same plan for the same inputs.

@@ -10,10 +10,10 @@
 # Output is NOT committed (see .gitignore): it is derived, it is large, and a
 # regenerated copy churns the diff on every docstring edit. Run this instead.
 set -e
-cd "$(dirname "$0")"
-python3 -m pdoc ct_simple_control \
+cd "$(dirname "$0")/.."          # the repository root
+python3 -m pdoc ct.client \
     --output-directory docs/api \
     --no-show-source \
     --no-search \
     --docformat markdown
-echo "-> docs/api/ct_simple_control.html"
+echo "-> docs/api/ct/client.html"

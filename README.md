@@ -11,7 +11,7 @@ modules**. Two ESP32 bridges → RP2350B controllers; hardware I/O goes through
 ```bash
 git clone https://github.com/civerjia/ct_gui.git
 cd ct_gui
-pip install -r requirements.txt     # requests; matplotlib only for emission_plot.py
+pip install -r requirements.txt     # requests; matplotlib only for ct/analysis/emission_plot.py
 ```
 
 Needs Python 3.11+ and `git` on the PATH. Put the clone OUTSIDE a synced
@@ -34,6 +34,29 @@ corrupt the repository.
 - Keep your own scripts out of git: name them `*_local.py` (ignored), or keep
   them outside the clone. Runtime output (`logs/`, `recordings/`,
   `run_reports/`, `state/`, `calibration/`) is ignored too.
+
+## Layout
+
+```
+backend.py              start the server:  python backend.py
+ct_simple_control.py    the Python API's name for scripts:  from ct_simple_control import CTClient
+ct/                     the package
+  client/               CTClient (the code behind ct_simple_control)
+  server/               the HTTP backend (the code behind backend.py)
+  protocol.py           framed UART/TCP protocol to the RP2350 controllers
+  update.py             self-update from GitHub at start-up
+  paths.py              every directory the software uses (logs, state, web UI)
+  analysis/             offline tools:  python -m ct.analysis.emission_plot --latest
+web/                    the browser UI (served by the backend)
+docs/                   CT_SIMPLE_CONTROL_README.md (the client guide), TODO, reports
+examples/  tests/       scripts that use the API against real hardware
+scripts/                maintenance (make_api_docs.sh)
+logs/ state/ calibration/ recordings/ run_reports/    runtime output, git-ignored
+```
+
+The two top-level files are thin: `backend.py` starts `ct.server`, and
+`ct_simple_control` IS the `ct.client` module under its old name, so existing
+scripts and commands need no change. `from ct.client import CTClient` works too.
 
 ## View modes (Live / Plan / Debug)
 
@@ -88,7 +111,7 @@ each bridge. Two heartbeat badges per controller track liveness — **RP2350 ♥
 go green/pulsing when fresh (<3 s), amber when stale, red when dead.
 
 The backend (`backend.py`) holds two independent `TcpProtocolClient`s — reused
-from `../wifi_gui/net_protocol.py` — and exposes:
+from `ct/protocol.py` — and exposes:
 
 | Route | Method | Purpose |
 |-------|--------|---------|
@@ -168,7 +191,7 @@ finally:
 ```
 
 The GUI plays by the same rules: each tab has its own client id and takes the
-lease around a schedule download and a Cal & Test run (`static/client.js`).
+lease around a schedule download and a Cal & Test run (`web/client.js`).
 
 ## Logs
 
@@ -326,7 +349,7 @@ In Debug, the editor maps each control to a firmware command
   spike-free waveform on long cables) (`/api/hv-shift-hz`).
 
 Frames are built in `backend.py` (the firmware protocol is ahead of the WiFi
-GUI's `net_protocol`) and proxied via `POST /api/cmd {controller, command, …}`.
+GUI's `ct/protocol.py`) and proxied via `POST /api/cmd {controller, command, …}`.
 
 ## Machine geometry
 
@@ -357,7 +380,7 @@ python3 backend.py
 Then open <http://127.0.0.1:8770> (other machines: `http://<this-host>:8770`).
 
 Every input field remembers the last value you typed or picked
-(`static/sticky.js` → localStorage) and restores it on load, so a reload or a
+(`web/sticky.js` → localStorage) and restores it on load, so a reload or a
 rebuilt card never resets the bench setup. Fields marked `data-nostick` are
 deliberately not remembered: the **Override** safety gate and the two
 live-capture checkboxes (**Auto 2 Hz**, **Live**), which would otherwise start
@@ -369,4 +392,4 @@ forgets everything.
 - Toggles under the canvas show the beam fan, filament indices, collimator
   wedge, and detector pixel ticks.
 
-`backend.py` is stdlib only; `ct_simple_control.py` needs `requests`.
+The server is stdlib only; the Python client needs `requests`.

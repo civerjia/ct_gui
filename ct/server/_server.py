@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from net_protocol import (
+from ct.protocol import (
     BRIDGE_PORT,
     TYPE_NAMES,
     TcpProtocolClient,
@@ -126,12 +126,11 @@ GEOMETRY = {
 # started from wherever, and a relative path would scatter state across the
 # filesystem depending on how it was launched.
 
-LOG_DIR = Path(__file__).resolve().parent / "logs"
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-CALIB_DIR = Path(__file__).resolve().parent / "calibration"   # emission-current calibration records
-STATE_DIR = Path(__file__).resolve().parent / "state"         # operator decisions that must outlive a restart
+# Directories: all under the repository root, defined once in ct/paths.py.
+from ct.paths import CALIB_DIR, LOG_DIR, RECORD_DIR, RUN_REPORT_DIR, STATE_DIR  # noqa: E402
+from ct.paths import WEB_DIR as STATIC_DIR  # noqa: E402
 DEAD_STATE_PATH = STATE_DIR / "dead_fids.json"
-RECORD_DIR = Path(__file__).resolve().parent / "recordings"
+# (RECORD_DIR: see ct/paths.py)
 
 # ── Link timeouts ──────────────────────────────────────────────────────────
 
@@ -3707,7 +3706,7 @@ def _write_run_report(report: dict | None) -> None:
     if not report:
         return
     try:
-        d = Path(__file__).resolve().parent / "run_reports"
+        d = RUN_REPORT_DIR
         d.mkdir(exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(report.get("generated", time.time())))
         lines = [f"RUN POWER-STATE REPORT  {ts}",
@@ -6843,7 +6842,7 @@ def main() -> None:
     # Self-update from GitHub before binding the port (see ct_update.py): a
     # clone that is behind fast-forwards and the backend restarts on the new
     # code. Start-up only -- a running backend is never restarted by this.
-    import ct_update
+    from ct import update as ct_update
     ct_update.check_and_update()
     _BACKEND_VERSION.update(ct_update.version())
     host = os.environ.get("CT_GUI_HOST", "0.0.0.0")
