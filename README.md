@@ -28,7 +28,9 @@ corrupt the repository.
   It never overwrites local edits or local commits (it warns and carries on),
   and never updates mid-run. No network = a warning, not a failure.
   In IPython/Jupyter it pulls and asks you to restart the kernel.
-  `CT_NO_AUTO_UPDATE=1` turns it off.
+  `CT_NO_AUTO_UPDATE=1` turns it off. Every update, skip and failure is
+  logged to `logs/update.log` (time, host, script) -- readable remotely with
+  `ct.read_log("update.log")`.
 - **Versions.** A client warns once if the backend it talks to runs different
   code (`/api/version`); restart `backend.py` to update it.
 - Keep your own scripts out of git: name them `*_local.py` (ignored), or keep

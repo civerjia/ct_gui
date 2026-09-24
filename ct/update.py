@@ -22,13 +22,19 @@ has:
 
 Turn it off with the environment variable CT_NO_AUTO_UPDATE=1. The restarted
 process gets CT_UPDATED=1 so it never checks (and restarts) a second time.
+
+Every update, skip and failure is also appended to logs/update.log (time,
+host, the script that started it) -- readable from another machine through
+the backend: ct.read_log("update.log"). An up-to-date check writes nothing.
 """
 
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parents[1]   # the repository root (this file is ct/update.py)
@@ -40,8 +46,27 @@ def _git(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
                           text=True, timeout=timeout)
 
 
+UPDATE_LOG = REPO_DIR / "logs" / "update.log"
+
+
+def _record(msg: str) -> None:
+    """Append one line to logs/update.log. Never raises: a log that cannot be
+    written must not stop the script it is describing."""
+    try:
+        UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        script = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else "(interactive)"
+        with open(UPDATE_LOG, "a", encoding="utf-8") as fh:
+            for i, line in enumerate(msg.splitlines() or [""]):
+                prefix = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} {socket.gethostname()} {script}: "
+                          if i == 0 else "    ")
+                fh.write(prefix + line.strip() + "\n")
+    except OSError:
+        pass
+
+
 def _warn(msg: str) -> None:
     print(f"[ct_update] {msg}", file=sys.stderr)
+    _record(msg)
 
 
 def version() -> dict:
