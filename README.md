@@ -172,7 +172,24 @@ lease around a schedule download and a Cal & Test run (`static/client.js`).
 
 ## Logs
 
-`logs/backend.log`, rotated daily (`backend.log.YYYY-MM-DD`).
+`logs/backend.log`, rotated daily (`backend.log.YYYY-MM-DD`). Scripts write
+their call records to `logs/client/ct_client_YYYY-MM-DD.jsonl` on the machine
+they run on.
+
+**Reading them from another machine.** The backend serves its own `logs/`
+read-only, so from anywhere on the LAN:
+
+```python
+ct = CTClient("<backend IP>")
+ct.list_logs()                                            # what is there
+ct.read_log(tail=100)                                     # backend.log, last 100 lines
+ct.read_log(grep="WARNING", tail=50)                      # only warnings
+ct.read_log("client/ct_client_2026-09-24.jsonl", tail=20) # a day's call records, parsed
+```
+
+(or `http://<backend IP>:8770/api/logs` and
+`/api/logs/read?path=backend.log&tail=100&grep=AUDIT` in a browser). Only files
+under `logs/` are readable; the last 8 MB of a file are searched.
 
 **Audit: one line per command.** Every POST that changes something is logged
 with who sent it (the client id), a bounded summary of the request, and the

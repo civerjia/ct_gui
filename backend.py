@@ -731,6 +731,62 @@ SHARED_TTL_HV_SNAPSHOT_S = 1.0   # /api/hv-snapshot (HV_GET_ALL_BYTES)
 
 _BACKEND_VERSION: dict = {"commit": None, "dirty": False}   # set at start-up (main)
 
+# ── Remote log reading ──────────────────────────────────────────────────────
+# The backend may run on another machine than the person debugging it. These
+# let any client on the LAN read what is under LOG_DIR -- backend.log (and its
+# dated roll-overs) and the call records of scripts that ran ON THIS MACHINE
+# (logs/client/*.jsonl). READ-ONLY, no lease: they touch no hardware.
+# Confined to LOG_DIR and to .log / .log.<date> / .jsonl files; a path that
+# resolves outside it is refused. A read is capped at LOG_READ_MAX_BYTES from
+# the END of the file (tail semantics), so a huge file cannot tie up the server.
+LOG_READ_MAX_BYTES = 8 * 1024 * 1024
+LOG_READ_DEFAULT_TAIL = 500
+LOG_READ_MAX_TAIL = 20000
+
+
+def _log_file_ok(p: Path) -> bool:
+    name = p.name
+    return p.is_file() and (name.endswith(".jsonl") or name.endswith(".log") or ".log." in name)
+
+
+def list_log_files() -> list[dict]:
+    out = []
+    if LOG_DIR.is_dir():
+        for p in sorted(LOG_DIR.rglob("*")):
+            if _log_file_ok(p):
+                st = p.stat()
+                out.append({"path": p.relative_to(LOG_DIR).as_posix(), "size": st.st_size,
+                            "mtime": datetime.datetime.fromtimestamp(st.st_mtime).astimezone()
+                                     .isoformat(timespec="seconds")})
+    return out
+
+
+def read_log_file(rel: str, tail: int, grep: str | None) -> dict:
+    """Last `tail` lines of one log file (after an optional substring filter)."""
+    root = LOG_DIR.resolve()
+    try:
+        p = (root / rel).resolve()
+        p.relative_to(root)               # raises if it escapes LOG_DIR
+    except (ValueError, OSError):
+        return {"ok": False, "error": f"not a log path: {rel!r}"}
+    if not _log_file_ok(p):
+        return {"ok": False, "error": f"no such log file: {rel!r} (see /api/logs)"}
+    size = p.stat().st_size
+    start = max(0, size - LOG_READ_MAX_BYTES)
+    with open(p, "rb") as fh:
+        fh.seek(start)
+        data = fh.read()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]                 # first line is cut mid-way
+    if grep:
+        lines = [ln for ln in lines if grep in ln]
+    tail = max(1, min(int(tail), LOG_READ_MAX_TAIL))
+    matched = len(lines)
+    return {"ok": True, "path": p.relative_to(root).as_posix(), "size": size,
+            "lines": lines[-tail:], "matched": matched, "returned": min(tail, matched),
+            "scanned_from_byte": start, "grep": grep or None}
+
 _SHARED_GUARD = threading.Lock()
 _SHARED_LOCKS: dict = {}
 _SHARED_VALS: dict = {}
@@ -5040,6 +5096,18 @@ class CtHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             self._json({"ok": True, "filaments": out})
+        elif path == "/api/logs":
+            # Log files on THIS (the backend's) machine -- see list_log_files().
+            self._json({"ok": True, "log_dir": str(LOG_DIR), "files": list_log_files()})
+        elif path == "/api/logs/read":
+            # ?path=<as listed>&tail=<lines>&grep=<substring> -- see read_log_file().
+            from urllib.parse import unquote_plus
+            q = {k: unquote_plus(v) for k, v in self._query().items()}
+            try:
+                tail = int(q.get("tail") or LOG_READ_DEFAULT_TAIL)
+            except ValueError:
+                return self._json({"ok": False, "error": "tail must be an integer"})
+            self._json(read_log_file(q.get("path", "backend.log"), tail, q.get("grep") or None))
         elif path == "/api/version":
             # The commit this backend was started from (ct_update.version()),
             # so a client can tell it is talking to older or newer code.
@@ -6788,8 +6856,8 @@ def main() -> None:
     threading.Thread(target=_safety_loop, name="safety_watchdog", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
-    log.info("safety watchdog: ACTIVE -> %s after %.0fs, HV off after %.0fs "
-             "(commands renew; reads do not)",
+    log.info("safety watchdog: ACTIVE -> %s after %.0fs, grid MOSFETs opened after %.0fs "
+             "without an HV grid command (rails never touched; commands renew, reads do not)",
              power_state_name(SAFETY_ACTIVE_FALLBACK), SAFETY_ACTIVE_TIMEOUT_S,
              SAFETY_HV_TIMEOUT_S)
     server = ThreadingHTTPServer((host, port), CtHandler)

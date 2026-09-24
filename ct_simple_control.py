@@ -924,6 +924,52 @@ class CTClient:
         single-client TCP slot for another host to use."""
         return self._post("/api/disconnect", {"controller": int(controller)})
 
+    # ── the backend machine's logs, over the LAN ─────────────────────────────
+    # backend.py may run on another computer. These read ITS logs/ directory:
+    # backend.log (+ dated roll-overs) and the call records of scripts that
+    # ran on THAT machine (client/ct_client_<date>.jsonl). A script running
+    # here writes its own records here -- see record_path. Read-only; no lease.
+
+    def list_logs(self) -> dict:
+        """Log files on the backend's machine.
+
+            ct.list_logs()   ->  {"ok", "log_dir", "files": [{"path", "size", "mtime"}]}
+
+        Pass a "path" from here to read_log()."""
+        return self._get("/api/logs", timeout=10.0)
+
+    def read_log(self, path: str = "backend.log",   # as listed by list_logs()
+                 tail: int = 200,                    # last N lines (after grep), <= 20000
+                 grep: str | None = None) -> dict:   # keep only lines containing this
+        """Read one log file on the backend's machine: its last `tail` lines.
+
+            ct.read_log()                                         # backend.log, last 200
+            ct.read_log(grep="WARNING", tail=50)                  # its warnings
+            ct.read_log("client/ct_client_2026-09-24.jsonl", tail=20)
+            ct.read_log("client/ct_client_2026-09-24.jsonl", grep='"fire_single_pulse"')
+
+        Returns {"ok", "path", "size", "lines", "matched", "returned"}. A .jsonl
+        file also gets "records": each line parsed (a line that is not JSON
+        stays as its text under {"unparsed": ...}) -- so a record's result can
+        be read the same way as a live one: Result(rec["result"]).
+
+        Only the last 8 MB of a file are scanned; "scanned_from_byte" > 0 says
+        older content was not searched."""
+        from urllib.parse import urlencode
+        q = {"path": path, "tail": int(tail)}
+        if grep:
+            q["grep"] = grep
+        r = self._get("/api/logs/read?" + urlencode(q), timeout=30.0)
+        if r.get("ok") and str(r.get("path", "")).endswith(".jsonl"):
+            recs = []
+            for ln in r.get("lines") or []:
+                try:
+                    recs.append(json.loads(ln))
+                except ValueError:
+                    recs.append({"unparsed": ln})
+            r["records"] = recs
+        return r
+
     def status(self) -> dict:
         """Read overall backend status: which controllers are connected, the
         current master, and the lease state.
