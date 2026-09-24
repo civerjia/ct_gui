@@ -713,6 +713,46 @@ def run_chip_health(link: "ControllerLink") -> dict:
 
 
 
+# ── Shared reads: N GUIs cost the hardware what ONE does ───────────────────
+# Every GUI tab polls the same status endpoints on its own timer, so two tabs
+# used to put twice the requests on the RP2350 link (run status, HV grid bits)
+# and on the master ESP32's fragile HTTP server (ADS1115, HV pin status).
+# shared_read() makes those reads single-flight with a short TTL: within the
+# TTL every caller gets the one result, and concurrent callers wait for the one
+# read in flight instead of each starting their own. The hardware sees at most
+# 1/TTL reads per key however many tabs are open.
+#
+# A script that COMMANDS and then reads must never be handed the value from
+# before its command: every POST (every command) drops the whole cache when it
+# completes -- see do_POST.
+SHARED_TTL_RUN_STATUS_S = 0.4    # /api/run-status: <= 2.5 Hz per controller
+SHARED_TTL_STM32_S = 0.1         # /api/stm32/ads1115, /api/stm32/hv-status: <= 10 Hz each
+SHARED_TTL_HV_SNAPSHOT_S = 1.0   # /api/hv-snapshot (HV_GET_ALL_BYTES)
+
+_SHARED_GUARD = threading.Lock()
+_SHARED_LOCKS: dict = {}
+_SHARED_VALS: dict = {}
+
+
+def shared_read(key, ttl_s: float, fetch):
+    """fetch() at most once per ttl_s for `key`, shared by every caller."""
+    with _SHARED_GUARD:
+        lk = _SHARED_LOCKS.setdefault(key, threading.Lock())
+    with lk:
+        hit = _SHARED_VALS.get(key)
+        if hit is not None and (time.monotonic() - hit[0]) <= ttl_s:
+            return hit[1]
+        value = fetch()
+        _SHARED_VALS[key] = (time.monotonic(), value)
+        return value
+
+
+def shared_invalidate() -> None:
+    """Drop every shared read -- called after each command (POST)."""
+    with _SHARED_GUARD:
+        _SHARED_VALS.clear()
+
+
 # ── Board monitor: ONE reader per controller for the ring AND the matrix ────
 # The ring (/api/telemetry) and the boards matrix (/api/board-snapshot) used to
 # poll the RP2350 separately -- the matrix with live I2C (CH_GET_PRESENT, a
@@ -4652,11 +4692,15 @@ class CtHandler(BaseHTTPRequestHandler):
             if not link or not link.client.connected:
                 self._json({"ok": False, "error": "controller not connected"})
             else:
-                try:
-                    dec = link.request(0x13, b"", flags=0, timeout=2.0).get("decoded") or {}
-                    self._json({"ok": True, "desired": dec.get("desired", [0] * 8), "feedback": dec.get("feedback", [0] * 8)})
-                except Exception as exc:
-                    self._json({"ok": False, "error": str(exc)})
+                def _fetch_hv_snapshot(link=link):
+                    try:
+                        dec = link.request(0x13, b"", flags=0, timeout=2.0).get("decoded") or {}
+                        return {"ok": True, "desired": dec.get("desired", [0] * 8),
+                                "feedback": dec.get("feedback", [0] * 8)}
+                    except Exception as exc:
+                        return {"ok": False, "error": str(exc)}
+                self._json(shared_read(("hv-snapshot", id(link)), SHARED_TTL_HV_SNAPSHOT_S,
+                                       _fetch_hv_snapshot))
         elif path == "/api/adc/burst":
             # ESP32-local ADC (GP10, adc_sampler-driven) burst read via the
             # bridge's own /adc/burst — a DIFFERENT ADC path from
@@ -4774,7 +4818,9 @@ class CtHandler(BaseHTTPRequestHandler):
             # mV, and engineering units) over the STM32's I2C bus. Routed to
             # whichever controller is MASTER (STM32 hangs off one power only).
             host, err = self._master_host()
-            self._json({"ok": False, "error": err} if err else stm32_ads1115(host))
+            self._json({"ok": False, "error": err} if err else
+                       shared_read(("stm32-ads1115", host), SHARED_TTL_STM32_S,
+                                   lambda: stm32_ads1115(host)))
         elif path == "/api/stm32/adc-window":
             # Proxy to `/stm32/adc_window?n=` — a pulse-INDEPENDENT windowed
             # summary (min/max/mean/rms/std/pp) over the next n high-speed ADC
@@ -4796,7 +4842,8 @@ class CtHandler(BaseHTTPRequestHandler):
             if err:
                 self._json({"ok": False, "error": err})
             else:
-                self._json(stm32_hv_status(host))
+                self._json(shared_read(("stm32-hv-status", host), SHARED_TTL_STM32_S,
+                                       lambda: stm32_hv_status(host)))
         elif path == "/api/stm32/ds3502":
             # Proxy to `/stm32/ds3502?ch=` — reads back one DS3502 digital-pot
             # wiper (0-127) over I2C. ch selects the pot: 'ev'=emission voltage,
@@ -4994,33 +5041,38 @@ class CtHandler(BaseHTTPRequestHandler):
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
-            out = {}
-            for k, c in CONTROLLERS.items():
-                if not c.client.connected:
-                    out[str(k)] = {"connected": False}
-                    continue
-                # RP2350 heartbeat age — a periodic message from the RP2350; if it
-                # stops the RP2350 is dead/hung even though the ESP32 TCP link is up.
-                rp_age = None if c.rp_last == 0 else (time.time() - c.rp_last) * 1000.0
-                try:
-                    st = decode_shv_status(c.request(SHV_GET_STATUS, b"", timeout=1.0))
-                    out[str(k)] = {"connected": True, "status": st, "rp_age_ms": rp_age}
-                except Exception as exc:
-                    out[str(k)] = {"connected": True, "error": str(exc), "rp_age_ms": rp_age}
-            # Universal push teardown: tear the push down once the run has actually
-            # STARTED (state 2 seen) and then stopped — guards the Armed-but-not-yet-
-            # firing window right after enable. pollRunStatus polls this throughout.
-            global _PUSH_SAW_RUN
-            if _LIVE_PUSH:
-                any_running = any((v.get("status") or {}).get("state") == 2 for v in out.values())
-                if any_running:
-                    _PUSH_SAW_RUN = True
-                elif _PUSH_SAW_RUN:
-                    for c2 in list(_LIVE_PUSH):
-                        l2 = CONTROLLERS.get(c2)
-                        if l2 and l2.client.connected:
-                            set_scan_telemetry(l2, c2 - 1, False)
-                    _PUSH_SAW_RUN = False
+            # Shared (SHARED_TTL_RUN_STATUS_S): every GUI tab runs this poll while
+            # a schedule runs, and a run is exactly when the link must stay quiet.
+            def _fetch_run_status():
+                out = {}
+                for k, c in CONTROLLERS.items():
+                    if not c.client.connected:
+                        out[str(k)] = {"connected": False}
+                        continue
+                    # RP2350 heartbeat age — a periodic message from the RP2350; if it
+                    # stops the RP2350 is dead/hung even though the ESP32 TCP link is up.
+                    rp_age = None if c.rp_last == 0 else (time.time() - c.rp_last) * 1000.0
+                    try:
+                        st = decode_shv_status(c.request(SHV_GET_STATUS, b"", timeout=1.0))
+                        out[str(k)] = {"connected": True, "status": st, "rp_age_ms": rp_age}
+                    except Exception as exc:
+                        out[str(k)] = {"connected": True, "error": str(exc), "rp_age_ms": rp_age}
+                # Universal push teardown: tear the push down once the run has actually
+                # STARTED (state 2 seen) and then stopped — guards the Armed-but-not-yet-
+                # firing window right after enable. pollRunStatus polls this throughout.
+                global _PUSH_SAW_RUN
+                if _LIVE_PUSH:
+                    any_running = any((v.get("status") or {}).get("state") == 2 for v in out.values())
+                    if any_running:
+                        _PUSH_SAW_RUN = True
+                    elif _PUSH_SAW_RUN:
+                        for c2 in list(_LIVE_PUSH):
+                            l2 = CONTROLLERS.get(c2)
+                            if l2 and l2.client.connected:
+                                set_scan_telemetry(l2, c2 - 1, False)
+                        _PUSH_SAW_RUN = False
+                return out
+            out = shared_read(("run-status",), SHARED_TTL_RUN_STATUS_S, _fetch_run_status)
             self._json({"controllers": out})
         else:
             self._serve_static(path)
@@ -5038,6 +5090,9 @@ class CtHandler(BaseHTTPRequestHandler):
         try:
             self._do_post()
         finally:
+            # A command changes what the shared reads would return: drop them,
+            # so the next read -- this client's or anyone's -- is fresh.
+            shared_invalidate()
             with _suppress():
                 audit_post(self.path.split("?", 1)[0], self._audit_client,
                            self._audit_body, self._audit_resp, self._audit_note)

@@ -830,7 +830,7 @@ const HV_HTML = `
     <div class="block-title">HV monitor <span class="hint">— ADS1115</span></div>
     <div class="row wrap">
       <button id="adsRead" class="xs">Read</button>
-      <label class="chk"><input id="adsAuto" type="checkbox" checked data-nostick /> Auto 10 Hz</label>
+      <label class="chk"><input id="adsAuto" type="checkbox" checked data-nostick /> Auto 10 Hz (2 Hz while a run is on)</label>
     </div>
     <div class="detail-top">
       <div class="metric"><span class="metric-label">1.2V ref</span><span id="adsRef" class="metric-value">—</span></div>
@@ -1334,7 +1334,26 @@ function wireHv() {
   const tick = async () => { await adsRead(); await readHvStatus(false); };   // tiles live; buttons stay on the commanded state (poll must not yank a toggle)
   // Load both HV LUTs once at wire time and show their status next to Set V.
   refreshLutStatus('emission'); refreshLutStatus('focus');
-  const adsAutoApply = (on) => { clearInterval(adsTimer); adsTimer = on ? setInterval(tick, 500) : null; };
+  // 10 Hz idle (was cut to 500 ms when every tab hit the ESP32 separately).
+  // The backend now shares these reads across all tabs (shared_read,
+  // SHARED_TTL_STM32_S = 0.1 s), so the ESP32 sees <= 10 Hz whatever the tab
+  // count. Measured 2026-09-24, 2 tabs: ~7 Hz achieved (one ADS read is ~94 ms
+  // on the ESP32/STM32), all OK -- but the ESP32 serves HTTP from the loop()
+  // that relays the RP2350, so RP2350 command p95 rose 30 -> 146 ms. A run
+  // needs that link quiet: 2 Hz while a schedule is running.
+  // Self-rescheduling (not setInterval) so the rate follows the run state, and
+  // the next tick is only scheduled once this one's requests are done.
+  const ADS_AUTO_MS = 100, ADS_AUTO_RUN_MS = 500;
+  let adsAutoOn = false;
+  const adsLoop = async () => {
+    if (!adsAutoOn) return;
+    try { await tick(); } catch { /* keep polling */ }
+    if (adsAutoOn) adsTimer = setTimeout(adsLoop, state.scheduleRunning ? ADS_AUTO_RUN_MS : ADS_AUTO_MS);
+  };
+  const adsAutoApply = (on) => {
+    clearTimeout(adsTimer); adsTimer = null; adsAutoOn = on;
+    if (on) adsLoop();
+  };
   $p('adsRead').onclick = tick;
   $p('adsAuto').onchange = (e) => adsAutoApply(e.target.checked);
   adsAutoApply($p('adsAuto').checked);
