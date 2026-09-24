@@ -6,6 +6,35 @@ on top, then three columns — the **filament-ring monitor** (geometry), the
 modules**. Two ESP32 bridges → RP2350B controllers; hardware I/O goes through
 `backend.py` `/api/*` (and simulated telemetry drops into `ingestTelemetry()`).
 
+## Install and update
+
+```bash
+git clone https://github.com/civerjia/ct_gui.git
+cd ct_gui
+pip install -r requirements.txt     # requests; matplotlib only for emission_plot.py
+```
+
+Needs Python 3.11+ and `git` on the PATH. Put the clone OUTSIDE a synced
+folder (OneDrive, Dropbox): a sync client rewriting files under `.git` can
+corrupt the repository.
+
+- **One `backend.py` per bench.** It owns the single-client ESP32 bridges; every
+  other machine talks to it: `CTClient("<backend host IP>")` in Python, or
+  `http://<backend host IP>:8770` in a browser. The IP is printed at start-up
+  ("shared API on ...").
+- **Automatic update.** `import ct_simple_control` and `python backend.py`
+  check GitHub once, at start-up, before anything touches hardware. If the
+  clone is behind, it fast-forwards and restarts the script on the new code.
+  It never overwrites local edits or local commits (it warns and carries on),
+  and never updates mid-run. No network = a warning, not a failure.
+  In IPython/Jupyter it pulls and asks you to restart the kernel.
+  `CT_NO_AUTO_UPDATE=1` turns it off.
+- **Versions.** A client warns once if the backend it talks to runs different
+  code (`/api/version`); restart `backend.py` to update it.
+- Keep your own scripts out of git: name them `*_local.py` (ignored), or keep
+  them outside the clone. Runtime output (`logs/`, `recordings/`,
+  `run_reports/`, `state/`, `calibration/`) is ignored too.
+
 ## View modes (Live / Plan / Debug)
 
 A selector on the geometry card switches what the ring reflects:
@@ -305,7 +334,7 @@ GUI's `net_protocol`) and proxied via `POST /api/cmd {controller, command, …}`
 ## Run
 
 ```bash
-python3 tools/ct_gui/backend.py
+python3 backend.py
 ```
 
 Then open <http://127.0.0.1:8770> (other machines: `http://<this-host>:8770`).
@@ -323,4 +352,4 @@ forgets everything.
 - Toggles under the canvas show the beam fan, filament indices, collimator
   wedge, and detector pixel ticks.
 
-Stdlib only — no third-party dependencies.
+`backend.py` is stdlib only; `ct_simple_control.py` needs `requests`.
