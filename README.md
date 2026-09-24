@@ -1,45 +1,189 @@
-# Multi-Source CT Control GUI
+# CT filament & HV control
 
-Browser GUI for the 96-source ring CT. Layout: a full-width **Heating Gantt**
-on top, then three columns — the **filament-ring monitor** (geometry), the
-**Scan Schedule** (emission + derived heating plan), and the **hardware control
-modules**. Two ESP32 bridges → RP2350B controllers; hardware I/O goes through
-`backend.py` `/api/*` (and simulated telemetry drops into `ingestTelemetry()`).
+Host software for the 96-source ring CT: a **browser GUI**, a **Python API**
+(`ct_simple_control`) for scripts, and the **backend** (`backend.py`) that both
+of them talk to. The backend owns the connections to the two power controllers;
+nothing talks to the hardware except through it.
 
-## Install and update
+```
+  browser GUI ─┐                          ┌─ ESP32 bridge (C1, master) ─ RP2350: filament power, HV grid
+               ├─ HTTP :8770 ─ backend.py ─┤                              └ STM32: HV rails, current sense
+  your script ─┘   (one per bench)          └─ ESP32 bridge (C2) ────────── RP2350: filament power, HV grid
+```
+
+**API reference:** https://civerjia.github.io/ct_gui/ct/client.html -- every
+method, its arguments, what it returns and how it fails, rebuilt from the code
+on every push. **Client guide:** [docs/CT_SIMPLE_CONTROL_README.md](docs/CT_SIMPLE_CONTROL_README.md).
+**Examples:** [examples/](examples/).
+
+## 1. Install
 
 ```bash
 git clone https://github.com/civerjia/ct_gui.git
 cd ct_gui
-pip install -r requirements.txt     # requests; matplotlib only for ct/analysis/emission_plot.py
+pip install -r requirements.txt     # requests (+ matplotlib, optional, for plots)
 ```
 
-Needs Python 3.11+ and `git` on the PATH. Put the clone OUTSIDE a synced
-folder (OneDrive, Dropbox): a sync client rewriting files under `.git` can
-corrupt the repository.
+Python 3.11+ and `git` on the PATH. Clone OUTSIDE a synced folder (OneDrive,
+Dropbox): a sync client rewriting files under `.git` can corrupt it.
 
-- **One `backend.py` per bench.** It owns the single-client ESP32 bridges; every
-  other machine talks to it: `CTClient("<backend host IP>")` in Python, or
-  `http://<backend host IP>:8770` in a browser. The IP is printed at start-up
-  ("shared API on ...").
-- **Automatic update.** `import ct_simple_control` and `python backend.py`
-  check GitHub once, at start-up, before anything touches hardware. If the
-  clone is behind, it fast-forwards and restarts the script on the new code.
-  It never overwrites local edits or local commits (it warns and carries on),
-  and never updates mid-run. No network = a warning, not a failure.
-  In IPython/Jupyter it pulls and asks you to restart the kernel.
-  `CT_NO_AUTO_UPDATE=1` turns it off. Every update, skip and failure is
-  logged to `logs/update.log` (time, host, script) -- readable remotely with
-  `ct.read_log("update.log")`.
-- **Versions.** A client warns once if the backend it talks to runs different
-  code (`/api/version`); restart `backend.py` to update it.
-- Keep your own scripts out of git: name them `*_local.py` (ignored), or keep
-  them outside the clone. Runtime output (`logs/`, `recordings/`,
-  `run_reports/`, `state/`, `calibration/`) is ignored too.
+## 2. Start the backend -- once per bench
 
-**API reference:** https://civerjia.github.io/ct_gui/ -- rebuilt from the
-docstrings on every push (`.github/workflows/api-docs.yml`). Locally:
-`sh scripts/make_api_docs.sh` -> `docs/api/ct/client.html`.
+```bash
+python backend.py
+```
+
+Its banner prints the address other machines use:
+`shared API on http://192.168.8.165:8770`. Keep it running; it holds the
+controller connections, the safety watchdog and the logs.
+
+Only ONE backend may run per bench: each ESP32 bridge accepts a single
+connection, and a second backend is refused ("bridge slot already owned").
+
+## 3. Connect the two controllers
+
+Once per backend start, from the GUI (**Power Controllers** card -> **Connect**)
+or from Python:
+
+```python
+from ct_simple_control import CTClient
+ct = CTClient("192.168.8.165")               # the BACKEND's IP, never the ESP32's
+ct.connect(1, "192.168.8.242")               # controller 1 (master: STM32 + HV)
+ct.connect(2, "192.168.8.203")               # controller 2
+print(ct.status())                           # both "connected": True?
+```
+
+Every GUI and script then shares these connections. Do not press Connect again
+in a second GUI: it re-opens the connection and interrupts everyone using it.
+
+## 4. The GUI
+
+Open `http://<backend IP>:8770` in a browser -- any number of tabs, on any
+machine. They all read the same data (the backend reads the hardware once and
+serves every tab), so extra tabs add no load to the controllers.
+
+- **Power** panel: the 8x8 board matrix per controller (V, I, presence,
+  enable/fault dots), batch power states, the HV rails and grid switches.
+- **Geometry / Live**: the 96-filament ring with live heating currents; follows
+  a running schedule.
+- **Scan schedule**: build an emission + heating plan, download, arm, run.
+- **Tests**: calibration and hardware tests (open/short, emission, MOSFETs).
+
+Details of every panel: [GUI reference](#gui-reference) below.
+
+## 5. Python scripts
+
+A complete, safe single-filament shot:
+
+```python
+from ct_simple_control import CTClient
+
+ct = CTClient("192.168.8.165", client_id="my_test")    # client_id shows in the logs
+F = 8                                                   # filament number
+
+with ct.lease(ttl=120, note="emission test F8"):       # write access (see below)
+    try:
+        # Power ladder -- ALWAYS in this order, never skipping a step.
+        ct.stop_one(F, verify=True)
+        ct.sleep_one(F, verify=True)
+        ct.standby_one(F, verify=True)
+        print(ct.idle_one(F, current_ma=1200, verify=True))
+        print(ct.active_one(F, current_ma=2000, verify=True))
+
+        # HV
+        ct.set_emission_v(200)          # V (the output is negative)
+        ct.set_emission_i(80)           # mA current limit, 0..85.7
+        ct.set_focus_v(350)
+        ct.enable_emission(True)
+        ct.enable_focus(True)
+
+        # Fire and measure
+        r = ct.fire_single_pulse(filament=F, width_us=1000, trigger="sim", measure=True)
+        print(r)                                   # readable summary
+        print(r["measured"][0]["emission_mams"])   # one field
+    finally:
+        ct.enable_emission(False)       # always: HV off, filament back to STOP
+        ct.enable_focus(False)
+        ct.stop_one(F, verify=True)
+```
+
+**Things every script needs to know:**
+
+- **Check results, don't catch exceptions.** Methods never raise for a hardware
+  failure; they return `{"ok": False, "error": "..."}`. `print(r)` shows a
+  readable summary, `r.raw()` the plain dict. Only a refused lease raises
+  (`CTLeaseError`).
+- **`verify=True`** reads the hardware back and says whether the state was
+  really reached (`r["readback"]`, `r["not_reached"]`). Use it on anything that
+  energises or de-energises.
+- **The ladder is STOP -> SLEEP -> STANDBY -> IDLE -> ACTIVE**, one step at a
+  time; ACTIVE is refused unless the filament is at IDLE (a cold filament must
+  not see operating current). Going down (STOP) is always allowed. ACTIVE below
+  1500 mA (the idle operating current) is refused too.
+- **Batches:** `stop_all / sleep_all / standby_all()`,
+  `idle_all(default_ma=1000)`, `active_all(...)` -- every live filament, or
+  `filaments=[...]`; one frame per controller, all channels in parallel.
+- **The lease** (`with ct.lease(...)`) gives this script exclusive WRITE access;
+  other clients' writes are refused meanwhile. Reads never need it. It expires
+  on its own if the script dies.
+- **Dead filaments:** `ct.set_dead([6, 26], reason="open")` -- kept by the
+  backend, refused for anything that energises (STOP still works). `ct.dead`
+  lists them.
+- **External trigger:** `trigger="ext"` fires on YOUR edge. Pass `on_armed=`
+  a function; it is called at the moment everything is armed -- send the
+  trigger then (an earlier edge is lost). See `fire_single_pulse` in the API
+  reference ("EXTERNAL TRIGGER") and [examples/external_trigger.py](examples/external_trigger.py).
+- **Reading back:** `ct.read_filament_current_cached()` (heating currents, safe
+  during a run), `ct.hv_status()`, `ct.read_ads_all()` (HV rails), and the
+  board matrix at `/api/board-snapshot?controller=1`.
+- Every call is recorded to `logs/client/ct_client_<date>.jsonl` on the
+  machine the script runs on (arguments and full result).
+
+## 6. Safety
+
+- **Dead-man watchdog (in the backend):** a filament left at ACTIVE with no
+  command for 30 s falls back to SLEEP; an HV grid switch left closed with no
+  HV-grid command for 10 s opens every switch. It never turns the HV rails off
+  -- that is always your call (`enable_emission(False)`). `ct.safety()` shows
+  it; a running schedule holds it off.
+- **During a schedule run** the firmware refuses I2C-heavy queries (they would
+  disturb the run) and the backend polls only a 1 Hz status; cached readings
+  stay available.
+- **Always end with HV off and filaments at STOP** -- a `try/finally` as above,
+  or `with ct.session():` (which also STOPs every other filament).
+- Controller channels 7 and 8 are not used.
+
+## 7. Several machines, one bench
+
+- One backend; every other machine uses `CTClient("<backend IP>")` or a
+  browser. Scripts on different machines coordinate through the lease.
+- Who is connected: `http://<backend IP>:8770/api/clients`.
+- The backend machine's logs, from anywhere: `ct.list_logs()`,
+  `ct.read_log(tail=100)`, `ct.read_log(grep="WARNING")`,
+  `ct.read_log("client/ct_client_2026-09-24.jsonl", tail=20)`.
+
+## 8. Updates
+
+`import ct_simple_control` and `python backend.py` check GitHub once at
+start-up. If this clone is behind, it pulls and restarts the script on the new
+code -- never mid-run, never over local edits (then it only warns).
+Everything it does is logged to `logs/update.log`. `CT_NO_AUTO_UPDATE=1`
+turns it off. A script warns once if the backend runs different code: restart
+`backend.py` to update it. Keep your own scripts out of git by naming them
+`*_local.py`.
+
+## 9. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `cannot reach backend http://...:8770` | backend not running, wrong IP (the banner shows it), or firewall blocking TCP 8770 |
+| `master (Power 1) not connected` | connect the controllers (step 3) |
+| `another client holds the write lease: X` | another script is running; wait, or check `/api/clients` |
+| `bridge slot already owned by another client` | a second backend is connected somewhere; stop it |
+| `version mismatch` warning | restart `backend.py` (it updates at start-up) |
+| `currently at SLEEP; ACTIVE may only be entered from IDLE` | go up the ladder one step at a time |
+| a filament reads `not_reached` after STOP | its channel may be unreadable -- check that board at the bench |
+| HV status reads fail (`UART timeout`) | the ESP32 <-> STM32 link on controller 1; check it is powered and cabled |
 
 ## Layout
 
@@ -69,6 +213,23 @@ logs/ state/ calibration/ recordings/ run_reports/    runtime output, git-ignore
 The two top-level files are thin: `backend.py` starts `ct.server`, and
 `ct_simple_control` IS the `ct.client` module under its old name, so existing
 scripts and commands need no change. `from ct.client import CTClient` works too.
+
+# GUI reference
+
+## Using the GUI
+
+Every input field remembers the last value you typed or picked
+(`web/sticky.js` → localStorage) and restores it on load, so a reload or a
+rebuilt card never resets the bench setup. Fields marked `data-nostick` are
+deliberately not remembered: the **Override** safety gate and the two
+live-capture checkboxes (**Auto 10 Hz**, **Live**), which would otherwise start
+hardware traffic by themselves at page load. `ctSticky.clear()` in the console
+forgets everything.
+
+- **Play / Step / Reset** drive the scan; **Space** toggles play, **→** steps.
+- The collimator/active-filament/gantry sliders scrub the geometry directly.
+- Toggles under the canvas show the beam fan, filament indices, collimator
+  wedge, and detector pixel ticks.
 
 ## View modes (Live / Plan / Debug)
 
@@ -382,26 +543,3 @@ GUI's `ct/protocol.py`) and proxied via `POST /api/cmd {controller, command, …
 2. **Precision** — at each collimator position, sweep the gantry across ±max in
    N steps, firing all 35 filaments at every gantry angle. On reaching an
    extreme, advance the collimator and reverse the sweep (boustrophedon).
-
-## Run
-
-```bash
-python3 backend.py
-```
-
-Then open <http://127.0.0.1:8770> (other machines: `http://<this-host>:8770`).
-
-Every input field remembers the last value you typed or picked
-(`web/sticky.js` → localStorage) and restores it on load, so a reload or a
-rebuilt card never resets the bench setup. Fields marked `data-nostick` are
-deliberately not remembered: the **Override** safety gate and the two
-live-capture checkboxes (**Auto 2 Hz**, **Live**), which would otherwise start
-hardware traffic by themselves at page load. `ctSticky.clear()` in the console
-forgets everything.
-
-- **Play / Step / Reset** drive the scan; **Space** toggles play, **→** steps.
-- The collimator/active-filament/gantry sliders scrub the geometry directly.
-- Toggles under the canvas show the beam fan, filament indices, collimator
-  wedge, and detector pixel ticks.
-
-The server is stdlib only; the Python client needs `requests`.
