@@ -185,6 +185,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NewType
 
+# Self-update from GitHub BEFORE anything else happens (see ct_update.py): a
+# clone that is behind fast-forwards and this script restarts on the new code.
+# Only ever at start-up -- never while a script is controlling hardware.
+# CT_NO_AUTO_UPDATE=1 turns it off.
+import ct_update
+ct_update.check_and_update()
+
 # FID: the canonical 0..95 filament id the backend and firmware agree on.
 # A NewType, not a plain alias: passing a USER_INDEX where a Fid is required is
 # then a type error a checker catches, instead of a wrong-but-legal int that
@@ -702,6 +709,27 @@ class CTClient:
         # answer only changes when WE download, and this client is the one
         # doing that.
         self._loaded_fetched = False
+        # Client/backend version check, once, on the first request (lazy for
+        # the same reason as the filament order: constructing a CTClient costs
+        # no round trip). The backend is long-lived and does not update itself
+        # while running, so a freshly updated script can meet an older one.
+        self._version_checked = False
+
+    def _check_backend_version(self) -> None:
+        """Warn once if this client and the backend run different commits."""
+        self._version_checked = True
+        try:
+            theirs = self._s.get(self.base + "/api/version", timeout=2.0).json()
+        except Exception:
+            return          # unreachable or an old backend without /api/version
+        mine = ct_update.version()
+        # By CONTENT (tree hash), not commit: the published repo's commits are
+        # rewritten copies of the development repo's, same code, other hashes.
+        if mine.get("tree") and theirs.get("tree") and mine["tree"] != theirs["tree"]:
+            print(f"[ct_simple_control] version mismatch: this client is "
+                  f"{mine['commit']} (code {mine['tree']}), the backend at {self.base} "
+                  f"is {theirs.get('commit')} (code {theirs['tree']}) -- update and "
+                  f"restart backend.py.", file=sys.stderr)
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
     # Never raise. Any failure — connection refused, timeout, HTTP error, bad
@@ -844,6 +872,8 @@ class CTClient:
                       file=sys.stderr)
 
     def _post(self, path: str, body: dict, timeout: float | None = None) -> dict:
+        if not self._version_checked:
+            self._check_backend_version()
         r = self._one_post(path, body, timeout)
         attempt = 0
         while not r.get("ok") and self._is_transient(r) and attempt < self.max_retries:
@@ -858,6 +888,8 @@ class CTClient:
         return r if isinstance(r, Result) else Result(r)
 
     def _get(self, path: str, timeout: float | None = None) -> dict:
+        if not self._version_checked:
+            self._check_backend_version()
         r = self._one_get(path, timeout)
         attempt = 0
         while not r.get("ok") and self._is_transient(r) and attempt < self.max_retries:

@@ -1,0 +1,14 @@
+# Runtime output -- local to each machine, never published.
+logs/
+recordings/
+run_reports/
+state/
+calibration/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Personal scripts: keep your own experiments out of the shared repo by naming
+# them *_local.py (or listing them here).
+*_local.py
+liuxing_api.py

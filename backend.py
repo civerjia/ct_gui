@@ -729,6 +729,8 @@ SHARED_TTL_RUN_STATUS_S = 0.4    # /api/run-status: <= 2.5 Hz per controller
 SHARED_TTL_STM32_S = 0.1         # /api/stm32/ads1115, /api/stm32/hv-status: <= 10 Hz each
 SHARED_TTL_HV_SNAPSHOT_S = 1.0   # /api/hv-snapshot (HV_GET_ALL_BYTES)
 
+_BACKEND_VERSION: dict = {"commit": None, "dirty": False}   # set at start-up (main)
+
 _SHARED_GUARD = threading.Lock()
 _SHARED_LOCKS: dict = {}
 _SHARED_VALS: dict = {}
@@ -5038,6 +5040,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             self._json({"ok": True, "filaments": out})
+        elif path == "/api/version":
+            # The commit this backend was started from (ct_update.version()),
+            # so a client can tell it is talking to older or newer code.
+            self._json({"ok": True, **_BACKEND_VERSION})
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
@@ -6766,6 +6772,12 @@ def main() -> None:
     # Bind all interfaces by default: this process owns the single-client bridge
     # sockets, so every other program on the bench reaches the hardware through
     # this API. Set CT_GUI_HOST=127.0.0.1 to keep it to this machine.
+    # Self-update from GitHub before binding the port (see ct_update.py): a
+    # clone that is behind fast-forwards and the backend restarts on the new
+    # code. Start-up only -- a running backend is never restarted by this.
+    import ct_update
+    ct_update.check_and_update()
+    _BACKEND_VERSION.update(ct_update.version())
     host = os.environ.get("CT_GUI_HOST", "0.0.0.0")
     port = int(os.environ.get("CT_GUI_PORT", "8770"))
     _setup_logging()
