@@ -5,6 +5,7 @@ run_reports/
 state/
 calibration/
 __pycache__/
+docs/api/          # generated API reference (scripts/make_api_docs.sh)
 *.pyc
 .DS_Store
 

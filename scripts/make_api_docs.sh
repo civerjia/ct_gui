@@ -9,9 +9,16 @@
 #
 # Output is NOT committed (see .gitignore): it is derived, it is large, and a
 # regenerated copy churns the diff on every docstring edit. Run this instead.
+# Published automatically: every push to GitHub rebuilds it with this same
+# script and deploys it to https://civerjia.github.io/ct_gui/
+# (.github/workflows/api-docs.yml).
 set -e
 cd "$(dirname "$0")/.."          # the repository root
-python3 -m pdoc ct.client \
+# ct.client only: its private modules (_base, _power, ...) are how the class is
+# split up, not API -- '!ct.client._*' keeps them off the site. CTClient is
+# documented whole on ct/client.html (its public methods are its own
+# attributes; see the wrapper at the end of _client.py).
+python3 -m pdoc ct.client '!ct.client._*' \
     --output-directory docs/api \
     --no-show-source \
     --no-search \

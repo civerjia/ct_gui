@@ -37,6 +37,10 @@ corrupt the repository.
   them outside the clone. Runtime output (`logs/`, `recordings/`,
   `run_reports/`, `state/`, `calibration/`) is ignored too.
 
+**API reference:** https://civerjia.github.io/ct_gui/ -- rebuilt from the
+docstrings on every push (`.github/workflows/api-docs.yml`). Locally:
+`sh scripts/make_api_docs.sh` -> `docs/api/ct/client.html`.
+
 ## Layout
 
 ```

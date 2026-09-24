@@ -1717,9 +1717,18 @@ for _cls in CTClient.__mro__:
         # are not functions here, so they are skipped -- which is what we want:
         # they return numbers, and `filament_order` is a property whose access
         # must not be routed through a wrapper.
-        if _name.startswith("_") or not inspect.isfunction(_fn):
+        if _name.startswith("_"):
             continue
-        setattr(CTClient, _name, _as_result(_fn))
+        if inspect.isfunction(_fn):
+            setattr(CTClient, _name, _as_result(_fn))
+        elif _cls is not CTClient:
+            # Public constants, staticmethods, classmethods and properties of a
+            # mixin: the SAME object, set on CTClient so it is found there first
+            # (lookup already found it -- this changes nothing at runtime) and
+            # so the API reference documents it as CTClient's own. Left on the
+            # mixin only, pdoc filed it under a private module and dropped it:
+            # 12 members (WORK_FUNCTION_EV, fit_cold_resistance, ...).
+            setattr(CTClient, _name, _fn)
 del _seen, _cls
 del _name, _fn
 
