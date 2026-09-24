@@ -41,8 +41,14 @@ corrupt the repository.
 backend.py              start the server:  python backend.py
 ct_simple_control.py    the Python API's name for scripts:  from ct_simple_control import CTClient
 ct/                     the package
-  client/               CTClient (the code behind ct_simple_control)
-  server/               the HTTP backend (the code behind backend.py)
+  client/               CTClient (the code behind ct_simple_control), one mixin per area:
+                          _client (CTClient: HTTP, lease, session, watchdog, mapping...),
+                          _power _hv _schedule _measure _emission _diagnostics _decode,
+                          _base (Result, exceptions, PowerState, constants)
+  server/               the HTTP backend (the code behind backend.py):
+                          _server (routes + the state that changes at runtime),
+                          _common _wire _link _mapping _access _shared _logfiles
+                          _monitor _reads _safety _recording _schedule
   protocol.py           framed UART/TCP protocol to the RP2350 controllers
   update.py             self-update from GitHub at start-up
   paths.py              every directory the software uses (logs, state, web UI)
