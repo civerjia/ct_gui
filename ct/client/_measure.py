@@ -753,9 +753,25 @@ class _MeasureMixin:
             # pulse, so every shot carries (|V| - 2.82)/100k on top -- ~1 mA at
             # 100 V, ~2 mA at 200 V, which is the WHOLE signal at the cold end
             # of a curve. Computed from the rail, see diode_path_ma().
+            #
+            # ONLY IF THE PATH CONDUCTED. A closed switch always carries the
+            # diode path; a net current under half of it means the switch did
+            # not close (or the path is open), and net - diode_ma is then a
+            # zero current minus a CALCULATED one -- about -1.95 mA at 200 V,
+            # a legal-looking "emission" of a pulse that never reached the
+            # filament (seen 2026-09-25 on every "HV DID NOT TURN ON" shot).
+            # Such a pulse has no emission field at all, and says why.
+            conducted = None
             if diode_ma is not None and e.get("plateau_net_ma") is not None:
                 e["diode_ma"] = diode_ma
-                e["emission_ma"] = round(e["plateau_net_ma"] - diode_ma, 3)
+                conducted = e["plateau_net_ma"] >= 0.5 * diode_ma
+                e["path_conducted"] = conducted
+                if conducted:
+                    e["emission_ma"] = round(e["plateau_net_ma"] - diode_ma, 3)
+                else:
+                    e["emission_unavailable"] = (
+                        f"path did not conduct: net {e['plateau_net_ma']:.3f} mA is under half "
+                        f"the diode-path {diode_ma:.3f} mA (switch not closed, or the path open)")
                 # else: NO field at all. A net current with no background to
                 # subtract is not a measurement, and 0.0 would read as one.
             self._add_charge(e, resolved_ref_mv, r.get("integral_signed"),
@@ -770,7 +786,7 @@ class _MeasureMixin:
             # any of the three inputs is.
             emis_q = self._emission_charge(e.get("integral_mams"), diode_ma,
                                            e.get("on_us"))
-            if emis_q is not None:
+            if emis_q is not None and conducted is not False:
                 e["emission_mams"] = emis_q
         r["ref_mv"] = ref_mv
         return r

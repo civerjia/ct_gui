@@ -806,15 +806,26 @@ class _EmissionMixin:
                     "sigma_ma": round((sigma4 / 4.0) * slope, 4) if sigma4 else None,
                     "cold": cold,
                     "empty_envelope": bool(e.get("empty_envelope"))}
-            if shot["net_ma"] is not None:
+            # A shot whose net current is under half the pedestal did not
+            # conduct (the switch did not close): its "emission" would be a
+            # zero minus the pedestal, a legal-looking negative. Kept in the
+            # record, excluded from the point like a cold shot. A small
+            # negative emission from noise is NOT this -- it stays.
+            conducted = not (shot["net_ma"] is not None and pedestal_ma
+                             and shot["net_ma"] < 0.5 * pedestal_ma)
+            shot["path_conducted"] = conducted
+            if shot["net_ma"] is not None and conducted:
                 shot["emission_ma"] = round(shot["net_ma"] - pedestal_ma, 3)
             emis_q = self._emission_charge(shot["charge_mams"], pedestal_ma,
                                            shot["on_us"])
-            if emis_q is not None:
+            if emis_q is not None and conducted:
                 shot["emission_mams"] = emis_q
             pt["pulses"].append(shot)
             if cold:
                 pt["n_cold"] += 1
+                continue
+            if not conducted:
+                pt["n_not_conducted"] = pt.get("n_not_conducted", 0) + 1
                 continue
             if shot["empty_envelope"] or shot["net_ma"] is None:
                 continue

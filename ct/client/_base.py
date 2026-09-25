@@ -355,6 +355,8 @@ class Result(dict):
             if paired:
                 e = meas[n] if isinstance(meas[n], dict) else {}
                 row += (num(e.get("emission_ma"), "{:.3f}"), num(e.get("emission_mams"), "{:.2f}"))
+                if e.get("path_conducted") is False:
+                    flags.append("NO-CURRENT")      # the path did not conduct: no emission
             rows.append(row + (" ".join(flags) or "-",))
         widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
         out = [f"  pulses: [{len(recs)}]  (heat = RP2350 snapshot at the instant each pulse fired)"]

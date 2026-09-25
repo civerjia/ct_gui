@@ -26,7 +26,7 @@ the shape of the result, never invented numbers.
 ```python
 from ct_simple_control import CTClient
 
-ct = CTClient("192.168.8.165", client_id="bench-check")   # the BACKEND's IP (its banner)
+ct = CTClient("192.168.8.218", client_id="bench-check")   # the BACKEND's IP (its banner)
 print(ct.status())            # both controllers "connected": True?
 ```
 
@@ -327,7 +327,9 @@ that changes between `r1` and `r2` = timing/noise.
 ```python
 with ct.lease(note="presence scan"):
     present = set(ct.present_filaments())
-ct.set_dead(sorted(set(range(96)) - present), reason="not fitted")
+print(sorted(present))
+# To mark everything absent as dead (this REPLACES the dead mask):
+# ct.set_dead(sorted(set(range(96)) - present), reason="not fitted")
 ```
 
 SLEEPs every board to power the presence rail, re-scans, **leaves them at
@@ -347,8 +349,8 @@ to a line: the **slope gives R_eq**; an offset only moves the intercept.
 
 ```python
 with ct.lease(note="MOSFET R_eq sweep"):
-    r = ct.mosfet_sweep(v_start=30, v_step=10, n=4, limit_ma=30)   # 30/40/50/60 V
-print(r)
+    r = ct.mosfet_sweep([0, 1, 2, 3], v_start=30, v_step=10, n=4, limit_ma=30)   # 30/40/50/60 V
+print(r)          # leave out the list to sweep every live filament (minutes)
 ```
 
 - **Emission must be OFF before you start** — the sweep sets its own
@@ -391,7 +393,7 @@ folder (JSON + CSV), whichever machine the script runs on.
 
 ```python
 with ct.lease(note="R0 sweep"):
-    r = ct.sweep_filament_impedance([8, 9, 10], cool_s=60)
+    r = ct.sweep_filament_impedance([1, 2, 3], cool_s=60)
 print(r)
 print({f: x["R0_ohm"] for f, x in r["results"].items()})
 ```
@@ -418,6 +420,9 @@ backend then uses for every **Set V** and every `set_emission_v()` /
 channel's HV on first — the sweep refuses to energise it for you — and it
 zeroes the wiper when done. (GUI only; there is no client method.)
 
+**The emission current limit.** At 200 V use a 55 mA limit, as below: on this
+bench a 30 mA limit holds the rail at about 65 V (it reached 197.8 V at 55 mA).
+
 ### Emission pedestal — measure_emission_pedestal()
 
 The non-emission part of a pulse's current (the diode path), measured at a
@@ -425,10 +430,10 @@ heating too low to emit. **HV must already be on at the voltage you will
 measure the curve at** — the pedestal scales with the rail.
 
 ```python
-ct.set_emission_i(30); ct.set_emission_v(200); ct.enable_emission(True)
+ct.set_emission_i(55); ct.set_emission_v(200); ct.enable_emission(True)
 try:
     with ct.lease(note="pedestal"):
-        p = ct.measure_emission_pedestal(8, heat_ma=1400)
+        p = ct.measure_emission_pedestal(1, heat_ma=1400)
     print(p)          # pedestal_ma, width_independent, temperature_independent
 finally:
     ct.enable_emission(False)
@@ -443,10 +448,10 @@ Is this filament emitting, and roughly how much. One ramp through the CC
 loop, seconds at ACTIVE. No temperature.
 
 ```python
-ct.set_emission_i(30); ct.set_emission_v(200); ct.enable_emission(True)
+ct.set_emission_i(55); ct.set_emission_v(200); ct.enable_emission(True)
 try:
-    with ct.lease(note="emission ramp F8"):
-        r = ct.emission_ramp(8, from_ma=1500, to_ma=2800)
+    with ct.lease(note="emission ramp F1"):
+        r = ct.emission_ramp(1, from_ma=1500, to_ma=2800)
     print(r)          # span_ma, gap_max_ma, one point per shot
 finally:
     ct.enable_emission(False)
@@ -462,10 +467,10 @@ measures V and I with the shots, so every point has a resistance and a
 temperature. Tens of seconds at firing current.
 
 ```python
-ct.set_emission_i(30); ct.set_emission_v(200); ct.enable_emission(True)
+ct.set_emission_i(55); ct.set_emission_v(200); ct.enable_emission(True)
 try:
-    with ct.lease(note="emission curve F8"):
-        r = ct.emission_vs_heating(8, start_ma=2500, max_ma=2800, step_ma=100,
+    with ct.lease(note="emission curve F1"):
+        r = ct.emission_vs_heating(1, start_ma=2500, max_ma=2800, step_ma=100,
                                    save_as="emission_curve")
     print(r)
     f = ct.fit_richardson(r)
@@ -483,23 +488,39 @@ finally:
 - `fit_richardson()`: read `trustworthy` and `warnings` first, then
   `r_lead_plateau_ohm` (a wide plateau = R_lead is not determined by this
   data). A work function outside 1.5–6 eV means the model does not fit.
-- Several filaments into one file: `ct.save_emission_curves("run1", {8: r8, 9: r9})`.
+- Several filaments into one file: `ct.save_emission_curves("run1", {1: r1, 2: r2})`.
 
 ---
 
 ## 7. Schedule checks
 
+A complete, safe run of the path: a one-shot plan with no heating steps,
+downloaded and verified (nothing fires), then one COLD shot (filament at
+SLEEP, HV off — a dry run of the switching), and the records of it.
+
 ```python
-ct.download(plan)
+# One emission row: filament 1 fires at trigger 0. no_heat: no ACTIVE steps.
+plan = ct.build_scan_plan([{"filament": 1, "trigger": 0}], no_heat=[1])
+print(ct.download(plan))
 v = ct.verify_schedule(plan)          # counts + CRC read back from every controller
-assert v["ok"], v
-# ... arm, run ...
-print(ct.shv_pulse_log())             # one line per fired pulse: time, filament, heating
+print(v)
+
+cursor = ct.pulse_cursor()            # "since" for the report below
+with ct.lease(note="one cold shot"):
+    ct.stop_one(1, verify=True)
+    ct.sleep_one(1, verify=True)      # SLEEP: the iso rail on, no heating
+    r = ct.fire_single_pulse(1, trigger="sim", measure=True)
+    ct.stop_one(1, verify=True)
+print(r)                              # one line per pulse: time, heating at that instant
+print(ct.shv_pulse_log())             # the same, from the RP2350's own log
 print(ct.scan_report(since=cursor, plan=plan))
 ```
 
 - `verify_schedule(plan)` after `download(plan)`, before arming — catches a
   partial or corrupted transfer before anything fires.
+- `fire_single_pulse` downloads its own one-shot schedule, arms, triggers and
+  measures. In a real scan the filament goes up the ladder to ACTIVE first;
+  here it stays at SLEEP, so the heating column reads the standby level.
 - `shv_pulse_log()` prints one line per pulse: when it fired, the filament,
   the width, and the **heating current at that instant** (measured / target /
   diff), plus switch-verify flags.
