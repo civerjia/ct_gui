@@ -1017,7 +1017,7 @@ class _ScheduleMixin:
         for rec in out:
             if "filament" in rec:
                 rec["filament"] = self._user_index_of(rec["filament"])
-        return out
+        return PulseLog(out)
 
     # ── SyncIn simulate (ESP32-generated trigger pulses) ──────────────────────
     # fire_single_pulse(trigger="sim") uses this internally for a single burst.

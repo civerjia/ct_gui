@@ -312,6 +312,49 @@ class Result(dict):
             return
         out.append(f"{pad}{key}: {cls._scalar(v)}")
 
+    @classmethod
+    def _pulse_table(cls, res: dict) -> list:
+        """One line per fired pulse -- WHEN it fired, on WHICH filament, at WHAT
+        heating current (the RP2350's snapshot at that instant, measured and
+        commanded), and the emission it produced. Those were all in the result,
+        but in three places: tOnUs and heat_meas_mA inside `records`, the
+        emission inside `measured`, with a 25-line `status` in between -- so
+        "what was the heating when this pulse went out" could not be read off a
+        print. Emission is paired by ORDER and only when both lists have the
+        same length; otherwise the column is left out rather than guessed."""
+        recs = res.get("records")
+        if not (isinstance(recs, list) and recs and isinstance(recs[0], dict)
+                and "heat_meas_mA" in recs[0]):
+            return []
+        meas = res.get("measured")
+        paired = isinstance(meas, list) and len(meas) == len(recs)
+
+        def num(v, fmt="{:.0f}"):
+            return "-" if v is None else fmt.format(v)
+        rows = [("#", "fil", "t_on ms", "width us", "heat mA", "target", "diff")
+                + (("emission mA",) if paired else ()) + ("flags",)]
+        for n, r in enumerate(recs):
+            m, t = r.get("heat_meas_mA"), r.get("heat_target_mA")
+            heat = num(m) if m is not None else f"n/a ({r.get('heat_meas_unavailable') or '?'})"
+            flags = [name for name, key in (("ON-MISMATCH", "on_mismatch"),
+                                            ("STUCK-ON", "hv_stuck_on"),
+                                            ("unverified", "unverified")) if r.get(key)]
+            row = (str(n), num(r.get("filament")),
+                   num(None if r.get("tOnUs") is None else r["tOnUs"] / 1000.0, "{:.1f}"),
+                   num(r.get("durationUs")), heat,
+                   num(t) if t is not None else f"n/a ({r.get('heat_target_unavailable') or '?'})",
+                   num(m - t, "{:+.0f}") if m is not None and t is not None else "-")
+            if paired:
+                e = meas[n] if isinstance(meas[n], dict) else {}
+                row += (num(e.get("emission_ma"), "{:.3f}"),)
+            rows.append(row + (" ".join(flags) or "-",))
+        widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+        out = [f"  pulses: [{len(recs)}]  (heat = RP2350 snapshot at the instant each pulse fired)"]
+        for r in rows:
+            out.append("    " + "  ".join(c.rjust(w) if i < len(r) - 1 else c
+                                          for i, (c, w) in enumerate(zip(r, widths))).rstrip())
+        return out
+
     def __repr__(self) -> str:
         if not self:
             return "Result({})"
@@ -322,12 +365,32 @@ class Result(dict):
             if k in self and k not in done:
                 self._render(k, self[k], 2, out)
                 done.add(k)
+        out.extend(self._pulse_table(self))   # the answer, before the detail
         for k, v in self.items():
             if k in done:
                 continue
             self._render(k, v, 2, out)
             done.add(k)
         return (f"Result({head})" if head else "Result") + ("\n" + "\n".join(out) if out else "")
+
+
+class PulseLog(list):
+    """shv_pulse_log()'s records -- still a plain list (index it, len() it,
+    json.dump it), but it PRINTS as the one-line-per-pulse table: time,
+    filament, width, heating current at that instant (measured / commanded),
+    flags. A schedule's pulses used to print as a raw list of dicts, the
+    heating current one field among fifteen per pulse."""
+
+    def __repr__(self) -> str:
+        if not self:
+            return "PulseLog([])"
+        table = Result._pulse_table({"records": list(self)})
+        return "\n".join(["PulseLog"] + table) if table else list.__repr__(self)
+
+    def raw(self) -> list:
+        """The plain list."""
+        return list(self)
+
 
 
 class CTError(Exception):
