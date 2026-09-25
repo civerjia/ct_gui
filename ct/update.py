@@ -35,8 +35,10 @@ SKIPPED -- each says why, nothing is silent:
   - an interactive session (python -i, IPython, Jupyter) -> update the files,
     then ask for a manual restart: the interpreter's state cannot be carried
 
-It never updates mid-session. The restarted process gets CT_UPDATED=1 so it
-does not check (and restart) a second time.
+It never updates mid-session. The restarted process gets CT_UPDATED=<commit>:
+if GitHub still names that same commit and the files still do not match, it
+stops there instead of updating and restarting in a loop. Any other commit is
+updated normally, so a leftover flag can never block a later update.
 
 Every update, skip and failure is appended to logs/update.log (time, host, the
 script that started it) -- readable from another machine through the backend:
@@ -159,6 +161,31 @@ def version() -> dict:
 
 _CHILD_ENV = "CT_RESTART_CHILD"
 _RESTART_CODE = 75   # a child exiting with this asks its parent to start it again
+# The child's CT_* environment for the next run (CT_RECONNECT, CT_UPDATED, ...),
+# handed to the parent that starts it: the parent's own environment is the one
+# from when the window was first started and must not be reused as it is.
+_RESTART_ENV = REPO_DIR / "logs" / ".restart_env.json"
+
+
+def _ct_env(env) -> dict:
+    return {k: v for k, v in env.items() if k.startswith("CT_")}
+
+
+def _next_child_env() -> dict:
+    """The environment for the next child: the parent's, with its CT_* vars
+    replaced by the ones the exiting child asked for."""
+    try:
+        want = json.loads(_RESTART_ENV.read_text(encoding="utf-8"))
+        _RESTART_ENV.unlink()
+    except (OSError, ValueError):
+        want = None
+    env = dict(os.environ)
+    if isinstance(want, dict):
+        for k in _ct_env(env):
+            del env[k]
+        env.update({str(k): str(v) for k, v in want.items()})
+    env[_CHILD_ENV] = "1"
+    return env
 
 
 def restart_in_place() -> None:
@@ -182,6 +209,12 @@ def restart_in_place() -> None:
             # Already the child of the process that owns the window: ask IT to
             # start the next one, rather than nesting a grandchild -- every
             # restart would otherwise leave one more process waiting.
+            try:
+                _RESTART_ENV.parent.mkdir(parents=True, exist_ok=True)
+                _RESTART_ENV.write_text(json.dumps(_ct_env(os.environ)), encoding="utf-8")
+            except OSError as exc:
+                print(f"[ct_update] could not hand the restart settings over ({exc}); "
+                      f"the next run starts with the window's original ones", file=sys.stderr)
             os._exit(_RESTART_CODE)
         env = dict(os.environ, **{_CHILD_ENV: "1"})
         while True:
@@ -191,6 +224,7 @@ def restart_in_place() -> None:
                 rc = 130
             if rc != _RESTART_CODE:
                 os._exit(rc)
+            env = _next_child_env()
     os.execv(sys.executable, argv)
 
 
@@ -285,8 +319,7 @@ def apply_update(sha: str, files: dict[str, bytes]) -> dict:
 
 
 def check_and_update() -> None:
-    if os.environ.get("CT_UPDATED"):
-        return                                   # the process an update just restarted
+    just_updated_to = os.environ.pop("CT_UPDATED", "")
     if os.environ.get("CT_NO_AUTO_UPDATE"):
         print("[ct_update] update check off (CT_NO_AUTO_UPDATE)", file=sys.stderr)
         return
@@ -302,6 +335,10 @@ def check_and_update() -> None:
     ver = version()
     if m.get("commit") == sha and not ver["dirty"]:
         print(f"[ct_update] up to date ({sha[:7]})", file=sys.stderr)   # not logged: every start
+        return
+    if just_updated_to == sha:
+        _warn(f"just updated to {sha[:7]} but the files here still do not match it -- "
+              f"not updating again (check logs/update.log and the folder's permissions)")
         return
     try:
         files = _download(sha)
@@ -331,5 +368,5 @@ def check_and_update() -> None:
               "(what is loaded now is still the old version)")
         return
     _warn("restarting with the new version...")
-    os.environ["CT_UPDATED"] = "1"
+    os.environ["CT_UPDATED"] = sha
     restart_in_place()
