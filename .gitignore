@@ -13,3 +13,6 @@ docs/api/          # generated API reference (scripts/make_api_docs.sh)
 # them *_local.py (or listing them here).
 *_local.py
 liuxing_api.py
+
+# installed-version record written by ct/update.py
+.ct_version

@@ -165,13 +165,21 @@ with ct.lease(ttl=120, note="emission test F8"):       # write access (see below
 
 ## 8. Updates
 
-`import ct_simple_control` and `python backend.py` check GitHub once at
-start-up. If this clone is behind, it pulls and restarts the script on the new
-code -- never mid-run, never over local edits (then it only warns).
-Everything it does is logged to `logs/update.log`. `CT_NO_AUTO_UPDATE=1`
-turns it off. A script warns once if the backend runs different code: restart
-`backend.py` to update it. Keep your own scripts out of git by naming them
-`*_local.py`.
+`import ct_simple_control` and `python backend.py` ask GitHub which version
+is current, once at start-up. If this copy is not that version, they download
+it, write every file that differs, and restart the script on the new code --
+never mid-run. **No git needed**: it works on a plain download, and on a clone
+whose `.git` is broken (a synced folder).
+
+- Only files that exist on GitHub are written. `calibration/`, `state/`,
+  `logs/` and your own `*_local.py` scripts are never touched.
+- A file you edited here is backed up to `logs/update_backup/<time>/` before
+  it is overwritten (on the very first update every changed file is, since
+  there is no record yet of what was installed).
+- Every start prints one `[ct_update]` line: `up to date (<commit>)`, what it
+  updated, or why it could not check. Updates are logged to `logs/update.log`.
+- `CT_NO_AUTO_UPDATE=1` turns it off. A script warns once if the backend runs
+  different code -- restart the backend (`ct.restart_backend()`) to update it.
 
 
 **Restart the backend remotely** -- from any machine, e.g. to pick up an
