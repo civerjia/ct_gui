@@ -448,8 +448,17 @@ class _ScheduleMixin:
         # from that point the master's envelopes frame the WRONG pulse on the
         # other board. Every measurement after it is suspect, and it would
         # otherwise look like a dead MOSFET.
-        if len(st_by) > 1:
-            edges = {c: v.get("triggerEdges") for c, v in st_by.items()}
+        # Only controllers that TOOK PART: a one-filament shot arms only that
+        # filament's controller, and the idle one's 0 edges is not "out of
+        # step" (it read as a failure on every single-controller shot).
+        # "Took part" = fired something in this report's log, or armed now. A
+        # status left "complete" by an EARLIER run is not this run.
+        fired_ctrl = {r.get("controller") for r in logs}
+        took_part = {c: v for c, v in st_by.items()
+                     if c in fired_ctrl or str(c) in {str(x) for x in fired_ctrl}
+                     or v.get("state") in (1, 2)}
+        if len(took_part) > 1:
+            edges = {c: v.get("triggerEdges") for c, v in took_part.items()}
             if None not in edges.values() and len(set(edges.values())) > 1:
                 problems.append(
                     f"the controllers counted different numbers of triggers "
@@ -764,6 +773,27 @@ class _ScheduleMixin:
                 self._last_plan.pop(cid + 1, None)
             self._last_crc.pop(cid + 1, None)
         return r
+
+    def _verify_retrying_timeouts(self, plan: dict, attempts: int = 3) -> dict:
+        """verify_schedule(), retried when EVERY failure is a transport
+        timeout. The verify is a read -- repeating it changes nothing -- and a
+        single timed-out read on a busy link used to throw away a whole
+        emission point that had downloaded fine (2800 mA, 2026-09-25: C1 timed
+        out on 0x74, C2 matched). A real MISMATCH (a row with match False) is
+        never retried: that is what the verify exists to catch."""
+        v: dict = {}
+        for attempt in range(max(1, attempts)):
+            v = self.verify_schedule(plan)
+            if v.get("ok"):
+                return v
+            rows = [r for r in (v.get("results") or {}).values() if not r.get("ok")]
+            timeouts_only = bool(rows) and all(
+                r.get("match") is None and "time" in str(r.get("error", "")).lower()
+                for r in rows)
+            if not timeouts_only:
+                return v
+            time.sleep(0.2)
+        return v
 
     def verify_schedule(self, plan: dict) -> dict:
         """Read the emission/heat table counts + CRC back from every
@@ -1700,7 +1730,7 @@ class _ScheduleMixin:
             # since reuse's whole safety mechanism depends on having a fresh
             # CRC baseline to compare against on the NEXT call.
             if verify or reuse:
-                v = self.verify_schedule(plan)
+                v = self._verify_retrying_timeouts(plan)
                 if not v.get("ok"):
                     return {"ok": False, "error": f"schedule verify mismatch after download: {v}",
                             "fired": 0, "records": [], "status": {}}
