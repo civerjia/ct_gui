@@ -271,8 +271,20 @@ print(r)
 
 - Every edge should be 0–2 µs. `>20000 us` = the pin **never followed** (dead
   driver or held from outside); a slow edge names its load.
-- In circuit, the 165 chain shows transitions. All zeros **in circuit** means
-  MISO is stuck or the clock/load is not reaching the chips.
+- The 165 clock-out reads whichever channel S0–S2 currently address, and with
+  every grid switch off all its inputs are equal — so a **constant stream is
+  normal in circuit** (on C1, 2026-09-25: all 1s, S0–S2 at CH8). It only proves
+  something out of circuit. The real in-circuit chain check is
+  `read_hv_diag165()` / `hv_switch_test()` (HV off).
+
+**(real)** — C1 in circuit, power on:
+
+```
+        SCK:    verdict=OK  gpio=31  rise=1 us  fall=1 us  note=None
+        ...
+      chain_165: 1111111111111111111111111111111111111111111111111111111111111111
+      chain_transitions: 0
+```
 
 ### self_test() — do the I/O expanders toggle?
 

@@ -757,8 +757,11 @@ class _DiagnosticsMixin:
 
         Healthy: every pin rises and falls in 0-2 us. `>20000 us` = the pin
         never followed (a dead driver or a line held from outside); a slow edge
-        names its load. The 165 chain in circuit shows transitions; an all-zero
-        chain with the board unplugged is expected (nothing drives MISO).
+        names its load. The 165 clock-out reads whichever channel S0-S2 address
+        at the time; with all grid switches off its inputs are all equal, so a
+        constant stream (all 1s on the bench, 2026-09-25) is NORMAL in circuit.
+        It is a real test only out of circuit. For the chain in circuit use
+        read_hv_diag165() / hv_switch_test() with HV off.
         """
         def one(c: int) -> dict:
             raw, err = self._diag_cmd(c, "PIN_PROBE", {}, timeout=15.0)
@@ -784,9 +787,15 @@ class _DiagnosticsMixin:
             bad = [f"{n} (gp{p['gpio']}): {p['note']}" for n, p in pins.items() if p["verdict"] == "FAIL"]
             return {"ok": not bad, "fail": bad, "pins": pins,
                     "chain_165": chain, "chain_transitions": raw[3],
-                    "chain_note": ("MISO never moved (stuck, or clock/load not reaching the chips; "
-                                   "expected with the control board unplugged)") if raw[3] == 0 else
-                                  "MISO moves (the chain clocks)"}
+                    # The clock-out reads whichever channel S0-S2 address right now,
+                    # and with every grid switch off all its sense inputs are equal:
+                    # a CONSTANT stream is normal in circuit. It proves the clock/load
+                    # reach the chips only when it moves; for a real in-circuit chain
+                    # check use read_hv_diag165() / hv_switch_test() (HV off).
+                    "chain_note": ("constant stream: normal in circuit (all sense inputs equal, "
+                                   "switches off). Out of circuit, all 0 = MISO undriven. Real "
+                                   "chain check: read_hv_diag165() / hv_switch_test()") if raw[3] == 0
+                                  else "MISO moves: the clock and load reach the chips"}
         return self._per_controller(controller, one)
 
     # ── HV switch toggle test ─────────────────────────────────────────────────
