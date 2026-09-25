@@ -684,6 +684,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .test-legend .sw.short { background: #ff5d5d; }
 .test-legend .sw.open { background: #f2c14e; }
 .test-legend .sw.leak { background: #b07ce8; }
+.test-legend .sw.skip { background: #5a6470; }
 .test-foot { gap: 10px; align-items: center; margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px; }
 /* single-board cal & test (HV card) */
 .sb-test .seg.sm { margin: 4px 0 6px; flex-wrap: wrap; }

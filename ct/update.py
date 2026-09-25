@@ -25,7 +25,8 @@ process gets CT_UPDATED=1 so it never checks (and restarts) a second time.
 
 Every update, skip and failure is also appended to logs/update.log (time,
 host, the script that started it) -- readable from another machine through
-the backend: ct.read_log("update.log"). An up-to-date check writes nothing.
+the backend: ct.read_log("update.log"). An up-to-date check prints one line
+("[ct_update] up to date (<commit>)") and writes nothing to the log.
 """
 
 from __future__ import annotations
@@ -120,6 +121,8 @@ def check_and_update() -> None:
         return
     behind = int(_git("rev-list", "--count", "HEAD..@{u}").stdout.strip() or 0)
     if behind == 0:
+        # Say so: silence could not be told apart from "never checked".
+        print(f"[ct_update] up to date ({version()['commit']})", file=sys.stderr)   # not logged: it would be every start
         return
     ahead = int(_git("rev-list", "--count", "@{u}..HEAD").stdout.strip() or 0)
     if ahead:

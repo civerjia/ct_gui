@@ -4,8 +4,8 @@
  * 1. Filament Resistance   — all → STANDBY (0.8 V), read INA219, R = V/I.
  * 2. Emission short scan    — cold (SLEEP), emission −30 V @ 30 mA, pulse/filament.
  * 3. Focus leak scan        — focus −30 V, emission OFF, pulse/filament, watch emis V/I.
- * 4. Emission current test  — heat each filament, emission −200 V, 1 ms pulse,
- *                             check the per-pulse emission current is in range.
+ * 4. Emission path R_eq     — cold (SLEEP) MOSFET test at n >= 3 emission voltages;
+ *                             a line fit of I vs V per filament gives R_eq and Vf.
  * 5. Emission current calibration — per filament, sweep heating 1.0→2.5 A (0.25 A
  *                             step, 200 ms settle), record the emission-current
  *                             curve, save to host disk.
@@ -675,62 +675,128 @@ async function test3() {
 }
 
 // =========================================================================
-// 4 — Emission current test (heat each filament, check the range)
+// 4 — Emission path R_eq sweep (cold MOSFET test at n emission voltages)
 // =========================================================================
+// Every filament COLD (SLEEP: iso rail on, no heating), so the only path for
+// emission current is the sub-board's two diodes + its resistor through the
+// grid MOSFET: I = (V − Vf) / R. One voltage cannot tell a healthy path from a
+// front-end offset (a −0.4 mA offset reads as "dead" at 16 V), so the rail is
+// stepped through n ≥ 3 voltages and each filament's I–V points are fitted to a
+// line: the SLOPE gives R_eq, the intercept gives Vf, and an offset moves only
+// the intercept. The rail is read back at every step and the sweep stops if it
+// is not where it was set -- a rail that did not come up must not be measured.
+function fitLine(pts) {
+  const n = pts.length; if (n < 2) return null;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+  for (const [x, y] of pts) { sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y; }
+  const d = n * sxx - sx * sx; if (!d) return null;
+  const a = (n * sxy - sx * sy) / d, b = (sy - a * sx) / n;
+  const ssTot = syy - sy * sy / n, ssRes = pts.reduce((t, [x, y]) => t + (y - a * x - b) ** 2, 0);
+  return { a, b, r2: ssTot > 0 ? 1 - ssRes / ssTot : 0 };
+}
 async function test4() {
-  // heating current entered in A (scan units); firmware CC target is mA.
-  const heatA = parseFloat($t('t4Heat').value) || 2.6, heatMa = Math.round(heatA * 1000);
-  const emV = Math.abs(parseFloat($t('t4V').value) || 200);
-  const settle = Math.max(0, parseInt($t('t4Settle').value, 10) || 1500);
+  const vStart = Math.abs(parseFloat($t('t4VStart').value) || 50);
+  const vStep = Math.abs(parseFloat($t('t4VStep').value) || 10);
+  const nV = Math.max(3, parseInt($t('t4N').value, 10) || 4);
+  const limitMa = Math.max(1, parseFloat($t('t4Limit').value) || 30);
   const widthUs = parseInt($t('t4Width').value, 10) || 1000;
-  const nMin = parseFloat($t('t4Min').value) || 2, nMax = parseFloat($t('t4Max').value) || 40;
-  const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
-  const items = [], bad = [], unmeasured = [], cur = { id: await pulseCursor() }; let cer = null;
+  const shots = Math.max(1, parseInt($t('t4Shots').value, 10) || 3);
+  const rNom = parseFloat($t('t4RNom').value) || 100;      // kΩ
+  const tol = (parseFloat($t('t4Tol').value) || 35) / 100;
+  const volts = Array.from({ length: nV }, (_, i) => vStart + i * vStep);
+  if (volts[volts.length - 1] > 350) { tMsg(`top voltage ${volts[volts.length - 1]} V is above the 350 V rail`, 'bad'); return; }
+  // Never write a setpoint over a rail someone else left live.
+  if (await hvIsOn('emission')) { tMsg('Emission is already ON — turn it off first; this test sets its own voltages.', 'bad'); return; }
+  if (await anyRunning()) { tMsg('A schedule is running — not testing now.', 'bad'); return; }
+  // Only filaments on CONNECTED controllers: an unconnected one can only fail,
+  // slowly, and would read as "inconclusive" for a reason unrelated to it.
+  const st = await tGetJ('/api/status');
+  const conn = new Set(Object.entries((st && st.controllers) || {}).filter(([, c]) => c && c.connected).map(([k]) => +k));
+  const fmap = await loadFilMap();
+  let fils = Object.keys(fmap).map(Number).filter((f) => conn.has(fmap[f].ctrl)).sort((a, b) => a - b);
+  const pts = {}, railV = [];
+  const items = [], cur = { id: await pulseCursor() };
+  let prepped = [];
   try {
-    tMsg(`Emission → −${emV} V…`);
-    if (!(await setHvAndWait('emission', emV))) return;
-    await hvEnable('emission', true);
+    // Cold, on the iso rail: STOP then SLEEP (never skip a step).
+    tMsg(`Emission path R_eq sweep: SLEEP ${fils.length} filaments (cold)…`);
+    await tPostJ('/api/filament-prep', { state: 1, filaments: fils });
+    const sl = await tPostJ('/api/filament-prep', { state: 2, filaments: fils });
+    const skipped = new Set([...(sl.dead_skipped || [])]);
+    fils = fils.filter((f) => !skipped.has(f));
+    prepped = fils.slice();
+    for (const f of fils) pts[f] = [];
+    await setEmiLimit(limitMa);
     await pulseArm(); await tSleep(150);
-    for (let i = 0; i < fils.length; i++) {
+    for (let vi = 0; vi < volts.length; vi++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
-      const f = fils[i], m = fmap[f]; cer = m;
-      tMsg(`Emission current test: ${i + 1}/${fils.length} (F${f}) heating ${heatA} A…`);
-      await setState(m.ctrl, m.ch, m.pos, 5, heatMa);     // ACTIVE
-      await tSleep(settle);
-      if (abortFlag) { await setState(m.ctrl, m.ch, m.pos, 2, 0); break; }
-      const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs);
-      await setState(m.ctrl, m.ch, m.pos, 2, 0);          // STOP before next
-      // No trustworthy current for this filament (no event at all, or an event
-      // whose background was never measured). It is NOT 0 mA: 0 classifies as
-      // 'open' and accuses the filament of a fault the measurement never
-      // established. Its own bucket, its own bar colour, and it blocks the PASS
-      // — "all in range" must not be said about filaments nobody measured.
-      if (r.unusable) {
-        unmeasured.push(`F${f}: ${r.unusable}`);
-        items.push({ f, value: 0, cls: 'skip' });
-        drawBars('t4Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(nMax * 1.5, 60), fmt: (v) => v.toFixed(0) });
-        continue;
+      const v = volts[vi];
+      tMsg(`Emission → −${v} V (limit ${limitMa} mA)…`);
+      if (!(await setHvAndWait('emission', v))) return;
+      if (vi === 0) { await hvEnable('emission', true); await tSleep(500); }
+      const meas = await lutMeasV('emission', 3);
+      railV.push({ set: v, read: meas });
+      if (meas == null || Math.abs(meas) < 0.9 * v || Math.abs(meas) > 1.1 * v) {
+        tMsg(`Rail did not reach −${v} V (read ${meas == null ? 'nothing' : meas.toFixed(1) + ' V'}) — stopping the sweep. `
+          + 'Check the emission current limit and the HV LUT.', 'bad');
+        break;
       }
-      const mA = r.mA;
-      const cls = (mA >= nMin && mA <= nMax) ? 'ok' : (mA < nMin ? 'open' : 'short');
-      items.push({ f, value: Math.max(0, mA), cls });
-      if (cls !== 'ok') bad.push(`F${f}: ${mA.toFixed(1)} mA`);
-      drawBars('t4Plot', items, { yLabel: 'Ie (mA)', yMax: Math.max(nMax * 1.5, 60), fmt: (v) => v.toFixed(0) });
+      const vAbs = Math.abs(meas);
+      items.length = 0;
+      for (let i = 0; i < fils.length; i++) {
+        if (abortFlag) break;
+        const f = fils[i], m = fmap[f];
+        tMsg(`−${v} V (${vi + 1}/${nV}) · F${f} ${filBoard(m)} (${i + 1}/${fils.length})…`);
+        const nets = [];
+        for (let k = 0; k < shots; k++) {
+          const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs);
+          if (!r.unusable && r.netMa != null) nets.push(r.netMa);   // SIGNED: the fit takes the offset
+        }
+        if (nets.length) pts[f].push([vAbs, nets.reduce((a, b) => a + b, 0) / nets.length]);
+        const last = pts[f].length ? pts[f][pts[f].length - 1][1] : 0;
+        items.push({ f, value: Math.max(0, last), cls: nets.length ? 'ok' : 'skip' });
+        drawBars('t4Plot', items, { yLabel: `I @ −${v} V (mA)`, fmt: (x) => x.toFixed(2) });
+      }
     }
-    testResult('t4Result', {
-      title: 'Emission current', pass: bad.length === 0 && unmeasured.length === 0,
-      counts: [{ n: fils.length, label: 'tested' }, { n: fils.length - bad.length - unmeasured.length, label: 'in-range' },
-               { n: bad.length, label: 'out', bad: bad.length > 0 },
-               { n: unmeasured.length, label: 'unmeasured', bad: unmeasured.length > 0 }],
-      note: `range ${nMin}–${nMax} mA`, flagged: bad.concat(unmeasured),
-    });
-    tMsg(`Emission current test done — ${bad.length ? bad.length + ' out of range' : 'all measured in range'}`
-      + `${unmeasured.length ? `, ${unmeasured.length} NOT measured` : ''}.`,
-      (bad.length || unmeasured.length) ? 'bad' : '');
   } finally {
-    if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 2, 0);
+    // HV comes down FIRST, then the filaments: a rail left on while a slow
+    // teardown runs is exposure with nothing being measured.
     await hvEnable('emission', false); await lutZeroV('emission'); await pulseDisarm();
+    if (prepped.length) await tPostJ('/api/filament-prep', { state: 1, filaments: prepped });
   }
+  // Fit and judge.
+  const bars = [], flagged = [], fits = {};
+  let nOk = 0, nDead = 0, nOdd = 0, nSkip = 0;
+  for (const f of fils) {
+    const p = pts[f] || [], m = fmap[f];
+    const fit = p.length >= 3 ? fitLine(p) : null;
+    let cls = 'skip', note = `${p.length} of ${nV} points`, rK = null, vf = null;
+    if (fit) {
+      rK = fit.a > 0 ? 1 / fit.a : Infinity;            // mA/V -> kΩ
+      vf = fit.a > 0 ? -fit.b / fit.a : null;
+      const iTop = p[p.length - 1][1], iExp = (p[p.length - 1][0] - 1.4) / rNom;
+      if (!(fit.a > 0) || rK > 5 * rNom || iTop < 0.2 * iExp) { cls = 'open'; note = 'not conducting'; nDead++; }
+      else if (Math.abs(rK - rNom) <= tol * rNom && fit.r2 >= 0.9) { cls = 'ok'; note = null; nOk++; }
+      else { cls = rK < rNom ? 'short' : 'open'; note = `R ${rK.toFixed(0)} kΩ, r² ${fit.r2.toFixed(2)}`; nOdd++; }
+    } else nSkip++;
+    fits[f] = { points: p, r_kohm: rK != null && isFinite(rK) ? +rK.toFixed(1) : null,
+                vf_v: vf != null ? +vf.toFixed(2) : null, r2: fit ? +fit.r2.toFixed(3) : null, verdict: cls, note };
+    bars.push({ f, value: rK != null && isFinite(rK) ? Math.min(rK, 3 * rNom) : 0, cls });
+    if (cls !== 'ok') flagged.push(`F${f} ${filBoard(m)}: ${cls === 'skip' ? 'unmeasured' : cls === 'open' && note === 'not conducting' ? 'NOT conducting' : note}`);
+  }
+  drawBars('t4Plot', bars, { yLabel: 'R_eq (kΩ)', yMax: 3 * rNom, fmt: (x) => x.toFixed(0) });
+  testResult('t4Result', {
+    title: 'Emission path R_eq', pass: nOk === fils.length && fils.length > 0,
+    counts: [{ n: fils.length, label: 'tested' }, { n: nOk, label: 'ok' },
+             { n: nDead, label: 'not conducting', bad: nDead > 0 }, { n: nOdd, label: 'R off', bad: nOdd > 0 },
+             { n: nSkip, label: 'unmeasured', bad: nSkip > 0 }],
+    note: `${volts.join('/')} V · nominal ${rNom} kΩ ±${Math.round(tol * 100)}% · rail read ${railV.map((r) => r.read == null ? '?' : Math.abs(r.read).toFixed(0)).join('/')} V`,
+    flagged,
+  });
+  const save = await tPostJ('/api/calibration/save', { name: 'emission_path_req',
+    data: { params: { volts, limitMa, widthUs, shots, rNom, tol }, rail: railV, fits } });
+  tMsg(`R_eq sweep done — ${nOk} ok, ${nDead} not conducting, ${nOdd} R off, ${nSkip} unmeasured`
+    + (save && save.ok ? ' · saved' : ' · NOT saved'), (nDead || nOdd || nSkip) ? 'bad' : '');
 }
 
 // =========================================================================
@@ -890,18 +956,20 @@ const TESTS_HTML = `
   </div>
 
   <div class="test-block" id="testBlock4">
-    <div class="block-title" title="Heats each filament (one at a time) to the heat current, sets emission −200 V, fires a 1 ms pulse, and checks the per-pulse emission current is inside the normal window. Out-of-range = low (amber) / high (red).">4 · Emission current test <span class="hint">ⓘ</span></div>
+    <div class="block-title" title="Cold MOSFET test at n emission voltages: every filament at SLEEP (no heating), the rail stepped start, start+step, … (n ≥ 3 points, read back at each), N pulses per filament per step. A line fit of I against V per filament gives R_eq (slope) and Vf (intercept), so a fixed front-end offset cannot fake a dead or a good MOSFET. HV off first on teardown.">4 · Emission path R_eq (MOSFET sweep) <span class="hint">ⓘ</span></div>
     <div class="test-params">
-      <label class="numlabel">heat A<input id="t4Heat" type="number" min="0" max="4" step="0.05" value="2.6" /></label>
-      <label class="numlabel">emis −V<input id="t4V" type="number" min="0" max="350" value="200" /></label>
-      <label class="numlabel">settle ms<input id="t4Settle" type="number" min="0" max="10000" value="1500" /></label>
+      <label class="numlabel">from −V<input id="t4VStart" type="number" min="10" max="350" step="10" value="50" /></label>
+      <label class="numlabel">step V<input id="t4VStep" type="number" min="1" max="100" value="10" /></label>
+      <label class="numlabel">n ≥3<input id="t4N" type="number" min="3" max="20" value="4" /></label>
+      <label class="numlabel">limit mA<input id="t4Limit" type="number" min="1" max="85" value="30" /></label>
       <label class="numlabel">pulse µs<input id="t4Width" type="number" min="1" max="100000" value="1000" /></label>
-      <label class="numlabel">norm mA<input id="t4Min" type="number" min="0" value="2" /></label>
-      <label class="numlabel">– max<input id="t4Max" type="number" min="0" value="40" /></label>
+      <label class="numlabel">shots<input id="t4Shots" type="number" min="1" max="10" value="3" /></label>
+      <label class="numlabel">R kΩ<input id="t4RNom" type="number" min="1" value="100" /></label>
+      <label class="numlabel">tol %<input id="t4Tol" type="number" min="1" max="100" value="35" /></label>
       <button class="xs quick test-run" id="t4Run">Run</button>
     </div>
     <canvas id="t4Plot" class="test-plot"></canvas>
-    <div class="test-legend"><span><i class="sw ok"></i>in range</span><span><i class="sw open"></i>low</span><span><i class="sw short"></i>high</span></div>
+    <div class="test-legend"><span><i class="sw ok"></i>R ok</span><span><i class="sw open"></i>not conducting / R high</span><span><i class="sw short"></i>R low</span><span><i class="sw skip"></i>unmeasured</span></div>
     <div id="t4Result" class="summary"></div>
   </div>
 

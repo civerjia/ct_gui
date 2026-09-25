@@ -70,9 +70,61 @@ class _DiagnosticsMixin:
                     f"({r.get('error') or 'no reason given'}) — it may still be LIVE")
         return None
 
+    def _mosfet_targets(self, filaments) -> tuple[list[int], list[str]]:
+        """Live filaments on CONNECTED controllers, and why any were dropped.
+        An unconnected controller's filaments can only fail -- slowly, ~5 s each
+        -- and would read as inconclusive for a reason that is not theirs."""
+        wanted = self._live_user_indices() if filaments is None else \
+            [int(f) for f in filaments]
+        wanted = [f for f in wanted if not self._is_dead(f)]
+        conn = set(self._connected_controllers())
+        rows = ((self.get_mapping() or {}).get("mapping") or {}).get("filaments") or []
+        ctrl_of = {int(r["filament"]): int(r["controller"]) + 1 for r in rows
+                   if r.get("controller") in (0, 1)}
+        keep, skipped = [], []
+        for f in wanted:
+            c = ctrl_of.get(self._fid_of(f))
+            (keep if c in conn else skipped).append(f)
+        notes = ([f"{len(skipped)} filament(s) not tested: their controller is not "
+                  f"connected ({skipped[:6]}{'...' if len(skipped) > 6 else ''})"]
+                 if skipped else [])
+        return keep, notes
+
+    def _mosfet_rail(self, volts: float, timeout_s: float = 3.0) -> tuple[float | None, str | None]:
+        """Set the emission rail and wait until it READS BACK within 10%.
+        (read value, None) on success, (last read, problem) otherwise."""
+        self.set_emission_v(abs(volts))
+        deadline = time.time() + timeout_s
+        v = None
+        while True:
+            time.sleep(0.3)
+            v = self.read_emission_v()
+            if v is not None and abs(abs(v) - abs(volts)) <= 0.10 * abs(volts):
+                return v, None
+            if time.time() >= deadline:
+                return v, (f"the emission rail did not reach -{abs(volts):g} V "
+                           f"(read {'nothing' if v is None else f'{v:.1f} V'}) -- check "
+                           f"the current limit and the HV LUT; nothing measured on it")
+
+    def _mosfet_fire(self, f: int, *, pulses: int, width_us: int,
+                     inter_pulse_ms: int, controller) -> dict:
+        """Fire `pulses` on one cold filament: {"nets": [signed net mA per
+        shot], "on_mismatch": bool, "error": str | None}."""
+        fr = self.fire_single_pulse(
+            f, num_pulses=pulses, width_us=width_us,
+            inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
+            total_ms=max(10000, pulses * (inter_pulse_ms + 1000)),
+            controller=controller, trigger="sim",
+            timeout_s=15.0 + pulses * inter_pulse_ms / 1000.0,
+            verify=True, reuse=False, measure=True)
+        nets = [e["plateau_net_ma"] for e in (fr.get("measured") or [])
+                if e.get("plateau_net_ma") is not None and not e.get("empty_envelope")]
+        return {"nets": nets, "on_mismatch": bool(fr.get("on_mismatch")),
+                "error": fr.get("error")}
+
     def mosfet_test(self, filaments=None,
                     emission_v: float = 100.0,
-                    limit_ma: float = 5.0,
+                    limit_ma: float = 30.0,
                     width_us: int = 1000,
                     pulses: int = 3,
                     inter_pulse_ms: int = 400,
@@ -101,7 +153,17 @@ class _DiagnosticsMixin:
         fact nothing was ever tried. SLEEP enables the rail without any heating
         current, which is exactly what this test wants.
 
-        This complements hv_switch_test() rather than replacing it: that one
+        THE CURRENT LIMIT. limit_ma is the emission supply's limit, and 30 mA is
+    the working value: at 5 mA the rail never came up (set 80 V, read back
+    -16 V, 2026-09-25) and every verdict was measured on the wrong rail. The
+    rail is now read back before anything fires and the test refuses to run on
+    one more than 10% away from what was set.
+
+    ONE VOLTAGE CANNOT SEPARATE A HEALTHY PATH FROM AN OFFSET: a front-end
+    offset of -0.4 mA calls a good MOSFET dead at a low rail. mosfet_sweep()
+    fits several voltages and judges the slope; prefer it.
+
+    This complements hv_switch_test() rather than replacing it: that one
         reads the 74HC165 sense back and proves the CONTROL path reached the
         gate, which a dead MOSFET also passes. Run both and a disagreement is
         informative -- switch bit set, no current, is a failed device.
@@ -126,111 +188,88 @@ class _DiagnosticsMixin:
             inconclusive  in between, or no pulse was measured at all
         """
         tol = self._MOSFET_TOL_FRAC if tolerance_frac is None else float(tolerance_frac)
-        problems: list[str] = []
-        wanted = self._live_user_indices() if filaments is None else \
-            [int(f) for f in filaments]
-        wanted = [f for f in wanted if not self._is_dead(f)]
+        wanted, problems = self._mosfet_targets(filaments)
         if not wanted:
             return {"ok": False, "results": {}, "counts": {},
-                    "problems": ["no live filaments to test"]}
+                    "problems": problems + ["no live filament on a connected controller"]}
 
-        # THE RAIL FIRST, BEFORE ANYTHING IS ENERGISED. This used to sit
-        # inside the energised() block, after every filament had been driven to
-        # SLEEP -- so a rig with no HV drove and tore down the whole set (96 of
-        # them by default) before reporting that there was nothing to measure.
-        # A refusal that costs nothing must come before the side effects, not
-        # after them.
+        # THE RAIL FIRST, BEFORE ANYTHING IS ENERGISED -- and READ BACK: a rail
+        # that did not come up must not be measured (5 mA limit: -16 V of 80).
         self.set_emission_i(limit_ma)
         self.set_emission_v(abs(emission_v))
         self.enable_emission(True)
-        time.sleep(1.0)
-        v_read = self.read_emission_v()
+        v_read, rail_problem = self._mosfet_rail(emission_v)
         hv = self.hv_status()
-        if not hv.get("emission_on"):
+        if rail_problem or not hv.get("emission_on"):
             off = self._hv_off_problem()
-            return {"ok": False, "results": {}, "counts": {},
-                    "problems": ["the emission rail did not come on — nothing "
-                                 "to measure, and no filament was touched"]
+            return {"ok": False, "emission_v": v_read, "results": {}, "counts": {},
+                    "problems": problems + [rail_problem or "the emission rail did not come on "
+                                            "-- nothing to measure, and no filament was touched"]
                                 + ([off] if off else [])}
-
-        # Also decidable before anything is energised, so it lives here and not
-        # inside the try: that keeps the try free of early returns, which is
-        # what guarantees the HV-off result below always reaches the caller.
-        v_eff = abs(v_read) if v_read else abs(emission_v)
+        v_eff = abs(v_read)
         expected = self.mosfet_expected_ma(v_eff, r_ohm, vf_v)
         if expected <= 0:
             off = self._hv_off_problem()
             return {"ok": False, "results": {}, "counts": {},
-                    "problems": [f"rail {v_eff} V is at or below the "
+                    "problems": problems + [f"rail {v_eff} V is at or below the "
                                  f"{sum(vf_v or self._MOSFET_VF_V)} V of diode "
-                                 f"drop — no current can flow through the path "
+                                 f"drop -- no current can flow through the path "
                                  f"this test measures"] + ([off] if off else [])}
 
         results: dict[int, dict] = {}
         hv_off = None
         try:
             with self.energised(*wanted):
-                # COLD, and on the iso rail. sleep_all() does both.
-                self.stop_all(wanted)
-                sl = self.sleep_all(wanted)
-                if not sl.get("ok"):
-                    problems.append(f"could not put every filament to SLEEP "
-                                    f"({self.describe(sl)[:100]}) — a filament "
-                                    f"still at STOP reads as a dead MOSFET")
-                # `expected` was computed from the rail ACTUALLY there, not the
-                # one asked for, before this block -- a rail sitting 15 V low
-                # would otherwise make every good MOSFET look 15% weak.
-                for f in wanted:
-                    fr = self.fire_single_pulse(
-                        f, num_pulses=pulses, width_us=width_us,
-                        inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
-                        total_ms=max(10000, pulses * (inter_pulse_ms + 1000)),
-                        controller=controller, trigger="sim",
-                        timeout_s=15.0 + pulses * inter_pulse_ms / 1000.0,
-                        verify=True, reuse=False, measure=True)
-                    nets = [e["plateau_net_ma"] for e in (fr.get("measured") or [])
-                            if e.get("plateau_net_ma") is not None
-                            and not e.get("empty_envelope")]
-                    row = {"measured_ma": None, "expected_ma": round(expected, 4),
-                           "ratio": None, "verdict": "inconclusive",
-                           "shots": len(nets), "note": None}
-                    if not nets:
-                        row["note"] = (fr.get("error")
-                                       or "no pulse was measured — the switch "
-                                          "was never actually exercised")
-                    elif fr.get("on_mismatch"):
-                        # The switch never closed, so the MOSFET was never put
-                        # across the rail: ≈0 mA here says nothing about it,
-                        # and calling it dead would send someone to the wrong
-                        # part. The switch fault itself is the finding.
-                        row["measured_ma"] = round(sum(nets) / len(nets), 4)
-                        row["note"] = fr.get("error")
-                    else:
-                        m = sum(nets) / len(nets)
-                        row["measured_ma"] = round(m, 4)
-                        row["ratio"] = round(m / expected, 3)
-                        if abs(m - expected) <= tol * expected:
-                            row["verdict"] = "pass"
-                        elif m < self._MOSFET_DEAD_FRAC * expected:
-                            row["verdict"] = "dead"
-                            row["note"] = (f"{m:.3f} mA against {expected:.3f} mA "
-                                           f"expected — the MOSFET is not "
-                                           f"conducting")
+                try:
+                    # COLD, and on the iso rail. sleep_all() does both.
+                    self.stop_all(wanted)
+                    sl = self.sleep_all(wanted)
+                    if not sl.get("ok"):
+                        problems.append(f"could not put every filament to SLEEP "
+                                        f"({self.describe(sl)[:100]}) -- a filament "
+                                        f"still at STOP reads as a dead MOSFET")
+                    for f in wanted:
+                        m = self._mosfet_fire(f, pulses=pulses, width_us=width_us,
+                                              inter_pulse_ms=inter_pulse_ms,
+                                              controller=controller)
+                        nets = m["nets"]
+                        row = {"measured_ma": None, "expected_ma": round(expected, 4),
+                               "ratio": None, "verdict": "inconclusive",
+                               "shots": len(nets), "note": None}
+                        if not nets:
+                            row["note"] = (m["error"] or "no pulse was measured -- the "
+                                           "switch was never actually exercised")
+                        elif m["on_mismatch"]:
+                            # The switch never closed: ~0 mA says nothing about the
+                            # MOSFET. The switch fault itself is the finding.
+                            row["measured_ma"] = round(sum(nets) / len(nets), 4)
+                            row["note"] = m["error"]
                         else:
-                            row["note"] = (f"{m:.3f} mA against {expected:.3f} mA "
-                                           f"expected ({m / expected:.2f}x) — "
-                                           f"neither the diode path nor zero")
-                    results[int(f)] = row
-                    if callable(progress):
-                        progress(int(f), row)
+                            mean = sum(nets) / len(nets)
+                            row["measured_ma"] = round(mean, 4)
+                            row["ratio"] = round(mean / expected, 3)
+                            if abs(mean - expected) <= tol * expected:
+                                row["verdict"] = "pass"
+                            elif mean < self._MOSFET_DEAD_FRAC * expected:
+                                row["verdict"] = "dead"
+                                row["note"] = (f"{mean:.3f} mA against {expected:.3f} mA "
+                                               f"expected -- the MOSFET is not conducting")
+                            else:
+                                row["note"] = (f"{mean:.3f} mA against {expected:.3f} mA "
+                                               f"expected ({mean / expected:.2f}x) -- "
+                                               f"neither the diode path nor zero")
+                        results[int(f)] = row
+                        if callable(progress):
+                            progress(int(f), row)
+                finally:
+                    # The rail comes down FIRST, before energised() STOPs the
+                    # filaments: that teardown can be slow, and a rail left on
+                    # while it runs is exposure with nothing being measured
+                    # (it once stayed up 4 minutes past the last shot).
+                    hv_off = self._hv_off_problem()
         finally:
-            # The rail comes down whatever happened, including on Ctrl-C -- and
-            # whether it DID come down is reported, not assumed. This used to be
-            # `try: enable_emission(False) except Exception: pass`, where the
-            # except was dead code (the client never raises) and the RETURN
-            # value, the only place a failed turn-off shows up, was discarded.
-            # So a rail left live read exactly like one that was turned off.
-            hv_off = self._hv_off_problem()
+            if hv_off is None:
+                hv_off = self._hv_off_problem()   # idempotent; covers a failure before the inner try
 
         if hv_off:
             problems.append(hv_off)
@@ -239,10 +278,141 @@ class _DiagnosticsMixin:
             counts[row["verdict"]] += 1
         for f, row in sorted(results.items()):
             if row["verdict"] != "pass":
-                problems.append(f"filament {f}: {row['verdict']} — {row['note']}")
+                problems.append(f"filament {f}: {row['verdict']} -- {row['note']}")
         return {"ok": not problems and bool(results),
                 "emission_v": v_read, "expected_ma": round(expected, 4),
                 "tolerance_frac": tol, "results": results, "counts": counts,
+                "problems": problems}
+
+    def mosfet_sweep(self, filaments=None,
+                     v_start: float = 50.0,
+                     v_step: float = 10.0,
+                     n: int = 4,
+                     limit_ma: float = 30.0,
+                     width_us: int = 1000,
+                     pulses: int = 3,
+                     inter_pulse_ms: int = 400,
+                     r_ohm: float | None = None,
+                     tolerance_frac: float | None = None,
+                     controller: int | None = None,
+                     progress=None) -> dict:
+        """The MOSFET test at n >= 3 emission voltages, judged on the SLOPE.
+
+            r = ct.mosfet_sweep()                      # -50/-60/-70/-80 V, 30 mA limit
+            r = ct.mosfet_sweep([0, 1, 2], v_start=40, v_step=10, n=5)
+            print(r)
+
+        Every filament COLD (SLEEP), as in mosfet_test(): the only current path
+        is the sub-board's two diodes and its resistor through the grid MOSFET,
+        I = (V - Vf) / R. Each filament is fired at every voltage and its I-V
+        points are fitted to a line. The slope gives R_eq; a constant
+        front-end offset lands in the intercept and cannot fake a verdict --
+        which is exactly what a single voltage cannot do (-0.4 mA offsets called
+        good MOSFETs dead at a low rail). The intercept is reported as vf_v but
+        is only a diode drop when there is no offset: judge on r_kohm.
+
+        The rail is read back at every step; the sweep stops at the first step
+        that is more than 10% off (the limit is usually why). HV off first on
+        teardown, then the filaments.
+
+        Returns {"ok", "volts": set points, "rail_v": read-backs,
+        "results": {user_index: {"points": [[V, mA], ...], "r_kohm", "vf_v",
+        "r2", "verdict", "note"}}, "counts": {"pass", "dead", "odd",
+        "unmeasured"}, "problems"}.
+
+        Verdicts (nominal r_ohm, default 100 kOhm; tolerance default 35%):
+            pass         |R_eq - R| <= tol*R and r2 >= 0.9
+            dead         slope <= 0, R_eq > 5 R, or the top-voltage current
+                         < 30% of expected -- not conducting
+            odd          conducts, but R_eq is off or the fit is poor
+            unmeasured   fewer than 3 usable points
+        """
+        n = max(3, int(n))
+        volts = [abs(float(v_start)) + i * abs(float(v_step)) for i in range(n)]
+        r_nom = float(r_ohm or self._MOSFET_R_OHM) / 1000.0          # kOhm
+        tol = self._MOSFET_TOL_FRAC if tolerance_frac is None else float(tolerance_frac)
+        wanted, problems = self._mosfet_targets(filaments)
+        if not wanted:
+            return {"ok": False, "results": {}, "counts": {},
+                    "problems": problems + ["no live filament on a connected controller"]}
+        if self.hv_status().get("emission_on"):
+            return {"ok": False, "results": {}, "counts": {},
+                    "problems": problems + ["the emission rail is already ON -- turn it off "
+                                            "first; this test sets its own voltages"]}
+        points: dict[int, list] = {f: [] for f in wanted}
+        rail: list = []
+        hv_off = None
+        self.set_emission_i(limit_ma)
+        try:
+            with self.energised(*wanted):
+                try:
+                    self.stop_all(wanted)
+                    sl = self.sleep_all(wanted)
+                    if not sl.get("ok"):
+                        problems.append(f"could not put every filament to SLEEP "
+                                        f"({self.describe(sl)[:100]})")
+                    for i, v in enumerate(volts):
+                        if i == 0:
+                            self.set_emission_v(v)
+                            self.enable_emission(True)
+                        v_read, bad = self._mosfet_rail(v)
+                        rail.append(v_read)
+                        if bad:
+                            problems.append(bad)
+                            break
+                        for f in wanted:
+                            m = self._mosfet_fire(f, pulses=pulses, width_us=width_us,
+                                                  inter_pulse_ms=inter_pulse_ms,
+                                                  controller=controller)
+                            if m["nets"] and not m["on_mismatch"]:
+                                points[f].append([round(abs(v_read), 2),
+                                                  round(sum(m["nets"]) / len(m["nets"]), 4)])
+                            if callable(progress):
+                                progress(v, int(f), m)
+                finally:
+                    hv_off = self._hv_off_problem()     # rail FIRST, then the filaments
+        finally:
+            if hv_off is None:
+                hv_off = self._hv_off_problem()
+        if hv_off:
+            problems.append(hv_off)
+
+        results: dict[int, dict] = {}
+        counts = {"pass": 0, "dead": 0, "odd": 0, "unmeasured": 0}
+        vf_nom = sum(self._MOSFET_VF_V)
+        for f in wanted:
+            p = points[f]
+            row = {"points": p, "r_kohm": None, "vf_v": None, "r2": None,
+                   "verdict": "unmeasured", "note": f"{len(p)} of {n} points"}
+            if len(p) >= 3:
+                xs = [q[0] for q in p]
+                ys = [q[1] for q in p]
+                k = len(p)
+                mx, my = sum(xs) / k, sum(ys) / k
+                sxx = sum((x - mx) ** 2 for x in xs)
+                sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+                syy = sum((y - my) ** 2 for y in ys)
+                a = sxy / sxx if sxx else 0.0
+                b = my - a * mx
+                r2 = (sxy * sxy / (sxx * syy)) if sxx and syy else 0.0
+                row["r2"] = round(r2, 3)
+                i_top, i_exp = ys[-1], (xs[-1] - vf_nom) / r_nom
+                if a > 0:
+                    row["r_kohm"] = round(1.0 / a, 1)
+                    row["vf_v"] = round(-b / a, 2)
+                if a <= 0 or 1.0 / a > 5 * r_nom or i_top < self._MOSFET_DEAD_FRAC * i_exp:
+                    row["verdict"], row["note"] = "dead", "not conducting"
+                elif abs(1.0 / a - r_nom) <= tol * r_nom and r2 >= 0.9:
+                    row["verdict"], row["note"] = "pass", None
+                else:
+                    row["verdict"] = "odd"
+                    row["note"] = f"R_eq {1.0 / a:.0f} kOhm (nominal {r_nom:.0f}), r2 {r2:.2f}"
+            counts[row["verdict"]] += 1
+            results[int(f)] = row
+            if row["verdict"] != "pass":
+                problems.append(f"filament {f}: {row['verdict']} -- {row['note']}")
+        return {"ok": not problems and bool(results), "volts": volts, "rail_v": rail,
+                "limit_ma": limit_ma, "results": results, "counts": counts,
                 "problems": problems}
 
     # ── Board self-test & I2C diagnostics ─────────────────────────────────────
