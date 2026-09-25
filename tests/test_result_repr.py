@@ -57,11 +57,11 @@ def check(name: str, data: dict) -> list[str]:
     # pulse table and only when it says so; full() must still carry every key.
     full = Result(data).full()
     for k in data:
-        if k != "ok" and f"{k}:" not in full and f"{k}=" not in full:
+        if k not in ("ok", Result._DETAIL_KEY) and f"{k}:" not in full and f"{k}=" not in full:
             problems.append(f"{name}: key {k!r} is not in full()")
     hidden = [k for k in data if k != "ok" and f"{k}:" not in txt and f"{k}=" not in txt]
-    if hidden and (not set(hidden) <= set(Result._PULSE_DETAIL)
-                   or "firmware detail hidden" not in txt):
+    allowed = set(Result._PULSE_DETAIL) | set(data.get(Result._DETAIL_KEY) or ()) | {Result._DETAIL_KEY}
+    if hidden and (not set(hidden) <= allowed or "detail hidden" not in txt):
         problems.append(f"{name}: print hides {hidden} without saying so")
     for n, line in enumerate(txt.splitlines()):
         if len(line) > MAX_LINE and not unbreakable(line):

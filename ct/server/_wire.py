@@ -101,6 +101,16 @@ def build_payload(command: str, b: dict):
         # what it already knows how to read, so a newly appended field is
         # invisible through it by construction.
         return 0x79, 0, b""
+    # Diagnostics (RP2350 fw 00397fe+). None of them does I2C except PIN_PROBE's
+    # pin drive; the two pin commands are refused (Busy) while a run owns it.
+    if command == "CH_GET_BOARD_HEALTH":     # 0x3E: [ch] -> dark + per-board lost/recovering
+        return 0x3E, 0, bytes([ch])
+    if command == "CH_GET_I2C_STATS":        # 0x3F: [ch, clear] -> bus counters (clear AFTER reading)
+        return 0x3F, 0, bytes([ch, 1 if b.get("clear") else 0])
+    if command == "GET_PIN_REPORT":          # 0x62: [page] -> every used GPIO (page 0 measures)
+        return 0x62, 0, bytes([int(b.get("page", 0)) & 0xFF])
+    if command == "PIN_PROBE":               # 0x63: drives the HV chain's SAFE pins (lease needed)
+        return 0x63, 0, b""
     if command == "CH_SLEW_RATE":            # 0x3C: empty=GET, 6 bytes=SET
         # Three voltage-ramp slew rates, runtime-settable. Out-of-range CLAMPS
         # rather than rejecting, and the response is always the values IN FORCE

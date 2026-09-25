@@ -387,6 +387,37 @@ class Result(dict):
         bad = [f"{k}={st[k]}" for k in cls._RUN_COUNTERS if st.get(k)]
         return [line] + ([f"  firmware counters: {'  '.join(bad)}"] if bad else [])
 
+    #: A key in a result dict whose value is a list of that dict's keys to
+    #: leave out of the PRINT (r.full() and the dict keep them).
+    _DETAIL_KEY = "_detail"
+
+    @classmethod
+    def _has_detail(cls, v) -> bool:
+        if isinstance(v, dict):
+            return cls._DETAIL_KEY in v or any(cls._has_detail(x) for x in v.values())
+        if isinstance(v, (list, tuple)):
+            return any(cls._has_detail(x) for x in v)
+        return False
+
+    @classmethod
+    def _brief(cls, v):
+        """A copy with every _detail-named key (and _detail itself) removed."""
+        if isinstance(v, dict):
+            hide = set(v.get(cls._DETAIL_KEY) or ()) | {cls._DETAIL_KEY}
+            return {k: cls._brief(x) for k, x in v.items() if k not in hide}
+        if isinstance(v, list):
+            return [cls._brief(x) for x in v]
+        return v
+
+    @classmethod
+    def _strip_marker(cls, v):
+        """A copy without the _detail markers, every other key kept."""
+        if isinstance(v, dict):
+            return {k: cls._strip_marker(x) for k, x in v.items() if k != cls._DETAIL_KEY}
+        if isinstance(v, list):
+            return [cls._strip_marker(x) for x in v]
+        return v
+
     def full(self) -> str:
         """Every field, nothing hidden -- the firmware-level detail included."""
         return self._render_all(brief=False)
@@ -397,6 +428,12 @@ class Result(dict):
     def _render_all(self, brief: bool) -> str:
         if not self:
             return "Result({})"
+        if self._has_detail(self):
+            if brief:
+                text = Result(self._brief(dict(self)))._render_all(brief=True)
+                note = "  (detail hidden -- r.full() prints every field; the call log keeps them all)"
+                return text if note in text else text + "\n" + note
+            return Result(self._strip_marker(dict(self)))._render_all(brief=False)
         head = "ok" if self.get("ok") else ("FAILED" if "ok" in self else "")
         out: list[str] = []
         done = {"ok"}
@@ -406,16 +443,18 @@ class Result(dict):
                 done.add(k)
         table = self._pulse_table(self)
         out.extend(table)   # the answer, before the detail
+        hid = False
         if table and brief:
             out.extend(self._run_line(self.get("status")))
             done.update(k for k in self._PULSE_DETAIL if k in self)
+            hid = True
         for k, v in self.items():
             if k in done:
                 continue
             self._render(k, v, 2, out)
             done.add(k)
-        if table and brief:
-            out.append("  (firmware detail hidden -- r.full() prints every field; the call log keeps them all)")
+        if hid:
+            out.append("  (detail hidden -- r.full() prints every field; the call log keeps them all)")
         return (f"Result({head})" if head else "Result") + ("\n" + "\n".join(out) if out else "")
 
 

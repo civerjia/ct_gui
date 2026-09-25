@@ -547,6 +547,248 @@ class _DiagnosticsMixin:
         """
         return self._post("/api/selftest", {}, timeout=60.0)
 
+    # ── RP2350 on-chip diagnostics (formerly USB-console only) ──────────────
+    # The same measurements as the RP2350 console commands `health`, `i2cstat`,
+    # `pinreport` and `pinprobe` -- the firmware measures once and both the
+    # console and these print that one result, so the two cannot disagree.
+    # Each covers every CONNECTED controller, or one if `controller` is given;
+    # a controller that did not answer carries its own "error" and no data.
+
+    #: GPIO -> name, as the RP2350 firmware's pin table has it.
+    _PIN_NAMES = {0: "UART_TX", 1: "UART_RX", 2: "I2C1_SDA", 3: "I2C1_SCL", 4: "I2C2_SDA",
+                  5: "I2C2_SCL", 6: "I2C3_SDA", 7: "I2C3_SCL", 8: "I2C4_SDA", 9: "I2C4_SCL",
+                  10: "I2C5_SDA", 11: "I2C5_SCL", 12: "I2C6_SDA", 13: "I2C6_SCL",
+                  18: "S0", 19: "MISO", 20: "S2", 21: "S1", 22: "LOAD_N", 23: "CLKINH",
+                  24: "ISO_INT", 25: "MOSI", 27: "MUX_RST_N", 28: "SRCLR_N", 29: "TPS_INT",
+                  30: "HV_INT", 31: "SCK", 32: "TRIG_OUT", 33: "SYNC_OUT", 34: "READY_OUT",
+                  35: "READY_IN", 36: "SYNC_IN", 37: "LATCH0", 38: "LATCH1", 39: "LATCH2",
+                  40: "LATCH3", 41: "LATCH4", 42: "LATCH5", 43: "LATCH6", 44: "LATCH7",
+                  45: "DLY_TRIG"}
+    _PIN_VERDICTS = {0: "OK", 1: "FAIL", 2: "WARN", 3: "info"}
+    _PIN_REASONS = {0: "", 1: "pad isolated", 2: "input buffer off",
+                    3: "no owner (funcsel NULL)", 4: "I2C pin not on PIO",
+                    5: "UART pin not on UART", 6: "pulled low but pad stays HIGH",
+                    7: "released but held LOW (stuck bus)",
+                    8: "driven but pad reads the other level -- held from outside",
+                    9: "interrupt line asserted (low) the whole window",
+                    10: "input: level and edges only"}
+
+    def _diag_cmd(self, controller: int, command: str, body: dict | None = None,
+                  timeout: float = 10.0):
+        """(raw payload, None) or (None, error) for one /api/cmd round trip.
+        A firmware status other than Ok is an error, never an empty answer."""
+        r = self._post("/api/cmd", {"controller": int(controller), "command": command,
+                                    **(body or {})}, timeout=timeout)
+        raw = ((r.get("response") or {}).get("raw")) if r.get("ok") else None
+        if not raw:
+            return None, r.get("error") or f"no response to {command}"
+        if raw[0] != 0:
+            names = {0x0F: "Busy -- a schedule owns the hardware; try after the run",
+                     0x02: "not supported by this firmware (flash RP2350 00397fe or later)"}
+            return None, f"{command}: firmware status 0x{raw[0]:02X} " + names.get(raw[0], "")
+        return raw, None
+
+    def _per_controller(self, controller, fn) -> dict:
+        ctrls = [int(controller)] if controller is not None else self._connected_controllers()
+        if not ctrls:
+            return {"ok": False, "error": "no controller connected", "controllers": {}}
+        per = {str(c): fn(c) for c in ctrls}
+        return {"ok": all(v.get("ok") for v in per.values()), "controllers": per}
+
+    def board_health(self, controller: int | None = None, channels=range(6)) -> dict:
+        """Which boards the RP2350 has LOST and which channels are DARK -- the
+        firmware's dynamic failure tracking (RP2350 00397fe). Read-only, no
+        I2C: safe at any time, including during a schedule run.
+
+            r = ct.board_health()
+            print(r)                          # one line per channel
+            r["controllers"]["1"]["lost"]     # ["CH1.7", "CH2.7"]
+
+        A LOST board failed >= 2 visits spanning >= 1 s: its control work is
+        suspended and it is probed on a doubling backoff (0.25 -> 5 s). When it
+        answers it is brought back to its COMMANDED state up the ladder (an
+        ACTIVE board through a converged IDLE first) -- `recovering` meanwhile.
+        A DARK channel is one whose mux stopped answering: only the mux is
+        probed until it returns. Boards at STOP are never lost (silence is
+        normal there).
+
+        Returns {"ok", "controllers": {"1": {"ok", "lost": [labels], "dark":
+        [channels], "channels": {"CH1": {"state" ok/DARK, "boards_ok",
+        "lost", "recovering", "dark_for_ms", "times_dark"}}, "attention":
+        {label: board} (only boards with something to say), "boards": {every
+        board: {"state", "fail_streak", "lost_for_ms", "next_probe_ms",
+        "probe_fails", "lost_count", "recover_count"}}}}}. The print shows
+        channels + attention; r.full() and the dict carry every board.
+        """
+        def one(c: int) -> dict:
+            out: dict = {"ok": True, "lost": [], "dark": [], "channels": {},
+                         "attention": {}, "boards": {}, "_detail": ["boards"]}
+            for ch in channels:
+                raw, err = self._diag_cmd(c, "CH_GET_BOARD_HEALTH", {"channel": int(ch)})
+                if err or len(raw) < 9 + 8 * 15:
+                    return {"ok": False, "error": err or f"short CH_GET_BOARD_HEALTH reply ({len(raw)} bytes)"}
+                u16 = lambda i: raw[i] | (raw[i + 1] << 8)
+                u32 = lambda i: raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24)
+                dark = bool(raw[2] & 1)
+                boards = {}
+                for m in range(8):
+                    o = 9 + m * 15
+                    lost, rec = bool(raw[o] & 1), bool(raw[o] & 2)
+                    label = f"CH{ch + 1}.{m + 1}"
+                    boards[label] = {"state": "LOST" if lost else ("recovering" if rec else "ok"),
+                                     "fail_streak": raw[o + 1], "probe_fails": raw[o + 2],
+                                     "lost_for_ms": u32(o + 3) if lost else None,
+                                     "next_probe_ms": u32(o + 7) if lost else None,
+                                     "lost_count": u16(o + 11), "recover_count": u16(o + 13)}
+                    if lost:
+                        out["lost"].append(label)
+                # One FLAT record per channel, so it prints as one line; the
+                # per-board detail is kept in `boards` (r.full(), the call log).
+                lost_l = [lb for lb, b in boards.items() if b["state"] == "LOST"]
+                rec_l = [lb for lb, b in boards.items() if b["state"] == "recovering"]
+                out["channels"][f"CH{ch + 1}"] = {
+                    "state": "DARK" if dark else "ok",
+                    "boards_ok": sum(1 for b in boards.values() if b["state"] == "ok"),
+                    "lost": ", ".join(lost_l) or "-", "recovering": ", ".join(rec_l) or "-",
+                    "dark_for_ms": u32(3) if dark else None, "times_dark": u16(7)}
+                out["boards"].update(boards)
+                # Boards with anything to say (lost, recovering, or a history).
+                out["attention"].update({lb: b for lb, b in boards.items()
+                                         if b["state"] != "ok" or b["lost_count"] or b["fail_streak"]})
+                if dark:
+                    out["dark"].append(f"CH{ch + 1}")
+            return out
+        return self._per_controller(controller, one)
+
+    def i2c_stats(self, controller: int | None = None, channels=range(6),
+                  clear: bool = False) -> dict:
+        """The RP2350's I2C bus counters per channel (console `i2cstat`).
+        Read-only, no I2C: safe at any time, including during a run.
+
+            r = ct.i2c_stats()                # everything since boot / last clear
+            r = ct.i2c_stats(clear=True)      # read, then zero (a clean window)
+
+        How to read it -- the numbers that matter:
+            timeouts / recoveries / bus_clears / sda_stuck climbing
+                the BUS wedged (a slave holding SDA); sda_stuck = hardware
+            nak_streak growing and never resetting, 0 timeouts
+                the channel's chips stopped answering (cable, power) -- the
+                "dark channel" signature
+            nacks alone
+                normal: every probe of an empty slot is a NAK
+            bad_ina_reads
+                corrupted INA219 transfers discarded (C1's high-byte 0x8x)
+        """
+        def one(c: int) -> dict:
+            rows = {}
+            for ch in channels:
+                raw, err = self._diag_cmd(c, "CH_GET_I2C_STATS", {"channel": int(ch), "clear": bool(clear)})
+                if err or len(raw) < 54:
+                    return {"ok": False, "error": err or f"short CH_GET_I2C_STATS reply ({len(raw)} bytes)"}
+                u32 = lambda i: raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24)
+                ago = lambda v: None if v == 0xFFFFFFFF else v
+                rows[f"CH{ch + 1}"] = {
+                    "timeouts": u32(3), "nacks": u32(7), "recoveries": u32(11),
+                    "bus_clears": u32(15), "sda_stuck": u32(19), "retry_fails": u32(23),
+                    "nak_streak": u32(38), "max_nak_streak": u32(42),
+                    "last_ok_ms_ago": ago(u32(46)), "bad_ina_reads": u32(50),
+                    "last_timeout_ms_ago": ago(u32(34)),
+                    "last_timeout_addr": f"0x{raw[31]:02X}" if u32(3) else None,
+                    "bus": "hw" if raw[2] else "pio"}
+            return {"ok": True, "cleared": bool(clear), "channels": rows}
+        return self._per_controller(controller, one)
+
+    def pin_report(self, controller: int | None = None) -> dict:
+        """Every GPIO the RP2350 firmware uses, checked as the chip sees it
+        (console `pinreport`). READ-ONLY: samples registers for ~50 ms and
+        drives nothing. Refused (Busy) while a schedule is armed or running.
+
+            r = ct.pin_report()
+            print(r)                          # one line per pin, FAIL/WARN first
+            r["controllers"]["1"]["fail"]     # ["SCK (gp31): driven but pad ..."]
+
+        FAIL = a driven output whose pad reads the other level (held from
+        outside -- the 2026-09-24 GP31 fault), an I2C line stuck, a pin on the
+        wrong owner, pad isolation on. WARN = an interrupt line asserted the
+        whole window. A static read cannot clear a pin whose driver died at the
+        level it happens to be driven to: pin_probe() drives the safe ones.
+        """
+        def one(c: int) -> dict:
+            pins, page, total = {}, 0, None
+            while total is None or len(pins) < total:
+                raw, err = self._diag_cmd(c, "GET_PIN_REPORT", {"page": page})
+                if err or len(raw) < 4:
+                    return {"ok": False, "error": err or "short PIN_REPORT reply"}
+                total, count = raw[1], raw[3]
+                if count == 0:
+                    break
+                for i in range(count):
+                    o = 4 + i * 11
+                    gpio, bits, verdict, reason = raw[o], raw[o + 3], raw[o + 4], raw[o + 5]
+                    name = self._PIN_NAMES.get(gpio, f"gp{gpio}")
+                    samples, ones, edges = raw[o + 6], raw[o + 9], raw[o + 10]
+                    note = self._PIN_REASONS.get(reason, f"reason {reason}")
+                    if reason == 10:
+                        note = f"input: high {ones}/{samples}, {edges} edges"
+                    elif reason in (6, 8):
+                        note += f" ({raw[o + 8]}/{raw[o + 7]})"
+                    pins[name] = {"gpio": gpio, "verdict": self._PIN_VERDICTS.get(verdict, verdict),
+                                  "owner": raw[o + 2], "oe": bits & 1, "out": (bits >> 1) & 1,
+                                  "in": (bits >> 2) & 1, "note": note or None}
+                page += 1
+            fail = [f"{n} (gp{p['gpio']}): {p['note']}" for n, p in pins.items() if p["verdict"] == "FAIL"]
+            warn = [f"{n} (gp{p['gpio']}): {p['note']}" for n, p in pins.items() if p["verdict"] == "WARN"]
+            inputs = {n: p["note"] for n, p in pins.items() if p["verdict"] == "info"}
+            return {"ok": not fail, "summary": f"{len(pins)} pins, {len(fail)} FAIL, {len(warn)} WARN",
+                    "fail": fail, "warn": warn, "inputs": inputs,
+                    "pins": pins, "_detail": ["pins"]}
+        return self._per_controller(controller, one)
+
+    def pin_probe(self, controller: int | None = None) -> dict:
+        """ACTIVE test of the HV shift chain's safe pins (console `pinprobe`):
+        drives SCK, MOSI, LOAD_N, CLKINH, S0-S2 high and low and times each pad
+        edge, then clocks the 165 read-back chain 64 bits. The LATCH pins and
+        SRCLR_N are never touched, so no grid switch can move -- but it DRIVES
+        pins, so it takes the lease and is refused while a schedule runs.
+
+            with ct.lease(note="pin probe"):
+                r = ct.pin_probe()
+            print(r)
+
+        Healthy: every pin rises and falls in 0-2 us. `>20000 us` = the pin
+        never followed (a dead driver or a line held from outside); a slow edge
+        names its load. The 165 chain in circuit shows transitions; an all-zero
+        chain with the board unplugged is expected (nothing drives MISO).
+        """
+        def one(c: int) -> dict:
+            raw, err = self._diag_cmd(c, "PIN_PROBE", {}, timeout=15.0)
+            if err or len(raw) < 12 + 7 * 7:
+                return {"ok": False, "error": err or "short PIN_PROBE reply"}
+            bits = int.from_bytes(bytes(raw[4:12]), "little")
+            pins = {}
+            for i in range(7):
+                o = 12 + i * 7
+                gpio, flags, owner = raw[o], raw[o + 1], raw[o + 2]
+                rise, fall = raw[o + 3] | (raw[o + 4] << 8), raw[o + 5] | (raw[o + 6] << 8)
+                name = self._PIN_NAMES.get(gpio, f"gp{gpio}")
+                if flags & 1:
+                    pins[name] = {"gpio": gpio, "verdict": "SKIPPED", "note": f"not on SIO (owner {owner})"}
+                    continue
+                us = lambda v: f">{v} us" if v >= 20000 else f"{v} us"
+                pins[name] = {"gpio": gpio, "verdict": "OK" if flags & 2 else "FAIL",
+                              "rise": us(rise), "fall": us(fall),
+                              "note": None if flags & 2 else ("will not go HIGH" if rise >= 20000 else
+                                                               "will not go LOW (held high)" if fall >= 20000
+                                                               else "slow edge")}
+            chain = "".join("1" if (bits >> i) & 1 else "0" for i in range(64))
+            bad = [f"{n} (gp{p['gpio']}): {p['note']}" for n, p in pins.items() if p["verdict"] == "FAIL"]
+            return {"ok": not bad, "fail": bad, "pins": pins,
+                    "chain_165": chain, "chain_transitions": raw[3],
+                    "chain_note": ("MISO never moved (stuck, or clock/load not reaching the chips; "
+                                   "expected with the control board unplugged)") if raw[3] == 0 else
+                                  "MISO moves (the chain clocks)"}
+        return self._per_controller(controller, one)
+
     # ── HV switch toggle test ─────────────────────────────────────────────────
 
     _HV_SETTLE_MS = 12          # host-side settle before reading the 165 back
