@@ -100,15 +100,29 @@ def _interactive() -> bool:
 def check_and_update() -> None:
     if os.environ.get("CT_NO_AUTO_UPDATE") or os.environ.get("CT_UPDATED"):
         return
+    # Every way of NOT checking says why. These used to return silently, so a
+    # clone whose .git had been damaged (a synced folder) or a shell without
+    # git on its PATH simply never updated again, and a restart printed
+    # nothing that could tell anyone (2026-09-25).
     try:
         top = _git("rev-parse", "--show-toplevel")
-    except (OSError, subprocess.SubprocessError):
-        return                      # git not installed: nothing to update with
-    if top.returncode != 0 or Path(top.stdout.strip()).resolve() != REPO_DIR:
-        return                      # not a standalone clone of this directory
+    except (OSError, subprocess.SubprocessError) as exc:
+        _warn(f"update check skipped: git is not available here ({type(exc).__name__}: {exc}). "
+              f"Install git or put it on PATH.")
+        return
+    if top.returncode != 0:
+        _warn(f"update check skipped: {REPO_DIR} is not a working git clone "
+              f"({(top.stderr or '').strip().splitlines()[-1:] or ['no detail']}). If it sits in "
+              f"OneDrive/Dropbox, the sync may have damaged .git -- clone it fresh outside the "
+              f"synced folder.")
+        return
+    if Path(top.stdout.strip()).resolve() != REPO_DIR:
+        return                      # part of a bigger repo (the dev tree): not ours to pull
     upstream = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
     if upstream.returncode != 0:
-        return                      # no upstream branch configured
+        _warn("update check skipped: this clone has no upstream branch "
+              "(git branch --set-upstream-to=origin/main main)")
+        return
     try:
         fetched = _git("fetch", "--quiet", timeout=FETCH_TIMEOUT_S)
     except subprocess.TimeoutExpired:
