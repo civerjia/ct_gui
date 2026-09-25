@@ -544,6 +544,47 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
     # ran on THAT machine (client/ct_client_<date>.jsonl). A script running
     # here writes its own records here -- see record_path. Read-only; no lease.
 
+    def restart_backend(self, wait_s: float = 60.0) -> dict:
+        """Restart the backend in place -- and, on the way up, run its GitHub
+        update check, so this is also how a remote backend picks up new code.
+
+            r = ct.restart_backend()
+            print(r)      # version before/after, controllers reconnected
+
+        The connections it had are re-opened by the new process. REFUSED while
+        a schedule is armed or running, or while another client holds the
+        lease: it drops every connection for a few seconds. Waits up to
+        `wait_s` for the backend to answer again and for the controllers it
+        had to be back.
+        """
+        before = self._get("/api/version", timeout=5.0)
+        r = self._post("/api/restart", {}, timeout=10.0)
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error") or "restart refused"}
+        want = {str(k) for k in (r.get("reconnect") or {})}
+        deadline = time.time() + wait_s
+        time.sleep(2.0)
+        st: dict = {}
+        while time.time() < deadline:
+            try:
+                st = self._get("/api/status", timeout=3.0)
+            except Exception:
+                st = {}
+            ctrls = st.get("controllers") or {}
+            if st.get("ok") is not False and ctrls and all(
+                    (ctrls.get(c) or {}).get("connected") for c in want):
+                break
+            time.sleep(1.0)
+        else:
+            return {"ok": False, "error": f"the backend did not come back with {sorted(want)} "
+                                          f"connected within {wait_s:g} s",
+                    "version_before": before.get("commit")}
+        after = self._get("/api/version", timeout=5.0)
+        return {"ok": True, "version_before": before.get("commit"),
+                "version_after": after.get("commit"),
+                "updated": before.get("tree") != after.get("tree"),
+                "reconnected": sorted(want)}
+
     def list_logs(self) -> dict:
         """Log files on the backend's machine.
 

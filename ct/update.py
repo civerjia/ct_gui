@@ -97,6 +97,43 @@ def _interactive() -> bool:
             or not sys.argv or sys.argv[0] in ("", "-c"))
 
 
+_CHILD_ENV = "CT_RESTART_CHILD"
+_RESTART_CODE = 75   # a child exiting with this asks its parent to start it again
+
+
+def restart_in_place() -> None:
+    """Run this program again, in the SAME terminal window, and never return.
+
+    POSIX: os.execv replaces the process -- same PID, same window.
+    Windows: os.execv is only emulated there -- it starts a NEW process and
+    the old one exits, so cmd/PowerShell sees the program as finished, prints
+    its prompt, and Ctrl-C / closing the window no longer reliably reach the
+    new one; started any other way it can end up with no window at all. So on
+    Windows the old process starts the new one as its child in the same
+    console and WAITS for it, exiting with its code: the window keeps showing
+    one running program. The caller must already have let go of every socket.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    argv = [sys.executable, *sys.argv]
+    # CT_RESTART_AS_CHILD=1 takes the Windows path anywhere (to test it).
+    if os.name == "nt" or os.environ.get("CT_RESTART_AS_CHILD"):
+        if os.environ.get(_CHILD_ENV):
+            # Already the child of the process that owns the window: ask IT to
+            # start the next one, rather than nesting a grandchild -- every
+            # restart would otherwise leave one more process waiting.
+            os._exit(_RESTART_CODE)
+        env = dict(os.environ, **{_CHILD_ENV: "1"})
+        while True:
+            try:
+                rc = subprocess.call(argv, env=env)
+            except KeyboardInterrupt:
+                rc = 130
+            if rc != _RESTART_CODE:
+                os._exit(rc)
+    os.execv(sys.executable, argv)
+
+
 def check_and_update() -> None:
     if os.environ.get("CT_NO_AUTO_UPDATE") or os.environ.get("CT_UPDATED"):
         return
@@ -163,4 +200,4 @@ def check_and_update() -> None:
     sys.stdout.flush()
     sys.stderr.flush()
     os.environ["CT_UPDATED"] = "1"
-    os.execv(sys.executable, [sys.executable, *sys.argv])
+    restart_in_place()

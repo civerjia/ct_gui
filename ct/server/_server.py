@@ -23,6 +23,7 @@ import json
 import logging
 import logging.handlers
 import os
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -2860,6 +2861,28 @@ class CtHandler(BaseHTTPRequestHandler):
                            if busy else "bridge accepted then closed the connection")
                     return self._json({"ok": False, "error": err, "status": link.status()}, HTTPStatus.OK)
                 self._json({"ok": True, "status": link.status()})
+            elif path == "/api/restart":
+                # Restart this backend in place (and, on the way up, the same
+                # GitHub update check a manual start does). The controller
+                # connections are REMEMBERED and re-opened by the new process.
+                # Refused while a schedule is armed or running, or while another
+                # client holds the lease -- a restart drops every connection
+                # for a few seconds and must never land inside someone's run.
+                who = self._client(body)
+                lease = _lease_snapshot()
+                if lease["held"] and lease["owner"] != who:
+                    return self._json({"ok": False, "error": f"refused: {lease['owner']} holds the "
+                                       f"lease ({lease['note'] or 'no note'})"}, HTTPStatus.OK)
+                busy = [cid for cid in CONTROLLERS
+                        if (board_monitor_snapshot(cid) or {}).get("run_owns")]
+                if busy:
+                    return self._json({"ok": False, "error": f"refused: a schedule is armed or "
+                                       f"running on controller(s) {busy}"}, HTTPStatus.OK)
+                keep = {cid: link.host for cid, link in CONTROLLERS.items()
+                        if link.client.connected and getattr(link, "host", None)}
+                log.warning("restart requested by %s -- reconnecting %s after", who, keep or "nothing")
+                self._json({"ok": True, "restarting": True, "reconnect": keep})
+                threading.Thread(target=_restart_self, args=(keep,), name="restart", daemon=True).start()
             elif path == "/api/disconnect":
                 # Close the framed TCP session to one controller (body:
                 # {controller}). Host-side only — no frame is sent to the RP2350;
@@ -4422,6 +4445,60 @@ class CtHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
+_HTTP_SERVER: dict = {}   # {"server": ..., "restart": {cid: host} once one is requested}
+
+
+def _restart_self(keep: dict) -> None:
+    """/api/restart's worker: the reply has gone out, so ask the MAIN thread
+    to restart. It is done there, not here: stopping serve_forever from this
+    thread let main() fall through to its normal exit, and the process ended
+    before this thread could relaunch it (2026-09-25)."""
+    time.sleep(0.5)
+    _HTTP_SERVER["restart"] = dict(keep)
+    srv = _HTTP_SERVER.get("server")
+    if srv is not None:
+        srv.shutdown()          # serve_forever returns in main(), which restarts
+
+
+def _do_restart(keep: dict, server) -> None:
+    """In the main thread, after serve_forever returned: let go of the port and
+    the bridges (each accepts ONE client), then run again in this window. The
+    new process re-opens `keep` and runs the update check first."""
+    os.environ["CT_RECONNECT"] = ",".join(f"{cid}={host}" for cid, host in keep.items())
+    os.environ.pop("CT_UPDATED", None)
+    os.environ["CT_RESTARTED_FROM"] = str(os.getpid())
+    try:
+        server.server_close()
+    except Exception:
+        pass
+    for link in CONTROLLERS.values():
+        try:
+            link.disconnect()
+        except Exception:
+            pass
+    log.warning("=== backend restarting (in place, same window) ===")
+    print(f"[ct] backend restarting in this window (pid {os.getpid()}) ...", flush=True)
+    logging.shutdown()
+    from ct import update as ct_update
+    ct_update.restart_in_place()
+
+
+def _reconnect_from_env() -> None:
+    """After an in-place restart, re-open the connections the old process had."""
+    spec = os.environ.pop("CT_RECONNECT", "")
+    for part in filter(None, spec.split(",")):
+        try:
+            cid_s, host = part.split("=", 1)
+            link = CONTROLLERS.get(int(cid_s))
+            if link is None:
+                continue
+            link.connect(host)
+            log.info("restart: reconnected %s to %s -> %s", link.name, host,
+                     "ok" if link.client.connected else "FAILED")
+        except Exception as exc:
+            log.warning("restart: could not reconnect %r: %s", part, exc)
+
+
 def main() -> None:
     # Bind all interfaces by default: this process owns the single-client bridge
     # sockets, so every other program on the bench reaches the hardware through
@@ -4446,13 +4523,28 @@ def main() -> None:
              "without an HV grid command (rails never touched; commands renew, reads do not)",
              power_state_name(SAFETY_ACTIVE_FALLBACK), SAFETY_ACTIVE_TIMEOUT_S,
              SAFETY_HV_TIMEOUT_S)
-    server = ThreadingHTTPServer((host, port), CtHandler)
+    # After an in-place restart the port may still be in TIME_WAIT or being
+    # released, so the bind is retried briefly instead of failing at once.
+    for attempt in range(40):
+        try:
+            server = ThreadingHTTPServer((host, port), CtHandler)
+            break
+        except OSError:
+            if attempt == 39:
+                raise
+            time.sleep(0.25)
+    _HTTP_SERVER["server"] = server
+    if os.environ.pop("CT_RESTARTED_FROM", None):
+        print(f"[ct] backend RESTARTED -- now pid {os.getpid()}, running in this window", flush=True)
+    threading.Thread(target=_reconnect_from_env, name="reconnect", daemon=True).start()
     print(f"CT GUI server listening on http://{host}:{port}  (log: {LOG_DIR}/backend.log)")
     if host == "0.0.0.0":
         lan = primary_local_ip()
         print(f"  open http://127.0.0.1:{port}" + (f" · shared API on http://{lan}:{port}" if lan else ""))
     try:
         server.serve_forever()
+        if "restart" in _HTTP_SERVER:
+            _do_restart(_HTTP_SERVER["restart"], server)   # does not return
     except KeyboardInterrupt:
         pass
     finally:
