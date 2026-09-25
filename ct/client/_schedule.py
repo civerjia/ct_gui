@@ -12,6 +12,10 @@ use comes from _base (star-imported, underscore names included -- see
 _base.__all__) or, for CTClient itself, is bound in by _client.py.
 """
 from ._base import *  # noqa: F401,F403
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:   # editors only: at run time _client.py binds CTClient into this module
+    from ._client import CTClient
 
 
 class _ScheduleMixin:

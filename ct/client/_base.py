@@ -511,4 +511,15 @@ _FAULT_NAMES = {0: "none", 1: "open", 2: "OCP/SCP"}
 
 # Everything above, for `from ._base import *` in the client's modules --
 # underscore names included: the methods use private helpers and constants.
-__all__ = [_n for _n in list(globals()) if not _n.startswith("__")]
+# A LITERAL list, not computed: editors (Pylance/pyright) read __all__
+# statically, and a computed one left every star-imported helper
+# "not defined" -- goto definition stopped working. tests/test_star_exports.py
+# fails if this falls out of step with the module's globals.
+__all__ = [
+    "ACTIVE", "CLIENT_LOG_DIR", "CTConnectionError", "CTError", "CTLeaseError",
+    "CTTimeoutError", "Fid", "IDLE", "NewType", "Path", "PowerState", "PulseLog",
+    "Result", "SHV_ARMED", "SHV_COMPLETE", "SHV_FAULT", "SHV_IDLE", "SHV_RUNNING",
+    "SHV_STATE_NAMES", "SHV_STOP_REASON_NAMES", "SLEEP", "STANDBY", "STOP", "VOLTAGE",
+    "_FAULT_NAMES", "_STATE_NAMES", "contextmanager", "ct_update", "enum", "functools",
+    "inspect", "json", "math", "requests", "sys", "textwrap", "threading", "time",
+]

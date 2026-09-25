@@ -208,4 +208,53 @@ _SIM_LOCK = threading.Lock()
 
 
 # Every name above, for `from ... import *` (underscore names included).
-__all__ = [_n for _n in list(globals()) if not _n.startswith("__")]
+# A LITERAL list, not computed: editors (Pylance/pyright) read __all__
+# statically, and a computed one left every star-imported helper
+# "not defined" -- goto definition stopped working. tests/test_star_exports.py
+# fails if this falls out of step with the module's globals.
+__all__ = [
+    "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",
+    "BaseHTTPRequestHandler", "CALIB_DIR", "CH_FILAMENT_CURRENTS",
+    "CH_GET_BOARD_BITMAPS", "CH_GET_BOARD_CACHE", "CH_GET_BOARD_HEALTH",
+    "CH_GET_CACHED_CURRENTS", "CH_GET_DIAGNOSIS", "CH_GET_I2C_ENABLE_MASK",
+    "CH_GET_INA219", "CH_GET_PRESENT", "CH_READ_TCA9554", "CH_RESET_MUX",
+    "CH_SET_I2C_ENABLE_MASK", "CH_SET_POWER_STATE", "CH_TCA9554_SELF_TEST",
+    "CONTROLLERS", "ControllerLink", "DEAD_STATE_PATH", "DEFAULT_CHANNELS",
+    "DEFAULT_GROUP_SIZE", "ENERGISING_STATES", "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT",
+    "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
+    "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
+    "IDLE_CEILING_MA", "LAST_POWER_STATE", "LOADED_CRC", "LOADED_EMIT_FIDS",
+    "LOADED_PLAN", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S", "LOG_DIR", "NO_FILAMENT",
+    "ORDER_EPOCH", "PING_PAYLOAD", "PING_TYPE", "POLL_PAUSE_MAX_S", "POWER_SLOTS",
+    "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES", "POWER_STATE_SLEEP",
+    "POWER_STATE_STANDBY", "POWER_STATE_STOP", "POWER_STATE_VOLTAGE", "Path",
+    "PowerState", "RECORD_DIR", "RUN_REPORT_DIR", "SAFETY_ACTIVE_FALLBACK",
+    "SAFETY_ACTIVE_TIMEOUT_S", "SAFETY_HV_TIMEOUT_S", "SAFETY_TICK_S",
+    "SCAN_TELEMETRY_PERIOD_MS", "SCOPE_PER_CONTROLLER", "SET_EVENT_CONFIG", "SHV_ARM",
+    "SHV_CAPABILITY", "SHV_CLEAR_TABLE", "SHV_DISARM", "SHV_EMIT_CHUNK",
+    "SHV_FAULT_POLICY", "SHV_GET_ACTIVE_LIST", "SHV_GET_CONFIG", "SHV_GET_PULSE_LOG",
+    "SHV_GET_STATUS", "SHV_GET_TABLE_INFO", "SHV_HEAT_CHUNK", "SHV_HEAT_CLEAR",
+    "SHV_HEAT_GET_INFO", "SHV_HEAT_SET_ENTRIES", "SHV_SET_ACTIVE_LIST",
+    "SHV_SET_CONFIG", "SHV_SET_ENTRIES", "SHV_TRIGGER_DELAY", "STATE_DIR", "STATIC_DIR",
+    "TELEMETRY_MODE_CACHED", "TPS_STATUS_TIMEOUT_S", "TYPE_NAMES", "TcpProtocolClient",
+    "ThreadingHTTPServer", "UART_STATUS_NAMES", "_DEAD_LOCK", "_DIAG_CHIPS",
+    "_DailySizeRotatingHandler", "_EM_I_FULL_MA", "_HV_DS_CH", "_HV_FULL_V",
+    "_LIVE_PUSH", "_OCP_MA_PER_CODE", "_OCP_SENSE_RESISTOR_OHMS", "_ORDER_LOCK",
+    "_SIM_LOCK", "_SIM_STATE", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG",
+    "_coerce_bytes", "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable",
+    "_popcount", "_setup_logging", "_status_err", "_status_ok", "_suppress",
+    "_trigger_delay_one", "_u16", "_u32", "_unpack_spi_shot", "adc_get_burst",
+    "adc_pulse_arm", "adc_pulse_diag", "adc_pulse_disarm", "adc_ready_arm",
+    "adc_ready_disarm", "adc_ready_renew", "adc_ready_status", "adc_ring_peek",
+    "adc_ring_start", "adc_ring_stop", "adc_ring_window", "adc_ring_window_data",
+    "adc_spi_shot_arm", "adc_spi_shot_data", "annotations", "build_command_payload",
+    "build_payload", "check_heating_plan", "copy", "csv", "datetime",
+    "decode_shv_status", "enum", "fetch_bridge_info", "fetch_stm32_status", "json",
+    "log", "logging", "os", "parse_power_state", "power_state_name", "primary_local_ip",
+    "pulse_events_get", "scan_for_bridge", "stm32_adc_window", "stm32_ads1115",
+    "stm32_ds3502_get", "stm32_ds3502_set", "stm32_hv_clear_target",
+    "stm32_hv_enable_set", "stm32_hv_get_target", "stm32_hv_set_target",
+    "stm32_hv_status", "sync_get_burst_status", "sync_get_status", "sync_post_abort",
+    "sync_post_burst", "sync_post_burst_stop", "sync_post_config", "sync_post_fire",
+    "threading", "time", "trigger_delay_all", "trigger_delay_mismatch",
+]
