@@ -198,6 +198,7 @@ CH_GET_CACHED_CURRENTS = 0x3A    # CC-loop cached currents, NO I2C (run-safe tel
 
 
 CH_GET_BOARD_CACHE = 0x3D        # every board's cached V/I/presence, NO I2C (RP2350 fw: idle monitor)
+CH_GET_BOARD_HEALTH = 0x3E       # one channel's dark / lost / recovering state, NO I2C (RP2350 fw)
 
 
 CH_GET_PRESENT = 0x25            # I2C presence scan (mux/tps/ina/io per board)

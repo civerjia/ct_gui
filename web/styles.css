@@ -317,6 +317,9 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .status-tile.present { background: #eef7f3; }
 .status-tile.fault { background: #fbeae9; border-color: rgba(192,57,43,0.4); }
 .status-tile.absent { background: #f2efe9; opacity: 0.6; }
+.status-tile.lost { background: #fdf3e1; border: 1px dashed #d39e00; }            /* stopped answering: probed, will be restored */
+.status-tile.dark { background: #ece6f5; border: 1px dashed #7d5ba6; }            /* whole channel: mux not answering */
+.status-tile.recovering { box-shadow: inset 0 0 0 2px #d39e00; }
 /* channel masked off in the enable mask — dimmed + non-interactive */
 .status-tile.masked { opacity: 0.3; cursor: not-allowed; filter: grayscale(0.85); }
 .status-tile.selected { outline: 2px solid var(--accent); }

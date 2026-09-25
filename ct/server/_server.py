@@ -299,6 +299,15 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
             snap["status"], snap["status_at"] = st, now
             owns = st.get("state") in (1, 2) or (now - hint) < MONITOR_ARM_HINT_S
     snap["run_owns"] = owns
+    # Lost boards / dark channels: no I2C on the firmware side, so this one
+    # runs during a schedule run too, at the same 1 Hz.
+    if (now - snap.get("health_at", 0.0)) >= MONITOR_HEALTH_PERIOD_S:
+        try:
+            health = read_board_health(link, _scan_channels())
+        except Exception:
+            health = None
+        if health is not None:
+            snap["health"], snap["health_at"] = health, now
     if owns:
         # 1 Hz cache read (no I2C), then the push on top when it is on. No
         # bitmaps: that is I2C, and it belongs to the run.

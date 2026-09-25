@@ -94,6 +94,8 @@ MONITOR_RUN_STATUS_S = 1.0       # status + 0x3D cadence while a run owns the bo
 MONITOR_BITMAP_PERIOD_S = 2.0    # iso/tps-enable/fault bitmaps (TCA reads), idle only
 
 
+MONITOR_HEALTH_PERIOD_S = 1.0    # 0x3E (lost boards / dark channels), idle AND during a run: no I2C
+MONITOR_HEALTH_STALE_S = 5.0     # older than this, the health fields are not served
 MONITOR_STALE_S = 2.0            # a snapshot older than this is not served as data
 
 
@@ -182,6 +184,34 @@ def _pushed_boards(link: "ControllerLink") -> dict:
     return board
 
 
+def read_board_health(link: "ControllerLink", channels) -> dict | None:
+    """0x3E for every channel in `channels`: {ch: {dark, dark_for_ms, dark_count,
+    boards: {mux: {lost, recovering, fail_streak, probe_fails, lost_for_ms,
+    next_probe_ms, lost_count, recover_count}}}}. None if ANY channel's read
+    failed or the firmware does not know the command -- never a half answer."""
+    out: dict[int, dict] = {}
+    for c in channels:
+        c = int(c)
+        if not 0 <= c < 8:
+            continue
+        resp = link.request(CH_GET_BOARD_HEALTH, bytes([c]), flags=0, timeout=1.0)
+        raw = (resp.get("raw") if isinstance(resp, dict) else None) or []
+        if len(raw) < 9 + 8 * 15 or raw[0] != 0 or raw[1] != c:
+            return None
+        u16 = lambda i: raw[i] | (raw[i + 1] << 8)
+        u32 = lambda i: raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24)
+        boards = {}
+        for m in range(8):
+            o = 9 + m * 15
+            boards[m] = {"lost": bool(raw[o] & 0x01), "recovering": bool(raw[o] & 0x02),
+                         "fail_streak": raw[o + 1], "probe_fails": raw[o + 2],
+                         "lost_for_ms": u32(o + 3), "next_probe_ms": u32(o + 7),
+                         "lost_count": u16(o + 11), "recover_count": u16(o + 13)}
+        out[c] = {"dark": bool(raw[2] & 0x01), "dark_for_ms": u32(3), "dark_count": u16(7),
+                  "boards": boards}
+    return out
+
+
 def board_monitor_snapshot(cid: int) -> dict | None:
     """The monitor's latest snapshot for one controller, or None."""
     with _BOARD_MON_LOCK:
@@ -198,6 +228,8 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
     boards = snap.get("boards") or {}
     fresh = bool(boards) and (now - snap.get("boards_at", 0.0)) <= MONITOR_STALE_S
     bitmaps = snap.get("bitmaps") or {}
+    health = snap.get("health") or {}
+    health_ok = bool(health) and (now - snap.get("health_at", 0.0)) <= MONITOR_HEALTH_STALE_S
     rows = []
     for ch in range(8):
         for mux in range(8):
@@ -220,10 +252,21 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
                 ok = v is not None and (now - v[1]) <= MONITOR_BITMAP_HOLD_S
                 row[name] = bool(v[0]) if ok else False
                 row[f"{name}_valid"] = ok
+            # Dynamic failure / recovery (firmware 0x3E). Without it (old
+            # firmware, failed read) the fields are None: unknown, not "fine".
+            hc = health.get(ch) if health_ok else None
+            hb = (hc or {}).get("boards", {}).get(mux)
+            row["health_valid"] = hb is not None
+            row["channel_dark"] = hc["dark"] if hc else None
+            for k in ("lost", "recovering", "lost_for_ms", "next_probe_ms", "probe_fails",
+                      "lost_count", "recover_count"):
+                row[k] = hb[k] if hb else None
             rows.append(row)
     meta = {"age_ms": round((now - snap.get("boards_at", 0.0)) * 1000) if boards else None,
             "source": snap.get("source"), "run_owns": bool(snap.get("run_owns")),
-            "fresh": fresh}
+            "fresh": fresh,
+            "dark_channels": sorted(ch + 1 for ch, h in health.items() if h.get("dark"))
+            if health_ok else None}
     return rows, meta
 
 

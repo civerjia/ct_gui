@@ -375,7 +375,11 @@ function renderBoardGrid() {
       boardTiles.set(k, tile);
       grid.appendChild(tile);
     }
-    const cls = b.tps_fault ? 'fault' : b.present ? 'present' : 'absent';
+    // Dynamic failure (firmware 0x3E): a DARK channel and a LOST board are
+    // not "absent" -- the firmware is probing them and will bring them back
+    // to their commanded state. Say that, instead of blanking the cell.
+    const cls = b.channel_dark ? 'dark' : b.lost ? 'lost'
+      : b.tps_fault ? 'fault' : b.present ? 'present' : 'absent';
     tile.className = 'status-tile ' + cls + (boardSel.has(k) ? ' selected' : '')
       + (chEnabled(b.channel) ? '' : ' masked')
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');
@@ -389,6 +393,16 @@ function renderBoardGrid() {
     setDot(p.dotT, b.tps_enabled, 'T', b.tps_fault, b.tps_enabled_valid);
     setDot(p.dotF, b.tps_fault, 'F', b.tps_fault, b.tps_fault_valid);
     p.dash.hidden = b.present; p.vSpan.hidden = !b.present; p.iSpan.hidden = !b.present;
+    const secs = (ms) => (ms == null ? '?' : (ms / 1000).toFixed(ms < 10000 ? 1 : 0));
+    p.dash.textContent = b.channel_dark ? 'dark' : b.lost ? `lost ${secs(b.lost_for_ms)}s` : '—';
+    tile.title = b.channel_dark
+      ? `CH${b.channel + 1} is DARK: its mux stopped answering. The firmware probes it and restores every board when it returns.`
+      : b.lost
+        ? `${b.label} LOST for ${secs(b.lost_for_ms)} s (${b.probe_fails} failed probes, next in ${secs(b.next_probe_ms)} s). `
+          + 'It is brought back to its commanded state when it answers.'
+        : b.recovering ? `${b.label} recovering: back from a loss, returning to its commanded state (ACTIVE goes through IDLE first).`
+        : '';
+    tile.classList.toggle('recovering', !!b.recovering);
     if (b.present) {
       // null = not a reading (aged out / not measured) -- shown as a dash,
       // never as 0 V / 0 mA.
@@ -589,7 +603,10 @@ async function refreshBoards() {
   if (!j.ok) { bmMsg(j.error || 'snapshot failed'); return; }
   boardCache = (j.boards && j.boards.length) ? j.boards : emptyBoards();
   renderBoardGrid(); renderOneBoard();
-  bmMsg(`Power ${pwTarget} — ${boardCache.filter((b) => b.present).length}/64 present · current refresh ${pollHz()} Hz.`);
+  const lost = boardCache.filter((b) => b.lost).length;
+  const dark = j.dark_channels && j.dark_channels.length ? ` · DARK: CH${j.dark_channels.join(', CH')}` : '';
+  bmMsg(`Power ${pwTarget} — ${boardCache.filter((b) => b.present).length}/64 present`
+    + (lost ? ` · ${lost} lost (retrying)` : '') + dark + ` · current refresh ${pollHz()} Hz.`);
 }
 state.refreshBoards = refreshBoards;
 // Resync the Emission/Focus enable buttons to the actual hardware state.
