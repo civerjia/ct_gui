@@ -173,6 +173,15 @@ turns it off. A script warns once if the backend runs different code: restart
 `backend.py` to update it. Keep your own scripts out of git by naming them
 `*_local.py`.
 
+
+**Restart the backend remotely** -- from any machine, e.g. to pick up an
+update: `ct.restart_backend()`. It restarts in place, in the same terminal
+window (it prints `[ct] backend RESTARTED -- now pid ...`), re-opens the
+controller connections it had, and runs the update check on the way up. It is
+refused while a schedule is armed/running or another client holds the lease.
+If a start prints no `[ct_update]` line at all, the update check could not
+run; since 2026-09-25 it always says why.
+
 ## 9. Troubleshooting
 
 | Symptom | Cause / fix |
