@@ -52,10 +52,17 @@ def check(name: str, data: dict) -> list[str]:
         txt = repr(Result(data))
     except Exception as exc:                      # a formatter must never raise
         return [f"{name}: repr() raised {type(exc).__name__}: {exc}"]
-    # Nothing disappears. "ok" is in the header rather than the body.
+    # Nothing disappears from full(). "ok" is in the header rather than the
+    # body. The PRINT may hide firmware-level detail, but only behind the
+    # pulse table and only when it says so; full() must still carry every key.
+    full = Result(data).full()
     for k in data:
-        if k != "ok" and f"{k}:" not in txt and f"{k}=" not in txt:
-            problems.append(f"{name}: key {k!r} is not in the output")
+        if k != "ok" and f"{k}:" not in full and f"{k}=" not in full:
+            problems.append(f"{name}: key {k!r} is not in full()")
+    hidden = [k for k in data if k != "ok" and f"{k}:" not in txt and f"{k}=" not in txt]
+    if hidden and (not set(hidden) <= set(Result._PULSE_DETAIL)
+                   or "firmware detail hidden" not in txt):
+        problems.append(f"{name}: print hides {hidden} without saying so")
     for n, line in enumerate(txt.splitlines()):
         if len(line) > MAX_LINE and not unbreakable(line):
             problems.append(f"{name}: line {n} is {len(line)} chars and is "

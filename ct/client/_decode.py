@@ -41,11 +41,8 @@ class _DecodeMixin:
         8: "StateConflict — already armed or running; disarm first",
     }
 
-    _SHV_STATE_NAMES = {0: "idle", 1: "armed", 2: "running",
-                        3: "complete", 4: "fault"}
-    _SHV_STOP_REASON_NAMES = {0: "none", 1: "complete", 2: "read-back mismatch",
-                              3: "inter-pulse timeout", 4: "total timeout",
-                              5: "fault", 6: "disarmed"}
+    _SHV_STATE_NAMES = SHV_STATE_NAMES            # one table, in _base
+    _SHV_STOP_REASON_NAMES = SHV_STOP_REASON_NAMES
 
     def describe(self, result: dict) -> str:
         """One short English sentence describing any result dict this

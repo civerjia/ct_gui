@@ -37,6 +37,14 @@ import requests
 # are kept for backward compatibility / advanced use but are not raised by
 # any method here by default — every failure comes back as {"ok": False}.
 
+#: SHV run state and stop reason, as the firmware numbers them (RP2350
+#: simple_hv_schedule.h). One table for the printer and the decoder.
+SHV_STATE_NAMES = {0: "idle", 1: "armed", 2: "running", 3: "complete", 4: "fault"}
+SHV_STOP_REASON_NAMES = {0: "none", 1: "complete", 2: "read-back mismatch",
+                         3: "inter-pulse timeout", 4: "total timeout",
+                         5: "fault", 6: "disarmed"}
+
+
 class Result(dict):
     """A result dict that PRINTS readably and behaves exactly like a dict.
 
@@ -332,7 +340,7 @@ class Result(dict):
         def num(v, fmt="{:.0f}"):
             return "-" if v is None else fmt.format(v)
         rows = [("#", "fil", "t_on ms", "width us", "heat mA", "target", "diff")
-                + (("emission mA",) if paired else ()) + ("flags",)]
+                + (("emission mA", "mA*ms") if paired else ()) + ("flags",)]
         for n, r in enumerate(recs):
             m, t = r.get("heat_meas_mA"), r.get("heat_target_mA")
             heat = num(m) if m is not None else f"n/a ({r.get('heat_meas_unavailable') or '?'})"
@@ -346,7 +354,7 @@ class Result(dict):
                    num(m - t, "{:+.0f}") if m is not None and t is not None else "-")
             if paired:
                 e = meas[n] if isinstance(meas[n], dict) else {}
-                row += (num(e.get("emission_ma"), "{:.3f}"),)
+                row += (num(e.get("emission_ma"), "{:.3f}"), num(e.get("emission_mams"), "{:.2f}"))
             rows.append(row + (" ".join(flags) or "-",))
         widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
         out = [f"  pulses: [{len(recs)}]  (heat = RP2350 snapshot at the instant each pulse fired)"]
@@ -355,7 +363,38 @@ class Result(dict):
                                           for i, (c, w) in enumerate(zip(r, widths))).rstrip())
         return out
 
+    #: With a pulse table shown, these are firmware-level detail: the raw pulse
+    #: records (in the table), the per-pulse ADC internals (answer in the
+    #: table), the SHV status block (summarised on one `run:` line), the ADC
+    #: reference and the schedule-reuse note. Hidden from the PRINT only --
+    #: the dict and the call log keep every field; r.full() prints them all.
+    _PULSE_DETAIL = ("records", "measured", "status", "ref_mv", "schedule")
+    #: Status counters that mean something went wrong -- shown when non-zero.
+    _RUN_COUNTERS = ("mismatches", "off_mismatches", "uncounted", "underfed",
+                     "rbDropped", "rbStale", "rbSaturated", "unsafeSlots")
+
+    @classmethod
+    def _run_line(cls, st) -> list:
+        if not isinstance(st, dict) or "state" not in st:
+            return []
+        state = SHV_STATE_NAMES.get(st.get("state"), st.get("state"))
+        why = SHV_STOP_REASON_NAMES.get(st.get("stopReason"), st.get("stopReason"))
+        line = f"  run: {state}"
+        if why not in (None, "none", state):
+            line += f" ({why})"
+        if st.get("totalPulsesTarget") is not None:
+            line += f", {st.get('totalPulsesDone')}/{st.get('totalPulsesTarget')} pulses"
+        bad = [f"{k}={st[k]}" for k in cls._RUN_COUNTERS if st.get(k)]
+        return [line] + ([f"  firmware counters: {'  '.join(bad)}"] if bad else [])
+
+    def full(self) -> str:
+        """Every field, nothing hidden -- the firmware-level detail included."""
+        return self._render_all(brief=False)
+
     def __repr__(self) -> str:
+        return self._render_all(brief=True)
+
+    def _render_all(self, brief: bool) -> str:
         if not self:
             return "Result({})"
         head = "ok" if self.get("ok") else ("FAILED" if "ok" in self else "")
@@ -365,12 +404,18 @@ class Result(dict):
             if k in self and k not in done:
                 self._render(k, self[k], 2, out)
                 done.add(k)
-        out.extend(self._pulse_table(self))   # the answer, before the detail
+        table = self._pulse_table(self)
+        out.extend(table)   # the answer, before the detail
+        if table and brief:
+            out.extend(self._run_line(self.get("status")))
+            done.update(k for k in self._PULSE_DETAIL if k in self)
         for k, v in self.items():
             if k in done:
                 continue
             self._render(k, v, 2, out)
             done.add(k)
+        if table and brief:
+            out.append("  (firmware detail hidden -- r.full() prints every field; the call log keeps them all)")
         return (f"Result({head})" if head else "Result") + ("\n" + "\n".join(out) if out else "")
 
 
