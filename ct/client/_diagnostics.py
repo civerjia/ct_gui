@@ -1009,7 +1009,11 @@ class _DiagnosticsMixin:
                 "channels": [c + 1 for c in channels],
                 # Switches whose restore-to-OFF was confirmed. Short of the
                 # total means one may still be ON -- worth seeing, not hiding.
-                "restored_off": f"{restored}/{len(keys)}"}
+                "restored_off": f"{restored}/{len(keys)}",
+                # One line per switch is 48 lines of "pass": kept in the dict
+                # and r.full(), left out of the print (dead / stuck_on /
+                # inconclusive above name every switch that matters).
+                "_detail": ["results"]}
 
     # ── Test & measurement flows ──────────────────────────────────────────────
     # Ports of the GUI's "Calibration & Test" tab, so a flow can be run from a
