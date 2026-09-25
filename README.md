@@ -14,6 +14,7 @@ nothing talks to the hardware except through it.
 **API reference:** https://civerjia.github.io/ct_gui/ct/client.html -- every
 method, its arguments, what it returns and how it fails, rebuilt from the code
 on every push. **Client guide:** [docs/CT_SIMPLE_CONTROL_README.md](docs/CT_SIMPLE_CONTROL_README.md).
+**Tests, self-tests and calibration (tutorial):** [docs/TESTS_AND_CALIBRATION.md](docs/TESTS_AND_CALIBRATION.md).
 **Examples:** [examples/](examples/).
 
 ## 1. Install

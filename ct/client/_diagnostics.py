@@ -480,8 +480,8 @@ class _DiagnosticsMixin:
 
         WHAT THIS CANNOT TELL YOU: whether the bus wedged or the devices went
         quiet. Both arrive here as `missing`, and they send you to opposite
-        ends of the hardware. The RP2350's own counters separate them, over its
-        USB serial (`i2cstat`; no Python wrapper yet):
+        ends of the hardware. The RP2350's own counters separate them --
+        ct.i2c_stats() (the console's `i2cstat`):
 
             timeouts/recoveries/busClears/sdaStuck climbing
                 -> the BUS wedged, a slave was holding SDA
@@ -492,7 +492,7 @@ class _DiagnosticsMixin:
         Measured here: a channel whose entire board set read `missing` had
         timeouts=0, recoveries=0, sdaStuck=0 and only NACKs -- nothing had ever
         been stuck, and time spent on the I2C driver for it was time wasted.
-        `i2cstat clear` zeroes the counters, which is what makes a
+        ct.i2c_stats(clear=True) zeroes the counters, which is what makes a
         single-operation before/after measurement possible.
 
         Read-only, ~300 ms per controller. Returns {"ok", "controllers": {...}},
