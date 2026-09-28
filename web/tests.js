@@ -3,7 +3,8 @@
  *
  * 1. Filament Resistance   — all → STANDBY (0.8 V), read INA219, R = V/I.
  * 2. Emission short scan    — cold (SLEEP), emission −30 V @ 30 mA, pulse/filament.
- * 3. Focus leak scan        — focus −30 V, emission OFF, pulse/filament, watch emis V/I.
+ * 3. Focus leak scan        — cold (SLEEP), emission −30 V @ 20 mA, focus OFF; close each
+ *                             grid MOSFET, a focus reading near emission V = leak.
  * 4. Emission path R_eq     — cold (SLEEP) MOSFET test at n >= 3 emission voltages;
  *                             a line fit of I vs V per filament gives R_eq and Vf.
  * 5. Emission current calibration — per filament, sweep heating 1.0→2.5 A (0.25 A
@@ -591,95 +592,130 @@ async function test2() {
 }
 
 // =========================================================================
-// 3 — Focus leak scan (monitor emission V per filament)
+// 3 — Focus leak scan (emission ON, focus OFF, read focus V per filament)
 // =========================================================================
-// Focus ON, emission OFF. Per filament: turn on HV bit, read ADS1115
-// emission V, turn off. Plot what was measured. Leak if emiss_v > vThr.
+// No heating (every filament at SLEEP: iso rail on, cold). Emission ON at
+// −V with a 20 mA limit, focus OFF (wiper 0). Per filament: close its grid
+// MOSFET, read the ADS1115 focus voltage, open it. A filament whose focus side
+// is connected to its emission side (a leak) pulls the focus reading up to
+// about the emission voltage; a healthy one leaves focus at its baseline.
+// The baseline (focus with every switch open) is read before the scan and
+// again after it: the focus reading at rest is not 0 V, so each filament is
+// judged by how far it moved focus from that baseline toward the emission
+// voltage -- leak if it covered at least `leak %` of the distance.
 async function test3() {
-  const magV = Math.abs(parseFloat($t('t3V').value) || 30);
+  const emV = Math.abs(parseFloat($t('t3V').value) || 30);
   const settleMs = Math.max(30, parseInt($t('t3Width').value, 10) || 200);
-  const vThr = parseFloat($t('t3VThr').value) || 10;
-
+  const frac = Math.min(1, Math.max(0.05, (parseFloat($t('t3VThr').value) || 80) / 100));
+  const limitMa = Math.max(1, parseFloat($t('t3Limit').value) || 20);
+  if (emV > 350) { tMsg(`emission ${emV} V is above the 350 V rail`, 'bad'); return; }
+  // Never write a setpoint over a rail someone else left live.
+  if (await hvIsOn('emission')) { tMsg('Emission is already ON — turn it off first; this test sets its own voltage.', 'bad'); return; }
+  if (await hvIsOn('focus')) { tMsg('Focus is ON — turn it off first; this test needs focus OFF.', 'bad'); return; }
+  if (await anyRunning()) { tMsg('A schedule is running — not testing now.', 'bad'); return; }
+  const st = await tGetJ('/api/status');
+  const conn = new Set(Object.entries((st && st.controllers) || {}).filter(([, c]) => c && c.connected).map(([k]) => +k));
   const fmap = await loadFilMap();
-  const fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
+  let fils = Object.keys(fmap).map(Number).filter((f) => conn.has(fmap[f].ctrl)).sort((a, b) => a - b);
 
   const hvBit = (ctrl, ch, bit, val) =>
     tPostJ('/api/cmd', { controller: ctrl, command: 'HV_SET_BIT', channel: ch, bit, value: val, force: true });
+  // Focus and emission magnitudes, averaged over n ADS reads; null if none read.
+  const readBoth = async (n) => {
+    let sf = 0, se = 0, k = 0;
+    for (let i = 0; i < n; i++) {
+      const a = await readAds();
+      if (a && a.ok && a.focus_v != null && a.emiss_v != null) { sf += Math.abs(+a.focus_v); se += Math.abs(+a.emiss_v); k++; }
+      if (i < n - 1) await tSleep(60);
+    }
+    return k ? { foc: sf / k, em: se / k } : null;
+  };
 
-  let lastBit = null;
-  const items = [], leaks = [];
-
-  // Respect pre-existing focus state — if already on, keep the user's wiper
-  const focWasOn = await hvIsOn('focus');
-  let priorFocWiper = null;
-  if (focWasOn) priorFocWiper = await readWiper('fv');
-
-  // Clear plot immediately so old data never shows
-  drawBars('t3Plot', [], { yLabel: 'Vem (V)', yMax: magV * 1.1, fmt: (v) => v.toFixed(1) });
+  let lastBit = null, prepped = [];
+  const items = [], leaks = [], results = {};
+  let base0 = null, base1 = null, railRead = null, nLeak = 0, nOk = 0, nSkip = 0;
+  drawBars('t3Plot', [], { yLabel: 'Vfocus (V)', yMax: emV * 1.1, fmt: (v) => v.toFixed(1) });
 
   try {
-    // Zero the emission voltage wiper so the emission rail sits at ~0 V baseline
-    // regardless of whether the STM32 supply enable can be toggled. The leak
-    // measurement only needs emiss_v ≈ 0; it does not require the supply to be
-    // fully disabled. Try to disable too, but don't abort if the STM32 refuses.
-    tMsg('Zeroing emission wiper…');
-    await dsWrite('ev', 0);
-    await hvEnable('emission', false);
-    await tSleep(400);
-    const p = await tPostJ('/api/filament-prep', { state: 2 });
-    if (!p.ok) { tMsg('Sleep failed: ' + (p.error || ''), 'bad'); return; }
+    // Cold, on the iso rail: STOP then SLEEP (never skip a step). No heating.
+    tMsg(`Focus leak scan: SLEEP ${fils.length} filaments (cold)…`);
+    await tPostJ('/api/filament-prep', { state: 1, filaments: fils });
+    const sl = await tPostJ('/api/filament-prep', { state: 2, filaments: fils });
+    if (!sl.ok) { tMsg('SLEEP failed: ' + (sl.error || ''), 'bad'); return; }
+    const skipped = new Set([...(sl.dead_skipped || [])]);
+    fils = fils.filter((f) => !skipped.has(f));
+    prepped = fils.slice();
 
-    if (focWasOn) {
-      tMsg(`Focus already ON (keeping current setpoint wiper=${priorFocWiper})…`);
-    } else {
-      tMsg(`Focus → −${magV} V…`);
-      if (!(await setHvAndWait('focus', magV))) return;
-      await hvEnable('focus', true);
+    await lutZeroV('focus');                                   // focus stays OFF, wiper 0
+    await setEmiLimit(limitMa);
+    tMsg(`Emission → −${emV} V (limit ${limitMa} mA), focus OFF…`);
+    if (!(await setHvAndWait('emission', emV))) return;
+    await hvEnable('emission', true);
+    await tSleep(500);
+    railRead = await lutMeasV('emission', 3);
+    if (railRead == null || Math.abs(railRead) < 0.9 * emV || Math.abs(railRead) > 1.1 * emV) {
+      tMsg(`Emission rail did not reach −${emV} V (read ${railRead == null ? 'nothing' : railRead.toFixed(1) + ' V'}) — not scanning. `
+        + 'Check the emission current limit and the HV LUT.', 'bad');
+      return;
     }
-    await tSleep(200);
+    base0 = await readBoth(3);
+    if (!base0) { tMsg('ADS1115 read failed — cannot read the focus baseline; not scanning.', 'bad'); return; }
+    tMsg(`Baseline (all switches open): focus ${base0.foc.toFixed(1)} V, emission ${base0.em.toFixed(1)} V. Scanning ${fils.length} filaments…`);
 
-    tMsg(`Scanning ${fils.length} filaments…`);
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted.'); break; }
       const f = fils[i], m = fmap[f];
       tMsg(`Focus leak: ${i + 1}/${fils.length} (F${f} · ${filBoard(m)})…`);
-
       lastBit = { ctrl: m.ctrl, ch: m.ch, pos: m.pos };
-      await hvBit(m.ctrl, m.ch, m.pos, 1);
+      const on = await hvBit(m.ctrl, m.ch, m.pos, 1);
       await tSleep(settleMs);
-      const ads = await readAds();
+      const r = (on && on.ok) ? await readBoth(2) : null;
       await hvBit(m.ctrl, m.ch, m.pos, 0);
       lastBit = null;
-
-      if (!ads || !ads.ok) {
-        tMsg(`F${f}: ADS1115 read failed (${(ads && ads.error) || 'no response'}) — skipping`, 'bad');
-        items.push({ f, value: 0, cls: 'skip' });
-        drawBars('t3Plot', items, { yLabel: 'Vem (V)', yMax: Math.max(magV * 1.1, vThr * 2), fmt: (v) => v.toFixed(1) });
-        continue;
+      const span = r ? r.em - base0.foc : 0;           // what a full leak would add
+      if (!on || !on.ok || !r || span < 5) {
+        const why = !on || !on.ok ? `switch command failed (${(on && on.error) || 'no reply'})`
+          : !r ? 'ADS1115 read failed' : `emission ${r.em.toFixed(1)} V too close to the focus baseline to judge`;
+        results[f] = { verdict: 'unmeasured', reason: why };
+        items.push({ f, value: 0, cls: 'skip' }); nSkip++;
+        tMsg(`F${f} (${filBoard(m)}): unmeasured — ${why}`, 'bad');
+      } else {
+        const ratio = (r.foc - base0.foc) / span;
+        const leak = ratio >= frac;
+        results[f] = { focus_v: +r.foc.toFixed(1), emission_v: +r.em.toFixed(1), ratio: +ratio.toFixed(3), verdict: leak ? 'leak' : 'ok' };
+        items.push({ f, value: r.foc, cls: leak ? 'leak' : 'ok' });
+        if (leak) { nLeak++; leaks.push(`F${f} (${filBoard(m)}): focus ${r.foc.toFixed(1)} V vs emission ${r.em.toFixed(1)} V (${Math.round(ratio * 100)}%)`); }
+        else nOk++;
       }
-      const vEm = Math.abs(ads.emiss_v);
-      tMsg(`F${f} (${filBoard(m)}): emiss_v=${ads.emiss_v?.toFixed(1)} V (|${vEm.toFixed(1)}| V) codes=[${(ads.codes||[]).join(',')}]`);
-      const leak = vEm > vThr;
-      items.push({ f, value: vEm, cls: leak ? 'leak' : 'ok' });
-      if (leak) leaks.push(`F${f} (${filBoard(m)}): Vem ${vEm.toFixed(1)} V`);
-      drawBars('t3Plot', items, { yLabel: 'Vem (V)', yMax: Math.max(magV * 1.1, vThr * 2), fmt: (v) => v.toFixed(1) });
+      drawBars('t3Plot', items, { yLabel: 'Vfocus (V)', yMax: emV * 1.1, fmt: (v) => v.toFixed(1) });
     }
-
-    testResult('t3Result', {
-      title: 'Focus leak scan', pass: leaks.length === 0,
-      counts: [{ n: fils.length, label: 'tested' }, { n: leaks.length, label: 'leak', bad: leaks.length > 0 }],
-      flagged: leaks,
-    });
-    tMsg(`Focus leak scan done — ${leaks.length ? leaks.length + ' leak' : 'no leak'}.`, leaks.length ? 'bad' : '');
-
+    base1 = await readBoth(3);
   } finally {
     if (lastBit) await hvBit(lastBit.ctrl, lastBit.ch, lastBit.pos, 0);
-    if (focWasOn) {
-      if (priorFocWiper != null) await dsWrite('fv', priorFocWiper);
-    } else {
-      await hvEnable('focus', false); await lutZeroV('focus');
-    }
+    // HV comes down FIRST, then the filaments.
+    await hvEnable('emission', false); await lutZeroV('emission');
+    if (prepped.length) await tPostJ('/api/filament-prep', { state: 1, filaments: prepped });
   }
+  if (!base0) return;
+  // A focus reading that did not come back to its baseline after the scan means
+  // the per-filament readings were riding on something else: say so.
+  const drift = base1 ? base1.foc - base0.foc : null;
+  const driftBad = drift == null || Math.abs(drift) > 0.25 * Math.max(5, (railRead ? Math.abs(railRead) : emV) - base0.foc);
+  testResult('t3Result', {
+    title: 'Focus leak scan', pass: nLeak === 0 && nSkip === 0 && !driftBad && fils.length > 0,
+    counts: [{ n: fils.length, label: 'tested' }, { n: nOk, label: 'ok' },
+             { n: nLeak, label: 'leak', bad: nLeak > 0 }, { n: nSkip, label: 'unmeasured', bad: nSkip > 0 }],
+    note: `emission −${emV} V (read ${railRead == null ? '?' : Math.abs(railRead).toFixed(1)} V) @ ${limitMa} mA · focus baseline `
+      + `${base0.foc.toFixed(1)} → ${base1 ? base1.foc.toFixed(1) : '?'} V after · leak ≥ ${Math.round(frac * 100)}% of the way to emission`
+      + (driftBad ? ' · ⚠ focus baseline did not return — results unreliable' : ''),
+    flagged: leaks,
+  });
+  const save = await tPostJ('/api/calibration/save', { name: 'focus_leak_scan',
+    data: { params: { emissionV: -emV, limitMa, settleMs, leakFrac: frac }, rail_v: railRead,
+            baseline: { before: base0, after: base1 }, results } });
+  tMsg(`Focus leak scan done — ${nLeak} leak, ${nOk} ok, ${nSkip} unmeasured`
+    + (driftBad ? ' · focus baseline drifted' : '') + (save && save.ok ? ' · saved' : ' · NOT saved'),
+  (nLeak || nSkip || driftBad) ? 'bad' : '');
 }
 
 // =========================================================================
@@ -951,11 +987,12 @@ const TESTS_HTML = `
   </div>
 
   <div class="test-block" id="testBlock3">
-    <div class="block-title" title="Focus ON (−V), emission OFF, wiper=0. Per filament: close switch, read ADS1115 emission voltage, open. Normal baseline ≈ −2.4 V. If focus leaks through the filament to the emission rail, emission V rises toward the focus setpoint.">3 · Focus leak scan <span class="hint">ⓘ</span></div>
+    <div class="block-title" title="No heating (filaments SLEEP). Emission ON at −V with the current limit, focus OFF. Per filament: close its grid MOSFET, read the ADS1115 focus voltage, open it. A leak pulls focus up to about the emission voltage; judged against the focus baseline read with every switch open (before and after the scan). HV off first — the test refuses to start with emission or focus on.">3 · Focus leak scan <span class="hint">ⓘ</span></div>
     <div class="test-params">
-      <label class="numlabel">focus −V<input id="t3V" type="number" min="0" max="1000" value="30" /></label>
+      <label class="numlabel">emission −V<input id="t3V" type="number" min="0" max="350" value="30" /></label>
+      <label class="numlabel">limit mA<input id="t3Limit" type="number" min="1" max="85" value="20" /></label>
       <label class="numlabel">settle ms<input id="t3Width" type="number" min="30" max="1000" value="200" /></label>
-      <label class="numlabel">leak V<input id="t3VThr" type="number" min="0" value="10" /></label>
+      <label class="numlabel">leak %<input id="t3VThr" type="number" min="5" max="100" value="80" /></label>
       <button class="xs quick test-run" id="t3Run">Run</button>
     </div>
     <canvas id="t3Plot" class="test-plot"></canvas>

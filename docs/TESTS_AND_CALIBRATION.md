@@ -667,7 +667,12 @@ by the code rather than hidden:
 - **R₀ sweep** does not fit on this bench with its defaults (the current does
   not move enough; the filament is not in thermal equilibrium per step).
 - **Emission rail at 30 mA** stops near 65 V; use ≤ 60 V there, 55 mA at 200 V.
-- **Focus leak scan (GUI test 3)** reads the one shared emission-rail voltage
-  against a fixed threshold with no baseline, so a leak that is present with
-  every switch open flags **every** filament. Take its result as "there is a
-  leak", not "these filaments leak".
+- **Focus leak scan (GUI test 3)** — rewritten 2026-09-28: no heating
+  (filaments at SLEEP), emission ON at −30 V with a 20 mA limit, focus OFF.
+  Each filament's grid MOSFET is closed in turn and the focus voltage read; a
+  leak pulls focus up to about the emission voltage. The focus reading at rest
+  is not 0 V, so it is judged against the focus baseline (every switch open,
+  read before and after the scan): leak when a filament moves focus ≥ 80 % of
+  the way to the emission voltage. A baseline that does not come back is
+  reported as "results unreliable". Refuses to start with emission or focus on.
+  Not yet run on hardware.
