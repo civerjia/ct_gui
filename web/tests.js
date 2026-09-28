@@ -21,8 +21,10 @@ import { state } from './state.js';
 
 // ---- scaling ----------------------------------------------------------------
 const ADS_MV_PER_COUNT = 6144 / 32768;
-const HV_FULL_V = { emission: 350, focus: 1000 };
-const voltToCount = (chan, magV) => Math.round((Math.abs(magV) / HV_FULL_V[chan] * 5000) / ADS_MV_PER_COUNT);
+const HV_FULL_V = { emission: 350, focus: 1000 };   // wiper scale (hardcodedWiper)
+// ADS pin volts per HV volt. Focus: Vpin = -V_focus * 0.009008 (the ESP32's focus_v uses the same).
+const ADS_V_PER_HV_V = { emission: 5 / HV_FULL_V.emission, focus: 0.009008 };
+const voltToCount = (chan, magV) => Math.round((Math.abs(magV) * ADS_V_PER_HV_V[chan] * 1000) / ADS_MV_PER_COUNT);
 const EMI_FULL_MA = 85.7;
 const emiLimitWiper = (mA) => Math.max(0, Math.min(127, Math.round(mA / EMI_FULL_MA * 127)));
 // THE single conversion from a raw STM32 ADC count to emission mA --
