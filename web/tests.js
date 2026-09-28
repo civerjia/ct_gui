@@ -21,9 +21,11 @@ import { state } from './state.js';
 
 // ---- scaling ----------------------------------------------------------------
 const ADS_MV_PER_COUNT = 6144 / 32768;
-const HV_FULL_V = { emission: 350, focus: 1000 };   // wiper scale (hardcodedWiper)
+// Wiper 127 -> these rail magnitudes: the no-LUT fallback only. Same numbers
+// as the backend's _HV_FULL_V (focus clips near 495 V, not 1000).
+const HV_FULL_V = { emission: 350, focus: 495 };
 // ADS pin volts per HV volt. Focus: Vpin = -V_focus * 0.009008 (the ESP32's focus_v uses the same).
-const ADS_V_PER_HV_V = { emission: 5 / HV_FULL_V.emission, focus: 0.009008 };
+const ADS_V_PER_HV_V = { emission: 5 / 350, focus: 0.009008 };
 const voltToCount = (chan, magV) => Math.round((Math.abs(magV) * ADS_V_PER_HV_V[chan] * 1000) / ADS_MV_PER_COUNT);
 const EMI_FULL_MA = 85.7;
 const emiLimitWiper = (mA) => Math.max(0, Math.min(127, Math.round(mA / EMI_FULL_MA * 127)));
@@ -142,24 +144,26 @@ function lutWiperForV(chan, magV) {
   }
   return { wiper: last.w, expectV: sign * last.m, clamped: true };
 }
-// Linear wiper estimate, used as a fallback when there is no usable LUT point
-// (no calibration, or the request is outside the LUT's calibrated range):
+// Linear wiper estimate, used ONLY when there is no LUT at all:
 // wiper ≈ |V| / full-scale × 127. Approximate — gets HV into the right ballpark.
 const hardcodedWiper = (chan, magV) => Math.max(0, Math.min(127, Math.round(Math.abs(magV) / HV_FULL_V[chan] * 127)));
-// Set a channel to a target magnitude. Prefers the calibrated LUT; falls back to
-// the hardcoded linear formula when the LUT is missing or the request is out of
-// its range, so a missing/partial calibration never blocks a test. Returns
-// {ok, wiper, expectV, method} — method 'lut' | 'formula(no-LUT)' | 'formula(out-of-LUT)'.
+// Set a channel to a target magnitude from the calibrated LUT. A request outside
+// the LUT's range is CLAMPED to its end (above the top -> the top wiper, the
+// most the rail was measured to reach) and reported (clamped: true) -- the same
+// as the backend's /api/hv/set-v. The linear formula is used only with no LUT.
+// Returns {ok, wiper, expectV, clamped, method} — method 'lut' | 'lut(clamped)' | 'formula(no-LUT)'.
 async function lutSetV(chan, magV) {
   if (!lutCache[chan]) await lutLoad(chan);
   const hit = lutWiperForV(chan, magV);
-  if (hit && !hit.clamped) {
+  if (hit) {
     const j = await dsWrite(HV_V_CH[chan].ds, hit.wiper);
-    return { ...j, ok: j.ok, wiper: hit.wiper, expectV: hit.expectV, method: 'lut' };
+    return { ...j, ok: j.ok, wiper: hit.wiper, expectV: hit.expectV, clamped: hit.clamped,
+             method: hit.clamped ? 'lut(clamped)' : 'lut' };
   }
   const w = hardcodedWiper(chan, magV);
   const j = await dsWrite(HV_V_CH[chan].ds, w);
-  return { ...j, ok: j.ok, wiper: w, expectV: -Math.abs(magV), method: hit ? 'formula(out-of-LUT)' : 'formula(no-LUT)' };
+  return { ...j, ok: j.ok, wiper: w, expectV: -(w / 127 * HV_FULL_V[chan]), clamped: false,
+           method: 'formula(no-LUT)' };
 }
 // Safe teardown: zero the voltage wiper (replaces the old hv-clear-target).
 const lutZeroV = (chan) => dsWrite(HV_V_CH[chan].ds, 0);
@@ -216,8 +220,10 @@ async function lutCalibrate(chan, opts = {}) {
 async function setHvAndWait(chan, magV, timeoutMs = 8000) {
   const r = await lutSetV(chan, magV);
   if (!r.ok) { tMsg(`HV ${chan} not set — DS3502 wiper write failed (${r.error || r.status || '?'}).`, 'bad'); return false; }
-  if (r.method !== 'lut') {
-    tMsg(`⚠ ${chan} −${Math.abs(magV)} V set via formula (wiper ${r.wiper}) — ${r.method.includes('no-LUT') ? 'no LUT; Calibrate for accuracy' : 'outside LUT range'}.`, 'bad');
+  if (r.clamped) {
+    tMsg(`⚠ ${chan} −${Math.abs(magV)} V is outside the LUT range — set to ≈${Math.round(r.expectV)} V (wiper ${r.wiper}).`, 'bad');
+  } else if (r.method !== 'lut') {
+    tMsg(`⚠ ${chan} −${Math.abs(magV)} V set via formula (wiper ${r.wiper}) — no LUT; Calibrate for accuracy.`, 'bad');
   }
   await tSleep(Math.min(timeoutMs, 600));                    // direct wiper settles fast
   return true;
