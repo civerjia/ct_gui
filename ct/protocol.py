@@ -1775,9 +1775,30 @@ def stm32_hv_enable_set(host: str, ch: str, on: bool) -> dict[str, Any]:
     return _stm32_post(host, "/stm32/hv_enable", {"ch": str(ch), "on": "1" if on else "0"})
 
 
+# FOCUS_V divider, ADS1115 ch1: the pin sees Vout = -V_focus * 0.009008.
+# Converted HERE, from the raw pin mV the ESP32 sends, so a new divider only
+# needs this number changed -- no ESP32 reflash. The ESP32's own focus_v
+# (0-5 V -> 0..-1000 V, out of date) is replaced.
+FOCUS_ADS_V_PER_HV_V = 0.009008
+
+
+def focus_hv_volts(pin_mv: float) -> float:
+    """Focus rail volts (negative) from the ADS1115 ch1 pin voltage in mV."""
+    return -(pin_mv / 1000.0) / FOCUS_ADS_V_PER_HV_V
+
+
 def stm32_ads1115(host: str) -> dict[str, Any]:
-    """Read the 4 ADS1115 channels (raw codes, mV, engineering units)."""
-    return _stm32_get_json(host, "/stm32/ads1115")
+    """Read the 4 ADS1115 channels (raw codes, mV, engineering units).
+    focus_v is computed here from mv[1] (see FOCUS_ADS_V_PER_HV_V); a reply
+    without it has no focus_v at all rather than the ESP32's stale value."""
+    r = _stm32_get_json(host, "/stm32/ads1115")
+    if isinstance(r, dict) and "focus_v" in r:
+        mv = r.get("mv")
+        try:
+            r["focus_v"] = round(focus_hv_volts(float(mv[1])), 1)
+        except (TypeError, ValueError, IndexError):
+            r.pop("focus_v", None)
+    return r
 
 
 def stm32_adc_window(host: str, n: int = 1000) -> dict[str, Any]:
