@@ -181,13 +181,43 @@ def _safety_schedule_running() -> tuple[bool, str | None]:
     return False, None
 
 
-def note_power_state(fids, state: int) -> None:
+# The IDLE current (mA) each FID was last commanded to -- what a timed ACTIVE
+# returns to when the caller does not name one.
+LAST_IDLE_MA: dict[int, int] = {}
+
+
+# Timed ACTIVE: FID -> (monotonic deadline, IDLE mA to return to). Set by the
+# state endpoints when an ACTIVE command carries active_s; the deadline loop
+# walks the filament back to IDLE when it passes. ANY later state command for
+# that FID clears it (note_power_state), so a STOP or a new IDLE always wins.
+ACTIVE_DEADLINES: dict[int, tuple[float, int]] = {}
+
+
+def note_power_state(fids, state: int, args=None) -> None:
+    """Record CONFIRMED power-state commands. `args`: the mA each FID was given
+    ({fid: mA}, or one number for all) -- kept for IDLE, as a timed ACTIVE's
+    default return current."""
     now = time.monotonic()
-    for f in fids:
-        LAST_POWER_STATE[int(f)] = (int(state), now)
+    with _SAFETY_LOCK:
+        for f in fids:
+            LAST_POWER_STATE[int(f)] = (int(state), now)
+            ACTIVE_DEADLINES.pop(int(f), None)
+            if int(state) == POWER_STATE_IDLE and args is not None:
+                a = args.get(int(f)) if isinstance(args, dict) else args
+                if a is not None:
+                    LAST_IDLE_MA[int(f)] = int(a)
     # Every power-state COMMAND funnels through here, which makes it the one
     # place the dead-man timer has to be renewed from. Reads do not reach it.
     safety_touch_filaments(fids, now)
+
+
+def set_active_deadlines(fids, active_s: float, idle_ma: dict) -> None:
+    """Start the timed-ACTIVE clock for FIDs that just LANDED at ACTIVE. Call
+    after note_power_state (which clears any previous deadline)."""
+    until = time.monotonic() + float(active_s)
+    with _SAFETY_LOCK:
+        for f in fids:
+            ACTIVE_DEADLINES[int(f)] = (until, int(idle_ma[int(f)]))
 
 
 def ladder_blocks_active(fid: int, arrival: str | None = None,
@@ -253,7 +283,7 @@ __all__ = [
     "DEFAULT_GROUP_SIZE", "ENERGISING_STATES", "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT",
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
-    "IDLE_CEILING_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
+    "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
     "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "POLL_PAUSE_MAX_S",
     "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES",
     "POWER_STATE_SLEEP", "POWER_STATE_STANDBY", "POWER_STATE_STOP",
@@ -281,7 +311,7 @@ __all__ = [
     "adc_spi_shot_data", "annotations", "build_command_payload", "build_payload",
     "copy", "csv", "datetime", "decode_shv_status", "enum", "fetch_bridge_info",
     "fetch_stm32_status", "json", "ladder_blocks_active", "log", "logging",
-    "note_power_state", "os", "parse_power_state", "power_state_name",
+    "note_power_state", "os", "set_active_deadlines", "parse_power_state", "power_state_name",
     "primary_local_ip", "pulse_events_get", "safety_touch_filaments", "scan_for_bridge",
     "stm32_adc_window", "stm32_ads1115", "stm32_ds3502_get", "stm32_ds3502_set",
     "stm32_hv_clear_target", "stm32_hv_enable_set", "stm32_hv_get_target",

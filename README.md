@@ -124,6 +124,13 @@ with ct.lease(ttl=120, note="emission test F8"):       # write access (see below
 - **Batches:** `stop_all / sleep_all / standby_all()`,
   `idle_all(default_ma=1000)`, `active_all(...)` -- every live filament, or
   `filaments=[...]`; one frame per controller, all channels in parallel.
+- **Heating time limit:** `active_one(F, 2600, active_s=20)` holds ACTIVE for
+  20 s, then the **backend** returns the filament to IDLE -- at the IDLE current
+  it was last given, or `then_idle_ma=1500`. The clock is in the backend, so it
+  still fires if the script dies. Any later STOP/IDLE/ACTIVE for that filament
+  cancels it; while a schedule is armed or running it waits for the run to end.
+  `active_all(filaments=[...], default_ma=2600, active_s=20)` does the same for
+  a batch. Time left: `GET /api/safety` -> `timed_active`.
 - **The lease** (`with ct.lease(...)`) gives this script exclusive WRITE access;
   other clients' writes are refused meanwhile. Reads never need it. It expires
   on its own if the script dies.

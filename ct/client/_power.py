@@ -24,7 +24,8 @@ class _PowerMixin:
     # ── power state ───────────────────────────────────────────────────────────
 
     def _prep(self, state: int, filaments=None,
-              currents: dict | None = None, arg: int = 0) -> dict:
+              currents: dict | None = None, arg: int = 0,
+              extra: dict | None = None) -> dict:
         self._ensure_keepalive(state)
         # USER_INDEX values this call actually asked for that the dead mask
         # drops BEFORE anything is sent — _live()'s filtering is invisible
@@ -61,7 +62,7 @@ class _PowerMixin:
         if live is not None and len(live) == 0:
             return {"ok": True, "applied": 0, "failed": [], "skipped_dead": True,
                     "dead_skipped": dead_skipped}
-        body: dict = {"state": state, "arg": arg}
+        body: dict = {"state": state, "arg": arg, **(extra or {})}
         if live is not None:
             body["filaments"] = live
         if currents:
@@ -84,6 +85,10 @@ class _PowerMixin:
             if isinstance(row, dict) and isinstance(row.get("ladder_reasons"), dict):
                 row["ladder_reasons"] = {str(self._user_index_of(int(k))): v
                                          for k, v in row["ladder_reasons"].items()}
+        # then_idle_ma (timed ACTIVE) is keyed by FID too.
+        if isinstance(r.get("then_idle_ma"), dict):
+            r["then_idle_ma"] = {str(self._user_index_of(int(k))): v
+                                 for k, v in r["then_idle_ma"].items()}
         if dead_skipped:
             r["dead_skipped"] = dead_skipped
         return r
@@ -328,7 +333,13 @@ class _PowerMixin:
                    verify: bool = False,          # wait until every commanded
                                                    # filament has settled
                    tolerance_ma: float = 150.0,   # only used if verify=True
-                   timeout_s: float = 10.0) -> dict:  # only used if verify=True
+                   timeout_s: float = 10.0,       # only used if verify=True
+                   active_s: float | None = None,     # hold ACTIVE this long,
+                                                       # then the BACKEND returns
+                                                       # each filament to IDLE
+                   then_idle_ma: float | None = None) -> dict:  # IDLE current to
+                                                       # return to; None = each
+                                                       # filament's last IDLE current
         """ACTIVE a BATCH of filaments, excluding the dead mask.
         For exactly one filament, use active_one() instead.
 
@@ -337,8 +348,17 @@ class _PowerMixin:
 
         verify=True: as idle_all's -- one bulk wait for the whole batch, the
         outcome under result["heating"], the stragglers in `not_reached`.
+
+        active_s: a heating time limit -- see active_one(). Needs an explicit
+        `filaments` list. result["then_idle_ma"] = {filament: mA} for every
+        filament whose clock was started.
         """
-        r = self._prep(ACTIVE, filaments, currents, arg=int(default_ma))
+        extra = self._timed_active_body(active_s, then_idle_ma)
+        if isinstance(extra, str):
+            return {"ok": False, "error": extra}
+        if extra and filaments is None:
+            return {"ok": False, "error": "active_s needs an explicit filaments list"}
+        r = self._prep(ACTIVE, filaments, currents, arg=int(default_ma), extra=extra)
         return (self._verify_batch(r, currents, default_ma, tolerance_ma, timeout_s)
                 if verify else r)
 
@@ -385,6 +405,28 @@ class _PowerMixin:
     # disconnected controller, or a board that simply didn't ACK all come
     # back as {"ok": False, "error": "...", ...} — check "ok" yourself.
 
+    def _timed_active_body(self, active_s, then_idle_ma):
+        """The request fields for a timed ACTIVE: {} when not timed, the fields
+        when valid, an error string when not. Range checks are repeated by the
+        backend; these just say it before anything is sent."""
+        if active_s is None:
+            if then_idle_ma is not None:
+                return "then_idle_ma needs active_s (it is what a timed ACTIVE returns to)"
+            return {}
+        try:
+            secs = float(active_s)
+        except (TypeError, ValueError):
+            return f"active_s must be a number of seconds, got {active_s!r}"
+        if not secs > 0:
+            return f"active_s must be > 0, got {active_s!r}"
+        extra = {"active_s": secs}
+        if then_idle_ma is not None:
+            ma = int(then_idle_ma)
+            if not (0 < ma <= self._IDLE_CEILING_MA):
+                return f"then_idle_ma {ma} out of range 1..{self._IDLE_CEILING_MA} mA"
+            extra["then_idle_ma"] = ma
+        return extra
+
     def _idle_ceiling_refusal(self, filament, arg: int) -> dict | None:
         """The refusal an over-ceiling IDLE gets, or None if it is in range.
 
@@ -429,7 +471,8 @@ class _PowerMixin:
             if self._keepalive_stop is None:
                 self._keepalive_stop = self._start_keepalive()
 
-    def _state_one(self, filament: int, state: int, arg: int, op: str) -> dict:
+    def _state_one(self, filament: int, state: int, arg: int, op: str,
+                   extra: dict | None = None) -> dict:
         self._ensure_keepalive(state)
         if state == IDLE:
             refusal = self._idle_ceiling_refusal(int(filament), int(arg))
@@ -441,7 +484,8 @@ class _PowerMixin:
         if state in self._ENERGISING_STATES and self._is_dead(filament):
             return self._dead_result(filament)
         r = self._post("/api/filament-state",
-                       {"filament": self._fid_of(filament), "state": state, "arg": int(arg)})
+                       {"filament": self._fid_of(filament), "state": state, "arg": int(arg),
+                        **(extra or {})})
         # The board-didn't-ACK soft failure carries no "error" message on the
         # wire — fill one in so a printed/logged result is never just "None".
         if not r.get("ok") and not r.get("error"):
@@ -1013,7 +1057,13 @@ class _PowerMixin:
                    tolerance_ma: float = 150.0,   # only used if verify=True --
                                                    # passed straight to
                                                    # wait_for_current()
-                   timeout_s: float = 5.0) -> dict:  # only used if verify=True
+                   timeout_s: float = 5.0,        # only used if verify=True
+                   active_s: float | None = None,     # hold ACTIVE this long,
+                                                       # then the BACKEND returns
+                                                       # it to IDLE -- see below
+                   then_idle_ma: float | None = None) -> dict:  # IDLE current to
+                                                       # return to; None = the
+                                                       # filament's last IDLE current
         """Promote a single filament to ACTIVE at `current_ma` mA.
 
         The filament MUST already be at IDLE. Going straight to ACTIVE is not
@@ -1039,7 +1089,24 @@ class _PowerMixin:
 
         verify=True: same real-current feedback as idle_one(verify=True),
         merged under result["heating"].
+
+        active_s: a heating time limit. The BACKEND starts a clock when the
+        ACTIVE lands and, when it runs out, returns the filament to IDLE at
+        `then_idle_ma` (default: the IDLE current it was last commanded to; if
+        that is unknown the call is refused, not defaulted). The clock lives in
+        the backend, so it still fires if this script dies or is interrupted.
+        Any later state command for the filament (STOP, a new IDLE, another
+        ACTIVE) cancels it. Held while a schedule is armed/running -- the run
+        owns the heating -- and applied when the run ends. Independent of the
+        dead-man watchdog, which still drops an unrenewed ACTIVE to SLEEP.
+        The clock starts when the command lands, not when the current arrives.
+
+            ct.active_one(f, 2600, active_s=20)            # back to its IDLE current
+            ct.active_one(f, 2600, active_s=20, then_idle_ma=1500)
         """
+        extra = self._timed_active_body(active_s, then_idle_ma)
+        if isinstance(extra, str):
+            return {"ok": False, "filament": int(filament), "error": extra}
         # The backend enforces the ladder; this mirrors it so the reason is
         # clear without a round trip, and so a script gets the same answer
         # whether or not the backend is reachable. ACTIVE may only be entered
@@ -1055,7 +1122,7 @@ class _PowerMixin:
             return {"ok": False, "filament": int(filament),
                     "error": f"filament {int(filament)} has no board (unassigned "
                              f"in the active-list mapping, or out of range)"}
-        r = self._state_one(filament, ACTIVE, int(current_ma), "active_one")
+        r = self._state_one(filament, ACTIVE, int(current_ma), "active_one", extra)
         if r.get("ladder_blocked"):
             return r
         if verify and not r.get("dead"):

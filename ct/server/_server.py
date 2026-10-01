@@ -1063,7 +1063,11 @@ def safety_snapshot() -> dict:
     # The number stays for anything that was already reading it; the name goes
     # beside it so nothing downstream has to own a copy of the table.
     cfg["active_fallback_name"] = power_state_name(cfg["active_fallback"])
+    with _SAFETY_LOCK:
+        timed = {str(f): {"in_s": round(max(0.0, d - now), 1), "then_idle_ma": ma}
+                 for f, (d, ma) in sorted(ACTIVE_DEADLINES.items())}
     return {"ok": True, **cfg,
+            "timed_active": timed,
             "active_filaments": active,
             "grid_closed": grid_closed,
             "hv_idle_for_s": round(hv_age, 1) if hv_age is not None else None,
@@ -1174,6 +1178,124 @@ def _safety_loop() -> None:
                 _safety_open_grid()
         except Exception as exc:          # never let the watchdog die
             log.exception("safety-watchdog tick failed: %s", exc)
+
+
+# ── Timed ACTIVE: return to IDLE after active_s ─────────────────────────────
+# ACTIVE commands may carry active_s (and optionally then_idle_ma). The clock is
+# kept HERE, not in the client, so a script that dies or is interrupted still
+# has its filaments brought back to IDLE on time. Independent of the dead-man
+# watchdog above: that one still drops an ACTIVE nobody renews to SLEEP after
+# active_timeout_s, whichever comes first.
+ACTIVE_S_MAX = 3600.0              # longest timed ACTIVE accepted (s)
+ACTIVE_DEADLINE_TICK_S = 0.1       # how often deadlines are checked
+ACTIVE_DEADLINE_RETRY_S = 1.0      # deferred (run in progress) or failed -> retry after
+
+
+def _parse_timed_active(body: dict, state: int, filaments) -> tuple[dict | None, str | None]:
+    """(timed, error) from a state request's active_s / then_idle_ma.
+
+    timed = {"active_s": s, "idle_ma": {fid: mA}} or None when not requested.
+    then_idle_ma omitted: each filament returns to the IDLE current it was last
+    commanded to -- and if that is not known the request is REFUSED, never
+    defaulted: a timed ACTIVE with nowhere to go back to is not done.
+    """
+    raw_s, raw_ma = body.get("active_s"), body.get("then_idle_ma")
+    if raw_s is None:
+        if raw_ma is not None:
+            return None, "then_idle_ma needs active_s (it is what a TIMED ACTIVE returns to)"
+        return None, None
+    if int(state) != POWER_STATE_ACTIVE:
+        return None, f"active_s only applies to ACTIVE(5), not {power_state_name(int(state))}"
+    try:
+        active_s = float(raw_s)
+    except (TypeError, ValueError):
+        return None, f"active_s must be a number of seconds, got {raw_s!r}"
+    if not (0.0 < active_s <= ACTIVE_S_MAX):
+        return None, f"active_s {active_s:g} out of range (0, {ACTIVE_S_MAX:g}] s"
+    if filaments is None:
+        return None, "a timed ACTIVE needs an explicit filament list"
+    fids = [int(f) for f in filaments]
+    if raw_ma is not None:
+        try:
+            ma = int(raw_ma)
+        except (TypeError, ValueError):
+            return None, f"then_idle_ma must be a number of mA, got {raw_ma!r}"
+        if not (0 < ma <= IDLE_CEILING_MA):
+            return None, f"then_idle_ma {ma} out of range 1..{IDLE_CEILING_MA} mA"
+        return {"active_s": active_s, "idle_ma": {f: ma for f in fids}}, None
+    with _SAFETY_LOCK:
+        known = {f: LAST_IDLE_MA.get(f) for f in fids}
+    missing = [f for f, v in known.items() if not v]
+    if missing:
+        return None, (f"no IDLE current known for filament(s) {missing} -- pass "
+                      f"then_idle_ma (the IDLE current to return to after active_s)")
+    return {"active_s": active_s, "idle_ma": known}, None
+
+
+def _active_deadline_loop() -> None:
+    """Walk filaments whose timed ACTIVE has run out back to IDLE. Held while a
+    schedule is armed or running (the run owns the heating, as for the
+    dead-man watchdog) and retried after a failed write; recorded either way."""
+    deferred_logged = False
+    while True:
+        time.sleep(ACTIVE_DEADLINE_TICK_S)
+        try:
+            now = time.monotonic()
+            with _SAFETY_LOCK:
+                due = {f: v for f, v in ACTIVE_DEADLINES.items() if v[0] <= now}
+            if not due:
+                continue
+            # No longer ACTIVE (or no board): nothing to walk back.
+            gone = [f for f in due
+                    if LAST_POWER_STATE.get(f, (None, 0.0))[0] != POWER_STATE_ACTIVE
+                    or filament_to_board(f)[0] is None]
+            if gone:
+                with _SAFETY_LOCK:
+                    for f in gone:
+                        ACTIVE_DEADLINES.pop(f, None)
+                for f in gone:
+                    due.pop(f, None)
+                if not due:
+                    continue
+            running, unknown = _safety_schedule_running()
+            if running or unknown is not None:
+                with _SAFETY_LOCK:
+                    for f, (_d, ma) in due.items():
+                        if f in ACTIVE_DEADLINES:
+                            ACTIVE_DEADLINES[f] = (now + ACTIVE_DEADLINE_RETRY_S, ma)
+                if not deferred_logged:
+                    _safety_record("timed_active_deferred",
+                                   {"filaments": sorted(due),
+                                    "reason": unknown or "a schedule is armed/running — "
+                                              "returning to IDLE when it ends"})
+                    deferred_logged = True
+                continue
+            deferred_logged = False
+            by_ctrl: dict[int, dict[int, int]] = {}
+            for f, (_d, ma) in due.items():
+                by_ctrl.setdefault(int(filament_to_board(f)[0]), {})[f] = ma
+            for c0, group in by_ctrl.items():
+                link = CONTROLLERS.get(c0 + 1)
+                landed, err = [], None
+                if link and link.client.connected:
+                    try:
+                        r = prep_filaments(link, c0, POWER_STATE_IDLE, list(group),
+                                           currents=group, default_arg=0)
+                        landed = [int(f) for f in (r.get("landed") or [])]
+                    except Exception as exc:
+                        err = str(exc)
+                else:
+                    err = "controller not connected"
+                left = [f for f in group if f not in landed]
+                with _SAFETY_LOCK:
+                    for f in left:
+                        if f in ACTIVE_DEADLINES:
+                            ACTIVE_DEADLINES[f] = (now + ACTIVE_DEADLINE_RETRY_S, group[f])
+                _safety_record("timed_active_to_idle" if not left else "timed_active_to_idle_failed",
+                               {"controller": c0 + 1, "to_idle": {str(f): group[f] for f in landed},
+                                "retrying": left, **({"error": err} if err else {})})
+        except Exception as exc:          # never let it die
+            log.exception("timed-active tick failed: %s", exc)
 
 
 def dead_fids() -> set[int]:
@@ -1755,6 +1877,7 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
             results.append({"ok": False, "error": str(exc)})
     applied, failed = 0, []
     landed: list[int] = []
+    landed_args: dict[int, int] = {}
     for key, r in zip(keys, results):
         raw = r.get("raw") if isinstance(r, dict) else None
         for f in members[key]:
@@ -1763,12 +1886,13 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
             if appl & (1 << fpos):
                 applied += 1
                 landed.append(int(f))
+                landed_args[int(f)] = int(key)
             else:
                 failed.append(int(f))
     # Record only what the firmware CONFIRMED it applied. Recording the intent
     # would let a failed write leave the backend believing a filament is at
     # IDLE, which is exactly the belief the ACTIVE guard depends on.
-    note_power_state(landed, state)
+    note_power_state(landed, state, landed_args)
     # A filament the guards refused (ladder_blocked) was asked for and not
     # done, the same as a failed one. It used to leave ok True: an
     # idle_all(default_ma=2500) refused every filament at the 2000 mA ceiling
@@ -1778,7 +1902,7 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         {"controller": controller,
          "ok": not failed and not unslotted and not ladder_blocked, "applied": applied,
          "total": len(fils), "failed": failed, "state": int(state),
-         "touched": fils, "not_this_controller": not_this_controller,
+         "landed": landed, "touched": fils, "not_this_controller": not_this_controller,
          "unslotted": unslotted, "dead_skipped": dead_skipped,
          "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons},
         dead_stopped)
@@ -3257,6 +3381,10 @@ class CtHandler(BaseHTTPRequestHandler):
                                        f"for {IDLE_CEILING_MA} or less, or use "
                                        f"ACTIVE if you need more"},
                                       HTTPStatus.OK)
+                timed, err = _parse_timed_active(body, state, [filament])
+                if err:
+                    return self._json({"ok": False, "filament": filament, "error": err},
+                                      HTTPStatus.OK)
                 if state == POWER_STATE_ACTIVE:
                     # One cheap single-board 0x3A (the CC cache, no I2C) so the
                     # guard tests where the filament IS, not only what it was told.
@@ -3309,10 +3437,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 raw = resp.get("raw") if isinstance(resp, dict) else None
                 applied = bool(raw and len(raw) >= 4 and raw[3] == 1)
                 if applied:
-                    note_power_state([filament], state)
+                    note_power_state([filament], state, {filament: arg})
                 out = {"ok": _status_ok(resp) and applied, "filament": filament,
                        "controller": cid, "channel": ch, "mux_port": pos,
                        "state": state, "arg": arg}
+                if applied and timed:
+                    set_active_deadlines([filament], timed["active_s"], timed["idle_ma"])
+                    out["active_s"] = timed["active_s"]
+                    out["then_idle_ma"] = timed["idle_ma"][filament]
                 if dead_stopped:
                     out["dead_stopped"] = True
                     out["note"] = (f"filament {filament} is marked dead: STOPped "
@@ -3343,6 +3475,9 @@ class CtHandler(BaseHTTPRequestHandler):
                 currents = body.get("currents") or {}
                 default_arg = int(body.get("arg", 0))
                 channels = body.get("channels") or DEFAULT_CHANNELS
+                timed, err = _parse_timed_active(body, state, filaments)
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 results = {}
                 for cid, link in CONTROLLERS.items():
                     if not link.client.connected:
@@ -3380,6 +3515,11 @@ class CtHandler(BaseHTTPRequestHandler):
                 out = {"ok": all(r.get("ok") for r in results.values()) and not excluded,
                        "results": results, "failed": failed, "applied": applied,
                        "excluded": excluded}
+                if timed:
+                    landed = [int(f) for r in results.values() for f in (r.get("landed") or [])]
+                    set_active_deadlines(landed, timed["active_s"], timed["idle_ma"])
+                    out["active_s"] = timed["active_s"]
+                    out["then_idle_ma"] = {str(f): timed["idle_ma"][f] for f in landed}
                 if blocked:
                     reasons = {k: v for r in results.values()
                                for k, v in (r.get("ladder_reasons") or {}).items()}
@@ -4519,6 +4659,8 @@ def main() -> None:
     threading.Thread(target=_safety_loop, name="safety_watchdog", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
+    # Timed ACTIVE (active_s): returns filaments to IDLE when their time is up.
+    threading.Thread(target=_active_deadline_loop, name="timed_active", daemon=True).start()
     log.info("safety watchdog: ACTIVE -> %s after %.0fs, grid MOSFETs opened after %.0fs "
              "without an HV grid command (rails never touched; commands renew, reads do not)",
              power_state_name(SAFETY_ACTIVE_FALLBACK), SAFETY_ACTIVE_TIMEOUT_S,
