@@ -140,6 +140,15 @@ with ct.lease(ttl=120, note="emission test F8"):       # write access (see below
   cancels it; while a schedule is armed or running it waits for the run to end.
   `active_all(filaments=[...], default_ma=2600, active_s=20)` does the same for
   a batch. Time left: `GET /api/safety` -> `timed_active`.
+- **The backend knows each filament's power state from the firmware**, so a
+  backend restart no longer makes ACTIVE refuse with "power state unknown"
+  while the filament is really at IDLE. A filament that left ACTIVE less than
+  30 s ago may go back up while its CC loop is still settling (it is hot);
+  anything colder must have settled at IDLE first.
+- **Voltage-ramp slew rates are kept at 80 % of the ceilings**
+  (1600 / 4000 / 4000 mV/s) on every controller, re-applied within 30 s after an
+  RP2350 reset. A `set_slew_rates(...)` becomes the kept value. `CT_SLEW_PCT`
+  sets the percentage; `CT_SLEW_KEEP=0` turns it off.
 - **The lease** (`with ct.lease(...)`) gives this script exclusive WRITE access;
   other clients' writes are refused meanwhile. Reads never need it. It expires
   on its own if the script dies.

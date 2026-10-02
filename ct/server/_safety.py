@@ -193,6 +193,22 @@ LAST_IDLE_MA: dict[int, int] = {}
 ACTIVE_DEADLINES: dict[int, tuple[float, int]] = {}
 
 
+# When each FID last LEFT ACTIVE (monotonic). A filament that was at firing
+# current moments ago is hot, so the "IDLE must have settled" part of the
+# ACTIVE guard does not apply to it for WARM_AFTER_ACTIVE_S: coming down from
+# ACTIVE the CC loop keeps adjusting while the filament cools, and every
+# re-sent IDLE restarts its settle test, so a hot filament could be refused
+# ACTIVE for tens of seconds (2026-10-02 17:26, filament 16).
+LAST_ACTIVE_LEFT: dict[int, float] = {}
+WARM_AFTER_ACTIVE_S = 30.0
+
+
+def note_active_transition(fid: int, old_state, new_state: int, when: float) -> None:
+    """Record leaving ACTIVE. Caller holds _SAFETY_LOCK."""
+    if old_state == POWER_STATE_ACTIVE and int(new_state) != POWER_STATE_ACTIVE:
+        LAST_ACTIVE_LEFT[int(fid)] = when
+
+
 def note_power_state(fids, state: int, args=None) -> None:
     """Record CONFIRMED power-state commands. `args`: the mA each FID was given
     ({fid: mA}, or one number for all) -- kept for IDLE, as a timed ACTIVE's
@@ -200,6 +216,8 @@ def note_power_state(fids, state: int, args=None) -> None:
     now = time.monotonic()
     with _SAFETY_LOCK:
         for f in fids:
+            prev = LAST_POWER_STATE.get(int(f))
+            note_active_transition(int(f), prev[0] if prev else None, int(state), now)
             LAST_POWER_STATE[int(f)] = (int(state), now)
             ACTIVE_DEADLINES.pop(int(f), None)
             if int(state) == POWER_STATE_IDLE and args is not None:
@@ -249,6 +267,13 @@ def ladder_blocks_active(fid: int, arrival: str | None = None,
         return None          # older firmware reports no arrival: state-only check
     if arrival == "settled":
         return None
+    left = LAST_ACTIVE_LEFT.get(int(fid))
+    if (arrival == "ramping" and left is not None
+            and time.monotonic() - left <= WARM_AFTER_ACTIVE_S):
+        # Still hot from ACTIVE: the settle requirement exists for a filament
+        # that has not been warmed, which this one has. "capped" is still
+        # refused (the output cannot reach the current at all).
+        return None
     return (f"commanded to IDLE but the CC loop reports '{arrival}', not settled "
             f"— the filament has not actually reached idle current, and promoting "
             f"an unwarmed filament to firing current is what this guard prevents")
@@ -283,7 +308,7 @@ __all__ = [
     "DEFAULT_GROUP_SIZE", "ENERGISING_STATES", "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT",
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
-    "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
+    "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "LAST_ACTIVE_LEFT", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
     "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "POLL_PAUSE_MAX_S",
     "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES",
     "POWER_STATE_SLEEP", "POWER_STATE_STANDBY", "POWER_STATE_STOP",
@@ -311,7 +336,8 @@ __all__ = [
     "adc_spi_shot_data", "annotations", "build_command_payload", "build_payload",
     "copy", "csv", "datetime", "decode_shv_status", "enum", "fetch_bridge_info",
     "fetch_stm32_status", "json", "ladder_blocks_active", "log", "logging",
-    "note_power_state", "os", "set_active_deadlines", "parse_power_state", "power_state_name",
+    "WARM_AFTER_ACTIVE_S", "note_active_transition", "note_power_state", "os",
+    "set_active_deadlines", "parse_power_state", "power_state_name",
     "primary_local_ip", "pulse_events_get", "safety_touch_filaments", "scan_for_bridge",
     "stm32_adc_window", "stm32_ads1115", "stm32_ds3502_get", "stm32_ds3502_set",
     "stm32_hv_clear_target", "stm32_hv_enable_set", "stm32_hv_get_target",

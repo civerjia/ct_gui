@@ -285,6 +285,46 @@ def _read_bitmaps(link: "ControllerLink") -> dict | None:
     return out
 
 
+def _adopt_firmware_power_states(c0: int, cache: dict, read_at: float) -> list:
+    """Bring LAST_POWER_STATE in line with the power state the RP2350 itself
+    reports per board (0x3D board cache). The firmware is the truth: after a
+    backend restart LAST_POWER_STATE is empty while the boards are still where
+    they were (a warm IDLE stays IDLE), and ACTIVE was refused as "power state
+    unknown" until the ladder was walked again. A state is taken over only
+    where this backend has nothing newer: an entry written after the read
+    started (a command that just landed) is left alone. Adopting is not a
+    command, but the dead-man clock starts now, so an adopted ACTIVE that
+    nobody renews still falls back on time. Returns [(fid, state, was)]."""
+    adopted = []
+    with _SAFETY_LOCK:
+        for (ch, mux), b in (cache or {}).items():
+            st = b.get("power_state")
+            if not b.get("known") or st is None or not (1 <= int(st) <= 6):
+                continue
+            fid = MAPPING.filament_for_board(c0, int(ch), int(mux))
+            if fid is None:
+                continue
+            cur = LAST_POWER_STATE.get(int(fid))
+            if cur is not None and (cur[0] == int(st) or cur[1] >= read_at):
+                continue
+            note_active_transition(int(fid), cur[0] if cur else None, int(st), read_at)
+            LAST_POWER_STATE[int(fid)] = (int(st), read_at)
+            adopted.append((int(fid), int(st), cur[0] if cur else None))
+    if adopted:
+        safety_touch_filaments([f for f, _st, _was in adopted])
+        new = [f for f, _st, was in adopted if was is None]
+        if new:
+            log.info("power state taken from controller %d's firmware for %d filament(s) "
+                     "this backend had no record of: %s", c0 + 1, len(new),
+                     ", ".join(f"{f}={power_state_name(st)}" for f, st, was in adopted
+                               if was is None)[:600])
+        for f, st, was in adopted:
+            if was is not None:
+                log.debug("power state of %d changed in firmware: %s -> %s", f,
+                          power_state_name(was), power_state_name(st))
+    return adopted
+
+
 def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict) -> dict:
     snap = dict(prev) if prev else {"boards": {}, "boards_at": 0.0, "bitmaps": {},
                                     "bitmaps_at": 0.0, "status": None, "status_at": 0.0}
@@ -314,12 +354,14 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
         # bitmaps: that is I2C, and it belongs to the run.
         if (now - snap.get("run_cache_at", 0.0)) >= MONITOR_RUN_STATUS_S:
             snap["run_cache_at"] = now
+            read_at = time.monotonic()
             try:
                 cache = read_board_cache(link, _scan_channels())
             except Exception:
                 cache = None
             if cache is not None:
                 snap["boards"], snap["boards_at"], snap["source"] = cache, now, "cache(run)"
+                _adopt_firmware_power_states(cid - 1, cache, read_at)
         if cid in _LIVE_PUSH:
             pushed = _pushed_boards(link)
             if pushed:
@@ -331,9 +373,11 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
                                    "pushed": True} if old else b
                 snap["boards"], snap["boards_at"], snap["source"] = merged, now, "cache+push(run)"
         return snap
+    read_at = time.monotonic()
     cache = read_board_cache(link, _scan_channels())
     if cache is not None:
         snap["boards"], snap["boards_at"], snap["source"] = cache, now, "cache"
+        _adopt_firmware_power_states(cid - 1, cache, read_at)
     if (now - snap["bitmaps_at"]) >= MONITOR_BITMAP_PERIOD_S:
         try:
             bm = _read_bitmaps(link)
@@ -3100,6 +3144,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 try:
                     frame_type, flags, payload = build_payload(command, body)
                     resp = link.client.send_request(frame_type, payload, flags=flags, timeout=2.0)
+                    if command == "CH_SLEW_RATE" and body.get("below_mV_per_s") is not None:
+                        _slew_note_set(resp)     # the rig's slew is now what was set
                     self._json({"ok": True, "response": resp})
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
@@ -4641,6 +4687,78 @@ def _do_restart(keep: dict, server) -> None:
     ct_update.restart_in_place()
 
 
+# ── Voltage-ramp slew rates kept at the rig's setting ────────────────────────
+# The RP2350 starts with its own defaults (400/1000/2800 mV/s) after every
+# reset, so a value set once does not stay set. The backend keeps the rig's
+# slew -- by default CT_SLEW_PCT (80) % of the ceilings, or whatever was last
+# SET through /api/cmd CH_SLEW_RATE -- and every SLEW_KEEP_PERIOD_S writes it
+# back to any controller that reads differently. A controller that is armed or
+# running is skipped (no ramp change mid-run). CT_SLEW_KEEP=0 turns it off.
+SLEW_CEILINGS = {"below_mV_per_s": 2000, "above_mV_per_s": 5000, "warm_mV_per_s": 5000}
+SLEW_KEEP_PERIOD_S = 30.0
+_SLEW_KEYS = ("below_mV_per_s", "above_mV_per_s", "warm_mV_per_s")
+
+
+def _slew_default_want() -> dict:
+    try:
+        pct = float(os.environ.get("CT_SLEW_PCT", "80"))
+    except ValueError:
+        pct = 80.0
+    pct = min(100.0, max(10.0, pct))
+    return {k: int(SLEW_CEILINGS[k] * pct / 100.0) for k in _SLEW_KEYS}
+
+
+SLEW_WANT: dict = _slew_default_want()
+
+
+def _slew_decode(resp) -> dict | None:
+    raw = (resp.get("raw") if isinstance(resp, dict) else None) or []
+    if len(raw) < 7 or raw[0] != 0:
+        return None
+    le = lambda o: raw[o] | (raw[o + 1] << 8)
+    return {"below_mV_per_s": le(1), "above_mV_per_s": le(3), "warm_mV_per_s": le(5)}
+
+
+def _slew_note_set(resp) -> None:
+    got = _slew_decode(resp)
+    if got:
+        SLEW_WANT.update(got)
+        log.info("slew rates set to %s — kept on every controller from now on", got)
+
+
+def _slew_check_one(link) -> dict:
+    """Read one controller's slew; write the rig's if it differs. {before, after}."""
+    ft, flags, payload = build_payload("CH_SLEW_RATE", {})
+    cur = _slew_decode(link.client.send_request(ft, payload, flags=flags, timeout=2.0))
+    if cur is None or cur == SLEW_WANT:
+        return {"before": cur, "after": cur}
+    ft, flags, payload = build_payload("CH_SLEW_RATE", dict(SLEW_WANT))
+    after = _slew_decode(link.client.send_request(ft, payload, flags=flags, timeout=2.0))
+    return {"before": cur, "after": after}
+
+
+def _slew_keeper_loop() -> None:
+    while True:
+        time.sleep(SLEW_KEEP_PERIOD_S)
+        if os.environ.get("CT_SLEW_KEEP") == "0":
+            return
+        for cid, link in sorted(CONTROLLERS.items()):
+            if not link.client.connected:
+                continue
+            try:
+                st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+                if st and st.get("state") in (1, 2):
+                    continue                     # armed/running: no ramp change mid-run
+                r = _slew_check_one(link)
+                if r["before"] is not None and r["before"] != r["after"]:
+                    log.warning("%s: slew rates were %s (an RP2350 reset restores its "
+                                "defaults) — set to the rig's %s -> %s", link.name,
+                                r["before"], SLEW_WANT,
+                                "ok" if r["after"] == SLEW_WANT else f"read back {r['after']}")
+            except Exception as exc:
+                log.debug("slew keeper on %s: %s", getattr(link, "name", cid), exc)
+
+
 # ── Automatic discovery and connection ───────────────────────────────────────
 # Nobody types an IP. The backend scans the LAN for bridges, connects the one
 # whose ESP32 has seen an STM32 as Power 1 (the master -- that board's
@@ -4841,6 +4959,10 @@ def main() -> None:
     if os.environ.pop("CT_RESTARTED_FROM", None):
         print(f"[ct] backend RESTARTED -- now pid {os.getpid()}, running in this window", flush=True)
     threading.Thread(target=_reconnect_from_env, name="reconnect", daemon=True).start()
+    if os.environ.get("CT_SLEW_KEEP") != "0":
+        threading.Thread(target=_slew_keeper_loop, name="slew_keeper", daemon=True).start()
+        log.info("slew rates kept at %s mV/s on every controller (CT_SLEW_PCT, "
+                 "CT_SLEW_KEEP=0 to turn off)", SLEW_WANT)
     # Find and connect the controllers -- after the restart reconnect above has
     # had a moment, so it does not race it for the same bridges.
     if not os.environ.get("CT_NO_AUTO_CONNECT"):
