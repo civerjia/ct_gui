@@ -1129,6 +1129,16 @@ class _ScheduleMixin:
 
     # ── SHV schedule — single-filament pulse (high-level) ────────────────────
 
+    def _arm_failure(self, r: dict) -> tuple:
+        """(firmware reject code or None, why) for a failed shv_arm. A refusal
+        from the BACKEND (e.g. the controllers disagree on the trigger delay)
+        or a transport error carries no firmware code -- its reason is in
+        r["error"], which used to be dropped for "unknown reject code"."""
+        code = r.get("reject")
+        if code is not None:
+            return code, self._SHV_REJECT_NAMES.get(code, f"unknown reject code {code}")
+        return None, (r.get("error") or "no reason given by the backend")
+
     def fire_single_pulse(
         self,
         filament: int,
@@ -1741,10 +1751,10 @@ class _ScheduleMixin:
 
         arm_r = self.shv_arm(controller, repeats=1)
         if not arm_r.get("ok"):
-            code = arm_r.get("reject")
-            why = self._SHV_REJECT_NAMES.get(code, "unknown reject code")
+            code, why = self._arm_failure(arm_r)
             return {"ok": False,
-                    "error": f"arm rejected (code {code}): {why}",
+                    "error": (f"arm rejected (code {code}): {why}" if code is not None
+                              else why),
                     "arm_reject": code, "arm_reject_name": why,
                     "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
         if companion:
@@ -1757,12 +1767,12 @@ class _ScheduleMixin:
             c_arm = self.shv_arm(companion, repeats=1)
             if not c_arm.get("ok"):
                 self._disarm_all(armed_set)
-                code = c_arm.get("reject")
-                why = self._SHV_REJECT_NAMES.get(code, "unknown reject code")
+                code, why = self._arm_failure(c_arm)
                 return {"ok": False,
                         "error": f"the master (controller {companion}) could not be "
-                                 f"armed to frame this pulse: arm rejected (code "
-                                 f"{code}): {why}. Without it the STM32 gets no "
+                                 f"armed to frame this pulse: "
+                                 f"{f'arm rejected (code {code}): ' if code is not None else ''}"
+                                 f"{why}. Without it the STM32 gets no "
                                  f"envelope for controller {controller}'s pulse",
                         "arm_reject": code, "arm_reject_name": why,
                         "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
