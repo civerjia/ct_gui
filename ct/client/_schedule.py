@@ -81,7 +81,7 @@ class _ScheduleMixin:
         Dead entries are dropped rather than sent, matching _live()/_prep(), and
         reported so the drop is never silent."""
         dead_skipped: list[int] = []
-        dead = self.dead   # bound once — property, see _live()
+        dead = self._dead_users()   # USER_INDEX view of the physical mask
         out = dict(plan)
         for key in ("emission", "heating"):
             rows = plan.get(key)
@@ -180,7 +180,7 @@ class _ScheduleMixin:
 
         excluded = {int(f) for f in skip}
         if skip_dead:
-            excluded |= set(self.dead)
+            excluded |= set(self._dead_users())
 
         window_pos = 0
         coll = int(collimator_center) % n
@@ -482,7 +482,7 @@ class _ScheduleMixin:
             # plan was built before the filter ran. Reporting them as a
             # shortfall turns a guard doing its job into an alarm, which is
             # exactly the failure mode this report exists to avoid.
-            dead = self.dead
+            dead = self._dead_users()
             dropped_dead = sorted(f for f in expected if f in dead)
             short = {f: (n, fired.get(f, 0)) for f, n in expected.items()
                      if f not in dead and fired.get(f, 0) != n}

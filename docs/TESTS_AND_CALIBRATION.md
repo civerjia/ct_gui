@@ -370,7 +370,8 @@ with ct.lease(note="presence scan"):
 ```
 
 To mark everything absent as dead (**this replaces the dead mask**):
-`ct.set_dead(sorted(set(range(96)) - set(present)), reason="not fitted")`.
+`ct.set_dead(sorted(set(range(96)) - set(ct.to_physical(present))), reason="not fitted")`.
+The dead mask uses physical filament numbers, so the present list is converted first.
 
 ---
 

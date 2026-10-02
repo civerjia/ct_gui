@@ -56,7 +56,7 @@ class _PowerMixin:
                 keys=("applied", "failed", "excluded", "touched",
                       "not_this_controller", "unslotted", "dead_stopped"))
         requested = [int(f) for f in filaments] if filaments is not None else list(range(96))
-        dead = self.dead   # bound once — property, see _live()
+        dead = self._dead_users()   # USER_INDEX view of the physical mask
         dead_skipped = [f for f in requested if f in dead]
         live = self._live(filaments)
         if live is not None and len(live) == 0:

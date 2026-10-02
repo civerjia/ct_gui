@@ -282,7 +282,7 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         })
         # Dead mask — filaments blocked from all heating and HV pulse operations.
         # Set once with set_dead(); automatically applied to every batch call.
-        self._dead_cache: set[int] = set()   # USER_INDEX; see the `dead` property
+        self._dead_cache: set[int] = set()   # PHYSICAL filament numbers (FID); see `dead`
         self._dead_fetched_at = 0.0
         self._dead_stale = False
         # Software-level USER_INDEX -> FID swap — see set_filament_order().
@@ -640,13 +640,11 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         boards and return the filaments found, in YOUR numbering
         (USER_INDEX), same as every other read on this client.
 
-        The wire carries FIDs; they are translated here, which is the whole
-        reason this does not just return the response. Handing FIDs back
-        would break the documented use below in the worst possible way:
-        set_dead() takes USER_INDEX and maps outbound, so feeding it FIDs
-        maps them a second time and marks a DIFFERENT set of filaments dead
-        -- silently, and only once a non-identity order is installed, so it
-        tests clean on the bench that has no remapping.
+        The wire carries FIDs; they are translated here so this reads in
+        the same numbering as every other read. The dead mask, by contrast,
+        is PHYSICAL (see `dead`): to mark absent filaments dead, cross the
+        list with to_physical() first, as below -- passing USER_INDEX values
+        straight to set_dead() blocks the wrong filaments under a swap.
 
         SLOW (several seconds per controller — it sleeps every board to
         power the presence-sense rail, then re-scans I2C) and leaves
@@ -655,11 +653,22 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         raises) — an empty scan looks the same as "nothing connected", so
         check ct.status() first if you get an unexpectedly empty list:
 
-            present = set(ct.present_filaments())
-            ct.set_dead(set(range(96)) - present)
+            present = set(ct.to_physical(ct.present_filaments()))
+            ct.set_dead(set(range(96)) - present, reason="not fitted")
         """
         r = self._get("/api/present-filaments", timeout=30.0)
         return [self._user_index_of(int(f)) for f in (r.get("present") or [])]
+
+    def to_physical(self, filaments) -> list[int]:
+        """Your filament numbers (USER_INDEX) -> PHYSICAL filament numbers (FID),
+        the numbering the dead mask uses. Identity when no filament order is
+        set. Use it whenever a list from a read (present_filaments, a scan
+        report) is about to become a dead-mask entry."""
+        return [int(self._fid_of(f)) for f in filaments]
+
+    def to_user(self, physical) -> list[int]:
+        """PHYSICAL filament numbers (FID) -> your numbering (USER_INDEX)."""
+        return [self._user_index_of(int(f)) for f in physical]
 
     # ── active-list mapping (filament <-> power slot) ─────────────────────────
     # Which global filament (0-95) sits at which power slot — the
@@ -1169,7 +1178,17 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
 
     @property
     def dead(self) -> frozenset[int]:
-        """Filaments that must not be energised, in YOUR numbering (USER_INDEX).
+        """Filaments that must not be energised, as PHYSICAL filament numbers
+        (the hardware index, FID) -- NOT your filament_order numbering.
+
+        Physical on purpose. A dead filament is a broken piece of hardware;
+        which number you call it by must not change which one is blocked. The
+        mask used to be read and written in USER_INDEX, translated through
+        the filament order at the moment of the call: the same
+        set_dead([6, 26, 81, 90]) blocked different filaments depending on
+        whether set_filament_order() had run yet -- on 2026-10-02 it freed the
+        broken boards 6 and 90 and blocked three good filaments instead.
+        With the default order the two numberings are the same.
 
         A frozenset, deliberately: `ct.dead.add(5)` used to appear to work and
         would now silently fail to reach the backend, so it raises instead.
@@ -1177,6 +1196,11 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         """
         self._refresh_dead()
         return frozenset(self._dead_cache)
+
+    def _dead_users(self) -> frozenset[int]:
+        """The dead mask in THIS client's numbering (USER_INDEX), for the
+        internal checks that compare against the indices callers pass."""
+        return frozenset(self._user_index_of(int(f)) for f in self.dead)
 
     # Consecutive mode 2/3 reads before a fault is believed. A startup-inrush
     # OCP that recovers on the next revive can flash the fault bits, so one
@@ -1196,14 +1220,20 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
             # answer. The backend still enforces regardless of what we think.
             self._dead_stale = True
             return
-        # The backend stores FIDs; translate into this script's numbering so
-        # `ct.dead` matches the indices the caller passes everywhere else.
-        self._dead_cache = {self._user_index_of(int(f)) for f in (r.get("dead") or {})}
+        # The backend stores physical filament numbers (FID), and so does this
+        # cache -- see `dead`. _dead_users() gives the USER_INDEX view.
+        self._dead_cache = {int(f) for f in (r.get("dead") or {})}
         self._dead_fetched_at = now
         self._dead_stale = False
 
     def _write_dead(self, op: str, filaments, reason: str | None) -> dict:
-        fids = [int(self._fid_of(f)) for f in filaments]
+        # PHYSICAL numbers, sent as they are: never crossed through the
+        # filament order (see `dead`).
+        fids = [int(f) for f in filaments]
+        bad = [f for f in fids if not 0 <= f < self.FILAMENT_COUNT]
+        if bad:
+            return {"ok": False, "error": f"filament number(s) {bad} out of range "
+                                          f"0..{self.FILAMENT_COUNT - 1}; nothing changed"}
         body = {"op": op, "fids": fids}
         if op != "remove":
             # Not fabricated when absent: the backend requires a non-empty
@@ -1216,7 +1246,10 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         return r
 
     def set_dead(self, filaments, reason: str | None = None) -> dict:
-        """Replace the dead mask with the given filament indices (0–95).
+        """Replace the dead mask with the given PHYSICAL filament numbers (0–95).
+
+        Physical = the hardware filament index, the same whatever
+        set_filament_order() is in force, before or after it is called.
 
         "Dead" means THIS FILAMENT MUST NOT BE ENERGISED. The board it sits on
         may be perfectly fine -- the filament is the faulty part. It is your
@@ -1253,11 +1286,12 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         return self._write_dead("remove", filaments, None)
 
     def dead_details(self) -> dict:
-        """The dead mask with provenance: {USER_INDEX: {reason, by, at}}."""
+        """The dead mask with provenance: {PHYSICAL filament: {reason, by, at,
+        user_index}} -- user_index is what this client calls it."""
         r = self._get("/api/dead-fids", timeout=5.0)
         if not r.get("ok"):
             return r
-        return {"ok": True, "dead": {self._user_index_of(int(f)): v
+        return {"ok": True, "dead": {int(f): {**v, "user_index": self._user_index_of(int(f))}
                                      for f, v in (r.get("dead") or {}).items()},
                 "stale": False}
 
@@ -1270,10 +1304,10 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         efficient) — a pure permutation swap doesn't change the SET of
         "every filament", so this shortcut stays valid even with a swap set.
         """
-        if not self.dead and not self._swap_active and filaments is None:
+        if not self._dead_users() and not self._swap_active and filaments is None:
             return None
         base = list(filaments) if filaments is not None else list(range(self.FILAMENT_COUNT))
-        dead = self.dead   # bound once: `self.dead` is a property, and inside a
+        dead = self._dead_users()   # bound once: a property-backed set, and inside a
                            # comprehension it would be re-evaluated per element
         survivors = [f for f in base if f not in dead]   # dead mask is in USER_INDEX space
         return self._fids_of(survivors)                      # then cross to FID
@@ -1290,7 +1324,7 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         """
         base = ([int(f) for f in filaments] if filaments is not None
                 else list(range(self.FILAMENT_COUNT)))
-        dead = self.dead   # bound once -- property; see _live()
+        dead = self._dead_users()   # bound once -- see _live()
         return [f for f in base if f not in dead]
 
     # PowerState values that put power ON the filament (STANDBY enables the
@@ -1300,8 +1334,8 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
     # impossible to turn OFF.
 
     def _is_dead(self, filament: int) -> bool:
-        """True if filament is in the dead mask."""
-        return filament in self.dead
+        """True if filament (USER_INDEX, as callers pass it) is dead-masked."""
+        return int(filament) in self._dead_users()
 
     def _dead_result(self, filament: int, extra: dict | None = None) -> dict:
         """The standard soft-failure dict returned for a dead-filament target."""

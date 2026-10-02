@@ -64,7 +64,7 @@ class _HvMixin:
         # 5 dead-masked returned a bare ok:True while the grid switch stayed ON --
         # a success-shaped no-op on an HV path.
         requested = None if filaments is None else [int(f) for f in filaments]
-        dead = self.dead   # bound once — property, see _live()
+        dead = self._dead_users()   # USER_INDEX view of the physical mask
         dead_skipped = [] if requested is None else [f for f in requested if f in dead]
         live = self._live(filaments)   # already crossed to FID
         if live is not None and len(live) == 0:

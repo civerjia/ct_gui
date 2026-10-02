@@ -466,12 +466,9 @@ if not s.get("controllers", {}).get("1", {}).get("connected"):
 
 **`present_filaments()`** — Live-scan every connected controller for
 physically-present boards and return the filaments found, **in your own
-numbering (USER_INDEX)** like every other read on this client. The wire
-carries FIDs; they are translated on the way back, which is what makes the
-`set_dead()` pairing below correct — `set_dead()` maps USER_INDEX→FID
-outbound, so handing it raw FIDs would map them a *second* time and disable a
-different set of filaments, silently, and only once a non-identity order is
-installed.
+numbering (USER_INDEX)** like every other read on this client. The dead
+mask is **physical** (see [dead mask](#dead-mask)), so cross the list with
+`ct.to_physical(...)` before it becomes a dead-mask entry.
 **Slow** (a few seconds per controller — it sleeps every board to power the
 presence-sense rail, then re-scans I2C) and leaves touched boards at SLEEP
 afterward, so run it once at setup, not in a polling loop. This pairs
@@ -479,7 +476,7 @@ naturally with the [dead mask](#dead-mask) — auto-populate it from what's
 actually plugged in instead of hand-maintaining a list:
 
 ```python
-present = set(ct.present_filaments())
+present = set(ct.to_physical(ct.present_filaments()))   # physical numbers
 # Everything not physically present, marked as do-not-energise. NOTE this is
 # YOU deciding to disable those slots, not an automatic link: the entries
 # persist and will NOT clear themselves when a board is re-seated, because
@@ -655,13 +652,19 @@ remapping is set.
 `read_filament_current`/`read_filament_currents`,
 `read_filament_voltage`/`read_filament_voltages`,
 `filament_to_board`/`board_to_filament`, `fire_single_pulse`, and the
-low-level `shv_set_entry`/`shv_status`/`shv_pulse_log`. The dead mask
-(`set_dead`/`add_dead`/`remove_dead`) always operates in **your own USER_INDEX
-numbering**, independent of any swap.
+low-level `shv_set_entry`/`shv_status`/`shv_pulse_log`.
+
+**The dead mask is the exception: it is PHYSICAL** (the hardware filament
+number, FID). `set_dead`/`add_dead`/`remove_dead` and `ct.dead` all use
+physical numbers and are never translated through the order, so they mean the
+same filaments whether `set_filament_order()` runs before or after them. (They
+used to be translated at call time: on 2026-10-02 a second `set_dead` after
+an order swap freed two broken boards and blocked three good filaments.) Use
+`ct.to_physical([...])` / `ct.to_user([...])` to convert.
 
 ```python
 ct.set_filament_order({5: 8})
-ct.set_dead([6], reason="...")   # blocks YOUR filament 6; stored as its FID
+ct.set_dead([6], reason="...")   # blocks PHYSICAL filament 6, whatever the order
 
 # Verify the round-trip:
 board = ct.filament_to_board(5)              # physical 8's board location

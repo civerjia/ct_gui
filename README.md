@@ -154,7 +154,8 @@ with ct.lease(ttl=120, note="emission test F8"):       # write access (see below
 - **The lease** (`with ct.lease(...)`) gives this script exclusive WRITE access;
   other clients' writes are refused meanwhile. Reads never need it. It expires
   on its own if the script dies.
-- **Dead filaments:** `ct.set_dead([6, 26], reason="open")` -- kept by the
+- **Dead filaments:** `ct.set_dead([6, 26], reason="open")` -- PHYSICAL filament
+  numbers, never shifted by `set_filament_order()`; kept by the
   backend, refused for anything that energises (STOP still works). `ct.dead`
   lists them.
 - **External trigger:** `trigger="ext"` fires on YOUR edge. Pass `on_armed=`
