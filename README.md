@@ -43,8 +43,17 @@ connection, and a second backend is refused ("bridge slot already owned").
 
 ## 3. Connect the two controllers
 
-Once per backend start, from the GUI (**Power Controllers** card -> **Connect**)
-or from Python:
+**Automatic -- nothing to type.** On start the backend scans the LAN, connects
+the bridge whose ESP32 has seen an STM32 as **Power 1** (the master) and the
+other as **Power 2**, and keeps filling an empty slot in the background (every
+30 s, backing off to 5 min). It never takes a bridge another client already
+holds, never re-connects a slot you disconnected or connected yourself, and does
+nothing while someone holds the write lease. **Scan** in the Power Controllers
+card does the same immediately (`POST /api/auto-connect`). Turn the background
+part off with `CT_NO_AUTO_CONNECT=1`.
+
+By hand, if you need a specific bridge, from the GUI (**Power Controllers**
+card -> **Connect**) or from Python:
 
 ```python
 from ct_simple_control import CTClient
@@ -302,9 +311,9 @@ Mapping: `filament i → P{1|2} · CH{1–6}.{1–8}`, i.e. `channel = (i%48)//8
 `board = (i%48)%8`. The **offset** is what ties a global filament index to a
 bridge; it is editable per controller.
 
-In the **Power Controllers** card: **Scan :3333** sweeps the LAN / `CTPower`
-AP for hosts exposing TCP :3333 and fills the host fields; **Connect** opens
-each bridge. Two heartbeat badges per controller track liveness — **RP2350 ♥**
+In the **Power Controllers** card: **Scan** finds the bridges on the LAN /
+`CTPower` AP and connects them (STM32 board as Power 1) -- see section 3;
+**Connect** opens one bridge by hand. Two heartbeat badges per controller track liveness — **RP2350 ♥**
 (periodic PING through the bridge) and **STM32 ♥** (HTTP `/stm32` age). Badges
 go green/pulsing when fresh (<3 s), amber when stale, red when dead.
 
@@ -314,6 +323,7 @@ from `ct/protocol.py` — and exposes:
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/api/scan` | GET | hosts with :3333 open (`{host, name, controller_responsive}`) |
+| `/api/auto-connect` | POST | scan and connect bridges into empty slots, STM32 board as Power 1 (`{found, connected, failed, status, master}`) |
 | `/api/status` | GET | both controllers: connected, host, offset, RP2350/STM32 heartbeat ages |
 | `/api/connect` | POST | `{controller, host, offset}` → open a bridge |
 | `/api/disconnect` | POST | `{controller}` → close a bridge |

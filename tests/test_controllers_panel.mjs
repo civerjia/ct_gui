@@ -49,6 +49,20 @@ globalThis.fetch = async (path, opts) => {
     else { ctl[body.controller] = { connected: true, host: body.host }; r = { ok: true }; }
   } else if (path === '/api/disconnect') { ctl[body.controller] = { connected: false, host: null }; r = { ok: true }; }
   else if (path === '/api/master') { master = body.controller; r = { master }; }
+  else if (path === '/api/auto-connect') {
+    // as the backend: free slots only, STM32 board -> Power 1, busy bridges skipped
+    const found = scanResults.map((x) => ({ host: x.host, name: x.name, has_stm32: STM.has(x.host), busy: !!x.busy }));
+    const mine = new Set([1, 2].filter((n) => ctl[n].connected).map((n) => ctl[n].host));
+    const queue = found.filter((b) => !mine.has(b.host) && !b.busy);
+    const connected = {};
+    for (const n of [1, 2]) {
+      if (ctl[n].connected || !queue.length) continue;
+      const pick = (n === 1 ? queue.find((b) => b.has_stm32) : queue.find((b) => !b.has_stm32)) || queue[0];
+      queue.splice(queue.indexOf(pick), 1);
+      ctl[n] = { connected: true, host: pick.host }; connected[n] = pick.host;
+    }
+    r = { ok: true, found, connected, failed: {} };
+  }
   else r = {};
   return { json: async () => r };
 };
@@ -63,38 +77,35 @@ const results = [];
 const expect = (name, ok) => { results.push([name, ok]); console.log((ok ? 'PASS ' : 'FAIL ') + name + '   ' + show()); };
 const reset = async () => { ctl[1] = { connected: false, host: null }; ctl[2] = { connected: false, host: null }; await tick(); for (const c of cards) c.host.value = ''; };
 
-// Scenario 1: P1 connected to B (STM32), then rescan [A, B]
-await reset(); scanResults = [{ host: A, name: 'a', controller_responsive: true }, { host: B, name: 'b', controller_responsive: true }];
-cards[0].host.value = B; await cards[0].btn.fire('click'); await tick();
-await ids.scanBtn.fire('click'); await tick();
-expect('rescan with P1 connected keeps the other IP in P2', cards[1].host.value === A && cards[0].host.value === B);
-
-// Scenario 2: scan fills P1=A, P2=B; user connects P2 (B, STM32) first, P1 not connected
-await reset(); await ids.scanBtn.fire('click'); await tick();
+// Scenario 2 (run first: a fresh page, auto-arrange not yet used): scan fills P1=A, P2=B; user connects P2 (B, STM32) first, P1 not connected
+await reset(); cards[0].host.value = A; cards[1].host.value = B;
 const before = show();
 await cards[1].btn.fire('click'); await tick(); await tick();
 expect('connect STM32 board in P2 first: moved to P1, A kept in P2 (not connected)', cards[0].host.value === B && ctl[1].connected && ctl[1].host === B && cards[1].host.value === A && !ctl[2].connected);
 console.log('   (before connect: ' + before + ')');
 
-// Scenario 3: both connected with STM32 in P2 -> swapped, both stay connected
-await reset(); cards[0].host.value = A; cards[1].host.value = B;
+// Scenario 1: P1 connected to B (STM32), then rescan [A, B]
+await reset(); scanResults = [{ host: A, name: 'a', controller_responsive: true }, { host: B, name: 'b', controller_responsive: true }];
+cards[0].host.value = B; await cards[0].btn.fire('click'); await tick();
+await ids.scanBtn.fire('click'); await tick();
+expect('Scan with P1 connected: the other bridge is connected as P2', cards[1].host.value === A && cards[0].host.value === B && ctl[2].host === A);
+
+// Scenario 3: P1 connected by hand to A (no STM32), then Scan: the backend
+// connects B (STM32) as P2, and the panel swaps them so P1 is the STM32 board
+await reset(); cards[0].host.value = A;
 await cards[0].btn.fire('click'); await tick();
-await ids.scanBtn.fire('click'); await tick();   // re-enable auto-arrange (new scan)
-cards[1].host.value = B; await cards[1].btn.fire('click'); await tick(); await tick();
-expect('both connected, STM32 in P2: swapped, both still connected', ctl[1].host === B && ctl[2].host === A && cards[0].host.value === B && cards[1].host.value === A);
+await ids.scanBtn.fire('click'); await tick(); await tick();
+expect('P1 by hand (no STM32) + Scan: swapped, STM32 board P1, both connected', ctl[1].host === B && ctl[2].host === A && cards[0].host.value === B && cards[1].host.value === A);
 
 // Scenario 4: plain first scan, nothing connected
 await reset(); await ids.scanBtn.fire('click'); await tick();
-expect('first scan fills P1=A, P2=B', cards[0].host.value === A && cards[1].host.value === B);
-// Scenario 5: scan, then connect P1 = A (no STM32) -> P2 still shows B
-await reset(); await ids.scanBtn.fire('click'); await tick();
-await cards[0].btn.fire('click'); await tick();
-expect('scan, connect P1 (no STM32): P2 still shows B', ctl[1].host === A && cards[1].host.value === B);
-// Scenario 6: scan, user swaps fields, connects P1 = B (STM32) -> P2 still shows A
-await reset(); await ids.scanBtn.fire('click'); await tick();
-cards[0].host.value = B; cards[1].host.value = A;
-await cards[0].btn.fire('click'); await tick();
-expect('connect P1 = STM32 board: P2 still shows A', ctl[1].host === B && cards[1].host.value === A);
+expect('first Scan: STM32 board connected as P1, the other as P2', cards[0].host.value === B && cards[1].host.value === A && ctl[1].host === B && ctl[2].host === A);
+// Scenario 5: one bridge held by another client -> not connected, shown in the hint
+await reset(); scanResults = [{ host: A, name: 'a', busy: true }, { host: B, name: 'b' }];
+await ids.scanBtn.fire('click'); await tick();
+expect('busy bridge skipped and reported; free card shows it for the user', ctl[1].host === B && !ctl[2].connected
+  && /held by another client/.test(ids.scanHint.textContent) && cards[1].host.value === A);
+scanResults = [{ host: A, name: 'a' }, { host: B, name: 'b' }];
 // Scenario 7: the same IP typed into both cards, both Conn clicked -> the second
 // is refused and its card cleared; the two cards never both show it once one connects
 await reset(); cards[0].host.value = A; cards[1].host.value = A;

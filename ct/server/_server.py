@@ -2981,6 +2981,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 # A (re)connect may be a freshly reflashed controller with an empty
                 # table — drop its currents cache so the next download re-sends them.
                 invalidate_currents_cache(cid - 1)
+                _AUTO_MANUAL.add(cid)           # the user chose this connection
+                _AUTO_OWNED.discard(cid)
                 link.connect(host)
                 if not link.client.connected:
                     # Port opened but the session dropped — the bridge is single-
@@ -3026,7 +3028,13 @@ class CtHandler(BaseHTTPRequestHandler):
                 if not link:
                     return self._json({"ok": False, "error": "bad controller"}, HTTPStatus.BAD_REQUEST)
                 link.disconnect()
+                _AUTO_MANUAL.add(cid)           # the user took this slot over
+                _AUTO_OWNED.discard(cid)
                 self._json({"ok": True, "status": link.status()})
+            elif path == "/api/auto-connect":
+                # Scan the LAN and connect bridges into empty slots, STM32 board
+                # as Power 1 (see auto_connect). The GUI's Scan button.
+                self._json(auto_connect(explicit=True))
             elif path == "/api/master":
                 # Choose which controller carries the STM32 (all STM32/ADC commands
                 # route here). Default Power 1.
@@ -4633,6 +4641,150 @@ def _do_restart(keep: dict, server) -> None:
     ct_update.restart_in_place()
 
 
+# ── Automatic discovery and connection ───────────────────────────────────────
+# Nobody types an IP. The backend scans the LAN for bridges, connects the one
+# whose ESP32 has seen an STM32 as Power 1 (the master -- that board's
+# filaments are Power 1's by the mapping convention) and the other as Power 2,
+# and keeps filling empty slots in the background. Rules:
+#   * a slot is EMPTY when it has no host at all (a dropped bridge keeps its
+#     host and is reconnected by its own link, not by this);
+#   * a bridge another client already holds (tcp_client_busy) is never taken;
+#   * a slot the user disconnected or connected by hand is left to the user
+#     until the next explicit auto-connect (POST /api/auto-connect, Scan);
+#   * Power 1 / Power 2 are rearranged only when every connected slot was
+#     connected by this code -- never a connection the user made.
+# CT_NO_AUTO_CONNECT=1 turns the background loop off.
+AUTO_CONNECT_MIN_S = 30.0          # first retry interval while a slot is empty
+AUTO_CONNECT_MAX_S = 300.0         # backs off to this when nothing new is found
+_AUTO_LOCK = threading.Lock()
+_AUTO_MANUAL: set[int] = set()     # slots the user disconnected/connected by hand
+_AUTO_OWNED: set[int] = set()      # slots this code connected
+
+
+def scan_bridges() -> list[dict]:
+    """Bridges on the LAN, one row per device (deduplicated by AP SSID), with
+    whether its ESP32 has seen an STM32 and whether another client holds it.
+    Read-only: HTTP status pages and a TCP port probe, no session opened."""
+    rows, seen = [], set()
+    for rec in scan_for_bridge(probe_controller=False):
+        bridge = rec.get("bridge", {})
+        if not bridge.get("port_open"):
+            continue
+        host = rec.get("host")
+        ident = bridge.get("name") or host
+        if ident in seen:
+            continue
+        seen.add(ident)
+        try:
+            stm = bool(fetch_stm32_status(host, timeout=1.0).get("ever_seen"))
+        except Exception:
+            stm = False
+        rows.append({"host": host, "name": bridge.get("name"), "has_stm32": stm,
+                     "busy": bool(bridge.get("tcp_client_busy"))})
+    # STM32 first: it is the master, Power 1.
+    rows.sort(key=lambda r: (not r["has_stm32"], r["host"] or ""))
+    return rows
+
+
+def _slot_free(cid: int) -> bool:
+    link = CONTROLLERS.get(cid)
+    return bool(link) and not link.host
+
+
+def auto_connect(explicit: bool = False) -> dict:
+    """Scan and connect bridges into empty slots (see the rules above).
+    explicit=True (the user asked) also re-enables slots the user had taken
+    over by hand. Returns what was found and done."""
+    global MASTER
+    if not _AUTO_LOCK.acquire(blocking=explicit):
+        return {"ok": False, "error": "an automatic scan is already running"}
+    try:
+        if explicit:
+            _AUTO_MANUAL.clear()
+        found = scan_bridges()
+        mine = {str(l.host).strip() for l in CONTROLLERS.values() if l.host}
+        free_bridges = [b for b in found if b["host"] not in mine and not b["busy"]]
+        slots = [c for c in sorted(CONTROLLERS) if _slot_free(c) and c not in _AUTO_MANUAL]
+        done: dict[str, str] = {}
+        failed: dict[str, str] = {}
+
+        def put(cid: int, bridge: dict) -> bool:
+            link = CONTROLLERS[cid]
+            invalidate_currents_cache(cid - 1)
+            try:
+                link.connect(bridge["host"])
+            except Exception as exc:
+                failed[str(cid)] = f"{bridge['host']}: {exc}"
+            if link.client.connected:
+                _AUTO_OWNED.add(cid)
+                done[str(cid)] = bridge["host"]
+                return True
+            link.disconnect()           # leave the slot free for the next try
+            failed.setdefault(str(cid), f"{bridge['host']}: did not connect")
+            return False
+
+        # The STM32 bridge goes to Power 1 when that slot is free; the rest
+        # fill the remaining free slots in order.
+        queue = list(free_bridges)
+        for cid in list(slots):
+            if not queue:
+                break
+            if cid == 1:
+                pick = next((b for b in queue if b["has_stm32"]), None) or queue[0]
+            else:
+                pick = next((b for b in queue if not b["has_stm32"]), None) or queue[0]
+            queue.remove(pick)
+            put(cid, pick)
+
+        # Power 1 must be the STM32 board. If the code (not the user) ended up
+        # with it in slot 2, swap the two.
+        stm_hosts = {b["host"] for b in found if b["has_stm32"]}
+        l1, l2 = CONTROLLERS.get(1), CONTROLLERS.get(2)
+        if (l1 and l2 and l2.host in stm_hosts and l1.host not in stm_hosts
+                and 2 in _AUTO_OWNED and (not l1.host or 1 in _AUTO_OWNED)):
+            h1, h2 = l1.host, l2.host
+            log.warning("auto-connect: the STM32 bridge %s is on Power 2 — swapping "
+                        "so it is Power 1", h2)
+            l2.disconnect()
+            if h1:
+                l1.disconnect()
+            for cid, h in ((1, h2), (2, h1)):
+                if h:
+                    put(cid, {"host": h})
+        if 1 in _AUTO_OWNED and CONTROLLERS[1].host in stm_hosts:
+            MASTER = 1
+        if done:
+            log.info("auto-connect: %s", ", ".join(f"Power {c} -> {h}" for c, h in done.items()))
+        return {"ok": True, "found": found, "connected": done, "failed": failed,
+                "status": {str(k): c.status() for k, c in CONTROLLERS.items()},
+                "master": MASTER}
+    finally:
+        _AUTO_LOCK.release()
+
+
+def _auto_connect_loop() -> None:
+    wait = 0.0
+    while True:
+        time.sleep(max(1.0, wait))
+        if os.environ.get("CT_NO_AUTO_CONNECT"):
+            return
+        try:
+            if not any(_slot_free(c) and c not in _AUTO_MANUAL for c in CONTROLLERS):
+                wait = AUTO_CONNECT_MIN_S       # nothing to do; check again later
+                continue
+            if _lease_snapshot().get("held"):
+                # Somebody is driving the bench: a controller appearing in the
+                # middle of their run would be swept into its batch commands.
+                wait = AUTO_CONNECT_MIN_S
+                continue
+            r = auto_connect()
+            wait = (AUTO_CONNECT_MIN_S if r.get("connected")
+                    else min(AUTO_CONNECT_MAX_S, max(AUTO_CONNECT_MIN_S, wait * 2)))
+        except Exception as exc:          # never let it die
+            log.exception("auto-connect tick failed: %s", exc)
+            wait = AUTO_CONNECT_MAX_S
+
+
 def _reconnect_from_env() -> None:
     """After an in-place restart, re-open the connections the old process had."""
     spec = os.environ.pop("CT_RECONNECT", "")
@@ -4689,6 +4841,11 @@ def main() -> None:
     if os.environ.pop("CT_RESTARTED_FROM", None):
         print(f"[ct] backend RESTARTED -- now pid {os.getpid()}, running in this window", flush=True)
     threading.Thread(target=_reconnect_from_env, name="reconnect", daemon=True).start()
+    # Find and connect the controllers -- after the restart reconnect above has
+    # had a moment, so it does not race it for the same bridges.
+    if not os.environ.get("CT_NO_AUTO_CONNECT"):
+        threading.Thread(target=lambda: (time.sleep(3.0), _auto_connect_loop()),
+                         name="auto_connect", daemon=True).start()
     print(f"CT GUI server listening on http://{host}:{port}  (log: {LOG_DIR}/backend.log)")
     if host == "0.0.0.0":
         lan = primary_local_ip()

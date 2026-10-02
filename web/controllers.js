@@ -91,27 +91,20 @@ export function initControllers() {
     scanBtn.disabled = true;
     userPinnedMaster = false;   // fresh scan → re-detect master from STM32 presence
     hasAutoArranged = false;    // allow slot swap to run again after a new scan
-    scanHint.textContent = 'Scanning LAN + 192.168.4.0/24 …';
+    scanHint.textContent = 'Finding and connecting the controllers …';
     try {
-      const { results } = await api('/api/scan');
-      // responsive controllers first, then port-open — so the best host wins.
-      const found = (results || []).slice().sort(
-        (a, b) => (b.controller_responsive ? 1 : 0) - (a.controller_responsive ? 1 : 0));
-
-      // Dedup by identity (name = AP SSID / MAC) so a bridge answering at
-      // both its LAN IP and 192.168.4.1 doesn't fill both slots.
-      const seenId = new Set();
-      allFoundHosts = [];
-      for (const r of found) {
-        const id = r.name || r.host;
-        if (seenId.has(id)) continue;
-        seenId.add(id);
-        allFoundHosts.push({
-          host: r.host,
-          name: r.name,
-          label: (r.name ? r.name + ' · ' : '') + (r.controller_responsive ? 'RP2350 ✓' : 'port open'),
-        });
-      }
+      // The BACKEND scans and connects (STM32 board -> Power 1); the cards
+      // only show the result. Deduplicated by device there already.
+      const res = await post('/api/auto-connect', {});
+      if (res && res.ok === false && res.error) { scanHint.textContent = res.error; return; }
+      const found = (res && res.found) || [];
+      allFoundHosts = found.map((r) => ({
+        host: r.host,
+        name: r.name,
+        label: (r.name ? r.name + ' · ' : '') + (r.has_stm32 ? 'STM32 (master)' : 'no STM32')
+          + (r.busy ? ' · held by another client' : ''),
+      }));
+      await refresh();
 
       // Fill only the cards that are NOT connected, and only with hosts no
       // connected card already holds. Filling every card in scan order used to
@@ -137,10 +130,13 @@ export function initControllers() {
       if (!found.length) {
         scanHint.textContent = 'No bridge found. Join the CTPower-XXXXXX AP or check the ESP32 is powered, then scan again.';
       } else {
-        const live = found.filter((r) => r.controller_responsive).length;
-        scanHint.textContent = found.length === 1
-          ? `Found ${found[0].name || found[0].host}${found[0].controller_responsive ? ' — controller alive' : ' — controller silent'} @ ${found[0].host}.`
-          : `Found ${found.length} bridge(s), ${live} with a live controller — filled the cards (adjust if needed).`;
+        const conn = Object.entries((res && res.connected) || {}).map(([c, h]) => `Power ${c} → ${h}`);
+        const busy = found.filter((r) => r.busy).map((r) => r.host);
+        const fail = Object.entries((res && res.failed) || {}).map(([c, e]) => `Power ${c}: ${e}`);
+        scanHint.textContent = `Found ${found.length} bridge(s)`
+          + (conn.length ? ` — connected ${conn.join(', ')}` : ' — nothing new to connect')
+          + (busy.length ? ` · held by another client: ${busy.join(', ')}` : '')
+          + (fail.length ? ` · failed: ${fail.join('; ')}` : '');
       }
     } catch (e) {
       scanHint.textContent = 'Scan failed: ' + e;
@@ -224,7 +220,16 @@ export function initControllers() {
     });
   }
 
-  async function refresh() {
+  // One refresh at a time. The 1.5 s timer and the Scan/Conn handlers both call
+  // it; two overlapping runs could write one run's pre-swap status over the
+  // other's post-swap result (and the duplicate rule then wiped an IP).
+  let refreshing = null;
+  function refresh() {
+    if (!refreshing) refreshing = doRefresh().finally(() => { refreshing = null; });
+    return refreshing;
+  }
+
+  async function doRefresh() {
     let st;
     try { st = await api('/api/status'); } catch { return; }
     if (st.master) master = st.master;
