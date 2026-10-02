@@ -86,6 +86,14 @@ def _trigger_delay_one(link: "ControllerLink", delay_us=None) -> dict:
     return {"ok": False, "error": "no valid trigger-delay reply"}
 
 
+# The trigger delay the whole rig is meant to run at: the last value SET
+# through trigger_delay_all(), or -- before any set since this backend started
+# -- the first non-zero value every controller agreed on. A dict, not a bare
+# int, so the star-importing modules see updates. Not persisted: after a
+# backend restart the first consistent read fills it again.
+TRIGGER_DELAY_WANT: dict = {"us": None}
+
+
 def trigger_delay_all(delay_us=None) -> dict:
     """GET or SET the trigger delay on EVERY connected controller, as one value.
 
@@ -127,15 +135,53 @@ def trigger_delay_all(delay_us=None) -> dict:
                                    f"reset reads 0. Set it again (it writes all).")
     else:
         out["ok"] = True
+        if delay_us is not None:
+            TRIGGER_DELAY_WANT["us"] = int(delay_us)
+        elif TRIGGER_DELAY_WANT["us"] is None and out["delayUs"]:
+            TRIGGER_DELAY_WANT["us"] = int(out["delayUs"])
     return out
 
 
+def _restore_trigger_delay(r: dict) -> dict | None:
+    """Re-apply the rig's trigger delay to controllers that lost it to an
+    RP2350 reset (which zeroes it). Only for that exact signature: every
+    controller read back, each reads either 0 or the wanted value, and at least
+    one reads 0. Anything else -- a read failure, a different non-zero value
+    someone set on purpose -- is left alone and refused at arm as before.
+    Returns the re-applied trigger_delay_all() result, or None if not applied."""
+    want = TRIGGER_DELAY_WANT.get("us")
+    if not want:
+        return None
+    per = r.get("controllers") or {}
+    vals = {c: x.get("delayUs") for c, x in per.items() if x.get("ok")}
+    if not vals or len(vals) != len(per):
+        return None
+    if any(v not in (0, want) for v in vals.values()):
+        return None
+    zeroed = sorted(c for c, v in vals.items() if v == 0)
+    if not zeroed:
+        return None
+    w = trigger_delay_all(want)
+    log.warning("trigger delay: controller(s) %s read 0 (RP2350 reset) — re-applied "
+                "the rig's %d us -> %s", zeroed, want,
+                "ok" if w.get("ok") else w.get("error"))
+    return w
+
+
 def trigger_delay_mismatch() -> str | None:
-    """Why arming now would be wrong, or None. Only meaningful with more than
-    one controller connected; with one there is nothing to disagree with."""
-    if sum(1 for l in CONTROLLERS.values() if l.client.connected) < 2:
+    """Why arming now would be wrong, or None. A controller whose delay was
+    zeroed by an RP2350 reset is first given the rig's value back
+    (_restore_trigger_delay). Disagreement only matters with more than one
+    controller connected; with one there is nothing to disagree with."""
+    n = sum(1 for l in CONTROLLERS.values() if l.client.connected)
+    if n == 0 or (n < 2 and not TRIGGER_DELAY_WANT.get("us")):
         return None
     r = trigger_delay_all()
+    w = _restore_trigger_delay(r)
+    if w is not None:
+        r = w
+    if n < 2:
+        return None
     return None if r.get("ok") else r.get("error")
 
 
@@ -243,7 +289,7 @@ __all__ = [
     "_SIM_LOCK", "_SIM_STATE", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG",
     "_coerce_bytes", "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable",
     "_popcount", "_setup_logging", "_status_err", "_status_ok", "_suppress",
-    "_trigger_delay_one", "_u16", "_u32", "_unpack_spi_shot", "adc_get_burst",
+    "TRIGGER_DELAY_WANT", "_restore_trigger_delay", "_trigger_delay_one", "_u16", "_u32", "_unpack_spi_shot", "adc_get_burst",
     "adc_pulse_arm", "adc_pulse_diag", "adc_pulse_disarm", "adc_ready_arm",
     "adc_ready_disarm", "adc_ready_renew", "adc_ready_status", "adc_ring_peek",
     "adc_ring_start", "adc_ring_stop", "adc_ring_window", "adc_ring_window_data",

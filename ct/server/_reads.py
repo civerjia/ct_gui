@@ -411,7 +411,7 @@ __all__ = [
     "_OCP_SENSE_RESISTOR_OHMS", "_ORDER_LOCK", "_SIM_LOCK", "_SIM_STATE",
     "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG", "_cached_entry", "_coerce_bytes",
     "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable", "_popcount",
-    "_setup_logging", "_status_err", "_status_ok", "_suppress", "_trigger_delay_one",
+    "_setup_logging", "_status_err", "_status_ok", "_suppress", "TRIGGER_DELAY_WANT", "_restore_trigger_delay", "_trigger_delay_one",
     "_u16", "_u32", "_unpack_spi_shot", "adc_get_burst", "adc_pulse_arm",
     "adc_pulse_diag", "adc_pulse_disarm", "adc_ready_arm", "adc_ready_disarm",
     "adc_ready_renew", "adc_ready_status", "adc_ring_peek", "adc_ring_start",
