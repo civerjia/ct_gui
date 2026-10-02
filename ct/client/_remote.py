@@ -105,9 +105,9 @@ class RemoteCTClient:
         d = self.__dict__
         d["base"], d["client_id"] = base, client_id
         d["_rp_init"], d["_rp_sid"] = init, sid
-        d["_rp_http"] = requests.Session()
-        d["_rp_http"].headers.update({"X-CT-Client": client_id})
-        d["_rp_lock"] = threading.Lock()
+        # One HTTP session per script thread: calls from different threads go
+        # out (and run in the backend) concurrently, as on a local client.
+        d["_rp_tls"] = threading.local()
         d["_rp_kinds"] = {}
         d["_rp_local_client"] = None
         d["_rp_stop"] = threading.Event()
@@ -190,14 +190,32 @@ class RemoteCTClient:
               + (" (filament numbering kept)" if st.get("order") is not None else "")
               + (" (watchdog keepalive resumed)" if st.get("keepalive") else ""), flush=True)
 
+    def _rp_http(self) -> requests.Session:
+        tls = self._rp_tls
+        if getattr(tls, "http", None) is None:
+            tls.http = requests.Session()
+            tls.http.headers.update({"X-CT-Client": self.client_id})
+        return tls.http
+
     def _rp_send(self, body: dict) -> dict:
         """One raw request to the current session; returns the JSON reply."""
-        payload = {**body, "sid": self._rp_sid_box().get("sid")}
+        ptid = threading.get_ident()
+        payload = {**body, "sid": self._rp_sid_box().get("sid"), "ptid": ptid}
         try:
-            with self._rp_lock:
-                r = self._rp_http.post(self.base + "/api/remote/call", json=payload,
-                                       timeout=(5, None))
+            r = self._rp_http().post(self.base + "/api/remote/call", json=payload,
+                                     timeout=(5, None))
             return r.json()
+        except KeyboardInterrupt:
+            # Ctrl-C must stop the CALL, not just this wait: the backend raises
+            # KeyboardInterrupt inside it so its own cleanup runs, as it would
+            # have in this process. Then the interrupt carries on here.
+            try:
+                requests.post(self.base + "/api/remote/cancel",
+                              json={"sid": payload["sid"], "ptid": ptid},
+                              headers={"X-CT-Client": self.client_id}, timeout=5)
+            except Exception:
+                pass
+            raise
         except requests.exceptions.RequestException as exc:
             raise _base.CTConnectionError(f"backend unreachable at {self.base}: {exc}") from exc
 

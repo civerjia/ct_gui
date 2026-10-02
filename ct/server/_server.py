@@ -3085,6 +3085,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 self._json(_remote.call(body))
             elif path == "/api/remote/ping":
                 self._json(_remote.ping(body))
+            elif path == "/api/remote/cancel":
+                self._json(_remote.cancel(body))
             elif path == "/api/remote/close":
                 self._json(_remote.close(body))
             elif path == "/api/auto-connect":

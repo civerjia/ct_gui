@@ -102,6 +102,7 @@ _UNGATED_POSTS = {
     # Remote CTClient sessions: they only CARRY calls; every hardware request
     # a call makes is a normal, gated, audited request of its own.
     "/api/remote/open", "/api/remote/call", "/api/remote/ping", "/api/remote/close",
+    "/api/remote/cancel",
 }
 
 

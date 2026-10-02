@@ -5,7 +5,7 @@ results come back as the same types, errors as the same exceptions, a
 crashed script's `with` blocks are closed by the backend, and a backend
 restart keeps the script's filament numbering and watchdog keepalive.
 
-    python3 tests/test_remote_client.py          (~40 s: includes a crash wait)
+    python3 tests/test_remote_client.py          (~45 s: includes a crash wait)
 """
 
 import _path  # noqa: F401
@@ -84,6 +84,32 @@ try:
     ct.__dict__["_rp_local_client"] = type("L", (), {"status": lambda self, cb=None: calls.append(cb) or "local"})()
     check("a call given a callable runs locally", ct.status(cb=lambda: None) == "local" and calls)
     ct.__dict__["_rp_local_client"] = None
+
+    # Calls from different threads run concurrently, as on a local client.
+    import threading as _th
+    long_call = _th.Thread(target=lambda: ct.wait_for_current(0, 1000, timeout_s=6))
+    long_call.start()
+    time.sleep(1.0)
+    t1 = time.time()
+    ct.status()
+    check("another thread's call is not queued behind a long one", time.time() - t1 < 2,
+          f"{time.time() - t1:.1f}s")
+    long_call.join()
+
+    # Ctrl-C stops the call in the backend too, not only the local wait.
+    import threading as _th
+    _th.Timer(1.5, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+    t0 = time.time()
+    try:
+        ct.wait_for_current(0, 1000, timeout_s=30)        # polls for 30 s without hardware
+        check("Ctrl-C interrupts a remote call", False)
+    except KeyboardInterrupt:
+        check("Ctrl-C interrupts a remote call", time.time() - t0 < 5, f"{time.time() - t0:.1f}s")
+    time.sleep(1.0)
+    t1 = time.time()
+    ct.status()
+    check("...and the backend stopped it (the session is free at once)", time.time() - t1 < 2,
+          f"{time.time() - t1:.1f}s")
 
     # A script that dies inside a lease: the backend closes it.
     crash = ("import sys,os; sys.path.insert(0,'.'); from ct_simple_control import CTClient;"
