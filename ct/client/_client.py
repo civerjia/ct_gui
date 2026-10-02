@@ -1372,6 +1372,12 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
     #    OCP that recovers on the next revive can flash the fault bits, so one
     #    sighting is not a verdict; ~0.3 s at the default poll interval.
     _FAULT_CONFIRM_READS = 3
+    #    Batch verify (wait_for_currents): a filament whose distance to target
+    #    has not shrunk by STALL_PROGRESS_MA in STALL_S -- or that has had no
+    #    reading for that long -- is given up on, so a board that will never
+    #    get there does not hold every other filament until the timeout.
+    STALL_S = 3.0
+    STALL_PROGRESS_MA = 25.0
 
     # The firmware's DEFAULTS, which are NOT the ceilings (below 2000,
     # above/warm 5000). below/above are the COLD-start rates and sit well under

@@ -125,7 +125,9 @@ with ct.lease(ttl=120, note="emission test F8"):       # write access (see below
   (`CTLeaseError`).
 - **`verify=True`** reads the hardware back and says whether the state was
   really reached (`r["readback"]`, `r["not_reached"]`). Use it on anything that
-  energises or de-energises.
+  energises or de-energises. A batch verify does not wait for a filament that has
+  stopped getting closer to its target (or has no reading) for 3 s: it is
+  reported `stalled` and the rest of the batch returns as soon as it arrives.
 - **The ladder is STOP -> SLEEP -> STANDBY -> IDLE -> ACTIVE**, one step at a
   time; ACTIVE is refused unless the filament is at IDLE (a cold filament must
   not see operating current). Going down (STOP) is always allowed. ACTIVE below

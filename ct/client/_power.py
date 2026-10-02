@@ -874,6 +874,12 @@ class _PowerMixin:
         streaks = {f: 0 for f in live}
         pending = set(live)
         polls = 0
+        # Stall detection: a filament that is not getting any closer to its
+        # target (or has no reading at all -- a lost board) is given up on, so
+        # it does not hold the rest of the batch until the timeout. Progress =
+        # the distance to target shrinking by STALL_PROGRESS_MA within STALL_S.
+        best_gap: dict[int, float | None] = {f: None for f in live}
+        progress_at = {f: start for f in live}
 
         def finish(f, data, ok, **extra):
             raw = data.get("current_mA")
@@ -930,7 +936,21 @@ class _PowerMixin:
                 raw = data.get("current_mA")
                 if arrival is None and raw is not None \
                         and abs(float(raw) - live[f]) <= tolerance_ma:
-                    results[f] = finish(f, data, True); pending.discard(f)
+                    results[f] = finish(f, data, True); pending.discard(f); continue
+                now = time.monotonic()
+                gap = abs(float(raw) - live[f]) if raw is not None else None
+                if gap is not None and (best_gap[f] is None
+                                        or gap < best_gap[f] - self.STALL_PROGRESS_MA):
+                    best_gap[f], progress_at[f] = gap, now
+                if now - start >= self.STALL_S and now - progress_at[f] >= self.STALL_S:
+                    why = (f"no reading for {self.STALL_S:g} s (board lost or absent?)"
+                           if raw is None else
+                           f"stuck at {float(raw):.0f} mA, not getting closer to "
+                           f"{live[f]:.0f} mA for {self.STALL_S:g} s")
+                    results[f] = finish(f, data, False, stalled=True,
+                        error=f"{why} — given up so it does not hold the rest of "
+                              f"the batch; the controller keeps regulating it")
+                    pending.discard(f)
             if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(poll_interval_s)
