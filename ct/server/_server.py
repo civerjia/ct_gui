@@ -2968,6 +2968,16 @@ class CtHandler(BaseHTTPRequestHandler):
                 host = str(body.get("host", "")).strip()
                 if not host:
                     return self._json({"ok": False, "error": "no host"}, HTTPStatus.BAD_REQUEST)
+                # One bridge, one slot. Refused HERE, by name, rather than left to
+                # the bridge's single-client rule, whose refusal reads as a busy
+                # bridge and does not say which slot already has it.
+                for other_id, other in CONTROLLERS.items():
+                    if (other_id != cid and other.client.connected
+                            and str(getattr(other, "host", "") or "").strip() == host):
+                        return self._json({"ok": False, "error":
+                                           f"{host} is already connected as Power {other_id} "
+                                           f"— one bridge cannot be both controllers"},
+                                          HTTPStatus.OK)
                 # A (re)connect may be a freshly reflashed controller with an empty
                 # table — drop its currents cache so the next download re-sends them.
                 invalidate_currents_cache(cid - 1)

@@ -44,7 +44,8 @@ globalThis.fetch = async (path, opts) => {
   else if (path === '/api/scan') r = { results: scanResults };
   else if (path === '/api/connect') {
     const other = body.controller === 1 ? 2 : 1;
-    if (ctl[other].connected && ctl[other].host === body.host) r = { ok: false, error: 'already connected on the other slot' };
+    if (!body.host) r = { ok: false, error: 'no host' };   // as the real backend
+    else if (ctl[other].connected && ctl[other].host === body.host) r = { ok: false, error: 'already connected as Power ' + other };
     else { ctl[body.controller] = { connected: true, host: body.host }; r = { ok: true }; }
   } else if (path === '/api/disconnect') { ctl[body.controller] = { connected: false, host: null }; r = { ok: true }; }
   else if (path === '/api/master') { master = body.controller; r = { master }; }
@@ -94,4 +95,11 @@ await reset(); await ids.scanBtn.fire('click'); await tick();
 cards[0].host.value = B; cards[1].host.value = A;
 await cards[0].btn.fire('click'); await tick();
 expect('connect P1 = STM32 board: P2 still shows A', ctl[1].host === B && cards[1].host.value === A);
+// Scenario 7: the same IP typed into both cards, both Conn clicked -> the second
+// is refused and its card cleared; the two cards never both show it once one connects
+await reset(); cards[0].host.value = A; cards[1].host.value = A;
+await cards[0].btn.fire('click'); await tick();
+await cards[1].btn.fire('click'); await tick();
+expect('same IP in both cards: only one connects, other card cleared',
+  ctl[1].host === A && !ctl[2].connected && cards[1].host.value !== A && /no host|already/.test(ids.scanHint.textContent));
 process.exit(results.every(([, ok]) => ok) ? 0 : 1);
