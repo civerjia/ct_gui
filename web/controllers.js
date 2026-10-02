@@ -113,12 +113,23 @@ export function initControllers() {
         });
       }
 
-      // Assign distinct IPs to the cards (first found → P1, second → P2).
-      const hosts = allFoundHosts.map((r) => r.host);
-      cards.forEach((card, i) => {
+      // Fill only the cards that are NOT connected, and only with hosts no
+      // connected card already holds. Filling every card in scan order used to
+      // put a connected bridge's IP into the free card -- which the duplicate
+      // rule in updateHostLists() then wiped, so the other bridge's IP vanished
+      // from both cards.
+      const taken = new Set();
+      for (const card of cards) {
         const h = card.querySelector('[data-host]');
-        if (h && hosts[i]) h.value = hosts[i];
-      });
+        if (connected[card.dataset.ctrl] && h && h.value) taken.add(h.value.trim());
+      }
+      const free = allFoundHosts.map((r) => r.host).filter((x) => !taken.has(x));
+      let k = 0;
+      for (const card of cards) {
+        if (connected[card.dataset.ctrl]) continue;
+        const h = card.querySelector('[data-host]');
+        if (h && free[k]) h.value = free[k++];
+      }
 
       // Rebuild datalists with the fresh results (each excludes the other slot).
       updateHostLists();
@@ -144,31 +155,43 @@ export function initControllers() {
 
   // If the STM32 bridge ended up in slot 2, swap slots so it becomes slot 1
   // (Power 1 = master is the invariant). Runs once per scan/session.
+  // Returns true if it swapped the slots (the caller must then re-read the
+  // status: the one it holds describes the arrangement BEFORE the swap).
   async function autoArrangeByStm32(st) {
-    if (userPinnedMaster || hasAutoArranged) return;
+    if (userPinnedMaster || hasAutoArranged) return false;
     const c1 = st.controllers['1'];
     const c2 = st.controllers['2'];
     const c1HasStm = c1 && c1.connected && c1.stm32 && c1.stm32.ever_seen;
     const c2HasStm = c2 && c2.connected && c2.stm32 && c2.stm32.ever_seen;
-    if (!c1HasStm && !c2HasStm) return;   // STM32 not visible on either yet — wait
+    if (!c1HasStm && !c2HasStm) return false;   // STM32 not visible on either yet — wait
     hasAutoArranged = true;
+    let swapped = false;
     if (c2HasStm && !c1HasStm) {
+      swapped = true;
       // STM32 is on P2 → disconnect both, swap IP slots, reconnect
       const host2 = c2.host;
-      const host1 = c1 && c1.connected ? c1.host : null;
+      const c1Conn = !!(c1 && c1.connected);
+      // Slot 1's IP moves to slot 2 -- the connected one, or, when slot 1 is
+      // not connected, whatever the scan or the user put in its field. It used
+      // to be dropped in that case, so the other bridge's IP disappeared.
+      const typed1 = ((hostInputOf(1) || {}).value || '').trim();
+      const host1 = c1Conn ? c1.host : (typed1 && typed1 !== host2 ? typed1 : null);
       if (c2.connected) await post('/api/disconnect', { controller: 2 });
-      if (c1 && c1.connected) await post('/api/disconnect', { controller: 1 });
+      if (c1Conn) await post('/api/disconnect', { controller: 1 });
       // Swap the IP fields first so the UI reflects the new arrangement
       const h1 = hostInputOf(1); if (h1) h1.value = host2;
       const h2 = hostInputOf(2); if (h2) h2.value = host1 || '';
       await post('/api/connect', { controller: 1, host: host2 });
-      if (host1) await post('/api/connect', { controller: 2, host: host1 });
+      // Reconnect slot 2 only if it was connected before; otherwise leave its
+      // IP in the field for the user to connect.
+      if (c1Conn && host1) await post('/api/connect', { controller: 2, host: host1 });
     }
     // Master is always slot 1 (now guaranteed to hold the STM32 bridge)
     if (master !== 1) {
       const res = await post('/api/master', { controller: 1 });
       if (res && res.master) master = res.master;
     }
+    return swapped;
   }
 
   for (const card of cards) {
@@ -216,7 +239,13 @@ export function initControllers() {
           + (lk.note ? ` — ${lk.note}` : '') + ` · ${Math.ceil(lk.expires_in_s)}s left`;
       }
     }
-    await autoArrangeByStm32(st);
+    // After a swap, the status read above is stale: using it would write the
+    // pre-swap host back into the cards (and the duplicate rule would then wipe
+    // the other bridge's IP). Read it again.
+    if (await autoArrangeByStm32(st)) {
+      try { st = await api('/api/status'); } catch { return; }
+      if (st.master) master = st.master;
+    }
     for (const card of cards) {
       const cid = parseInt(card.dataset.ctrl, 10);
       const c = st.controllers[card.dataset.ctrl];
