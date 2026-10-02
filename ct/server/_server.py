@@ -124,6 +124,7 @@ from ._schedule import *  # noqa: F401,F403,E402
 from ._reads import *  # noqa: F401,F403,E402
 from ._recording import *  # noqa: F401,F403,E402
 from ._safety import *  # noqa: F401,F403,E402
+from . import _remote  # noqa: E402  (remote CTClient sessions; not star-imported)
 from ._shared import *  # noqa: F401,F403,E402
 # (RECORD_DIR: see ct/paths.py)
 
@@ -2315,6 +2316,8 @@ class CtHandler(BaseHTTPRequestHandler):
                         "lock": _lease_snapshot()})
         elif path == "/api/safety":
             self._json(safety_snapshot())
+        elif path == "/api/remote/sessions":
+            self._json({"ok": True, "sessions": _remote.sessions()})
         elif path == "/api/status":
             # Session snapshot: each controller's cached connection state
             # (ControllerLink.status(), no live hardware read), the current
@@ -3075,6 +3078,15 @@ class CtHandler(BaseHTTPRequestHandler):
                 _AUTO_MANUAL.add(cid)           # the user took this slot over
                 _AUTO_OWNED.discard(cid)
                 self._json({"ok": True, "status": link.status()})
+            elif path == "/api/remote/open":
+                # Remote CTClient: open a session -- see ct/server/_remote.py.
+                self._json(_remote.open_session(body))
+            elif path == "/api/remote/call":
+                self._json(_remote.call(body))
+            elif path == "/api/remote/ping":
+                self._json(_remote.ping(body))
+            elif path == "/api/remote/close":
+                self._json(_remote.close(body))
             elif path == "/api/auto-connect":
                 # Scan the LAN and connect bridges into empty slots, STM32 board
                 # as Power 1 (see auto_connect). The GUI's Scan button.
@@ -4929,6 +4941,9 @@ def main() -> None:
     from ct import update as ct_update
     ct_update.check_and_update()
     _BACKEND_VERSION.update(ct_update.version())
+    # Inside the backend a CTClient is always the real, in-process one: a
+    # remote proxy here would only call back into this same process.
+    os.environ["CT_CLIENT_LOCAL"] = "1"
     host = os.environ.get("CT_GUI_HOST", "0.0.0.0")
     port = int(os.environ.get("CT_GUI_PORT", "8770"))
     _setup_logging()

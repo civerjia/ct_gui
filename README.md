@@ -117,6 +117,20 @@ with ct.lease(ttl=120, note="emission test F8"):       # write access (see below
         ct.stop_one(F, verify=True)
 ```
 
+**Your script's `ct` runs inside the backend.** `CTClient(...)` returns a thin
+proxy: every call is executed by the backend on a client of its own, and the
+result comes back with the same type (Result, dict with int keys, frozenset,
+...) and errors as the same exceptions. So the client logic is the backend's
+code -- **restart the backend and every running script uses the new version at
+its next call; the scripts themselves do not need restarting.** If the backend
+restarts mid-script the proxy reconnects by itself, keeping the script's
+filament numbering and its watchdog keepalive. If the script dies, the backend
+notices within ~15 s and closes it like a crash: open `with` blocks are exited
+(lease released, `session()` / `energised()` teardown run). Calls given a
+function (`progress=...`, `on_armed=...`) run locally. Older backend, or
+`CT_CLIENT_LOCAL=1`: the client runs in your process, as before.
+`GET /api/remote/sessions` lists the scripts connected this way.
+
 **Things every script needs to know:**
 
 - **Check results, don't catch exceptions.** Methods never raise for a hardware

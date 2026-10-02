@@ -99,6 +99,9 @@ _UNGATED_POSTS = {
     "/api/diagnosis",         # CH_GET_DIAGNOSIS   — per-chip classification
     "/api/tca9554-read",      # CH_READ_TCA9554    — expander registers
     "/api/verify-schedule",   # ShvGetTableInfo / ShvHeatGetInfo readback
+    # Remote CTClient sessions: they only CARRY calls; every hardware request
+    # a call makes is a normal, gated, audited request of its own.
+    "/api/remote/open", "/api/remote/call", "/api/remote/ping", "/api/remote/close",
 }
 
 
@@ -237,6 +240,8 @@ def is_deenergising_post(path: str, body: dict) -> bool:
 def _audit_skipped(path: str, body: dict) -> bool:
     if is_read_post(path, body) or path == "/api/poll-pause":
         return True
+    if path.startswith("/api/remote/"):
+        return True        # the forwarded calls are audited themselves
     if path == "/api/lock" and str(body.get("action", "acquire")).lower() in ("renew", "status"):
         return True
     if path == "/api/safety" and set(body) <= {"keepalive", "filaments", "client"}:

@@ -172,6 +172,7 @@ Usage:
 Dependencies: pip install requests
 """
 
+import os  # noqa: E402  (CTClient.__new__ reads CT_CLIENT_LOCAL)
 from ._base import *  # noqa: F401,F403 -- this module IS ct_simple_control:
 #   every shared name stays reachable here, as it was in the single file
 from ._power import _PowerMixin
@@ -214,6 +215,26 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
     # what scripts already pass. Conversion happens at the boundary, and
     # everything past it carries Fid.
 
+    def __new__(cls, *args, **kwargs):
+        """CTClient(...) normally returns a REMOTE client: a thin proxy whose
+        every call runs on a CTClient inside the backend (ct/client/_remote.py).
+        The client's logic is then the backend's code, so a backend restart
+        updates it for every running script -- no script restart needed.
+
+        A local, in-process client is used instead when:
+          _local=True                (the backend's own sessions; tests)
+          CT_CLIENT_LOCAL=1          (environment: opt out)
+          the backend has no remote API (an older backend)
+          a subclass of CTClient is being built, or no arguments (a bare
+          CTClient.__new__(CTClient), as tests do)
+        """
+        if (cls is not CTClient or not (args or kwargs) or kwargs.get("_local")
+                or os.environ.get("CT_CLIENT_LOCAL") == "1"):
+            return super().__new__(cls)
+        from ._remote import RemoteCTClient
+        proxy = RemoteCTClient.open(*args, **kwargs)
+        return proxy if proxy is not None else super().__new__(cls)
+
     def __init__(
         self,
         host: str = "localhost",      # backend.py's address — SAME machine:
@@ -242,6 +263,7 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
                                        # something. See _ensure_keepalive();
                                        # False means you renew it yourself, or
                                        # accept the fallback firing mid-run.
+        _local: bool = False,         # internal: see __new__
     ):
         """Connect to a running backend.py instance.
 
