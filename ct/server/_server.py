@@ -3923,15 +3923,32 @@ class CtHandler(BaseHTTPRequestHandler):
                 # it isn't. Only meaningful when the caller named filaments; None
                 # means "every populated board", which excludes nothing by
                 # definition.
+                # Dead filaments skipped on purpose (grid ON) were handled, not
+                # lost -- the same rule as /api/filament-prep.
                 excluded = []
                 if filaments is not None:
-                    touched = {f for r in results.values() for f in (r.get("touched") or [])}
+                    touched = {int(f) for r in results.values()
+                               for f in (r.get("touched") or []) + (r.get("dead_skipped") or [])}
                     excluded = [int(f) for f in filaments if int(f) not in touched]
                 out = {"ok": all(r.get("ok") for r in results.values()) and not excluded,
                        "results": results, "applied": applied, "failed": failed,
                        "excluded": excluded}
                 if mismatched:
                     out["mismatched"] = mismatched
+                if not out["ok"]:
+                    # One readable sentence, as for filament-prep.
+                    rows: dict = {}
+                    probs = ([f"{_board_word(f)}: {_why_not_applied(f, rows)}" for f in failed]
+                             + [f"{_board_word(f)}: switch did not read back as commanded"
+                                for f in mismatched]
+                             + [f"{_board_word(f)}: not sent — {_why_not_applied(f, rows)}"
+                                for f in excluded]
+                             + [f"Power {c}: {r['error']}" for c, r in sorted(results.items())
+                                if r.get("error")])
+                    out["error"] = (f"HV grid {'ON' if on else 'OFF'}: {len(applied)} applied. "
+                                    f"{len(probs)} problem(s): " + "; ".join(probs[:12])
+                                    + (f"; and {len(probs) - 12} more" if len(probs) > 12 else "")
+                                    + ".")
                 # Dead-man timer. A close that failed or did not verify may
                 # still have closed, so it counts as closed; an open counts
                 # only where it applied.

@@ -154,6 +154,29 @@ check("batch including a dead filament is ok", r.get("ok") is True, str(r.get("e
 check("...the dead one is not 'excluded'", dead_f not in (r.get("excluded") or []), str(r.get("excluded")))
 check("...and the summary says it was left off on purpose",
       "marked dead, left off on purpose" in (r.get("summary") or ""), r.get("summary"))
+
+
+def _fake_grid(link, c0, fids, on, force):
+    mine = [int(f) for f in fids if board_of(f)[0] == c0]
+    dead = [f for f in mine if f in S.DEAD_FIDS] if on else []
+    live = [f for f in mine if f not in dead]
+    return {"controller": c0, "ok": True, "applied": live, "failed": [], "mismatched": [],
+            "touched": live, "dead_skipped": dead, "not_this_controller": [], "unslotted": []}
+
+
+S.hv_grid_set = _fake_grid
+S.note_grid_commanded = lambda *a, **k: None
+req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/hv-grid",
+                             data=json.dumps({"on": True, "filaments": want}).encode(),
+                             headers={"Content-Type": "application/json", "X-CT-Client": "test"})
+r = json.loads(urllib.request.urlopen(req, timeout=10).read())
+check("HV grid ON including a dead filament is ok", r.get("ok") is True, str(r.get("error") or r)[:300])
+S.hv_grid_set = lambda link, c0, fids, on, force: {**_fake_grid(link, c0, fids, on, force),
+                                                    "ok": False, "failed": [live_f]}
+r = json.loads(urllib.request.urlopen(req, timeout=10).read())
+check("a real HV grid failure reads as a sentence naming the board",
+      not r.get("ok") and f"CH{lch + 1}.{lpos + 1}" in (r.get("error") or ""), str(r.get("error")))
+print("   hv-grid error:", r.get("error"))
 srv.shutdown()
 
 S.DEAD_FIDS.clear()
