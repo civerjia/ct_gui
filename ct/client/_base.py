@@ -73,7 +73,7 @@ class Result(dict):
     #: Shown first, in this order, when present -- the fields that answer
     #: "what happened". Everything else follows in the order the result
     #: carries it, which is usually the order the code that built it chose.
-    _LEAD = ("ok", "error", "not_reached", "reason", "filament", "filaments", "state",
+    _LEAD = ("ok", "error", "summary", "not_reached", "reason", "filament", "filaments", "state",
              "state_name", "verdict", "fired", "measured_ma", "arrival")
     _WIDTH = 78
 

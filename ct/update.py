@@ -318,6 +318,22 @@ def apply_update(sha: str, files: dict[str, bytes]) -> dict:
             "backup_dir": str(BACKUP_DIR / stamp) if backed_up else None}
 
 
+def remote_check(running_commit: str | None) -> dict:
+    """Is there a newer commit on GitHub than the code this process RUNS?
+    Asks GitHub for the branch head only -- nothing is downloaded or written;
+    applying it is still a restart (check_and_update at start-up).
+    running_commit: the short sha recorded at start-up (version()["commit"])."""
+    if _is_dev_copy():
+        # The development copy is the source GitHub is split out of: its
+        # commit hashes never match the public repo's, so there is nothing
+        # meaningful to compare.
+        return {"ok": True, "available": False, "dev_copy": True}
+    sha = _latest_commit()
+    cur = (running_commit or "")[:7] or None
+    return {"ok": True, "latest": sha[:7], "current": cur,
+            "available": cur is None or not sha.startswith(cur)}
+
+
 def check_and_update() -> None:
     just_updated_to = os.environ.pop("CT_UPDATED", "")
     if os.environ.get("CT_NO_AUTO_UPDATE"):

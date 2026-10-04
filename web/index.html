@@ -23,6 +23,7 @@
         <div class="header-badges">
           <div id="modeBadge" class="badge online" title="Active scan mode">Mode: Stationary</div>
           <div id="progressBadge" class="badge heartbeat-idle" title="Scan progress">Idle</div>
+          <button id="updateBadge" class="badge update" type="button" hidden></button>
         </div>
       </header>
 
@@ -87,7 +88,9 @@
             <span class="legend-item"><span class="legend-dot" style="background:#c79a3a"></span> Standby</span>
             <span class="legend-item"><span class="legend-dot" style="background:#3fb6a0"></span> Idle</span>
             <span class="legend-item"><span class="legend-dot" style="background:#ff5d5d"></span> Active</span>
-            <span class="legend-item"><span class="legend-dot" style="background:none;color:#7a838b">&#10005;</span> dead</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#9a6ed2"></span> Voltage</span>
+            <span class="legend-item" title="Marked dead in the backend: it refuses to power this filament"><span class="legend-dot" style="background:none;color:#ff5d5d;box-shadow:0 0 0 1px #ff5d5d">&#10005;</span> dead (enforced)</span>
+            <span class="legend-item" title="Left out of this plan only (absent board or disabled by hand)"><span class="legend-dot" style="background:none;color:#7a838b">&#10005;</span> off in plan</span>
           </div>
           <div class="legend geo-legend">
             <span class="legend-cap">rings</span>
@@ -400,16 +403,14 @@
             <div id="hwRunStatus" class="hw-status hint"></div>
           </section>
 
-          <!-- HV control + monitor (mirror of the Direct Power Control HV card —
-               same master STM32; handy during a hardware run without scrolling) -->
+          <!-- HV control + monitor: the same controls as the Direct Power
+               Control HV card, on purpose, next to the run (master STM32). -->
           <details class="card module hv-mirror-card foldable" data-module="hvmirror" open>
             <summary class="section-head foldable-summary">
               <h2>HV Control &amp; Monitor <span class="hint">— master STM32 · LUT −V</span></h2>
             </summary>
-            <!-- setpoint rows + enable buttons are rendered by power.js's
-                 wireHv() (hvSetpointRowsHtml('2') + hvEnableRowHtml('2')) —
-                 the same markup as the primary HV card, so this can't drift
-                 from it when a setpoint field changes there. -->
+            <!-- setpoint rows + enable buttons: rendered by power.js wireHv()
+                 from the same template and handlers as the HV card. -->
             <div id="hvMirrorSetpoints"></div>
             <div class="detail-top">
               <div class="metric"><span class="metric-label">Emission V</span><span id="adsEmV2" class="metric-value">—</span></div>

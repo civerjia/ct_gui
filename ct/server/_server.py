@@ -1343,6 +1343,171 @@ def _active_deadline_loop() -> None:
             log.exception("timed-active tick failed: %s", exc)
 
 
+def _annotate_board_rows(cid: int, rows: list) -> None:
+    """Add what the board grid needs to tell a DEAD filament from one that is
+    simply not started: fid, dead (+ reason, from DEAD_FIDS) and power_state
+    -- the firmware's own report (0x3D) when the monitor has it, else this
+    backend's last commanded state (power_state_src says which; None = unknown,
+    never guessed as STOP)."""
+    with _DEAD_LOCK:
+        dead = {f: dict(v) for f, v in DEAD_FIDS.items()}
+    for r in rows:
+        fid = MAPPING.filament_for_board(cid - 1, r["channel"], r["mux_port"])
+        r["fid"] = fid
+        d = dead.get(fid) if fid is not None else None
+        r["dead"] = d is not None
+        r["dead_reason"] = (d or {}).get("reason")
+        st, src = r.get("power_state"), "firmware" if r.get("power_state") else None
+        if not st and fid is not None and fid in LAST_POWER_STATE:
+            st, src = LAST_POWER_STATE[fid][0], "backend"
+        r["power_state"] = int(st) if st else None
+        r["power_state_name"] = POWER_STATE_NAMES.get(int(st)) if st else None
+        r["power_state_src"] = src
+
+
+def _raw_cmd_targets(cid: int, body: dict) -> list[tuple[int, int, int | None]]:
+    """(channel, mux, fid) every board a raw /api/cmd or /api/power-cmd body
+    addresses: target=single -> one board, else the board_mask bits."""
+    out = []
+    if body.get("target") == "single":
+        ch, mux = int(body.get("channel", 0)), int(body.get("mux_port", 0))
+        out.append((ch, mux))
+    else:
+        mask = body.get("board_mask") or [0] * 8
+        for ch in range(min(8, len(mask))):
+            for mux in range(8):
+                if int(mask[ch]) & (1 << mux):
+                    out.append((ch, mux))
+    return [(ch, mux, MAPPING.filament_for_board(cid - 1, ch, mux)) for ch, mux in out]
+
+
+def _raw_power_guard(cid: int, command: str, body: dict) -> tuple[dict | None, list, int | None]:
+    """The raw proxies (/api/cmd, /api/power-cmd) used to forward a power
+    command as-is, so the GUI's debug/batch buttons and tests could power a
+    DEAD filament or jump STOP->ACTIVE -- the very things /api/filament-state
+    refuses. Same rules here: refuse the WHOLE command (naming each board and
+    why), never a silent partial. Returns (refusal | None, fids, state)."""
+    command = command.upper()
+    energising = False
+    state = None
+    if command == "CH_SET_POWER_STATE":
+        try:
+            state = int(body.get("state", 0))
+        except (TypeError, ValueError):
+            return ({"ok": False, "error": f"state must be an integer 1..6, got {body.get('state')!r}"},
+                    [], None)
+        energising = state in ENERGISING_STATES
+    elif command == "CH_SET_TPS_ENABLE":
+        energising = bool(body.get("enable"))
+    elif command == "CH_SET_TPS_VOLTAGE":
+        energising = True
+    else:
+        return None, [], None
+    targets = _raw_cmd_targets(cid, body)
+    fids = [f for _ch, _m, f in targets if f is not None]
+    blocked = []
+    if energising:
+        with _DEAD_LOCK:
+            dead = {f: dict(v) for f, v in DEAD_FIDS.items()}
+        for ch, mux, f in targets:
+            if f in dead:
+                why = dead[f].get("reason")
+                blocked.append(f"Power {cid} CH{ch + 1}.{mux + 1} (filament {f}) is marked dead"
+                               + (f": {why}" if why else ""))
+    if state == POWER_STATE_ACTIVE:
+        for ch, mux, f in targets:
+            if f is None:
+                continue
+            why = ladder_blocks_active(f)
+            if why:
+                blocked.append(f"Power {cid} CH{ch + 1}.{mux + 1} (filament {f}) may not go "
+                               f"to ACTIVE: {why}")
+    if blocked:
+        what = POWER_STATE_NAMES.get(state, f"state {state}") if state else command
+        return ({"ok": False, "refused": True, "blocked": blocked,
+                 "error": f"{what} refused — nothing was sent. " + "; ".join(blocked[:6])
+                          + (f"; and {len(blocked) - 6} more" if len(blocked) > 6 else "")},
+                fids, state)
+    return None, fids, state
+
+
+def _board_word(fid: int) -> str:
+    """'Power 1 CH2.1 (filament 8)' -- how an operator finds the board."""
+    c0, ch, pos, _ = filament_to_board(int(fid))
+    if c0 is None or ch is None:
+        return f"an unmapped slot (filament {fid})"
+    return f"Power {c0 + 1} CH{ch + 1}.{pos + 1} (filament {fid})"
+
+
+def _why_not_applied(fid: int, rows_by_cid: dict) -> str:
+    """Best explanation for a filament the firmware did not apply, from the
+    board monitor's cached health (no request). Says 'reason unknown' rather
+    than guess when the monitor has nothing."""
+    c0, ch, pos, _ = filament_to_board(int(fid))
+    if c0 is None or ch is None:
+        return "it has no board slot in the mapping"
+    cid = c0 + 1
+    link = CONTROLLERS.get(cid)
+    if not link or not link.client.connected:
+        return f"Power {cid} is not connected"
+    if cid not in rows_by_cid:
+        try:
+            rows_by_cid[cid] = {(r["channel"], r["mux_port"]): r for r in monitor_board_rows(cid)[0]}
+        except Exception:
+            rows_by_cid[cid] = {}
+    r = rows_by_cid[cid].get((ch, pos))
+    if not r or not r.get("present_valid"):
+        return "the firmware did not apply it (board status unknown)"
+    if r.get("channel_dark"):
+        return f"the whole CH{ch + 1} is dark (its I²C mux is not answering)"
+    if r.get("lost"):
+        secs = (r.get("lost_for_ms") or 0) / 1000
+        return f"the board is lost (not answering for {secs:.0f} s; the firmware keeps retrying)"
+    if not r.get("present"):
+        return "no board answers in that slot (absent or unplugged)"
+    if r.get("tps_fault"):
+        return "the board's TPS55289 reports a fault"
+    return "the firmware did not apply it (the board is present; reason not reported)"
+
+
+def _prep_summary(state: int, requested, out: dict, results: dict) -> str:
+    """One readable paragraph for a batch power command: what landed, and for
+    every filament that did not, WHERE it is and WHY. The structured lists
+    (failed/excluded/ladder_blocked/...) stay alongside for programs."""
+    name = POWER_STATE_NAMES.get(int(state), f"state {state}")
+    rows: dict = {}
+    parts: list[str] = []
+    lines: list[str] = []
+    for f in out.get("failed") or []:
+        lines.append(f"{_board_word(f)}: {_why_not_applied(f, rows)}")
+    for f in out.get("excluded") or []:
+        lines.append(f"{_board_word(f)}: not sent — {_why_not_applied(f, rows)}")
+    reasons = {k: v for r in results.values() for k, v in (r.get("ladder_reasons") or {}).items()}
+    for f in out.get("ladder_blocked") or []:
+        lines.append(f"{_board_word(f)}: refused — {reasons.get(str(f), 'blocked by the power ladder')}")
+    for f in sorted({int(x) for r in results.values() for x in (r.get("unslotted") or [])}):
+        lines.append(f"{_board_word(f)}: not sent — it has no power slot")
+    for cid, r in sorted(results.items()):
+        if r.get("error"):
+            lines.append(f"Power {cid}: {r['error']}")
+    dead = sorted({int(x) for r in results.values() for x in (r.get("dead_skipped") or [])})
+    applied = int(out.get("applied") or 0)
+    total = applied + len(out.get("failed") or [])
+    parts.append(f"{name}: {applied} of {total} applied" if total else f"{name}: nothing applied")
+    if lines:
+        shown = lines[:12]
+        parts.append(f"{len(lines)} problem(s): " + "; ".join(shown)
+                     + (f"; and {len(lines) - 12} more" if len(lines) > 12 else ""))
+    if dead:
+        parts.append(f"{len(dead)} marked dead, left off on purpose: "
+                     + ", ".join(_board_word(f) for f in dead[:6])
+                     + (" …" if len(dead) > 6 else ""))
+    stopped = sorted({int(x) for r in results.values() for x in (r.get("dead_stopped") or [])})
+    if stopped:
+        parts.append(f"{len(stopped)} dead filament(s) sent to STOP instead of SLEEP")
+    return ". ".join(parts) + "."
+
+
 def dead_fids() -> set[int]:
     with _DEAD_LOCK:
         return set(DEAD_FIDS)
@@ -2385,13 +2550,19 @@ class CtHandler(BaseHTTPRequestHandler):
                 board_rows, meta = monitor_board_rows(cid)
                 if not meta["fresh"]:
                     continue      # no reading is no row -- never a row of zeros
+                _annotate_board_rows(cid, board_rows)
                 for b in board_rows:
-                    fil = MAPPING.filament_for_board(cid - 1, b["channel"], b["mux_port"])
+                    fil = b["fid"]
                     if fil is None:
                         continue
                     rows[fil] = {"index": fil, "present": b["present"],
                                  "bus_mV": b["bus_mV"], "current_mA": b["current_mA"],
-                                 "age_ms": b["age_ms"], "cached": True}
+                                 "age_ms": b["age_ms"], "cached": True,
+                                 # the firmware's reported state -- the ring
+                                 # colours by this, it no longer guesses from mA
+                                 "power_state": b["power_state"],
+                                 "power_state_src": b["power_state_src"],
+                                 "dead": b["dead"], "dead_reason": b["dead_reason"]}
             # Feed the run recorder so an end-of-run report can confirm each active
             # filament actually reached its target current. Auto start on the first
             # running poll (if a sim didn't already start it with the scheduled set)
@@ -2440,6 +2611,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # request of its own (see MONITOR_*). vi_only/cached are accepted
                 # for old callers and change nothing: every field is cached now.
                 rows, meta = monitor_board_rows(cid)
+                _annotate_board_rows(cid, rows)
                 if meta["fresh"]:
                     self._json({"ok": True, "boards": rows, **meta})
                 else:
@@ -2868,8 +3040,11 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json(read_log_file(q.get("path", "backend.log"), tail, q.get("grep") or None))
         elif path == "/api/version":
             # The commit this backend was started from (ct_update.version()),
-            # so a client can tell it is talking to older or newer code.
-            self._json({"ok": True, **_BACKEND_VERSION})
+            # so a client can tell it is talking to older or newer code, plus
+            # the periodic GitHub check ("update", see _update_watch_loop).
+            with _UPDATE_LOCK:
+                upd = dict(_UPDATE_STATUS)
+            self._json({"ok": True, **_BACKEND_VERSION, "update": upd})
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
@@ -3155,11 +3330,19 @@ class CtHandler(BaseHTTPRequestHandler):
                 if not link.client.connected:
                     return self._json({"ok": False, "error": f"{link.name} not connected"}, HTTPStatus.OK)
                 command = body.get("command", "")
+                refusal, fids, pstate = _raw_power_guard(cid, command, body)
+                if refusal:
+                    log.warning("/api/cmd %s refused: %s", command, refusal["error"])
+                    return self._json(refusal, HTTPStatus.OK)
                 try:
                     frame_type, flags, payload = build_payload(command, body)
                     resp = link.client.send_request(frame_type, payload, flags=flags, timeout=2.0)
                     if command == "CH_SLEW_RATE" and body.get("below_mV_per_s") is not None:
                         _slew_note_set(resp)     # the rig's slew is now what was set
+                    if pstate and fids and _status_ok(resp):
+                        # Track it like /api/filament-state does, so the ladder
+                        # and the ACTIVE dead-man see GUI/debug commands too.
+                        note_power_state(fids, pstate, {f: int(body.get("arg", 0)) for f in fids})
                     self._json({"ok": True, "response": resp})
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
@@ -3599,12 +3782,12 @@ class CtHandler(BaseHTTPRequestHandler):
                     out["active_s"] = timed["active_s"]
                     out["then_idle_ma"] = {str(f): timed["idle_ma"][f] for f in landed}
                 if blocked:
-                    reasons = {k: v for r in results.values()
-                               for k, v in (r.get("ladder_reasons") or {}).items()}
                     out["ladder_blocked"] = blocked
-                    why = sorted(set(reasons.values()))
-                    out["error"] = (f"{len(blocked)} filament(s) refused and NOT commanded: "
-                                    + "; ".join(why[:3]) + (" …" if len(why) > 3 else ""))
+                # One readable sentence for people (the lists stay for programs);
+                # a failed batch carries it as `error`, so nothing reads just
+                # "failed" any more.
+                summary = _prep_summary(state, filaments, out, results)
+                out["error" if not out["ok"] else "summary"] = summary
                 self._json(out)
             elif path == "/api/ocp-threshold":
                 # Per-board TPS55289 IOUT_LIMIT (steady-state OCP threshold, mA)
@@ -4014,9 +4197,15 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "bad controller"}, HTTPStatus.OK)
                 if not link.client.connected:
                     return self._json({"ok": False, "error": f"{link.name} not connected"}, HTTPStatus.OK)
+                refusal, fids, pstate = _raw_power_guard(cid, str(body.get("command", "")), body)
+                if refusal:
+                    log.warning("/api/power-cmd %s refused: %s", body.get("command"), refusal["error"])
+                    return self._json(refusal, HTTPStatus.OK)
                 try:
                     ft, flags, payload = build_command_payload(str(body.get("command", "")), body)
                     resp = link.client.send_request(ft, payload, flags=flags, timeout=2.5)
+                    if pstate and fids and _status_ok(resp):
+                        note_power_state(fids, pstate, {f: int(body.get("arg", 0)) for f in fids})
                     self._json({"ok": _status_ok(resp), "response": resp})
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
@@ -4933,6 +5122,44 @@ def _reconnect_from_env() -> None:
             log.warning("restart: could not reconnect %r: %s", part, exc)
 
 
+# ── Periodic "is there a newer version on GitHub?" check ─────────────────────
+# Start-up already updates; a backend that runs for days would otherwise never
+# notice a fix was published. This only LOOKS (one small GitHub API call every
+# UPDATE_CHECK_S, well under the 60/h anonymous limit) -- applying is still a
+# restart, which the GUI offers and /api/restart guards (no run, no lease).
+UPDATE_CHECK_S = float(os.environ.get("CT_UPDATE_CHECK_S", "420"))
+UPDATE_FIRST_CHECK_S = 60.0
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_STATUS: dict = {"checked": False}
+
+
+def _update_watch_loop() -> None:
+    from ct import update as ct_update
+    time.sleep(UPDATE_FIRST_CHECK_S)
+    announced = None
+    while True:
+        try:
+            st = ct_update.remote_check(_BACKEND_VERSION.get("commit"))
+            st["error"] = None
+        except Exception as exc:          # offline, rate-limited, GitHub down
+            st = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        st["checked"] = True
+        st["checked_at"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        with _UPDATE_LOCK:
+            prev = dict(_UPDATE_STATUS)
+            # A failed check keeps the last answer (an update seen an hour ago
+            # is still there) and only adds the error.
+            if not st.get("ok") and prev.get("ok"):
+                st = {**prev, "error": st["error"], "checked_at": st["checked_at"]}
+            _UPDATE_STATUS.clear()
+            _UPDATE_STATUS.update(st)
+        if st.get("available") and st.get("latest") != announced:
+            announced = st.get("latest")
+            log.warning("update available on GitHub: %s (running %s) -- restart the backend "
+                        "to apply it", st.get("latest"), st.get("current"))
+        time.sleep(max(60.0, UPDATE_CHECK_S))
+
+
 def main() -> None:
     # Bind all interfaces by default: this process owns the single-client bridge
     # sockets, so every other program on the bench reaches the hardware through
@@ -4943,6 +5170,8 @@ def main() -> None:
     from ct import update as ct_update
     ct_update.check_and_update()
     _BACKEND_VERSION.update(ct_update.version())
+    if not os.environ.get("CT_NO_AUTO_UPDATE"):
+        threading.Thread(target=_update_watch_loop, name="update_watch", daemon=True).start()
     # Inside the backend a CTClient is always the real, in-process one: a
     # remote proxy here would only call back into this same process.
     os.environ["CT_CLIENT_LOCAL"] = "1"

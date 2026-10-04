@@ -248,6 +248,7 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
                    "bus_mV": b.get("bus_mV") if b else None,
                    "current_mA": b.get("current_mA") if b else None,
                    "age_ms": b.get("age_ms") if b else None,
+                   "power_state": (b.get("power_state") or None) if b and b.get("known") else None,
                    "from_cc_loop": bool(b and b.get("from_cc_loop")),
                    "present_valid": bool(b and b.get("known")),
                    "current_mA_valid": bool(b) and b.get("current_mA") is not None}

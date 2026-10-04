@@ -49,10 +49,15 @@ export function setLiveRefV(ref_mv) { if (ref_mv != null) liveRefV = ref_mv / 10
 export const peakToMa = (peak) => 2 * (peak * 3.3 / 4095 - 0.5 * liveRefV) / 4.7 / 8.2 * 1000;
 
 // ---- hardware helpers -------------------------------------------------------
+// Filaments marked DEAD in the backend are left out: the backend refuses to
+// power them, so a test step on one could only fail (or, before the raw
+// proxies enforced it, quietly heat a filament someone took out of service).
 async function loadFilMap() {
-  const j = await tGetJ('/api/mapping');
+  const [j, d] = await Promise.all([tGetJ('/api/mapping'), tGetJ('/api/dead-fids')]);
+  const dead = new Set(Object.keys((d && d.dead) || {}).map(Number));
   const map = {};
   (j && j.mapping && j.mapping.filaments || []).forEach((r) => {
+    if (dead.has(r.filament)) return;
     if (r.controller === 0 || r.controller === 1) map[r.filament] = { ctrl: r.controller + 1, ch: r.channel, pos: r.position };
   });
   return map;
@@ -78,6 +83,8 @@ const firePulse = (ctrl, ch, pos, widthUs) =>
 // something else armed the detector, and a wrong rate rescales the result
 // silently rather than failing.
 const PULSE_ARM_RATE_HZ = 1000000;
+// RP2350 kIdleMaxMilliamps (backend IDLE_CEILING_MA): IDLE above this is clamped.
+const IDLE_CEILING_MA = 2000;
 const pulseArm = () => tPostJ('/api/adc/pulse-arm', { rate: PULSE_ARM_RATE_HZ });
 const pulseDisarm = () => tPostJ('/api/adc/pulse-disarm', {});
 const hvEnable = (chan, on) => tPostJ('/api/stm32/hv-enable', { ch: chan, on });
@@ -863,10 +870,19 @@ async function test5() {
     for (let i = 0; i < fils.length; i++) {
       if (abortFlag) { tMsg('Aborted — saving partial…'); break; }
       const f = fils[i], m = fmap[f]; cer = m; const pts = []; curves[f] = [];
+      // The ladder: never straight to firing current. STANDBY, then IDLE; a
+      // level up to the IDLE ceiling is held in IDLE, above it ACTIVE (which
+      // the backend only allows from IDLE).
+      await setState(m.ctrl, m.ch, m.pos, 3, 0); await tSleep(300);
       for (const a of levels) {
         if (abortFlag) break;
         tMsg(`Calibration: F${f} (${i + 1}/${fils.length}) @ ${a.toFixed(2)} A…`);
-        await setState(m.ctrl, m.ch, m.pos, 5, Math.round(a * 1000));   // ACTIVE @ a amps
+        const heatMa = Math.round(a * 1000), st = heatMa <= IDLE_CEILING_MA ? 4 : 5;
+        const sr = await setState(m.ctrl, m.ch, m.pos, st, heatMa);
+        if (!sr || !sr.ok) {
+          tMsg(`Calibration: F${f} @ ${a.toFixed(2)} A not applied — ${(sr && sr.error) || 'no reply'}. Skipping the rest of F${f}.`);
+          break;
+        }
         await tSleep(settle);
         const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs);
         // A point with no trustworthy current is saved as mA null + the reason,
@@ -879,7 +895,7 @@ async function test5() {
         pts.push({ x: a, y: Math.max(0, mA) });
         drawCurve('t5Plot', pts, { xMax: toA, yLabel: `Ie (mA) · F${f}` });
       }
-      await setState(m.ctrl, m.ch, m.pos, 2, 0);   // STOP before the next filament
+      await setState(m.ctrl, m.ch, m.pos, 2, 0);   // SLEEP (heating off) before the next filament
     }
   } finally {
     if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 2, 0);
@@ -928,7 +944,7 @@ async function test6() {
           drawCurve('t6Curve', pts, { yLabel: `V · F${f}`, xUnit: 'A' });
         }
       }
-      await setState(m.ctrl, m.ch, m.pos, 2, 0);                   // STOP before next
+      await setState(m.ctrl, m.ch, m.pos, 2, 0);                   // SLEEP (heating off) before next
       const fit = fitR0(curves[f]); const R0 = fit ? fit.R0 : null; r0s[f] = R0; done++;
       bars.push({ f, value: R0 == null ? Infinity : R0, cls: R0 == null ? 'open' : (R0 < shortR ? 'short' : 'ok') });
       drawBars('t6Plot', bars, { yLabel: 'R₀ (Ω)', yMax: 0.6, fmt: (v) => v.toFixed(2) });

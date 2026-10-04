@@ -33,9 +33,17 @@ export function drawFilaments(r) {
     const isHover = i === s.hover;
 
     // dead/disabled filament: a hollow gray ✕ on the ring, no bars
+    // hwDead (the backend's enforced dead mask) is a red ✕ in a ring, so it
+    // never reads like a plan-disabled/absent filament or a STOP marker.
     if (f.dead) {
       const p = r._filamentPos(i), sx = r._x(p.x), sy = r._y(p.y), d = 3;
-      ctx.strokeStyle = 'rgba(120,130,138,0.85)'; ctx.lineWidth = 1.3;
+      if (f.hwDead) {
+        ctx.strokeStyle = 'rgba(255,93,93,0.95)'; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.arc(sx, sy, 5, 0, 2 * Math.PI); ctx.stroke();
+        ctx.lineWidth = 1.6;
+      } else {
+        ctx.strokeStyle = 'rgba(120,130,138,0.85)'; ctx.lineWidth = 1.3;
+      }
       ctx.beginPath();
       ctx.moveTo(sx - d, sy - d); ctx.lineTo(sx + d, sy + d);
       ctx.moveTo(sx + d, sy - d); ctx.lineTo(sx - d, sy + d);

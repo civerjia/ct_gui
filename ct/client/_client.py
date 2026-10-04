@@ -173,6 +173,9 @@ Dependencies: pip install requests
 """
 
 import os  # noqa: E402  (CTClient.__new__ reads CT_CLIENT_LOCAL)
+import re  # noqa: E402
+
+_FIL_IN_TEXT = re.compile(r"\(filament (\d+)\)")   # see _reindex_response
 from ._base import *  # noqa: F401,F403 -- this module IS ct_simple_control:
 #   every shared name stays reachable here, as it was in the single file
 from ._power import _PowerMixin
@@ -1757,6 +1760,12 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         for k in keys:
             if isinstance(r.get(k), list):
                 r[k] = [self._user_index_of(f) for f in r[k]]
+        # The backend's readable sentences name boards as "Power 1 CH2.1
+        # (filament 8)" with the PHYSICAL id; say it in this script's numbering.
+        for k in ("error", "summary"):
+            if isinstance(r.get(k), str):
+                r[k] = _FIL_IN_TEXT.sub(
+                    lambda m: f"(filament {self._user_index_of(int(m.group(1)))})", r[k])
         for row in (r.get("results") or {}).values():
             if isinstance(row, dict):
                 for k in keys:

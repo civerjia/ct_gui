@@ -763,14 +763,6 @@ function stopLiveTelemetry() {
   if (liveTelemetryTimer) { clearTimeout(liveTelemetryTimer); liveTelemetryTimer = null; }
 }
 
-function inferState(f, mA, present) {
-  if (!present) return STATE.STOP;
-  const idle = f.idleA * 1000, act = f.activeA * 1000;
-  if (mA >= (idle + act) / 2) return STATE.ACTIVE;
-  if (mA >= idle * 0.4) return STATE.IDLE;
-  return STATE.STOP;
-}
-
 async function pollTelemetry() {
   if (viewMode !== 'live') return;
   let data;
@@ -789,7 +781,10 @@ async function pollTelemetry() {
     // board with one untrusted sample flickered to STOP. Pass state:null instead
     // and ingestTelemetry keeps the last known state — don't infer from a value
     // we didn't measure. Firing rows below still override to ACTIVE regardless.
-    const state = t.current_mA == null ? null : inferState(f, t.current_mA, t.present);
+    // The state is the firmware's own report (0x3D, via the backend), never a
+    // guess from the current: a guess painted every cold IDLE as STOP. null =
+    // not reported -> ingestTelemetry keeps the last known state.
+    const state = t.power_state || null;
     return { index: t.index, state, bus_mV: t.bus_mV, current_mA: t.current_mA };
   }).filter(Boolean);
   // the firmware-reported firing filament(s) are authoritative ACTIVE
@@ -827,24 +822,19 @@ function highlightState(st) {
   $('heatVField').hidden = st !== STATE.VOLTAGE;
 }
 
-// Set PowerState — the firmware closed-loop driver. IDLE/ACTIVE carry the
-// heating-current (mA) target, VOLTAGE carries a manual mV; others arg=0.
+// Set PowerState. IDLE/ACTIVE carry the heating-current (mA) target, VOLTAGE
+// a manual mV; others arg=0. The backend enforces the dead mask and the
+// STOP→SLEEP→STANDBY→IDLE→ACTIVE ladder; nothing is shown as changed until it
+// accepts -- the live telemetry then shows the state the firmware reports.
 async function dbgSetState(i, st) {
-  const f = filaments[i];
   // UI is in A / V; the firmware arg is mA (Idle/Active) or mV (Voltage).
   let arg = 0;
   if (st === STATE.IDLE || st === STATE.ACTIVE) arg = Math.round(Math.max(0, parseFloat($('heatI').value) || 0) * 1000);
   else if (st === STATE.VOLTAGE) arg = Math.round(Math.max(0, parseFloat($('heatV').value) || 0) * 1000);
-  f.state = st;
-  if (st === STATE.IDLE) f.current_mA = arg || f.idleA * 1000;
-  else if (st === STATE.ACTIVE) f.current_mA = arg || f.activeA * 1000;
-  else if (st === STATE.VOLTAGE) { f.voltage_mV = arg; f.current_mA = 0; }
-  else if (st === STATE.STANDBY) { f.voltage_mV = 800; f.current_mA = 0; }
-  else { f.voltage_mV = 0; f.current_mA = 0; }
-  highlightState(st); sync();
   const j = await cmd(i, 'CH_SET_POWER_STATE', { state: st, arg });
   const argTxt = st === STATE.VOLTAGE ? mvToV(arg) : (st === STATE.IDLE || st === STATE.ACTIVE) ? maToA(arg) : '';
-  heatMsg(j.ok ? `${STATE_NAME[st]}${arg ? ' @ ' + argTxt : ''} set.` : `State: ${j.error}`);
+  if (j.ok) { filaments[i].state = st; highlightState(st); sync(); }
+  heatMsg(j.ok ? `${STATE_NAME[st]}${arg ? ' @ ' + argTxt : ''} set.` : `${STATE_NAME[st] || 'State'} not set — ${j.error}`);
 }
 // "Set" the CC heating current: re-issue the power state carrying heatI. Keep
 // Idle if already Idle, else apply as Active.
@@ -858,20 +848,6 @@ async function dbgSetOcp(i) {
   filaments[i].ocp = ma;
   const j = await cmd(i, 'CH_SET_TPS_OCP_THRESHOLD', { threshold_mA: ma });
   heatMsg(j.ok ? `OCP set to ${maToA(ma)}.` : `OCP: ${j.error}`);
-}
-// INA219 is polled continuously while the popup is open (quiet = no status line).
-async function dbgReadIna(i, quiet) {
-  const j = await cmd(i, 'CH_GET_INA219', {});
-  const d = j.ok && j.response && j.response.decoded;
-  if (d && d.present) {
-    filaments[i].current_mA = d.current_mA; filaments[i].voltage_mV = d.bus_mV; sync();
-    $('heatImeas').textContent = maToA(d.current_mA);
-    $('heatVmeas').textContent = mvToV(d.bus_mV);
-    if (!quiet) heatMsg(`INA219: ${mvToV(d.bus_mV)} / ${maToA(d.current_mA)}.`);
-  } else if (d && !d.present) {
-    $('heatImeas').textContent = 'absent'; $('heatVmeas').textContent = '—';
-    if (!quiet) heatMsg('INA219 not present on this board (no daughter-board?).');
-  } else if (!quiet) heatMsg(`Read: ${j.error || 'no data'}`);
 }
 async function dbgReadState(i) {
   const j = await cmd(i, 'CH_GET_POWER_STATE', {});
@@ -890,12 +866,35 @@ async function dbgFire(i) {
   if (j.ok) { f.mAs += f.activeA * (f.durationUs / 1e6) * 1000; sync(); }
   heatMsg(j.ok ? `Pulsed ${f.durationUs} µs.` : `Fire: ${j.error}`);
 }
-async function dbgReadHv(i, quiet) {
-  const hw = filamentToHw(i);
-  const j = await cmd(i, 'HV_GET_ALL_BYTES', {});
-  const d = j.ok && j.response && j.response.decoded;
-  if (d && d.feedback) { setHvButton(i, !!(d.feedback[hw.channel] & (1 << hw.mux))); }
-  else { setHvButton(i, null); if (!j.ok && !quiet) heatMsg(`HV: ${j.error}`); }
+let popupBusy = false;
+async function popupRefresh(i) {
+  if (popupBusy) return;           // never stack requests on a slow link
+  popupBusy = true;
+  try {
+    const hw = filamentToHw(i);
+    const [t, h] = await Promise.all([
+      fetch('/api/telemetry').then((r) => r.json()).catch(() => null),
+      fetch(`/api/hv-snapshot?controller=${hw.controller}`).then((r) => r.json()).catch(() => null),
+    ]);
+    if (heatTarget !== i) return;  // popup moved on while this was in flight
+    const row = t && (t.telemetry || []).find((x) => x.index === i);
+    if (!row) {
+      $('heatImeas').textContent = '— A'; $('heatVmeas').textContent = '— V';
+    } else if (!row.present) {
+      $('heatImeas').textContent = 'absent'; $('heatVmeas').textContent = '—';
+    } else {
+      // null = no trustworthy reading: a dash, never 0
+      $('heatImeas').textContent = row.current_mA == null ? '— A' : maToA(row.current_mA);
+      $('heatVmeas').textContent = row.bus_mV == null ? '— V' : mvToV(row.bus_mV);
+      if (row.power_state) {
+        const st = row.power_state;
+        $('heatStateNow').textContent = `${STATE_NAME[st] || st}`
+          + (row.dead ? ` · DEAD${row.dead_reason ? ': ' + row.dead_reason : ''}` : '');
+      }
+    }
+    if (h && h.ok && h.feedback) setHvButton(i, !!(h.feedback[hw.channel] & (1 << hw.mux)));
+    else setHvButton(i, null);
+  } finally { popupBusy = false; }
 }
 async function dbgToggleHv(i) {
   const next = !filaments[i].dcHv;
@@ -933,9 +932,13 @@ function showHeatPopup(clientX, clientY, fil) {
   p.style.left = Math.max(8, Math.min(clientX, window.innerWidth - w - 8)) + 'px';
   p.style.top = Math.max(8, Math.min(clientY, window.innerHeight - h - 8)) + 'px';
   dbgReadState(fil); // pull live power-state + fault
-  // INA219 + DC HV auto-poll while the popup is open (like wifi_gui).
+  // Live V/I/state + DC HV while the popup is open -- from the backend's board
+  // monitor (/api/telemetry, the matrix's own source) and the shared HV
+  // snapshot cache. No per-board I2C: a 1 s single-board read here competed
+  // with the matrix on the one RP2350 link. The Read buttons stay as explicit
+  // one-off live reads.
   if (heatPollTimer) clearInterval(heatPollTimer);
-  const poll = () => { if (heatTarget >= 0) { dbgReadIna(heatTarget, true); dbgReadHv(heatTarget, true); } };
+  const poll = () => { if (heatTarget >= 0) popupRefresh(heatTarget); };
   poll();
   heatPollTimer = setInterval(poll, 1000);
 }
@@ -1090,7 +1093,7 @@ async function detectPresent() {
     // links the detected hardware to the plan (✕ marks) and the schedule.
     let alive = 0, dead = 0;
     for (let i = 0; i < N; i++) {
-      const shouldDie = !present.has(i);
+      const shouldDie = !present.has(i) || !!filaments[i].hwDead;   // backend-dead stays dead
       if (filaments[i].dead !== shouldDie) {
         filaments[i].dead = shouldDie;
         if (shouldDie) { filaments[i].state = STATE.STOP; filaments[i].mAs = 0; }
@@ -1102,7 +1105,86 @@ async function detectPresent() {
   } catch (e) { setStatus('Detect present failed: ' + e); }
 }
 
+// The backend's dead mask (/api/dead-fids, FID = this ring's filament index)
+// is the one that is ENFORCED -- the backend refuses to power those. The plan's
+// own `dead` (absent board, or a user omitting a filament) is plan-only. Keep
+// both visible and distinct: hwDead is drawn as a red ✕, plan-dead as grey.
+let backendDeadOk = false;
+async function syncBackendDead() {
+  let j;
+  try { j = await (await fetch('/api/dead-fids')).json(); } catch { return; }
+  if (!j || !j.ok || !j.dead) return;
+  backendDeadOk = true;
+  let changed = false;
+  for (let i = 0; i < N; i++) {
+    const f = filaments[i], e = j.dead[String(i)];
+    f.hwDead = !!e;
+    f.hwDeadReason = e ? (e.reason || '') : '';
+    if (f.hwDead && !f.dead) { f.dead = true; f.deadFromBackend = true; f.state = STATE.STOP; f.mAs = 0; changed = true; }
+    else if (!f.hwDead && f.deadFromBackend) { f.dead = false; f.deadFromBackend = false; changed = true; }
+  }
+  if (changed) { refreshFilList(); rebuildSchedule(); } else sync();
+}
+function refuseHwDead(i) {
+  const f = filaments[i];
+  if (!f.hwDead) return false;
+  setStatus(`Filament ${i} is marked DEAD in the backend${f.hwDeadReason ? ` (${f.hwDeadReason})` : ''} — `
+    + 'it cannot be enabled here. Clear it from the dead-filament list first.');
+  return true;
+}
+
+// "Update available on GitHub" badge. The backend checks GitHub every few
+// minutes (/api/version .update); applying it is a backend restart, which
+// /api/restart refuses during a run or while someone else holds the lease.
+let updateRunning = null;   // commit the backend runs, to spot the restarted one
+async function pollUpdateStatus() {
+  let j;
+  try { j = await (await fetch('/api/version')).json(); } catch { return; }
+  const u = (j && j.update) || {};
+  updateRunning = j && j.commit;
+  const b = $('updateBadge');
+  if (!b || b.disabled) return;
+  b.hidden = !u.available;
+  if (!u.available) return;
+  b.textContent = `Update available: ${u.latest}`;
+  b.title = `GitHub has ${u.latest}; this backend runs ${u.current || 'an unknown version'}`
+    + ` (checked ${u.checked_at || '?'}). Click to restart the backend and update — `
+    + 'refused while a schedule is armed/running or another client holds the lease.';
+}
+async function applyUpdate() {
+  const b = $('updateBadge');
+  if (!confirm(`${b.textContent}.\n\nRestart the backend now to update? Controller connections `
+    + 'drop for a few seconds and are re-opened. Scripts reconnect on their own.')) return;
+  b.disabled = true; b.textContent = 'Restarting…';
+  const updateFrom = updateRunning;
+  let j;
+  try {
+    j = await (await fetch('/api/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client: 'gui' }) })).json();
+  } catch (e) { j = { ok: false, error: String((e && e.message) || e) }; }
+  if (!j.ok) {
+    b.disabled = false;
+    setStatus(`Update not applied — ${j.error || 'restart failed'}`);
+    pollUpdateStatus();
+    return;
+  }
+  setStatus('Backend restarting to update — the page reloads when it is back.');
+  // Wait for the NEW process (the old one answers for a moment after
+  // replying), then reload so the page runs the new GUI too: back = it was
+  // seen down once, or it reports a different start time / commit.
+  let sawDown = false;
+  for (let k = 0; k < 90; k++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const v = await (await fetch('/api/version', { cache: 'no-store' })).json();
+      if (sawDown || (v && v.commit && v.commit !== updateFrom)) { location.reload(); return; }
+    } catch { sawDown = true; }
+  }
+  b.disabled = false; setStatus('Backend did not come back within 3 min — check its window/log.');
+}
+
 function toggleDead(i) {
+  if (filaments[i].dead && refuseHwDead(i)) return;
   filaments[i].dead = !filaments[i].dead;
   if (filaments[i].dead) { filaments[i].state = STATE.STOP; filaments[i].mAs = 0; }
   rebuildSchedule();
@@ -1131,6 +1213,7 @@ function applyScanSubset(n) {
 let filMenuTarget = -1;
 function setFilState(i, dead, noHv, noHeat) {
   const f = filaments[i];
+  if (!dead && refuseHwDead(i)) { hideFilMenu(); return; }
   f.dead = dead; f.noHv = noHv; f.noHeat = noHeat;
   if (dead) { f.state = STATE.STOP; f.mAs = 0; }
   hideFilMenu(); refreshFilList(); rebuildSchedule();
@@ -2253,6 +2336,9 @@ function init() {
   clampNumberInputs(document);
   if (!loadFilSettings(true)) rebuildSchedule(); // restore host settings, else fresh build
   setViewMode('live');  // start on real hardware — no simulated data until Plan is chosen
+  syncBackendDead(); setInterval(syncBackendDead, 10000);   // file read on the backend, no hardware
+  $('updateBadge').addEventListener('click', applyUpdate);
+  pollUpdateStatus(); setInterval(pollUpdateStatus, 60000);   // the backend does the GitHub check
   // On load, detect a firmware that's already armed/running/faulted (e.g. after a
   // page reload mid-run) and start the run monitor, so the GUI reflects it — Arm
   // stays disabled (no StateConflict re-arm), Disarm is available, Simulate works.

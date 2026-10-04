@@ -75,6 +75,10 @@ body {
 .badge { padding: 9px 13px; border-radius: 999px; font-weight: 700; font-size: 13px; }
 .badge.offline { background: var(--danger-soft); color: var(--danger); }
 .badge.online { background: var(--accent-soft); color: var(--accent); }
+.badge.update { background: var(--warn-soft); color: var(--warn); border: 1px solid rgba(141,93,17,0.35); cursor: pointer; font-family: inherit; }
+.badge.update:hover { background: #f7e3b0; }
+.badge.update:focus-visible { outline: 2px solid var(--warn); outline-offset: 2px; }
+.badge.update[disabled] { cursor: progress; opacity: 0.7; }
 .badge.heartbeat-idle { background: #efece5; color: var(--muted); }
 .badge.heartbeat-alive { background: var(--accent-soft); color: var(--accent); animation: pulse 1s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }
@@ -319,6 +323,26 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .status-tile.absent { background: #f2efe9; opacity: 0.6; }
 .status-tile.lost { background: #fdf3e1; border: 1px dashed #d39e00; }            /* stopped answering: probed, will be restored */
 .status-tile.dark { background: #ece6f5; border: 1px dashed #7d5ba6; }            /* whole channel: mux not answering */
+/* Power state: the tile tint and its chip share one colour per state, so STOP
+   (alive, not started) and DEAD (refused power) never look alike. */
+.status-tile.ps-stop    { background: #efeeea; }
+.status-tile.ps-sleep   { background: #e4ecf6; }
+.status-tile.ps-standby { background: #e0f2ec; }
+.status-tile.ps-idle    { background: #fbefd2; }
+.status-tile.ps-active  { background: #fadcd2; }
+.status-tile.ps-voltage { background: #ece3f5; }
+.status-tile.ps-unknown { background: #f6f4ef; }
+.status-tile.dead { background: repeating-linear-gradient(135deg, #3b4047, #3b4047 5px, #454b53 5px, #454b53 10px); border-color: #22262b; }
+.status-tile.dead .tile-title, .status-tile.dead .tile-measure { color: #c9ced4; }
+.ps-chip { font-family: var(--mono); font-size: 7px; font-weight: 800; line-height: 1; padding: 1px 3px; border-radius: 3px; color: #fff; background: #9aa1a7; letter-spacing: 0.04em; }
+.legend-item .ps-chip { font-size: 9px; padding: 2px 4px; margin-right: 2px; }
+.ps-chip.ps-stop,    .status-tile.ps-stop .ps-chip    { background: #868c92; }
+.ps-chip.ps-sleep,   .status-tile.ps-sleep .ps-chip   { background: #4876ad; }
+.ps-chip.ps-standby, .status-tile.ps-standby .ps-chip { background: #2b8a76; }
+.ps-chip.ps-idle,    .status-tile.ps-idle .ps-chip    { background: #b9820f; }
+.ps-chip.ps-active,  .status-tile.ps-active .ps-chip  { background: #c23f22; }
+.ps-chip.ps-voltage, .status-tile.ps-voltage .ps-chip { background: #7650a6; }
+.ps-chip.ps-dead,    .status-tile.dead .ps-chip       { background: #111417; color: #ff8b7a; outline: 1px solid #ff8b7a; }
 .status-tile.recovering { box-shadow: inset 0 0 0 2px #d39e00; }
 /* channel masked off in the enable mask — dimmed + non-interactive */
 .status-tile.masked { opacity: 0.3; cursor: not-allowed; filter: grayscale(0.85); }

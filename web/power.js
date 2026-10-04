@@ -56,6 +56,7 @@ const I_MAX_MA = OCP_MAX_MA;              // current capability = hardware ceili
 
 // power-state ladder (CH_SET_POWER_STATE arg = mA for Idle/Active, mV for Voltage)
 const STATE_STANDBY = 3, STATE_IDLE = 4, STATE_ACTIVE = 5, STATE_VOLTAGE = 6;
+const PS_NAME = { 1: 'STOP', 2: 'SLEEP', 3: 'STANDBY', 4: 'IDLE', 5: 'ACTIVE', 6: 'VOLTAGE' };
 let bmState = STATE_IDLE;
 // Batch power-state selector (applies to every selected board), independent of
 // the single-board one above — same UI reflection logic, parameterized (was
@@ -170,6 +171,8 @@ const BOARDS_HTML = `
     <span class="legend-item"><span class="dot fault">F</span> fault</span>
     <span class="legend-item"><span class="hv-badge on">HV</span> HV current</span>
     <span class="legend-item"><span class="dot absent">·</span> absent</span>
+    <span class="legend-item"><span class="ps-chip ps-stop">STOP</span><span class="ps-chip ps-sleep">SLEEP</span><span class="ps-chip ps-standby">STBY</span><span class="ps-chip ps-idle">IDLE</span><span class="ps-chip ps-active">ACTIVE</span><span class="ps-chip ps-voltage">VOLT</span> power state</span>
+    <span class="legend-item"><span class="ps-chip ps-dead">DEAD</span> marked dead (refused power)</span>
     <span class="hint">Shift-click = block · Ctrl/Cmd-click = toggle</span>
   </div>
   <div class="row compact i2c-mask bm-mask" title="Host poll set — only enabled channels are read for INA219 V/I (and selectable). Set applies it host-side; enable CH7 to start polling it. The firmware always scans all 8 regardless. Shared with the I²C section below.">
@@ -334,9 +337,13 @@ function buildTileParts(tile) {
   const vSpan = document.createElement('span');
   const iSpan = document.createElement('span');
   measure.append(dash, vSpan, iSpan);
-  tile.append(hv, title, dots, measure);
-  tile._parts = { hv, title, dotP, dotI, dotT, dotF, dash, vSpan, iSpan };
+  const ps = document.createElement('span'); ps.className = 'ps-chip';
+  tile.append(hv, title, ps, dots, measure);
+  tile._parts = { hv, title, ps, dotP, dotI, dotT, dotF, dash, vSpan, iSpan };
 }
+
+// Short power-state labels for the tile chip (full name in the tooltip).
+const PS_SHORT = { STOP: 'STOP', SLEEP: 'SLEEP', STANDBY: 'STBY', IDLE: 'IDLE', ACTIVE: 'ACTIVE', VOLTAGE: 'VOLT' };
 
 function renderBoardGrid() {
   const grid = $p('bmGrid'); if (!grid) return;
@@ -378,8 +385,13 @@ function renderBoardGrid() {
     // Dynamic failure (firmware 0x3E): a DARK channel and a LOST board are
     // not "absent" -- the firmware is probing them and will bring them back
     // to their commanded state. Say that, instead of blanking the cell.
+    // Then: DEAD (backend dead mask -- refused any power, on purpose) is a
+    // different thing from STOP (alive, just not started), so it gets its own
+    // look; a live board is coloured by its power state.
+    const psName = b.power_state_name || null;
     const cls = b.channel_dark ? 'dark' : b.lost ? 'lost'
-      : b.tps_fault ? 'fault' : b.present ? 'present' : 'absent';
+      : b.tps_fault ? 'fault' : b.dead ? 'dead'
+      : b.present ? `present ps-${psName ? psName.toLowerCase() : 'unknown'}` : 'absent';
     tile.className = 'status-tile ' + cls + (boardSel.has(k) ? ' selected' : '')
       + (chEnabled(b.channel) ? '' : ' masked')
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');
@@ -387,7 +399,9 @@ function renderBoardGrid() {
     const hvValid = b.hv_overcurrent_valid;
     p.hv.className = 'hv-badge ' + (!hvValid ? 'unknown' : b.hv_overcurrent ? 'on' : 'off');
     p.hv.title = `HV current ${!hvValid ? 'unavailable (chip not present)' : b.hv_overcurrent ? 'sensed (>1 mA)' : 'none'}`;
-    p.title.textContent = b.label;
+    p.title.textContent = b.label;   // the filament number is in the tooltip
+    p.ps.textContent = b.dead ? 'DEAD' : !b.present ? '' : (PS_SHORT[psName] || '?');
+    p.ps.hidden = !b.dead && !b.present;
     setDot(p.dotP, b.present, 'P');
     setDot(p.dotI, b.iso_enabled, 'I', false, b.iso_enabled_valid);
     setDot(p.dotT, b.tps_enabled, 'T', b.tps_fault, b.tps_enabled_valid);
@@ -401,7 +415,11 @@ function renderBoardGrid() {
         ? `${b.label} LOST for ${secs(b.lost_for_ms)} s (${b.probe_fails} failed probes, next in ${secs(b.next_probe_ms)} s). `
           + 'It is brought back to its commanded state when it answers.'
         : b.recovering ? `${b.label} recovering: back from a loss, returning to its commanded state (ACTIVE goes through IDLE first).`
-        : '';
+        : b.dead ? `${b.label} (filament #${b.fid}) is marked DEAD${b.dead_reason ? `: ${b.dead_reason}` : ''}. `
+          + 'The backend refuses to power it (STOP/SLEEP still allowed). Clear it in the dead-filament list to use it again.'
+        : b.present ? `${b.label} (filament #${b.fid}) — ${psName || 'power state unknown'}`
+          + (b.power_state_src === 'backend' ? ' (last commanded; firmware did not report)' : '')
+        : `${b.label}: no board answers here.`;
     tile.classList.toggle('recovering', !!b.recovering);
     if (b.present) {
       // null = not a reading (aged out / not measured) -- shown as a dash,
@@ -535,8 +553,10 @@ async function measureImpedance() {
       if (d && d.present && d.current_mA > 0) { zPoints.push({ v: d.bus_mV / 1000, i: d.current_mA / 1000 }); drawZ(); }
     }
   } finally {
-    // leave the board in Voltage mode at 0.8 V after the sweep
-    await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', channel: ch, mux_port: mux, state: STATE_VOLTAGE, arg: 800 });
+    // Back to STANDBY (the firmware's own 0.8 V detection floor) -- a ladder
+    // state the backend tracks. Staying in VOLTAGE 800 mV looked the same on
+    // the meter but was a manual mode nothing knew to clear.
+    await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', channel: ch, mux_port: mux, state: STATE_STANDBY, arg: 0 });
     $p('bmZMeasure').disabled = false;
   }
   if (zPoints.length < 3) { $p('bmZResult').textContent = `only ${zPoints.length} valid point(s) — enable ISO+TPS and check the board`; drawZ(); return; }
@@ -679,12 +699,13 @@ function wireBoards() {
     const arg = (bmState === STATE_IDLE || bmState === STATE_ACTIVE || bmState === STATE_VOLTAGE)
       ? Math.min(cap, Math.max(0, +$p('bmStateArg').value)) : 0;
     const j = await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', channel: boardPrimary.channel, mux_port: boardPrimary.mux_port, state: bmState, arg });
-    bmMsg(j.ok ? `state ${bmState}${arg ? ' @ ' + arg : ''} set` : (j.error || 'state failed'));
+    bmMsg(j.ok ? `${PS_NAME[bmState]}${arg ? ' @ ' + arg : ''} set` : (j.error || `${PS_NAME[bmState]} failed`));
     refreshBoards();
   };
   reflectStateArg();
-  // Batch power state — applies the chosen state to every selected board (loops
-  // CH_SET_POWER_STATE per board; 0x35 has no board-mask form).
+  // Batch power state — one board-masked CH_SET_POWER_STATE for the selection.
+  // The backend refuses the whole command if any selected board is dead or
+  // (for ACTIVE) not at IDLE, and says which.
   wireStateSeg('#bmBatchStateSeg button', 'bstate', 'bmBatchStateArg',
     () => bmBatchState, (v) => { bmBatchState = v; }, reflectBatchStateArg);
   $p('bmBatchApplyState').onclick = async () => {
@@ -701,8 +722,8 @@ function wireBoards() {
     // mask internally) — one round-trip instead of one command per board.
     const j = await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', board_mask: boardMask(), state: bmBatchState, arg });
     if (btn) btn.disabled = false;
-    bmMsg(j.ok ? `state ${bmBatchState}${arg ? ' @ ' + arg : ''} → ${keys.length} board(s)`
-              : (j.error || `state ${bmBatchState} failed`));
+    bmMsg(j.ok ? `${PS_NAME[bmBatchState]}${arg ? ' @ ' + arg : ''} → ${keys.length} board(s)`
+              : (j.error || `${PS_NAME[bmBatchState]} failed`));
     refreshBoards();
   };
   reflectBatchStateArg();
@@ -740,10 +761,10 @@ function pruneHvMaskedSelection() {
   }
 }
 
-// Setpoint rows + enable buttons shared between the primary HV card
-// (suffix='') and the index.html "HV Control & Monitor" mirror card
-// (suffix='2', rendered below Hardware Run) — was hand-duplicated markup
-// in index.html that could silently drift from here when a field changed.
+// Setpoint rows + enable buttons, rendered twice: the Direct Power Control HV
+// card (suffix='') and index.html's "HV Control & Monitor" card (suffix='2').
+// One template and one set of handlers (HV_SUFFIXES) -- only the ids differ.
+const HV_SUFFIXES = ['', '2'];
 function hvSetpointRowsHtml(suffix) {
   return `
     <div class="bm-set-row hv-set" title="Enter the magnitude — 70 sets −70 V (the output is negative). Set V maps the target through the calibrated LUT to a DS3502 wiper and writes it directly (no closed loop, no drift). Cal sweeps the wiper 0→127 and reads the measured V at each step to (re)build the LUT — enable Emission HV first.">
@@ -759,8 +780,8 @@ function hvSetpointRowsHtml(suffix) {
       <button id="focVcalBtn${suffix}" class="xs">Cal</button>
     </div>
     <div class="bm-set-row hv-set">
-      <label class="numlabel"><span class="cap">Emission I</span><input id="dsEi${suffix}" type="number" min="0" max="127" value="0" /></label>
-      <span id="dsEiEst${suffix}" class="pot-est">~0 mA</span>
+      <label class="numlabel" title="Emission current limit in mA (0–85.7). Written as the nearest DS3502 wiper step (~0.67 mA each); the step actually set is shown alongside."><span class="cap">Emission I mA</span><input id="dsEi${suffix}" type="number" min="0" max="85.7" step="0.1" value="0" /></label>
+      <span id="dsEiEst${suffix}" class="pot-est">0.0 mA</span>
       <button id="dsSet${suffix}" class="xs">Set I</button>
       <button id="dsRead${suffix}" class="xs">Read</button>
     </div>`;
@@ -827,18 +848,24 @@ const HV_HTML = `
   <div class="batch-box">
     <div class="block-title">HV setpoints <span class="hint">— LUT wiper (no drift)</span></div>
     ${hvSetpointRowsHtml('')}
-    <div class="block-title" style="margin-top:6px">Direct wiper <span class="hint">— raw DS3502 (bypasses the closed loop)</span></div>
-    <div class="bm-set-row hv-set" title="Write the DS3502 wiper directly (0–127), bypassing the closed loop — to isolate firmware-loop vs GUI/hardware. Clr the closed loop first or it will overwrite this. Watch the monitor's Emission V.">
+    <div class="block-title" style="margin-top:6px">Direct wiper <span class="hint">— raw DS3502, debug (skips the LUT)</span></div>
+    <div class="bm-set-row hv-set" title="Write the DS3502 wiper directly (0–127), skipping the calibrated LUT — for checking the pot and the HV supply. Watch the monitor's Emission V.">
       <label class="numlabel"><span class="cap">Em-V wiper</span><input id="evWiper" type="number" min="0" max="127" value="0" /></label>
       <span id="evWiperEst" class="pot-est">—</span>
       <button id="evWiperSet" class="xs">Set</button>
       <button id="evWiperGet" class="xs">Read</button>
     </div>
-    <div class="bm-set-row hv-set" title="Write the DS3502 wiper directly (0–127), bypassing the closed loop. Clr the focus closed loop first. Watch the monitor's Focus V.">
+    <div class="bm-set-row hv-set" title="Write the DS3502 wiper directly (0–127), skipping the calibrated LUT. Watch the monitor's Focus V.">
       <label class="numlabel"><span class="cap">Foc-V wiper</span><input id="fvWiper" type="number" min="0" max="127" value="0" /></label>
       <span id="fvWiperEst" class="pot-est">—</span>
       <button id="fvWiperSet" class="xs">Set</button>
       <button id="fvWiperGet" class="xs">Read</button>
+    </div>
+    <div class="bm-set-row hv-set" title="Write the emission-current DS3502 wiper directly (0–127); the mA it corresponds to is shown alongside. HV setpoints above takes the value in mA.">
+      <label class="numlabel"><span class="cap">Em-I wiper</span><input id="eiWiper" type="number" min="0" max="127" value="0" /></label>
+      <span id="eiWiperEst" class="pot-est">—</span>
+      <button id="eiWiperSet" class="xs">Set</button>
+      <button id="eiWiperGet" class="xs">Read</button>
     </div>
     ${hvEnableRowHtml('')}
   </div>
@@ -901,10 +928,9 @@ const HV_HTML = `
     <div id="sbResult" class="summary"></div>
   </div>`;
 
-// DS3502 writes share the STM32 I2C bus with the HV voltage closed-loop. Right
-// after a Set V (emission/focus), that loop is actively walking its own wiper, so
-// an immediate manual DS3502 write returns HTTP 502 (UART/I2C busy) until the loop
-// settles (a few seconds). Retry with backoff instead of surfacing the transient.
+// A DS3502 write can come back HTTP 502 (the STM32's UART/I2C momentarily busy,
+// e.g. with an ADS1115 monitor read). Retry with backoff instead of surfacing
+// the transient.
 async function ds3502SetRetry(ch, wiper, label) {
   let j;
   for (let i = 0; i < 8; i++) {
@@ -1145,10 +1171,9 @@ async function hvSwitchTest() {
 function wireHv() {
   $p('hvCard').innerHTML = HV_HTML;
   clampNumberInputs($p('hvCard'));
-  // index.html's "HV Control & Monitor" mirror card (below Hardware Run)
-  // shares this same setpoint/enable markup — rendered here so it can't
-  // drift from the primary card. The monitor metrics there are a
-  // deliberately smaller, static subset, left hand-written.
+  // index.html's "HV Control & Monitor" card (below Hardware Run) shows the
+  // same setpoints/enables on purpose, next to the run. Same markup and the
+  // same handlers (HV_SUFFIXES loop below); only the element ids differ.
   const hvMirror = $p('hvMirrorSetpoints');
   if (hvMirror) { hvMirror.innerHTML = hvSetpointRowsHtml('2') + hvEnableRowHtml('2'); clampNumberInputs(hvMirror); }
   renderHvGrid();
@@ -1225,32 +1250,38 @@ function wireHv() {
   };
   // LUT voltage: Emission/Focus target (V) → wiper via the calibrated LUT, then
   // written directly to the DS3502 (no closed loop, no drift). Cal (re)builds it.
-  $p('emVsetBtn').onclick = () => hvLutSet('emission', 'emVset');
-  $p('emVcalBtn').onclick = () => hvLutCalibrate('emission');
-  $p('focVsetBtn').onclick = () => hvLutSet('focus', 'focVset');
-  $p('focVcalBtn').onclick = () => hvLutCalibrate('focus');
-  // Emission I — DS3502 wiper (no closed-loop for current)
-  $p('dsEi').addEventListener('input', updatePotEsts);
+  // Emission I — entered in mA, written as the nearest DS3502 wiper step.
+  // A read updates every copy of the field.
+  const setAllEi = (ma) => forMirrored('dsEi', (e) => { e.value = ma; });
+  for (const sx of HV_SUFFIXES) {
+    if (!$p('emVsetBtn' + sx)) continue;   // that card is not on the page
+    $p('emVsetBtn' + sx).onclick = () => hvLutSet('emission', 'emVset' + sx);
+    $p('emVcalBtn' + sx).onclick = () => hvLutCalibrate('emission');
+    $p('focVsetBtn' + sx).onclick = () => hvLutSet('focus', 'focVset' + sx);
+    $p('focVcalBtn' + sx).onclick = () => hvLutCalibrate('focus');
+    $p('dsEi' + sx).addEventListener('input', updatePotEsts);
+    $p('dsSet' + sx).onclick = async () => {
+      if (!hvConnGuard()) return;
+      const w = eiMaToWiper(+$p('dsEi' + sx).value);
+      hvFb('Em-I: setting …');
+      const j = await ds3502SetRetry('ei', w, 'Em-I');
+      if (j.ok) { setAllEi(eiWiperToMa(w).toFixed(1)); updatePotEsts(); }   // keep both cards in step
+      hvFb(j.ok ? `Em-I limit set to ${eiWiperToMa(w).toFixed(1)} mA` : `Em-I ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
+    };
+    $p('dsRead' + sx).onclick = async () => {
+      if (!hvConnGuard()) return;
+      hvFb('reading …');
+      let j;
+      try { j = await (await fetch(`/api/stm32/ds3502?controller=${masterId()}&ch=ei`)).json(); }
+      catch (e) { hvFb(`Em-I read error — ${String((e && e.message) || e)}`, 'bad'); return; }
+      if (j.ok && j.wiper != null) { setAllEi(eiWiperToMa(j.wiper).toFixed(1)); updatePotEsts(); }
+      hvFb(j.ok ? `Em-I limit = ${eiWiperToMa(j.wiper).toFixed(1)} mA` : `read ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
+    };
+  }
   updatePotEsts();
-  $p('dsSet').onclick = async () => {
-    if (!hvConnGuard()) return;
-    const w = +$p('dsEi').value;
-    hvFb('Em-I: setting …');
-    const j = await ds3502SetRetry('ei', w, 'Em-I');
-    hvFb(j.ok ? `Em-I wiper ${w} set` : `Em-I ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
-  };
-  $p('dsRead').onclick = async () => {
-    if (!hvConnGuard()) return;
-    hvFb('reading …');
-    let j;
-    try { j = await (await fetch(`/api/stm32/ds3502?controller=${masterId()}&ch=ei`)).json(); }
-    catch (e) { hvFb(`Em-I read error — ${String((e && e.message) || e)}`, 'bad'); return; }
-    if (j.ok && j.wiper != null) { $p('dsEi').value = j.wiper; updatePotEsts(); }
-    hvFb(j.ok ? `Em-I wiper = ${j.wiper}` : `read ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
-  };
-  // Direct DS3502 wiper for the V channels — writes the wiper raw, bypassing the
-  // closed loop (Clr the loop first or it overwrites). Isolates firmware-loop vs
-  // GUI/hardware: set a wiper, watch the monitor's Emission/Focus V respond.
+  // Direct DS3502 wiper for the V channels (debug) — writes the wiper raw,
+  // skipping the calibrated LUT: set a wiper, watch the monitor's
+  // Emission/Focus V respond.
   const wireWiper = (chan, inId, estId, setId, getId, label) => {
     const est = () => { const e = $p(estId); if (e) e.textContent = potEstText(chan, +$p(inId).value); };
     $p(inId).addEventListener('input', est); est();
@@ -1258,7 +1289,7 @@ function wireHv() {
       if (!hvConnGuard()) return;
       hvFb(`${label}: wiper ${+$p(inId).value} …`);
       const j = await ds3502SetRetry(chan, +$p(inId).value, label);
-      hvFb(j.ok ? `${label} wiper ${+$p(inId).value} set (loop bypassed)` : `${label} ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
+      hvFb(j.ok ? `${label} wiper ${+$p(inId).value} set (raw, LUT skipped)` : `${label} ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
     };
     $p(getId).onclick = async () => {
       if (!hvConnGuard()) return;
@@ -1270,6 +1301,7 @@ function wireHv() {
   };
   wireWiper('ev', 'evWiper', 'evWiperEst', 'evWiperSet', 'evWiperGet', 'Em-V');
   wireWiper('fv', 'fvWiper', 'fvWiperEst', 'fvWiperSet', 'fvWiperGet', 'Foc-V');
+  wireWiper('ei', 'eiWiper', 'eiWiperEst', 'eiWiperSet', 'eiWiperGet', 'Em-I');
   // Enable buttons = two EXPLICIT, ABSOLUTE commands per channel (ON / OFF) —
   // not a toggle. Each click always sends that exact state via hv-enable,
   // regardless of whatever the buttons currently show. The clicked button
@@ -1297,41 +1329,12 @@ function wireHv() {
     if (!j.ok) setHvEnBtn(prefix, label, prev === '' ? null : prev === '1');   // command failed → undo the optimistic highlight
     hvFb(j.ok ? `${label} ${want ? 'ON' : 'OFF'}` : `${label} ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
   };
-  $p('hvEnEmOn').onclick   = () => hvEnClick('emission', 'hvEnEm', 'Emission', true);
-  $p('hvEnEmOff').onclick  = () => hvEnClick('emission', 'hvEnEm', 'Emission', false);
-  $p('hvEnFocOn').onclick  = () => hvEnClick('focus', 'hvEnFoc', 'Focus', true);
-  $p('hvEnFocOff').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus', false);
-  // Mirror HV control+monitor (foldable card below Hardware Run): same master-STM32
-  // handlers; its monitor/button values are kept in sync via the *2-suffixed IDs in
-  // setHvPin / setHvEnBtn / adsRead / pollHvLoop / hvFb. Skips cleanly if absent.
-  if ($p('emVsetBtn2')) $p('emVsetBtn2').onclick = () => hvLutSet('emission', 'emVset2');
-  if ($p('emVcalBtn2')) $p('emVcalBtn2').onclick = () => hvLutCalibrate('emission');
-  if ($p('focVsetBtn2')) $p('focVsetBtn2').onclick = () => hvLutSet('focus', 'focVset2');
-  if ($p('focVcalBtn2')) $p('focVcalBtn2').onclick = () => hvLutCalibrate('focus');
-  if ($p('hvEnEmOn2')) $p('hvEnEmOn2').onclick = () => hvEnClick('emission', 'hvEnEm', 'Emission', true);
-  if ($p('hvEnEmOff2')) $p('hvEnEmOff2').onclick = () => hvEnClick('emission', 'hvEnEm', 'Emission', false);
-  if ($p('hvEnFocOn2')) $p('hvEnFocOn2').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus', true);
-  if ($p('hvEnFocOff2')) $p('hvEnFocOff2').onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus', false);
-  // Mirror Emission-I (DS3502 wiper) — same 'ei' channel + retry path as the main card.
-  if ($p('dsEi2')) {
-    $p('dsEi2').addEventListener('input', updatePotEsts);
-    $p('dsSet2').onclick = async () => {
-      if (!hvConnGuard()) return;
-      const w = +$p('dsEi2').value;
-      hvFb('Em-I: setting …');
-      const j = await ds3502SetRetry('ei', w, 'Em-I');
-      if (j.ok && $p('dsEi')) { $p('dsEi').value = w; updatePotEsts(); }   // keep both cards in step
-      hvFb(j.ok ? `Em-I wiper ${w} set` : `Em-I ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
-    };
-    $p('dsRead2').onclick = async () => {
-      if (!hvConnGuard()) return;
-      hvFb('reading …');
-      let j;
-      try { j = await (await fetch(`/api/stm32/ds3502?controller=${masterId()}&ch=ei`)).json(); }
-      catch (e) { hvFb(`Em-I read error — ${String((e && e.message) || e)}`, 'bad'); return; }
-      if (j.ok && j.wiper != null) { $p('dsEi2').value = j.wiper; if ($p('dsEi')) $p('dsEi').value = j.wiper; updatePotEsts(); }
-      hvFb(j.ok ? `Em-I wiper = ${j.wiper}` : `read ${hvErr(j)}`, j.ok ? 'ok' : 'bad');
-    };
+  for (const sx of HV_SUFFIXES) {
+    if (!$p('hvEnEmOn' + sx)) continue;
+    $p('hvEnEmOn' + sx).onclick   = () => hvEnClick('emission', 'hvEnEm', 'Emission', true);
+    $p('hvEnEmOff' + sx).onclick  = () => hvEnClick('emission', 'hvEnEm', 'Emission', false);
+    $p('hvEnFocOn' + sx).onclick  = () => hvEnClick('focus', 'hvEnFoc', 'Focus', true);
+    $p('hvEnFocOff' + sx).onclick = () => hvEnClick('focus', 'hvEnFoc', 'Focus', false);
   }
   setHvEnBtn('hvEnEm', 'Emission', false);   // start OFF (boot-safe) — updates primary + mirror
   setHvEnBtn('hvEnFoc', 'Focus', false);
@@ -1566,11 +1569,24 @@ function potEstText(ch, wiper) {
   const w = Number.isFinite(wiper) ? Math.min(127, Math.max(0, wiper)) : 0;
   return `~${((w / 127) * s.full).toFixed(s.unit === 'mA' ? 1 : 0)} ${s.unit}`;
 }
+// Emission-I is entered in mA; the DS3502 only has 128 steps, so show the step
+// that will actually be written rather than pretend the typed value is exact.
+function eiMaToWiper(ma) {
+  const v = Number.isFinite(ma) ? ma : 0;
+  return Math.min(127, Math.max(0, Math.round((v / POT_EST.ei.full) * 127)));
+}
+function eiWiperToMa(w) { return (Math.min(127, Math.max(0, +w || 0)) / 127) * POT_EST.ei.full; }
+function eiEstText(ma) {
+  const w = eiMaToWiper(ma);
+  const real = eiWiperToMa(w);
+  const clamped = Number.isFinite(ma) && (ma < 0 || ma > POT_EST.ei.full);
+  return `${clamped ? 'max ' : ''}${real.toFixed(1)} mA`;
+}
 function updatePotEsts() {
-  const t = potEstText('ei', +$p('dsEi').value);
-  if ($p('dsEiEst')) $p('dsEiEst').textContent = t;
-  // keep the HV Control & Monitor mirror card's Emission-I estimate in step
-  if ($p('dsEiEst2') && $p('dsEi2')) $p('dsEiEst2').textContent = potEstText('ei', +$p('dsEi2').value);
+  for (const sx of HV_SUFFIXES) {
+    const inp = $p('dsEi' + sx), est = $p('dsEiEst' + sx);
+    if (inp && est) est.textContent = eiEstText(+inp.value);
+  }
 }
 
 // prominent, immediate feedback for every HV-setpoint action
