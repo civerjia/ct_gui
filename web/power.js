@@ -173,6 +173,8 @@ const BOARDS_HTML = `
     <span class="legend-item"><span class="dot absent">·</span> absent</span>
     <span class="legend-item"><span class="ps-chip ps-stop">STOP</span><span class="ps-chip ps-sleep">SLEEP</span><span class="ps-chip ps-standby">STBY</span><span class="ps-chip ps-idle">IDLE</span><span class="ps-chip ps-active">ACTIVE</span><span class="ps-chip ps-voltage">VOLT</span> power state</span>
     <span class="legend-item"><span class="ps-chip ps-dead">DEAD</span> marked dead (refused power)</span>
+    <span class="legend-item"><span class="ps-chip ps-lost">LOST</span> board stopped answering (retrying)</span>
+    <span class="legend-item"><span class="ps-chip ps-dark">DARK</span> whole channel not answering</span>
     <span class="hint">Shift-click = block · Ctrl/Cmd-click = toggle</span>
   </div>
   <div class="row compact i2c-mask bm-mask" title="Host poll set — only enabled channels are read for INA219 V/I (and selectable). Set applies it host-side; enable CH7 to start polling it. The firmware always scans all 8 regardless. Shared with the I²C section below.">
@@ -400,13 +402,16 @@ function renderBoardGrid() {
     p.hv.className = 'hv-badge ' + (!hvValid ? 'unknown' : b.hv_overcurrent ? 'on' : 'off');
     p.hv.title = `HV current ${!hvValid ? 'unavailable (chip not present)' : b.hv_overcurrent ? 'sensed (>1 mA)' : 'none'}`;
     p.title.textContent = b.label;   // the filament number is in the tooltip
-    p.ps.textContent = b.dead ? 'DEAD' : !b.present ? '' : (PS_SHORT[psName] || '?');
-    p.ps.hidden = !b.dead && !b.present;
+    p.ps.textContent = b.channel_dark ? 'DARK' : b.lost ? 'LOST' : b.dead ? 'DEAD'
+      : !b.present ? '' : (PS_SHORT[psName] || '?');
+    p.ps.hidden = !b.channel_dark && !b.lost && !b.dead && !b.present;
     setDot(p.dotP, b.present, 'P');
     setDot(p.dotI, b.iso_enabled, 'I', false, b.iso_enabled_valid);
     setDot(p.dotT, b.tps_enabled, 'T', b.tps_fault, b.tps_enabled_valid);
     setDot(p.dotF, b.tps_fault, 'F', b.tps_fault, b.tps_fault_valid);
-    p.dash.hidden = b.present; p.vSpan.hidden = !b.present; p.iSpan.hidden = !b.present;
+    // A lost/dark board's last V/I are not current -- show the failure instead.
+    const showVi = b.present && !b.lost && !b.channel_dark;
+    p.dash.hidden = showVi; p.vSpan.hidden = !showVi; p.iSpan.hidden = !showVi;
     const secs = (ms) => (ms == null ? '?' : (ms / 1000).toFixed(ms < 10000 ? 1 : 0));
     p.dash.textContent = b.channel_dark ? 'dark' : b.lost ? `lost ${secs(b.lost_for_ms)}s` : '—';
     tile.title = b.channel_dark
@@ -421,7 +426,7 @@ function renderBoardGrid() {
           + (b.power_state_src === 'backend' ? ' (last commanded; firmware did not report)' : '')
         : `${b.label}: no board answers here.`;
     tile.classList.toggle('recovering', !!b.recovering);
-    if (b.present) {
+    if (showVi) {
       // null = not a reading (aged out / not measured) -- shown as a dash,
       // never as 0 V / 0 mA.
       p.vSpan.textContent = b.bus_mV == null ? '— V' : (b.bus_mV / 1000).toFixed(2) + ' V';
@@ -623,10 +628,11 @@ async function refreshBoards() {
   if (!j.ok) { bmMsg(j.error || 'snapshot failed'); return; }
   boardCache = (j.boards && j.boards.length) ? j.boards : emptyBoards();
   renderBoardGrid(); renderOneBoard();
-  const lost = boardCache.filter((b) => b.lost).length;
+  const lost = boardCache.filter((b) => b.lost).map((b) => b.label);
   const dark = j.dark_channels && j.dark_channels.length ? ` · DARK: CH${j.dark_channels.join(', CH')}` : '';
   bmMsg(`Power ${pwTarget} — ${boardCache.filter((b) => b.present).length}/64 present`
-    + (lost ? ` · ${lost} lost (retrying)` : '') + dark + ` · current refresh ${pollHz()} Hz.`);
+    + (lost.length ? ` · ⚠ ${lost.length} LOST (retrying): ${lost.slice(0, 8).join(', ')}${lost.length > 8 ? ' …' : ''}` : '')
+    + dark + ` · current refresh ${pollHz()} Hz.`);
 }
 state.refreshBoards = refreshBoards;
 // Resync the Emission/Focus enable buttons to the actual hardware state.

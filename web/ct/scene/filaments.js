@@ -118,6 +118,12 @@ export function drawFilaments(r) {
     ctx.beginPath(); ctx.arc(sx, sy, rad, 0, 2 * Math.PI); ctx.fill();
     ctx.shadowBlur = 0;
     if (covered.has(i) && !isActive) { ctx.strokeStyle = 'rgba(242,193,78,0.7)'; ctx.lineWidth = 1; ctx.stroke(); }
+    // lost board / dark channel: a thick orange ring -- its state above is
+    // only the last one known, the board is not answering right now.
+    if (f.lost) {
+      ctx.strokeStyle = '#ff7a1a'; ctx.lineWidth = 2.2;
+      ctx.beginPath(); ctx.arc(sx, sy, rad + 3, 0, 2 * Math.PI); ctx.stroke();
+    }
 
     // index labels every 24 (bold), plus every-4 when the option is on
     const label = (i % LABEL_EVERY === 0) || (r.opts.indices && i % 4 === 0) || isActive;

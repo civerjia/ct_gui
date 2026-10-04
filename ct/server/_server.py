@@ -2562,7 +2562,9 @@ class CtHandler(BaseHTTPRequestHandler):
                                  # colours by this, it no longer guesses from mA
                                  "power_state": b["power_state"],
                                  "power_state_src": b["power_state_src"],
-                                 "dead": b["dead"], "dead_reason": b["dead_reason"]}
+                                 "dead": b["dead"], "dead_reason": b["dead_reason"],
+                                 "lost": bool(b.get("lost")),
+                                 "channel_dark": bool(b.get("channel_dark"))}
             # Feed the run recorder so an end-of-run report can confirm each active
             # filament actually reached its target current. Auto start on the first
             # running poll (if a sim didn't already start it with the scheduled set)

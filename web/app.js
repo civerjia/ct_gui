@@ -200,6 +200,7 @@ function ingestTelemetry(rows) {
     if (r.state != null) f.state = r.state;
     if (r.bus_mV != null) f.voltage_mV = r.bus_mV;
     if (r.current_mA != null) f.current_mA = r.current_mA;
+    if (r.lost !== undefined) f.lost = !!r.lost;
   }
   sync();
 }
@@ -729,6 +730,7 @@ function setViewMode(mode) {
 // per-board reads in Debug. Prevents Plan's design values from lingering.
 function clearLiveData() {
   for (const f of filaments) {
+    f.lost = false;
     if (f.dead) continue;
     f.state = STATE.STOP; f.voltage_mV = 0; f.current_mA = 0;
   }
@@ -785,7 +787,8 @@ async function pollTelemetry() {
     // guess from the current: a guess painted every cold IDLE as STOP. null =
     // not reported -> ingestTelemetry keeps the last known state.
     const state = t.power_state || null;
-    return { index: t.index, state, bus_mV: t.bus_mV, current_mA: t.current_mA };
+    return { index: t.index, state, bus_mV: t.bus_mV, current_mA: t.current_mA,
+             lost: !!(t.lost || t.channel_dark) };
   }).filter(Boolean);
   // the firmware-reported firing filament(s) are authoritative ACTIVE
   const firing = data.firing || [];
