@@ -109,6 +109,53 @@ check("ladder refusal carries its reason", "refused — currently at STANDBY" in
 check("controller-level error included", "Power 2: running — disarm first" in msg, msg)
 check("dead ones listed as left off on purpose", "marked dead, left off on purpose" in msg, msg)
 
+# --- /api/filament-prep end to end: a dead filament in an "all" batch -------
+# The GUI's "Standby all" asks for all 96; the dead ones are skipped on
+# purpose and must not turn the batch into a failure ("no board answers").
+import json  # noqa: E402
+import threading  # noqa: E402
+import urllib.request  # noqa: E402
+from http.server import ThreadingHTTPServer  # noqa: E402
+
+
+class _Cl:
+    connected = True
+
+
+class _Link:
+    client = _Cl()
+    name = "Power 1"
+
+    def request(self, *a, **k):
+        return {}
+
+
+def _fake_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None):
+    mine = [f for f in fids if board_of(f)[0] == c0]
+    dead = [f for f in mine if f in S.DEAD_FIDS]
+    live = [f for f in mine if f not in S.DEAD_FIDS]
+    return {"controller": c0, "ok": True, "applied": len(live), "failed": [], "state": state,
+            "landed": live, "touched": live, "dead_skipped": dead, "not_this_controller": [],
+            "unslotted": [], "ladder_blocked": [], "ladder_reasons": {}}
+
+
+S.prep_filaments = _fake_prep
+S.decode_shv_status = lambda r: {"state": 0}
+S.CONTROLLERS.clear()
+S.CONTROLLERS[1] = _Link()
+srv = ThreadingHTTPServer(("127.0.0.1", 0), S.CtHandler)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+want = [f for f in range(S.FILAMENT_COUNT) if board_of(f)[0] == 0 and board_of(f)[1] is not None]
+req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/filament-prep",
+                             data=json.dumps({"state": 3, "filaments": want}).encode(),
+                             headers={"Content-Type": "application/json", "X-CT-Client": "test"})
+r = json.loads(urllib.request.urlopen(req, timeout=10).read())
+check("batch including a dead filament is ok", r.get("ok") is True, str(r.get("error") or r)[:300])
+check("...the dead one is not 'excluded'", dead_f not in (r.get("excluded") or []), str(r.get("excluded")))
+check("...and the summary says it was left off on purpose",
+      "marked dead, left off on purpose" in (r.get("summary") or ""), r.get("summary"))
+srv.shutdown()
+
 S.DEAD_FIDS.clear()
 S.LAST_POWER_STATE.clear()
 print("\nALL PASS" if not FAILS else f"\n{len(FAILS)} FAILED: {FAILS}")

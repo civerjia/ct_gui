@@ -3769,8 +3769,12 @@ class CtHandler(BaseHTTPRequestHandler):
                 # bug being fixed here -- a caller could request N filaments, have
                 # fewer than N actually attempted, and still see ok:true with no
                 # indication anything was skipped.
+                # A dead filament its controller skipped ON PURPOSE was handled,
+                # not lost: counting it as excluded failed every "all" batch
+                # that included one, blaming "no board answers".
                 touched = {int(f) for r in results.values()
-                           for f in (r.get("touched") or []) + (r.get("dead_stopped") or [])}
+                           for f in (r.get("touched") or []) + (r.get("dead_stopped") or [])
+                           + (r.get("dead_skipped") or [])}
                 excluded = ([int(f) for f in filaments if int(f) not in touched]
                             if filaments is not None else [])
                 blocked = sorted(int(f) for r in results.values()
