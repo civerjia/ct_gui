@@ -23,8 +23,7 @@ that never re-arms at all, not a slowly-recovering corrupted estimate).
 """
 import _path  # noqa: F401  — makes ct_simple_control importable from tests/
 import sys, time
-import requests
-
+from ct import _http as requests  # stdlib, see ct/_http.py
 sys.path.insert(0, '.')
 from ct_simple_control import CTClient
 import serial

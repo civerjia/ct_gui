@@ -29,7 +29,9 @@ import threading
 import weakref
 from typing import Any
 
-import requests
+# Standard library only: the subset of `requests` this client uses (ct/_http.py).
+# Named `requests` so every call site reads as before.
+from ct import _http as requests  # noqa: N812
 
 from ct.remote_codec import decode, encode
 

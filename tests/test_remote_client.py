@@ -16,8 +16,7 @@ import subprocess
 import sys
 import time
 
-import requests
-
+from ct import _http as requests  # stdlib, see ct/_http.py
 PORT = 8796
 BASE = f"http://127.0.0.1:{PORT}"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

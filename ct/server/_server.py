@@ -1482,7 +1482,14 @@ def _raw_power_guard(cid: int, command: str, body: dict) -> tuple[dict | None, l
     targets = _raw_cmd_targets(cid, body)
     fids = [f for _ch, _m, f in targets if f is not None]
     blocked = []
-    if energising:
+    if energising and body.get("allow_dead"):
+        # Explicitly asked for (the GUI's "include dead filaments" tests).
+        # The ladder below still applies; only the dead mask is waived.
+        forced = [f for _ch, _m, f in targets if f in dead_fids()]
+        if forced:
+            log.warning("%s on DEAD filament(s) %s -- allow_dead set (controller %d)",
+                        command, forced, cid)
+    elif energising:
         with _DEAD_LOCK:
             dead = {f: dict(v) for f, v in DEAD_FIDS.items()}
         for ch, mux, f in targets:
@@ -1989,7 +1996,7 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
 # ---------------------------------------------------------------------------
 def prep_filaments(link: "ControllerLink", controller: int, state: int,
                    filaments=None, currents=None, default_arg: int = 0,
-                   channels=DEFAULT_CHANNELS) -> dict:
+                   channels=DEFAULT_CHANNELS, allow_dead: bool = False) -> dict:
     """Apply CH_SET_POWER_STATE to a set of this controller's filaments. `filaments`
     is a FID 0-95 list (only this controller's are touched); None = every
     populated board the controller owns. `currents` maps FID→mA for the
@@ -2020,7 +2027,16 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # is covered too. Only for states that energise: a dead filament must still
     # be STOPpable (see ENERGISING_STATES).
     dead_skipped: list[int] = []
-    if state in ENERGISING_STATES:
+    # allow_dead: the caller explicitly asked to power dead filaments too (the
+    # GUI's "include dead filaments" test option -- re-checking whether a
+    # filament marked dead really is). Never a default; logged every time.
+    if allow_dead:
+        forced = [f for f in fils if int(f) in dead_fids()]
+        if forced and state in ENERGISING_STATES | {POWER_STATE_SLEEP}:
+            log.warning("prep_filaments: allow_dead -- powering DEAD filaments %s "
+                        "(state=%s, controller=%d)", forced, power_state_name(int(state)),
+                        controller)
+    elif state in ENERGISING_STATES:
         fils, dead_skipped = split_dead(fils)
         if dead_skipped:
             log.warning("prep_filaments: refused to energise dead filaments %s "
@@ -2034,7 +2050,7 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # that is both lower and fully off, so a dead filament asked for SLEEP gets
     # STOP, and is named in dead_stopped.
     dead_stopped: dict = {}
-    if int(state) == POWER_STATE_SLEEP:
+    if int(state) == POWER_STATE_SLEEP and not allow_dead:
         fils, dead_sleep = split_dead(fils)
         if dead_sleep:
             dead_stopped = prep_filaments(link, controller, int(POWER_STATE_STOP),
@@ -3887,7 +3903,8 @@ class CtHandler(BaseHTTPRequestHandler):
                             results[str(cid)] = {"ok": False, "error": "running — disarm first"}
                             continue
                         results[str(cid)] = prep_filaments(link, cid - 1, state, filaments,
-                                                           currents, default_arg, channels)
+                                                           currents, default_arg, channels,
+                                                           allow_dead=bool(body.get("allow_dead")))
                     except Exception as exc:
                         results[str(cid)] = {"ok": False, "error": str(exc)}
                 if not results:
@@ -5361,6 +5378,10 @@ def main() -> None:
     # remote proxy here would only call back into this same process.
     os.environ["CT_CLIENT_LOCAL"] = "1"
     _setup_logging()
+    # The update ran before logging existed: repeat what it said, so a failed
+    # update is in backend.log and not only in update.log and the console.
+    for level, msg in ct_update.RUN_MESSAGES:
+        (log.warning if level == "warning" else log.info)("update: %s", msg)
     # The port BEFORE any thread or "start" line: a backend that cannot serve
     # must not run a watchdog or a monitor, or log that it started.
     # After an in-place restart the port may still be in TIME_WAIT or being

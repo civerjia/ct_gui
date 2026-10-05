@@ -1140,6 +1140,7 @@ function refuseHwDead(i) {
 // minutes (/api/version .update); applying it is a backend restart, which
 // /api/restart refuses during a run or while someone else holds the lease.
 let updateRunning = null;   // commit the backend runs, to spot the restarted one
+let lastUpdateProblem = null;   // shown in the status bar once per new failure
 async function pollUpdateStatus() {
   let j;
   try { j = await (await fetch('/api/version')).json(); } catch { return; }
@@ -1147,12 +1148,19 @@ async function pollUpdateStatus() {
   updateRunning = j && j.commit;
   const b = $('updateBadge');
   if (!b || b.disabled) return;
-  b.hidden = !u.available;
-  if (!u.available) return;
-  b.textContent = `Update available: ${u.latest}`;
-  b.title = `GitHub has ${u.latest}; this backend runs ${u.current || 'an unknown version'}`
-    + ` (checked ${u.checked_at || '?'}). Click to restart the backend and update — `
-    + 'refused while a schedule is armed/running or another client holds the lease.';
+  // A failed update is shown even when nothing newer is waiting: the backend
+  // may be running code that cannot work here (e.g. a missing package).
+  b.hidden = !u.available && !u.problem;
+  b.classList.toggle('failed', !!u.problem);
+  if (b.hidden) return;
+  b.textContent = u.problem ? `Update FAILED — ${u.current || '?'} still running` : `Update available: ${u.latest}`;
+  b.title = u.problem
+    ? `${u.problem}\n\nFix that (the message says how), then click to restart and try again.`
+    : `GitHub has ${u.latest}; this backend runs ${u.current || 'an unknown version'}`
+      + ` (checked ${u.checked_at || '?'}). Click to restart the backend and update — `
+      + 'refused while a schedule is armed/running or another client holds the lease.';
+  if (u.problem && u.problem !== lastUpdateProblem) setStatus('Update failed: ' + u.problem);
+  lastUpdateProblem = u.problem || null;
 }
 async function applyUpdate() {
   const b = $('updateBadge');

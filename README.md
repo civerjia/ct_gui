@@ -222,6 +222,15 @@ whose `.git` is broken (a synced folder).
   updated, or why it could not check. Updates are logged to `logs/update.log`.
 - `CT_NO_AUTO_UPDATE=1` turns it off. A script warns once if the backend runs
   different code -- restart the backend (`ct.restart_backend()`) to update it.
+- **Dependencies are checked before an update is applied.** The new version's
+  `requirements.txt` (lines marked OPTIONAL excepted) is compared with what this
+  Python has; anything missing is installed with `python -m pip install`. If
+  that fails, the update is **not applied** -- the current version keeps
+  running -- and the reason, with the pip command to run by hand, goes to the
+  console, `logs/update.log`, `backend.log` and the GUI's red "Update FAILED"
+  badge. `CT_NO_AUTO_INSTALL=1`: check only, never install. Every start also
+  checks the version already here. (The backend and the Python client
+  themselves need nothing beyond the standard library.)
 
 
 **Restart the backend remotely** -- from any machine, e.g. to pick up an

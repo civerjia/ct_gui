@@ -169,7 +169,7 @@ Usage:
       # lease released here even on error
     # session() teardown (HV off, all filaments stopped) runs here even on error
 
-Dependencies: pip install requests
+Dependencies: none -- standard library only
 """
 
 import os  # noqa: E402  (CTClient.__new__ reads CT_CLIENT_LOCAL)

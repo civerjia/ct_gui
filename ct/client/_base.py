@@ -29,7 +29,9 @@ ct_update.check_and_update()
 # only shows up as a filament that mysteriously did not fire. Zero runtime cost.
 Fid = NewType("Fid", int)
 
-import requests
+# Standard library only: the subset of `requests` this client uses (ct/_http.py).
+# Named `requests` so every call site reads as before.
+from ct import _http as requests  # noqa: N812
 
 # ── exceptions ────────────────────────────────────────────────────────────────
 # See "ERROR HANDLING" at the top of this file. These classes exist mainly

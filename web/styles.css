@@ -77,6 +77,7 @@ body {
 .badge.online { background: var(--accent-soft); color: var(--accent); }
 .badge.update { background: var(--warn-soft); color: var(--warn); border: 1px solid rgba(141,93,17,0.35); cursor: pointer; font-family: inherit; }
 .badge.update:hover { background: #f7e3b0; }
+.badge.update.failed { background: var(--danger-soft); color: var(--danger); border-color: rgba(143,45,61,0.45); }
 .badge.update:focus-visible { outline: 2px solid var(--warn); outline-offset: 2px; }
 .badge.update[disabled] { cursor: progress; opacity: 0.7; }
 .badge.heartbeat-idle { background: #efece5; color: var(--muted); }
@@ -858,3 +859,17 @@ button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 .readouts .kv:last-child { border-bottom: none; }
 .readouts .kv span { color: var(--muted); }
 .readouts .kv b { font-family: var(--mono); color: var(--ink); }
+
+/* Dead filament list (Calibration & Test card) */
+.dead-box { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; margin-bottom: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
+.dead-list { display: flex; flex-direction: column; gap: 3px; max-height: 160px; overflow-y: auto; }
+.dead-row { display: grid; grid-template-columns: 3.2em 8.5em minmax(0, 1fr) auto auto; gap: 8px; align-items: center; font-size: 12px; }
+.dead-id { font-family: var(--mono); font-weight: 800; color: var(--danger); }
+.dead-where { font-family: var(--mono); color: var(--muted); }
+.dead-why { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dead-by { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.dead-add { gap: 6px; flex-wrap: wrap; }
+.dead-reason { flex: 1 1 12em; min-width: 8em; }
+.dead-force { font-size: 12px; font-weight: 700; color: var(--danger); }
+.summary.warn { color: var(--warn); }
+@media (max-width: 520px) { .dead-row { grid-template-columns: 3.2em 1fr auto; } .dead-why, .dead-by { grid-column: 1 / -1; } }

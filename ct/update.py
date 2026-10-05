@@ -87,9 +87,25 @@ def _record(msg: str) -> None:
         pass
 
 
-def _warn(msg: str) -> None:
+# Everything this process said about updating, for the backend to repeat in
+# backend.log (update runs before the backend's logging is set up), and the
+# reason the last update did NOT happen, for the GUI. An update that did not
+# apply must never be silent: console, update.log, backend.log and the GUI.
+RUN_MESSAGES: list[tuple[str, str]] = []      # (level "info"|"warning", text)
+LAST_UPDATE_PROBLEM: str | None = None
+
+
+def _warn(msg: str, level: str = "info") -> None:
     print(f"[ct_update] {msg}", file=sys.stderr)
     _record(msg)
+    RUN_MESSAGES.append((level, msg))
+
+
+def _fail(msg: str) -> None:
+    """An update that should have happened did not -- say it everywhere."""
+    global LAST_UPDATE_PROBLEM
+    LAST_UPDATE_PROBLEM = msg
+    _warn("UPDATE FAILED: " + msg, level="warning")
 
 
 # ---- what is installed here -------------------------------------------------
@@ -262,6 +278,74 @@ def _download(sha: str) -> dict[str, bytes]:
     return files
 
 
+# ---- dependencies -------------------------------------------------------------
+# An update that needs a package the other machine does not have used to land
+# anyway, and the program then failed to import there (2026-10-05: `requests`
+# in ct/client/_base.py). Now the NEW version's requirements.txt is checked
+# before its files are written: missing packages are installed with this
+# interpreter's pip, and if that fails the update is not applied -- the
+# current version keeps running and says why. Lines marked OPTIONAL are not
+# required. CT_NO_AUTO_INSTALL=1: check only, never install.
+PIP_TIMEOUT_S = 600.0
+
+
+def required_specs(text: str | bytes | None) -> list[tuple[str, str]]:
+    """[(spec, distribution name)] from requirements.txt, OPTIONAL lines left out."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    out = []
+    for line in (text or "").splitlines():
+        if "OPTIONAL" in line.upper():
+            continue
+        spec = line.split("#", 1)[0].strip()
+        if not spec or spec.startswith("-"):
+            continue
+        name = spec
+        for sep in ("[", "=", "<", ">", "!", "~", ";", " "):
+            name = name.split(sep, 1)[0]
+        if name:
+            out.append((spec, name))
+    return out
+
+
+def missing_specs(specs) -> list[str]:
+    """The specs whose distribution is not installed for THIS interpreter.
+    Presence only -- a version pin is passed to pip when installing."""
+    from importlib import metadata
+    missing = []
+    for spec, name in specs:
+        try:
+            metadata.version(name)
+        except metadata.PackageNotFoundError:
+            missing.append(spec)
+    return missing
+
+
+def ensure_requirements(text, what: str) -> str | None:
+    """None when every required package is there (installing what is missing
+    if allowed), else why not -- for the caller to refuse the update."""
+    missing = missing_specs(required_specs(text))
+    if not missing:
+        return None
+    if os.environ.get("CT_NO_AUTO_INSTALL"):
+        return f"{what} needs {', '.join(missing)}, not installed (CT_NO_AUTO_INSTALL is set)"
+    _warn(f"{what} needs {', '.join(missing)} -- installing with {sys.executable} -m pip")
+    try:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                            *missing], capture_output=True, text=True, timeout=PIP_TIMEOUT_S)
+        ok, tail = r.returncode == 0, (r.stderr or r.stdout or "").strip()[-400:]
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok, tail = False, f"{type(exc).__name__}: {exc}"
+    still = missing_specs(required_specs(text))
+    if ok and not still:
+        _warn(f"installed {', '.join(missing)}")
+        return None
+    why = (f"{what} needs {', '.join(still or missing)}; installing failed"
+           + (f": {tail}" if tail else "") + f". Install it by hand: "
+           f"{sys.executable} -m pip install {' '.join(still or missing)}")
+    return why
+
+
 def _write(path: Path, data: bytes) -> None:
     """Write, retrying briefly: a sync client (OneDrive) can hold a file open."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -331,7 +415,11 @@ def remote_check(running_commit: str | None) -> dict:
     sha = _latest_commit()
     cur = (running_commit or "")[:7] or None
     return {"ok": True, "latest": sha[:7], "current": cur,
-            "available": cur is None or not sha.startswith(cur)}
+            "available": cur is None or not sha.startswith(cur),
+            # Why the last update was NOT applied in this process (missing
+            # package, download or write failure), so the GUI says so instead
+            # of offering it forever.
+            "problem": LAST_UPDATE_PROBLEM}
 
 
 def check_and_update() -> None:
@@ -341,6 +429,15 @@ def check_and_update() -> None:
         return
     if _is_dev_copy():
         return        # the development copy: the source of GitHub, never overwritten from it
+    # The code ALREADY here may need something this interpreter lacks (an
+    # update written before this check existed, or a different Python).
+    try:
+        here = (REPO_DIR / "requirements.txt").read_text(encoding="utf-8")
+    except OSError:
+        here = ""
+    why = ensure_requirements(here, "the code here")
+    if why:
+        _fail(f"the installed version cannot run here: {why}")
     try:
         sha = _latest_commit()
     except (OSError, ValueError, KeyError, urllib.error.URLError) as exc:
@@ -353,19 +450,25 @@ def check_and_update() -> None:
         print(f"[ct_update] up to date ({sha[:7]})", file=sys.stderr)   # not logged: every start
         return
     if just_updated_to == sha:
-        _warn(f"just updated to {sha[:7]} but the files here still do not match it -- "
+        _fail(f"just updated to {sha[:7]} but the files here still do not match it -- "
               f"not updating again (check logs/update.log and the folder's permissions)")
         return
     try:
         files = _download(sha)
     except (OSError, ValueError, zipfile.BadZipFile, urllib.error.URLError) as exc:
-        _warn(f"update check found {sha[:7]} but the download failed ({type(exc).__name__}: {exc}) -- "
+        _fail(f"update check found {sha[:7]} but the download failed ({type(exc).__name__}: {exc}) -- "
               f"carrying on with the code here")
+        return
+    # The NEW version's dependencies, before a single file of it is written.
+    why = ensure_requirements(files.get("requirements.txt"), f"version {sha[:7]}")
+    if why:
+        _fail(f"update to {sha[:7]} NOT applied -- {why}. Carrying on with "
+              f"{(m.get('commit') or '')[:7] or 'the code here'}.")
         return
     try:
         res = apply_update(sha, files)
     except OSError as exc:
-        _warn(f"update to {sha[:7]} failed while writing files ({exc}) -- some files may be "
+        _fail(f"update to {sha[:7]} failed while writing files ({exc}) -- some files may be "
               f"new and some old; run it again (restart) to finish")
         return
     was = (m.get("commit") or "")[:7] or "an untracked copy"

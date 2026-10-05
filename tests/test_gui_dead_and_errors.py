@@ -51,6 +51,13 @@ check("...and the error names the board and the reason",
       and "nothing was sent" in ref["error"], ref and ref["error"])
 ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", single(dch, dpos, state=1))
 check("STOP on a dead filament is allowed", ref is None)
+ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", single(dch, dpos, state=4, arg=1500,
+                                                                allow_dead=True))
+check("allow_dead: IDLE on a dead filament passes (the include-dead test option)", ref is None, str(ref))
+S.LAST_POWER_STATE.pop(dead_f, None)
+ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", single(dch, dpos, state=5, arg=2600,
+                                                                allow_dead=True))
+check("allow_dead never waives the ACTIVE ladder", ref and "ACTIVE" in ref["error"], str(ref))
 ref, _, _ = S._raw_power_guard(1, "CH_SET_TPS_ENABLE", single(dch, dpos, enable=True))
 check("TPS enable on a dead filament is refused", ref is not None)
 ref, _, _ = S._raw_power_guard(1, "CH_SET_TPS_ENABLE", single(dch, dpos, enable=False))
@@ -130,7 +137,7 @@ class _Link:
         return {}
 
 
-def _fake_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None):
+def _fake_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None, allow_dead=False):
     mine = [f for f in fids if board_of(f)[0] == c0]
     dead = [f for f in mine if f in S.DEAD_FIDS]
     live = [f for f in mine if f not in S.DEAD_FIDS]
@@ -154,6 +161,21 @@ check("batch including a dead filament is ok", r.get("ok") is True, str(r.get("e
 check("...the dead one is not 'excluded'", dead_f not in (r.get("excluded") or []), str(r.get("excluded")))
 check("...and the summary says it was left off on purpose",
       "marked dead, left off on purpose" in (r.get("summary") or ""), r.get("summary"))
+seen = {}
+
+
+def _spy_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None, allow_dead=False):
+    seen["allow_dead"] = allow_dead
+    return _fake_prep(link, c0, state, fids, currents, default_arg, channels)
+
+
+S.prep_filaments = _spy_prep
+req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/filament-prep",
+                             data=json.dumps({"state": 3, "filaments": want, "allow_dead": True}).encode(),
+                             headers={"Content-Type": "application/json", "X-CT-Client": "test"})
+json.loads(urllib.request.urlopen(req, timeout=10).read())
+check("filament-prep hands allow_dead through", seen.get("allow_dead") is True, str(seen))
+S.prep_filaments = _fake_prep
 
 
 def _fake_grid(link, c0, fids, on, force):
