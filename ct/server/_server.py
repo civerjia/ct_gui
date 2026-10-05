@@ -19,6 +19,7 @@ import copy
 import csv
 import enum
 import datetime
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -1038,19 +1039,74 @@ def _dead_save() -> None:
 # sees the same numbering the first one set, instead of every run silently
 # starting at identity.
 #
-# DELIBERATELY NOT PERSISTED TO DISK, unlike DEAD_FIDS. Those two look similar
-# and must not be treated alike:
-#   - dead is a property of the HARDWARE. A burnt filament is still burnt after
-#     a restart, so forgetting it would be unsafe.
-#   - the order is a property of a SESSION's convention. Reloading a stale
-#     permutation from disk into a rig whose backplane has since been rewired
-#     sends every command to the wrong filament, and nothing about that failure
-#     announces itself -- every index stays in range and every call succeeds.
-# Identity is the only honest default for a backend that just started, so a
-# restart forgets, on purpose.
+# PERSISTED, like DEAD_FIDS (state/filament_order.json), so the numbering a
+# script set survives a backend restart. It used to be forgotten on purpose,
+# and the reason still stands: a permutation reloaded into a rig whose
+# backplane has since been rewired sends every command to the wrong filament,
+# and nothing announces it -- every index stays in range, every call succeeds.
+# So the file also records the WIRING it was set against (the active lists,
+# _mapping_fingerprint) and is restored only onto the same wiring; anything
+# else starts at identity and says why in the log.
 FILAMENT_ORDER: list[int] | None = None       # None = identity
 ORDER_SET_BY: str = ""
 ORDER_SET_AT: float = 0.0
+ORDER_SAVED_FP: str | None = None             # wiring the current order was set against
+
+
+def _mapping_fingerprint() -> str:
+    """The wiring an order is valid for: every controller's active list (power
+    slot -> filament). Changes whenever the mapping does."""
+    h = hashlib.sha1()
+    for c in range(FILAMENT_COUNT // FILAMENTS_PER_CONTROLLER):
+        h.update(MAPPING.active_list(c))
+    return h.hexdigest()[:12]
+
+
+def _order_save() -> None:
+    """Caller holds _ORDER_LOCK. Atomic, like _dead_save."""
+    global ORDER_SAVED_FP
+    ORDER_SAVED_FP = _mapping_fingerprint()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = ORDER_STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({
+        "order": FILAMENT_ORDER, "set_by": ORDER_SET_BY,
+        "saved_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "mapping_fingerprint": ORDER_SAVED_FP}, indent=2))
+    tmp.replace(ORDER_STATE_PATH)
+
+
+def _order_load() -> None:
+    """Restore the saved order -- only onto the wiring it was set against.
+    An unreadable file or another wiring starts at identity, loudly."""
+    global FILAMENT_ORDER, ORDER_SET_BY, ORDER_SAVED_FP
+    try:
+        raw = json.loads(ORDER_STATE_PATH.read_text())
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log.warning("filament order: %s is unreadable (%s) -- starting at identity",
+                    ORDER_STATE_PATH.name, e)
+        return
+    order = raw.get("order") if isinstance(raw, dict) else None
+    if order is None:
+        return
+    why = order_validate(order)
+    if why:
+        log.warning("filament order: saved order is not valid (%s) -- starting at identity", why)
+        return
+    fp = _mapping_fingerprint()
+    if raw.get("mapping_fingerprint") != fp:
+        log.warning("filament order: NOT restored -- it was set by %s at %s for a different "
+                    "wiring (mapping %s, now %s). Starting at identity; set it again.",
+                    raw.get("set_by") or "?", raw.get("saved_at") or "?",
+                    raw.get("mapping_fingerprint"), fp)
+        return
+    FILAMENT_ORDER = [int(v) for v in order]
+    ORDER_SAVED_FP = fp
+    ORDER_SET_BY = f"{raw.get('set_by') or '?'} (restored from disk, saved {raw.get('saved_at')})"
+    log.info("filament order restored from disk: set by %s at %s, %d entries differ from identity",
+             raw.get("set_by") or "?", raw.get("saved_at") or "?",
+             sum(1 for i, v in enumerate(FILAMENT_ORDER) if v != i))
 
 
 def order_snapshot() -> dict:
@@ -1058,6 +1114,10 @@ def order_snapshot() -> dict:
         order = list(FILAMENT_ORDER) if FILAMENT_ORDER else list(range(FILAMENT_COUNT))
         return {"ok": True, "order": order, "identity": FILAMENT_ORDER is None,
                 "epoch": ORDER_EPOCH, "set_by": ORDER_SET_BY,
+                # The wiring changed since this order was set: it may now point
+                # at other filaments. Set it again.
+                "mapping_changed": (FILAMENT_ORDER is not None and ORDER_SAVED_FP is not None
+                                    and ORDER_SAVED_FP != _mapping_fingerprint()),
                 "set_at_s_ago": (round(time.monotonic() - ORDER_SET_AT, 1)
                                  if ORDER_SET_AT else None)}
 
@@ -1539,6 +1599,7 @@ def split_dead(fids) -> tuple[list[int], list[int]]:
 
 
 _dead_load()
+_order_load()
 
 
 def _hv_lut_path(chan: str) -> Path:
@@ -4136,6 +4197,7 @@ class CtHandler(BaseHTTPRequestHandler):
                         FILAMENT_ORDER = None
                         ORDER_SET_BY = self._client()
                         ORDER_SET_AT = time.monotonic()
+                        _order_save()
                     log.info("filament order cleared to identity by %s", self._client())
                     self._json(order_snapshot())
                 else:
@@ -4149,6 +4211,7 @@ class CtHandler(BaseHTTPRequestHandler):
                                               else None)
                             ORDER_SET_BY = self._client()
                             ORDER_SET_AT = time.monotonic()
+                            _order_save()
                         swapped = sum(1 for i, v in enumerate(order) if int(v) != i)
                         log.info("filament order set by %s (%d entries differ from identity)",
                                  self._client(), swapped)
@@ -5258,6 +5321,19 @@ def _update_watch_loop() -> None:
         time.sleep(max(60.0, UPDATE_CHECK_S))
 
 
+def _backend_already_running(port: int) -> str | None:
+    """A description of the backend already answering on this port, or None.
+    Only a real /api/version answer counts; a refused connection (nothing
+    there, or a restart's old socket being released) is None."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/version", timeout=1.5) as r:
+            v = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    return f"version {v.get('commit') or 'unknown'}" if isinstance(v, dict) and v.get("ok") else None
+
+
 def main() -> None:
     # Bind all interfaces by default: this process owns the single-client bridge
     # sockets, so every other program on the bench reaches the hardware through
@@ -5265,18 +5341,43 @@ def main() -> None:
     # Self-update from GitHub before binding the port (see ct_update.py): a
     # clone that is behind fast-forwards and the backend restarts on the new
     # code. Start-up only -- a running backend is never restarted by this.
+    host = os.environ.get("CT_GUI_HOST", "0.0.0.0")
+    port = int(os.environ.get("CT_GUI_PORT", "8770"))
+    # ONE backend per port, checked BEFORE anything else. 2026-10-05 11:06 two
+    # were started a second apart: the second updated the files on disk under
+    # the first, restarted, and found the port taken -- after it had already
+    # logged "backend start" and run its watchdog and monitor threads. The
+    # running backend was then old code with new files beside it.
+    other = _backend_already_running(port)
+    if other:
+        print(f"[ct] another backend is already running on port {port} ({other}) -- "
+              f"not starting, and not updating its files. Stop it first, or use the "
+              f"GUI's Update / /api/restart to restart it.", file=sys.stderr, flush=True)
+        raise SystemExit(1)
     from ct import update as ct_update
     ct_update.check_and_update()
     _BACKEND_VERSION.update(ct_update.version())
-    if not os.environ.get("CT_NO_AUTO_UPDATE"):
-        threading.Thread(target=_update_watch_loop, name="update_watch", daemon=True).start()
     # Inside the backend a CTClient is always the real, in-process one: a
     # remote proxy here would only call back into this same process.
     os.environ["CT_CLIENT_LOCAL"] = "1"
-    host = os.environ.get("CT_GUI_HOST", "0.0.0.0")
-    port = int(os.environ.get("CT_GUI_PORT", "8770"))
     _setup_logging()
-    log.info("=== backend start — listening on http://%s:%d ===", host, port)
+    # The port BEFORE any thread or "start" line: a backend that cannot serve
+    # must not run a watchdog or a monitor, or log that it started.
+    # After an in-place restart the port may still be in TIME_WAIT or being
+    # released, so the bind is retried briefly instead of failing at once.
+    for attempt in range(40):
+        try:
+            server = ThreadingHTTPServer((host, port), CtHandler)
+            break
+        except OSError as exc:
+            if attempt == 39:
+                log.error("backend NOT started: port %d unavailable (%s)", port, exc)
+                raise
+            time.sleep(0.25)
+    log.info("=== backend start — listening on http://%s:%d (%s) ===", host, port,
+             _BACKEND_VERSION.get("commit") or "unknown version")
+    if not os.environ.get("CT_NO_AUTO_UPDATE"):
+        threading.Thread(target=_update_watch_loop, name="update_watch", daemon=True).start()
     # The dead-man watchdog starts with the server and outlives every client.
     # Daemon: it must never hold the process open, and it has no state worth
     # draining on the way out.
@@ -5289,16 +5390,6 @@ def main() -> None:
              "without an HV grid command (rails never touched; commands renew, reads do not)",
              power_state_name(SAFETY_ACTIVE_FALLBACK), SAFETY_ACTIVE_TIMEOUT_S,
              SAFETY_HV_TIMEOUT_S)
-    # After an in-place restart the port may still be in TIME_WAIT or being
-    # released, so the bind is retried briefly instead of failing at once.
-    for attempt in range(40):
-        try:
-            server = ThreadingHTTPServer((host, port), CtHandler)
-            break
-        except OSError:
-            if attempt == 39:
-                raise
-            time.sleep(0.25)
     _HTTP_SERVER["server"] = server
     if os.environ.pop("CT_RESTARTED_FROM", None):
         print(f"[ct] backend RESTARTED -- now pid {os.getpid()}, running in this window", flush=True)

@@ -17,3 +17,9 @@ import sys
 _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
+
+# Tests never touch the operator's saved state (dead filaments, filament order):
+# this process and every backend it spawns use a scratch state directory.
+import tempfile  # noqa: E402
+
+os.environ.setdefault("CT_STATE_DIR", tempfile.mkdtemp(prefix="ct_test_state_"))

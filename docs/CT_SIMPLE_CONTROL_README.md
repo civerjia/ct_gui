@@ -672,19 +672,20 @@ back  = ct.board_to_filament(board["controller"], board["channel"], board["posit
 print(back)   # 5 -- reverse-translated back to your logical number
 ```
 
-#### The backend holds it, and forgets it on restart
+#### The backend holds it, and keeps it across a restart
 
 The order used to be a CTClient attribute, so every script silently started at
 identity. The **backend** holds it now: a new client inherits whatever the last
-one set, for as long as the backend stays up.
+one set — and since 2026-10-05 it is **saved to disk** (`state/filament_order.json`,
+next to the dead mask), so a backend restart keeps it too.
 
-**Deliberately not persisted to disk**, unlike the dead mask. The two look
-alike and must not be treated alike — `dead` is a property of the HARDWARE (a
-burnt filament is still burnt after a restart), while the order is a property
-of a SESSION's convention. Reloading a stale permutation into a rig whose
-backplane has since been rewired sends every command to the wrong filament, and
-nothing announces it: every index stays in range and every call succeeds.
-Identity is the only honest default for a backend that just started.
+It is saved together with the **wiring it was set for** (every controller's
+active list). On start-up it is restored only onto that same wiring; if the
+mapping has changed since, the backend starts at identity and logs why. The
+reason: a stale permutation on a rewired backplane sends every command to the
+wrong filament, and nothing announces it — every index stays in range and every
+call succeeds. `filament_order_status()` / `GET /api/filament-order` also report
+`mapping_changed: true` if the wiring changes while an order is set.
 
 The backend only REMEMBERS it — every endpoint still speaks FID, and this
 client still does the crossing.
@@ -697,12 +698,11 @@ old lens and some under the new, with nothing in any result saying which.
 - **`reload_filament_order()`** — deliberately re-sync, at a point you know no
   partially-issued operation is in flight.
 - **`filament_order_status()`** — compare your snapshot against the backend's
-  live order. `backend_restarted=True` means the backend forgot (memory only,
-  by design): this client stays self-consistent, but the NEXT script to start
-  gets identity, so re-apply if the order still reflects the hardware. The
-  epoch it compares changes on every backend start, so "the backend forgot" is
-  **detected**, not inferred from the order happening to look like identity —
-  which is also what a deliberate clear looks like.
+  live order. `backend_restarted=True` means the backend restarted since this
+  client took its snapshot (the epoch changes on every start). It normally
+  restored the same order from disk; if it did not (the wiring changed), the
+  two differ and the NEXT script to start gets identity — re-apply if the order
+  still reflects the hardware.
 
 Validation runs on both sides. A rejected write leaves your local table alone:
 continuing under a mapping the backend does not have is how two scripts end up

@@ -96,5 +96,20 @@ check("out-of-range number refused, nothing changed",
 
 check("to_physical / to_user cross the order both ways",
       ct3.to_physical([22, 82]) == [6, 90] and ct3.to_user([6, 90]) == [22, 82])
+
+# An error from the backend names the PHYSICAL filament; the script must read
+# its own number (2026-10-05 11:04: active_one(63) came back "filament 52 ...").
+ct4, _ = make()
+set_order(ct4, ORDER)
+user = ORDER.index(52)
+ct4._ensure_keepalive = lambda *a, **k: None
+ct4._post = lambda path, body, timeout=10.0: {
+    "ok": False, "ladder_blocked": True, "filament": body["filament"],
+    "error": f"filament {body['filament']} may not go to ACTIVE: not warm yet"}
+r = ct4._state_one(user, 5, 2600, "active")
+check("single-filament error is in the script's numbering, with the physical id",
+      r["error"].startswith(f"filament {user} (physical 52) may not go"), r["error"])
+check("...and the result still names the script's filament", r["filament"] == user)
+
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {', '.join(FAILS)}")
 raise SystemExit(1 if FAILS else 0)

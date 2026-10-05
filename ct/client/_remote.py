@@ -164,8 +164,9 @@ class RemoteCTClient:
         or a long silence). The new backend-side client is rebuilt to be the
         SAME client the script had:
           * its filament numbering is the one this script was using -- the
-            backend's order resets on restart, and adopting that would point
-            the script's filament numbers at other filaments. Installed in the
+            backend restores its saved order only onto unchanged wiring, and
+            adopting a different one would point the script's filament numbers
+            at other filaments. Installed in the
             client only (as a local client always kept its own snapshot), never
             pushed to the backend;
           * if it was keeping the dead-man watchdog alive, it carries on, so

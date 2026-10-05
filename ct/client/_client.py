@@ -1600,11 +1600,11 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         if in_sync:
             note = "client and backend agree"
         elif restarted:
-            note = ("the backend restarted and forgot the order (it is held in "
-                    "memory only, by design). This client still uses its own "
-                    "snapshot and stays consistent, but the next script to "
-                    "start will get identity — re-apply with "
-                    "set_filament_order() if it still matches the hardware.")
+            note = ("the backend restarted and did not restore this order (it "
+                    "restores the saved one only onto the same wiring). This "
+                    "client still uses its own snapshot and stays consistent, "
+                    "but the next script to start gets the backend's — re-apply "
+                    "with set_filament_order() if it still matches the hardware.")
         else:
             note = ("another client changed the order after this one took its "
                     "snapshot. This client keeps its own until "

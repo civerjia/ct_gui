@@ -136,8 +136,10 @@ try:
         check("backend down -> CTConnectionError", type(e).__name__ == "CTConnectionError", type(e).__name__)
     backend = start_backend()
     check("after a backend restart the same proxy works", isinstance(ct.status(), Result))
-    check("...with the script's filament numbering, not the backend's reset one",
-          ct._fid_of(0) == 16 and requests.get(BASE + "/api/filament-order").json()["order"][0] == 0)
+    check("...with the script's filament numbering kept",
+          ct._fid_of(0) == 16, str(ct._fid_of(0)))
+    check("...and the backend restored the same order from disk",
+          requests.get(BASE + "/api/filament-order").json()["order"][0] == 16)
     check("...and the watchdog keepalive resumed", ct._rp_state["keepalive"])
 finally:
     stop_backend(backend)

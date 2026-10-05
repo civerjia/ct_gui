@@ -14,6 +14,7 @@ use comes from _base (star-imported, underscore names included -- see
 _base.__all__) or, for CTClient itself, is bound in by _client.py.
 """
 from ._base import *  # noqa: F401,F403
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:   # editors only: at run time _client.py binds CTClient into this module
@@ -491,6 +492,13 @@ class _PowerMixin:
         if not r.get("ok") and not r.get("error"):
             r["error"] = "board did not ACK (absent, unseated, or faulted?)"
         r["filament"] = int(filament)   # always echo back YOUR (USER_INDEX) number, not the FID
+        # The backend's messages name the PHYSICAL filament ("filament 52 may not
+        # go to ACTIVE"); a script using a filament order asked about ITS 63 and
+        # read about 52. Say it in the script's numbering, with the physical id.
+        fid = int(self._fid_of(filament))
+        if fid != int(filament) and isinstance(r.get("error"), str):
+            r["error"] = re.sub(rf"\bfilament {fid}\b",
+                                f"filament {int(filament)} (physical {fid})", r["error"])
         return self._name_states(r)
 
     @staticmethod
