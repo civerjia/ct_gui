@@ -203,11 +203,21 @@ ACTIVE_DEADLINES: dict[int, tuple[float, int]] = {}
 LAST_ACTIVE_LEFT: dict[int, float] = {}
 WARM_AFTER_ACTIVE_S = 30.0
 
+# When each FID ENTERED IDLE (monotonic) -- from another state, not on a
+# re-sent IDLE: the same IDLE again does not cool a filament, so it must not
+# restart the "held at IDLE long enough" clock the ACTIVE guard uses.
+IDLE_SINCE: dict[int, float] = {}
+
 
 def note_active_transition(fid: int, old_state, new_state: int, when: float) -> None:
-    """Record leaving ACTIVE. Caller holds _SAFETY_LOCK."""
+    """Record leaving ACTIVE and entering IDLE. Caller holds _SAFETY_LOCK."""
     if old_state == POWER_STATE_ACTIVE and int(new_state) != POWER_STATE_ACTIVE:
         LAST_ACTIVE_LEFT[int(fid)] = when
+    if int(new_state) == POWER_STATE_IDLE:
+        if old_state != POWER_STATE_IDLE or int(fid) not in IDLE_SINCE:
+            IDLE_SINCE[int(fid)] = when
+    else:
+        IDLE_SINCE.pop(int(fid), None)
 
 
 def note_power_state(fids, state: int, args=None) -> None:
@@ -239,8 +249,18 @@ def set_active_deadlines(fids, active_s: float, idle_ma: dict) -> None:
             ACTIVE_DEADLINES[int(f)] = (until, int(idle_ma[int(f)]))
 
 
+# A filament held at IDLE this long, whose measured current is within
+# IDLE_WARM_TOL_MA (or IDLE_WARM_TOL_FRAC of target, whichever is larger) of its
+# target, IS warm even if the CC loop's arrival flag says "ramping".
+IDLE_WARM_HOLD_S = 10.0
+IDLE_WARM_TOL_MA = 100
+IDLE_WARM_TOL_FRAC = 0.08
+
+
 def ladder_blocks_active(fid: int, arrival: str | None = None,
-                         arrival_known: bool = False) -> str | None:
+                         arrival_known: bool = False,
+                         current_ma: float | None = None,
+                         target_ma: float | None = None) -> str | None:
     """None if ACTIVE is allowed for this filament, else why not.
 
     `arrival` is the CC loop's own verdict from 0x3A, when the caller has it.
@@ -268,6 +288,21 @@ def ladder_blocks_active(fid: int, arrival: str | None = None,
         return None          # older firmware reports no arrival: state-only check
     if arrival == "settled":
         return None
+    held_s = time.monotonic() - IDLE_SINCE.get(int(fid), when)
+    # "ramping" is not only "still warming up". The firmware clears its
+    # settled flag whenever the current drifts more than 60 mA off target
+    # (kCurrentLoopReengageBandMa) and only sets it again after 4 flat reads --
+    # a filament with a noisy contact flips to "ramping" for a moment after an
+    # hour at IDLE (filament 8, 2026-10-05 10:50, at 1280/1300 mA). The guard is
+    # about WARMTH, so ask the current: held at IDLE a while and measured near
+    # its target is warm. A board re-armed from the floor (revive, fault retry)
+    # or one that never came up (short, open) is far below target and is still
+    # refused.
+    if (arrival == "ramping" and held_s >= IDLE_WARM_HOLD_S
+            and current_ma is not None and target_ma):
+        tol = max(IDLE_WARM_TOL_MA, IDLE_WARM_TOL_FRAC * float(target_ma))
+        if abs(float(current_ma) - float(target_ma)) <= tol:
+            return None
     left = LAST_ACTIVE_LEFT.get(int(fid))
     if (arrival == "ramping" and left is not None
             and time.monotonic() - left <= WARM_AFTER_ACTIVE_S):
@@ -275,9 +310,13 @@ def ladder_blocks_active(fid: int, arrival: str | None = None,
         # that has not been warmed, which this one has. "capped" is still
         # refused (the output cannot reach the current at all).
         return None
-    return (f"commanded to IDLE but the CC loop reports '{arrival}', not settled "
-            f"— the filament has not actually reached idle current, and promoting "
-            f"an unwarmed filament to firing current is what this guard prevents")
+    meas = (f"measured {current_ma:.0f} mA of {target_ma:.0f} mA target"
+            if current_ma is not None and target_ma else "no current reading")
+    return (f"not warm yet: at IDLE for {held_s:.0f} s, CC loop '{arrival}', {meas}. "
+            f"ACTIVE is allowed once the loop settles, or after "
+            f"{IDLE_WARM_HOLD_S:.0f} s at IDLE within "
+            f"{IDLE_WARM_TOL_MA} mA of target — promoting an unwarmed filament "
+            f"to firing current is what this guard prevents")
 
 
 def _with_dead_stopped(out: dict, stopped: dict) -> dict:
@@ -309,7 +348,7 @@ __all__ = [
     "DEFAULT_GROUP_SIZE", "ENERGISING_STATES", "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT",
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
-    "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "LAST_ACTIVE_LEFT", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
+    "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "IDLE_SINCE", "IDLE_WARM_HOLD_S", "IDLE_WARM_TOL_FRAC", "IDLE_WARM_TOL_MA", "LAST_ACTIVE_LEFT", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
     "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "MONITOR_YIELD_S", "POLL_PAUSE_MAX_S",
     "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES",
     "POWER_STATE_SLEEP", "POWER_STATE_STANDBY", "POWER_STATE_STOP",

@@ -32,6 +32,7 @@ def check(name, cond, detail=""):
 def clear():
     S.LAST_POWER_STATE.clear()
     S.LAST_ACTIVE_LEFT.clear()
+    S.IDLE_SINCE.clear()
 
 
 # --- the warm rule -------------------------------------------------------------
@@ -50,6 +51,34 @@ check("re-sent IDLE does not reset the warm clock", S.ladder_blocks_active(1, "r
 why = S.ladder_blocks_active(1, "capped", True)
 check("hot but CAPPED -> still refused", why and "capped" in why, str(why))
 
+# --- "ramping" after a long IDLE: decided by the measured current ------------
+# The firmware drops "settled" when the current drifts > 60 mA, e.g. a noisy
+# contact (filament 8, 2026-10-05: refused at 1280/1300 mA after an hour at IDLE).
+clear()
+S.note_power_state([9], STANDBY)
+S.note_power_state([9], IDLE, {9: 1300})
+S.LAST_POWER_STATE[9] = (IDLE, time.monotonic() - 3600)          # an hour at IDLE
+S.IDLE_SINCE[9] = time.monotonic() - 3600
+check("long IDLE, ramping, at target -> warm, allowed",
+      S.ladder_blocks_active(9, "ramping", True, 1280, 1300) is None)
+why = S.ladder_blocks_active(9, "ramping", True, 300, 1300)
+check("long IDLE but far below target (re-armed from the floor) -> refused",
+      why and "300 mA of 1300" in why, str(why))
+why = S.ladder_blocks_active(9, "ramping", True, None, 1300)
+check("no current reading -> refused, never assumed warm", why and "no current reading" in why, str(why))
+S.note_power_state([9], IDLE, {9: 1300})                            # a re-sent IDLE...
+check("...does not restart the time at IDLE", S.ladder_blocks_active(9, "ramping", True, 1290, 1300) is None)
+S.note_power_state([9], STANDBY)
+S.note_power_state([9], IDLE, {9: 1300})                            # freshly entered IDLE
+why = S.ladder_blocks_active(9, "ramping", True, 1290, 1300)
+check("just commanded, even at target -> still refused (not held long enough)", why, str(why))
+check("capped is never warm by current", S.ladder_blocks_active(9, "capped", True, 1290, 1300))
+
+clear()
+S.note_power_state([1], STANDBY)
+S.note_power_state([1], IDLE, {1: 1200})
+S.note_power_state([1], ACTIVE, {1: 2600})
+S.note_power_state([1], IDLE, {1: 1200})
 S.LAST_ACTIVE_LEFT[1] = time.monotonic() - (S.WARM_AFTER_ACTIVE_S + 5)
 why = S.ladder_blocks_active(1, "ramping", True)
 check("left ACTIVE longer ago than the window -> refused again", why and "ramping" in why, str(why))

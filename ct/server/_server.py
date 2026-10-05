@@ -2030,6 +2030,7 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         # read_cached_telemetry's docstring.
         arrivals: dict[int, str | None] = {}
         arrivals_known = False
+        bulk: dict = {}
         try:
             bulk = read_cached_telemetry(link, controller) or {}
             arrivals = {int(k): (v or {}).get("arrival") for k, v in bulk.items()}
@@ -2038,8 +2039,10 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
             pass
         allowed = []
         for f in fils:
+            ent = bulk.get(int(f)) or bulk.get(str(f)) or {}
             why = ladder_blocks_active(
-                f, arrivals.get(int(f)), arrivals_known and int(f) in arrivals)
+                f, arrivals.get(int(f)), arrivals_known and int(f) in arrivals,
+                ent.get("current_mA"), ent.get("target_mA"))
             if why is None:
                 allowed.append(f)
             else:
@@ -3533,7 +3536,28 @@ class CtHandler(BaseHTTPRequestHandler):
                                 results[str(cid)]["disarm_error"] = str(exc)
                         elif str(cid) not in results:
                             results[str(cid)] = {"ok": False, "skipped": "an earlier board failed to arm"}
-                self._json({"ok": ok, "order": order, "results": results})
+                out = {"ok": ok, "order": order, "results": results}
+                if not ok:
+                    # One readable reason per board -- this used to come back
+                    # with no "error" at all, logged as "FAILED: failed".
+                    from ct.client._decode import _DecodeMixin
+                    names = _DecodeMixin._SHV_REJECT_NAMES
+                    why = []
+                    for cid in order:
+                        r = results.get(str(cid)) or {}
+                        if r.get("ok"):
+                            continue
+                        code = r.get("reject")
+                        if code is not None:
+                            why.append(f"Power {cid}: arm rejected — "
+                                       + names.get(code, f"reject code {code}"))
+                        elif r.get("skipped"):
+                            why.append(f"Power {cid}: not armed ({r['skipped']})")
+                        else:
+                            why.append(f"Power {cid}: {r.get('error') or 'no answer'}")
+                    out["error"] = ("arm failed, nothing left armed: " if results else "arm failed: ") \
+                        + ("; ".join(why) or "no controller connected")
+                self._json(out)
             elif path == "/api/disarm":
                 # Disarm the schedule engine on every connected controller
                 # (SHV_DISARM, 0x78) — the firmware clears the ENTIRE HV ISO
@@ -3701,7 +3725,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 if state == POWER_STATE_ACTIVE:
                     # One cheap single-board 0x3A (the CC cache, no I2C) so the
                     # guard tests where the filament IS, not only what it was told.
-                    arr, arr_known = None, False
+                    arr, arr_known, cur_ma, tgt_ma = None, False, None, None
                     _c0, _ch, _p, _ = filament_to_board(filament)
                     _lk = CONTROLLERS.get((_c0 + 1) if _c0 is not None else 0)
                     if _lk and _lk.client.connected:
@@ -3709,9 +3733,10 @@ class CtHandler(BaseHTTPRequestHandler):
                             ent = read_cached_telemetry_one(_lk, _c0, filament).get(filament)
                             if ent and "arrival" in ent:
                                 arr, arr_known = ent.get("arrival"), True
+                                cur_ma, tgt_ma = ent.get("current_mA"), ent.get("target_mA")
                         except Exception:
                             pass   # unreadable -> fall back to the state-only check
-                    why = ladder_blocks_active(filament, arr, arr_known)
+                    why = ladder_blocks_active(filament, arr, arr_known, cur_ma, tgt_ma)
                     if why:
                         log.warning("filament-state: refused ACTIVE for %d — %s", filament, why)
                         return self._json({"ok": False, "ladder_blocked": True,
