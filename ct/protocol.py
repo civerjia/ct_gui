@@ -303,6 +303,51 @@ class FrameParser:
                 del self.buffer[:2]
 
 
+LOW_PRIORITY_ATTR = "ct_low_priority"
+
+
+def mark_low_priority() -> None:
+    """Call at the top of a BACKGROUND thread's loop (board monitor, PING):
+    its requests then give way to every other request on the link."""
+    setattr(threading.current_thread(), LOW_PRIORITY_ATTR, True)
+
+
+class _PriorityLock:
+    """The per-link request lock, with two priorities. Every request on a
+    controller is serialized on one socket; a fire's set-up used to queue
+    behind the board monitor's periodic reads, which a busy RP2350 can be
+    slow to answer. Now a request from a thread marked low priority
+    (mark_low_priority) waits whenever ANY normal request is waiting, so a
+    core command goes next. It cannot preempt a request already on the wire --
+    nothing can; that one finishes first. Normal requests keep FIFO-ish order
+    among themselves. Context manager, like the Lock it replaces."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._held = False
+        self._normal_waiting = 0
+
+    def __enter__(self):
+        low = bool(getattr(threading.current_thread(), LOW_PRIORITY_ATTR, False))
+        with self._cv:
+            if not low:
+                self._normal_waiting += 1
+            try:
+                while self._held or (low and self._normal_waiting > 0):
+                    self._cv.wait()
+                self._held = True
+            finally:
+                if not low:
+                    self._normal_waiting -= 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._cv:
+            self._held = False
+            self._cv.notify_all()
+        return False
+
+
 class TcpProtocolClient:
     """
     TCP-transport equivalent of the UART GUI's `SerialProtocolClient`. The
@@ -316,7 +361,13 @@ class TcpProtocolClient:
         self._host: str | None = None
         self._port: int | None = None
         self._lock = threading.Lock()
-        self._request_lock = threading.Lock()
+        self._request_lock = _PriorityLock()
+        # Per-request timing, split in two: how long the request QUEUED for the
+        # link (every request on one controller shares _request_lock -- the
+        # board monitor, the PING, a schedule op) and how long the controller
+        # took to ANSWER once it was sent. A slow fire is one or the other, and
+        # they need opposite fixes. (monotonic t, type, wait_ms, rtt_ms, ok)
+        self.timings: deque = deque(maxlen=400)
         self._pending: dict[tuple[int, int], Queue[Frame]] = {}
         self._seq = 1
         self._reader_thread: threading.Thread | None = None
@@ -411,7 +462,9 @@ class TcpProtocolClient:
         sock = self._socket
         if not self.connected or sock is None:
             raise RuntimeError("Bridge is not connected")
+        t_queue = time.monotonic()
         with self._request_lock:
+            t_sent = time.monotonic()
             with self._lock:
                 seq = self._seq & 0xFF
                 self._seq = (self._seq + 1) & 0xFF
@@ -431,12 +484,43 @@ class TcpProtocolClient:
                 response = queue.get(timeout=timeout)
             except Empty as exc:
                 self._pending.pop(key, None)
+                self.timings.append((t_sent, frame_type, (t_sent - t_queue) * 1000.0,
+                                     (time.monotonic() - t_sent) * 1000.0, False))
                 raise TimeoutError(
                     f"Timed out waiting for response to {TYPE_NAMES.get(frame_type, hex(frame_type))}"
                 ) from exc
+            self.timings.append((t_sent, frame_type, (t_sent - t_queue) * 1000.0,
+                                 (time.monotonic() - t_sent) * 1000.0, True))
             decoded = self._decode_frame(response)
             self._update_latest(decoded)
             return decoded
+
+    def timing_summary(self, window_s: float = 60.0) -> dict:
+        """Request timing over the last `window_s`: queue wait and answer time,
+        median / 95th percentile / max, plus timeouts, and the slowest frame
+        types by answer time. None fields when nothing was sent."""
+        cut = time.monotonic() - window_s
+        rows = [t for t in list(self.timings) if t[0] >= cut]
+
+        def pct(vals, q):
+            if not vals:
+                return None
+            v = sorted(vals)
+            return round(v[min(len(v) - 1, int(q * (len(v) - 1) + 0.5))], 1)
+        waits = [r[2] for r in rows]
+        rtts = [r[3] for r in rows if r[4]]
+        by_type: dict = {}
+        for r in rows:
+            by_type.setdefault(r[1], []).append(r[3])
+        slow = sorted(((TYPE_NAMES.get(t, hex(t)), round(max(v), 1), len(v))
+                       for t, v in by_type.items()), key=lambda x: -x[1])[:5]
+        return {"window_s": window_s, "requests": len(rows),
+                "timeouts": sum(1 for r in rows if not r[4]),
+                "wait_ms": {"p50": pct(waits, 0.5), "p95": pct(waits, 0.95),
+                            "max": round(max(waits), 1) if waits else None},
+                "answer_ms": {"p50": pct(rtts, 0.5), "p95": pct(rtts, 0.95),
+                              "max": round(max(rtts), 1) if rtts else None},
+                "slowest_types": [{"type": n, "max_ms": m, "count": c} for n, m, c in slow]}
 
     def send_pipeline(self, requests, window: int = 8, timeout: float = 2.5,
                       on_progress=None):

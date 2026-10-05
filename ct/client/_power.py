@@ -51,10 +51,10 @@ class _PowerMixin:
             # of all 96 made the backend report the other controller's half as
             # `excluded` on a one-controller bench, so a STOP that reached
             # everything that exists came back ok:False.
-            return self._reindex_response(
+            return self._name_states(self._reindex_response(
                 self._post("/api/filament-prep", body, timeout=20.0),
                 keys=("applied", "failed", "excluded", "touched",
-                      "not_this_controller", "unslotted", "dead_stopped"))
+                      "not_this_controller", "unslotted", "dead_stopped")))
         requested = [int(f) for f in filaments] if filaments is not None else list(range(96))
         dead = self._dead_users()   # USER_INDEX view of the physical mask
         dead_skipped = [f for f in requested if f in dead]
@@ -91,7 +91,7 @@ class _PowerMixin:
                                  for k, v in r["then_idle_ma"].items()}
         if dead_skipped:
             r["dead_skipped"] = dead_skipped
-        return r
+        return self._name_states(r)
 
     def _verify_state(self, r: dict, state: int, timeout_s: float,
                       poll_interval_s: float = 0.5) -> dict:
@@ -491,6 +491,24 @@ class _PowerMixin:
         if not r.get("ok") and not r.get("error"):
             r["error"] = "board did not ACK (absent, unseated, or faulted?)"
         r["filament"] = int(filament)   # always echo back YOUR (USER_INDEX) number, not the FID
+        return self._name_states(r)
+
+    @staticmethod
+    def _name_states(r: dict) -> dict:
+        """Add "state_name" ("IDLE", ...) beside every power "state" number in
+        a result -- top level and per controller -- so a printed result reads
+        IDLE, not 4. The number stays: it is what programs compare (and
+        PowerState.IDLE == 4)."""
+        def name(row):
+            st = row.get("state") if isinstance(row, dict) else None
+            if isinstance(st, int) and not isinstance(st, bool) and "state_name" not in row:
+                try:
+                    row["state_name"] = PowerState(st).name
+                except ValueError:
+                    pass
+        name(r)
+        for row in (r.get("results") or {}).values() if isinstance(r.get("results"), dict) else ():
+            name(row)
         return r
 
     def wait_for_current(self, filament: int,

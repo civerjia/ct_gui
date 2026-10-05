@@ -26,6 +26,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
     sync_post_config,
@@ -79,6 +80,7 @@ _LIVE_PUSH: set = set()               # controllers (1-based) with the push enab
 
 def _trigger_delay_one(link: "ControllerLink", delay_us=None) -> dict:
     payload = _u16(int(delay_us)) if delay_us is not None else b""
+    link.hold_monitor()
     raw = link.request(SHV_TRIGGER_DELAY, payload).get("raw") or []
     # response: [status, us_lo, us_hi, applies] = 4 bytes
     if raw and raw[0] == 0 and len(raw) >= 4:
@@ -271,7 +273,7 @@ __all__ = [
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
     "IDLE_CEILING_MA", "LAST_POWER_STATE", "LOADED_CRC", "LOADED_EMIT_FIDS",
     "LOADED_PLAN", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S", "LOG_DIR", "NO_FILAMENT",
-    "ORDER_EPOCH", "PING_PAYLOAD", "PING_TYPE", "POLL_PAUSE_MAX_S", "POWER_SLOTS",
+    "ORDER_EPOCH", "PING_PAYLOAD", "PING_TYPE", "MONITOR_YIELD_S", "POLL_PAUSE_MAX_S", "POWER_SLOTS",
     "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES", "POWER_STATE_SLEEP",
     "POWER_STATE_STANDBY", "POWER_STATE_STOP", "POWER_STATE_VOLTAGE", "Path",
     "PowerState", "RECORD_DIR", "RUN_REPORT_DIR", "SAFETY_ACTIVE_FALLBACK",
@@ -295,7 +297,7 @@ __all__ = [
     "adc_ring_start", "adc_ring_stop", "adc_ring_window", "adc_ring_window_data",
     "adc_spi_shot_arm", "adc_spi_shot_data", "annotations", "build_command_payload",
     "build_payload", "check_heating_plan", "copy", "csv", "datetime",
-    "decode_shv_status", "enum", "fetch_bridge_info", "fetch_stm32_status", "json",
+    "decode_shv_status", "enum", "fetch_bridge_info", "fetch_stm32_status", "mark_low_priority", "json",
     "log", "logging", "os", "parse_power_state", "power_state_name", "primary_local_ip",
     "pulse_events_get", "scan_for_bridge", "stm32_adc_window", "stm32_ads1115",
     "stm32_ds3502_get", "stm32_ds3502_set", "stm32_hv_clear_target",

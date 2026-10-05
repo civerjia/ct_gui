@@ -14,6 +14,24 @@ an edge sent earlier is lost. Always ends with HV off and filament F at STOP.
 The callback and its timing rules are documented in `fire_single_pulse`'s
 docstring ("EXTERNAL TRIGGER").
 
+## `step_fire_schedule.py` — a short schedule, one filament per trigger, heated by the firmware
+
+```bash
+python3 step_fire_schedule.py --host 192.168.8.218 -f 93 12 40                 # ext trigger
+python3 step_fire_schedule.py --host 192.168.8.218 -f 93 12 40 --trigger sim --gap-s 10
+```
+
+Downloads ONE schedule (one entry per filament, in the order given) plus a
+heating table: each filament goes ACTIVE right after the previous one's pulse
+and back to IDLE right after its own, so the gap between two edges is its
+heating time. The first filament is brought to ACTIVE before arming (the table
+only runs after the first edge); the last is idled afterwards (its IDLE row is
+never reached). Prints, per pulse, the heating current at the moment it fired
+and the measured emission. While the run is RUNNING the backend refuses
+`idle_one`/`active_one` — the heating table is the only way to change a current
+mid-run. Always ends disarmed, detector off, HV off if it turned it on, and
+every filament it touched at STOP.
+
 ## `walkthrough.py` — the whole API, in runnable sections
 
 ```bash

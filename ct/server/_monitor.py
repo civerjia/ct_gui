@@ -26,6 +26,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
     sync_post_config,
@@ -230,7 +231,13 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
     snap = board_monitor_snapshot(cid) or {}
     now = time.monotonic()
     boards = snap.get("boards") or {}
-    fresh = bool(boards) and (now - snap.get("boards_at", 0.0)) <= MONITOR_STALE_S
+    # While a schedule op holds the link the monitor deliberately reads
+    # nothing; the last values (seconds old) stay servable for that window
+    # instead of the grid and ring blanking on every fire.
+    held = now < snap.get("held_until", 0.0)
+    fresh = bool(boards) and ((now - snap.get("boards_at", 0.0)) <= MONITOR_STALE_S
+                              or (held and (now - snap.get("boards_at", 0.0))
+                                  <= MONITOR_STALE_S + MONITOR_YIELD_S + 1.0))
     bitmaps = snap.get("bitmaps") or {}
     health = snap.get("health") or {}
     health_ok = bool(health) and (now - snap.get("health_at", 0.0)) <= MONITOR_HEALTH_STALE_S
@@ -269,7 +276,7 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
             rows.append(row)
     meta = {"age_ms": round((now - snap.get("boards_at", 0.0)) * 1000) if boards else None,
             "source": snap.get("source"), "run_owns": bool(snap.get("run_owns")),
-            "fresh": fresh,
+            "fresh": fresh, "held": held,
             "dark_channels": sorted(ch + 1 for ch, h in health.items() if h.get("dark"))
             if health_ok else None}
     return rows, meta
@@ -295,7 +302,7 @@ __all__ = [
     "LOCK_TTL_MAX_S", "LOG_DIR", "MONITOR_ARM_HINT_S", "MONITOR_BITMAP_HOLD_S",
     "MONITOR_BITMAP_PERIOD_S", "MONITOR_HEALTH_PERIOD_S", "MONITOR_HEALTH_STALE_S",
     "MONITOR_PERIOD_S", "MONITOR_RUN_STATUS_S", "MONITOR_STALE_S", "NO_FILAMENT",
-    "PING_PAYLOAD", "PING_TYPE", "POLL_PAUSE_MAX_S", "POWER_SLOTS",
+    "PING_PAYLOAD", "PING_TYPE", "MONITOR_YIELD_S", "POLL_PAUSE_MAX_S", "POWER_SLOTS",
     "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES", "POWER_STATE_SLEEP",
     "POWER_STATE_STANDBY", "POWER_STATE_STOP", "POWER_STATE_VOLTAGE", "Path",
     "PowerState", "RECORD_DIR", "RUN_REPORT_DIR", "SAFETY_ACTIVE_FALLBACK",
@@ -316,7 +323,7 @@ __all__ = [
     "adc_ready_status", "adc_ring_peek", "adc_ring_start", "adc_ring_stop",
     "adc_ring_window", "adc_ring_window_data", "adc_spi_shot_arm", "adc_spi_shot_data",
     "annotations", "board_monitor_snapshot", "build_command_payload", "copy", "csv",
-    "datetime", "enum", "fetch_bridge_info", "fetch_stm32_status", "json", "log",
+    "datetime", "enum", "fetch_bridge_info", "fetch_stm32_status", "mark_low_priority", "json", "log",
     "logging", "monitor_board_rows", "os", "parse_power_state", "power_state_name",
     "primary_local_ip", "pulse_events_get", "read_board_cache", "read_board_health",
     "scan_for_bridge", "stm32_adc_window", "stm32_ads1115", "stm32_ds3502_get",

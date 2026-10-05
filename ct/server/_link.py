@@ -26,6 +26,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
     sync_post_config,
@@ -110,6 +111,17 @@ class ControllerLink:
         self.bridge_name: str | None = None       # ESP32 AP SSID (MAC-derived identity)
         self._last_stm_uptime: int | None = None  # for restart detection, see _note_stm_reset
         self._stm_resets = 0
+        # Schedule ops (disarm/download/verify/arm) take precedence over the
+        # board monitor: every request on this link queues on one lock, and a
+        # monitor read the RP2350 answers slowly made each fire step wait
+        # behind it. Until this deadline the monitor sends nothing here.
+        self.monitor_hold_until = 0.0
+
+    def hold_monitor(self, seconds: float = MONITOR_YIELD_S) -> None:
+        """Keep the board monitor off this link for `seconds` (renewed by every
+        schedule op, so a fire's whole set-up is covered; an armed run is then
+        covered by the arm hint)."""
+        self.monitor_hold_until = max(self.monitor_hold_until, time.monotonic() + seconds)
 
     def connect(self, host: str) -> None:
         with self._lock:
@@ -195,6 +207,7 @@ class ControllerLink:
         # one when it comes back (with how long and how many attempts), and a
         # reminder every BRIDGE_DOWN_REMIND_S while it stays down.
         reconnecting = False
+        mark_low_priority()     # the PING gives way to every command (see _PriorityLock)
         down_since = 0.0
         attempts = 0
         reminded = 0.0
@@ -288,7 +301,10 @@ class ControllerLink:
             "connected": self.client.connected,
             "host": self.host,
             "bridge_name": self.bridge_name,
-            "rp2350": {"age_ms": rp_age, "rtt_ms": self.rp_rtt_ms},
+            "rp2350": {"age_ms": rp_age, "rtt_ms": self.rp_rtt_ms,
+                       # rtt_ms above includes queueing behind other requests;
+                       # this splits queue wait from the controller's answer time.
+                       "timing": self.client.timing_summary()},
             "stm32": {
                 "ever_seen": bool(stm.get("ever_seen")),
                 "age_ms": stm.get("age_ms"),
@@ -329,7 +345,7 @@ __all__ = [
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
     "IDLE_CEILING_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
-    "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "POLL_PAUSE_MAX_S",
+    "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "MONITOR_YIELD_S", "POLL_PAUSE_MAX_S",
     "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES",
     "POWER_STATE_SLEEP", "POWER_STATE_STANDBY", "POWER_STATE_STOP",
     "POWER_STATE_VOLTAGE", "Path", "PowerState", "RECORD_DIR", "RUN_REPORT_DIR",
@@ -352,7 +368,7 @@ __all__ = [
     "adc_ready_status", "adc_ring_peek", "adc_ring_start", "adc_ring_stop",
     "adc_ring_window", "adc_ring_window_data", "adc_spi_shot_arm", "adc_spi_shot_data",
     "annotations", "build_command_payload", "build_payload", "copy", "csv", "datetime",
-    "decode_shv_status", "enum", "fetch_bridge_info", "fetch_stm32_status", "json",
+    "decode_shv_status", "enum", "fetch_bridge_info", "fetch_stm32_status", "mark_low_priority", "json",
     "log", "logging", "os", "parse_power_state", "power_state_name", "primary_local_ip",
     "pulse_events_get", "scan_for_bridge", "stm32_adc_window", "stm32_ads1115",
     "stm32_ds3502_get", "stm32_ds3502_set", "stm32_hv_clear_target",

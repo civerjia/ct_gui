@@ -38,6 +38,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
     sync_post_config,
@@ -329,6 +330,16 @@ def _adopt_firmware_power_states(c0: int, cache: dict, read_at: float) -> list:
 def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict) -> dict:
     snap = dict(prev) if prev else {"boards": {}, "boards_at": 0.0, "bitmaps": {},
                                     "bitmaps_at": 0.0, "status": None, "status_at": 0.0}
+
+    def held() -> bool:
+        # A schedule op (fire set-up: disarm, download, verify, arm) is using
+        # this link: send nothing, so it does not queue behind a monitor read.
+        # Checked before EVERY read, not just once per tick.
+        return time.monotonic() < getattr(link, "monitor_hold_until", 0.0)
+    if held():
+        snap["held_until"] = link.monitor_hold_until
+        return snap
+    snap.pop("held_until", None)
     hint = getattr(link, "arm_hint_at", 0.0)
     owns = (now - hint) < MONITOR_ARM_HINT_S or bool(snap.get("run_owns"))
     # Status: every tick while idle (cheap, no I2C), 1 Hz while a run owns it.
@@ -343,7 +354,7 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
     snap["run_owns"] = owns
     # Lost boards / dark channels: no I2C on the firmware side, so this one
     # runs during a schedule run too, at the same 1 Hz.
-    if (now - snap.get("health_at", 0.0)) >= MONITOR_HEALTH_PERIOD_S:
+    if (now - snap.get("health_at", 0.0)) >= MONITOR_HEALTH_PERIOD_S and not held():
         try:
             health = read_board_health(link, _scan_channels())
         except Exception:
@@ -353,7 +364,7 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
     if owns:
         # 1 Hz cache read (no I2C), then the push on top when it is on. No
         # bitmaps: that is I2C, and it belongs to the run.
-        if (now - snap.get("run_cache_at", 0.0)) >= MONITOR_RUN_STATUS_S:
+        if (now - snap.get("run_cache_at", 0.0)) >= MONITOR_RUN_STATUS_S and not held():
             snap["run_cache_at"] = now
             read_at = time.monotonic()
             try:
@@ -374,12 +385,14 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
                                    "pushed": True} if old else b
                 snap["boards"], snap["boards_at"], snap["source"] = merged, now, "cache+push(run)"
         return snap
+    if held():
+        return snap
     read_at = time.monotonic()
     cache = read_board_cache(link, _scan_channels())
     if cache is not None:
         snap["boards"], snap["boards_at"], snap["source"] = cache, now, "cache"
         _adopt_firmware_power_states(cid - 1, cache, read_at)
-    if (now - snap["bitmaps_at"]) >= MONITOR_BITMAP_PERIOD_S:
+    if (now - snap["bitmaps_at"]) >= MONITOR_BITMAP_PERIOD_S and not held():
         try:
             bm = _read_bitmaps(link)
         except Exception:
@@ -398,6 +411,7 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
 
 
 def _board_monitor_loop() -> None:
+    mark_low_priority()     # its reads give way to every command (see _PriorityLock)
     while True:
         t0 = time.monotonic()
         for cid, link in list(CONTROLLERS.items()):
@@ -772,6 +786,8 @@ def read_pushed_telemetry(link: "ControllerLink", controller: int) -> dict:
 def shv_op(link: "ControllerLink", body: dict) -> dict:
     """Dispatch one Simple-HV-schedule operation on a controller (ShV panel)."""
     op = body.get("op")
+    if op not in ("status", "pulse_log"):
+        link.hold_monitor()        # fire set-up: the monitor waits, see hold_monitor
     if op == "push_active_list":
         # push THIS controller's mapping (64-byte power->filament) to the board
         controller = int(body.get("controller", 1)) - 1
@@ -1729,6 +1745,7 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     # pipeline is safe. A non-OK / timed-out frame is counted as a failure and the
     # overall ok is False — the GUI's Verify (CRC) is the backstop.
     t_all = time.monotonic()
+    link.hold_monitor(MONITOR_YIELD_S + 5.0)   # renewed per frame below
     reqs: list = []      # (frame_type, payload, flags) in send order
     labels: list = []
     cur_fil: list = []   # filament index for each req slot (None for non-current frames)
@@ -1845,6 +1862,7 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
         # reliable (Verify/CRC confirms). One retry per frame covers a rare transient.
         results = []
         for i, (ft, payload, flags) in enumerate(reqs):
+            link.hold_monitor()
             r = None
             for _try in range(2):
                 try:
@@ -3405,6 +3423,7 @@ class CtHandler(BaseHTTPRequestHandler):
                         continue
                     try:
                         controller = cid - 1
+                        link.hold_monitor()
                         ti = link.request(SHV_GET_TABLE_INFO, b"", flags=0).get("raw") or []
                         hi = link.request(SHV_HEAT_GET_INFO, b"", flags=0).get("raw") or []
                         emit = _le(ti, 1, 2) if ti and ti[0] == 0 and len(ti) >= 7 else None
@@ -3431,6 +3450,14 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 self._json({"ok": all(r.get("match") for r in results.values()), "results": results})
             elif path == "/api/arm":
+                # body {repeats, controllers?}: `controllers` limits the arm to
+                # those boards (fire_single_pulse: the target plus the master
+                # that frames it) -- still master last, still all-or-nothing,
+                # and the trigger delay checked ONCE for the lot.
+                want = body.get("controllers")
+                for _l in CONTROLLERS.values():
+                    if _l.client.connected:
+                        _l.hold_monitor()
                 why = trigger_delay_mismatch()
                 if why:
                     return self._json({"ok": False, "error": f"arm refused: {why}",
@@ -3466,8 +3493,15 @@ class CtHandler(BaseHTTPRequestHandler):
                 # both, not by one. Armed the other way round, or all at once in
                 # dict order, a trigger between two arms leaves the boards a
                 # whole entry apart for the run.
-                order = sorted((cid for cid, link in CONTROLLERS.items() if link.client.connected),
+                order = sorted((cid for cid, link in CONTROLLERS.items() if link.client.connected
+                                and (want is None or cid in {int(c) for c in want})),
                                key=lambda cid: cid == MASTER)
+                if want is not None:
+                    missing = sorted({int(c) for c in want} - set(order))
+                    if missing:
+                        return self._json({"ok": False, "order": order, "results": {},
+                                           "error": f"arm refused: controller(s) {missing} not "
+                                                    f"connected — nothing was armed"}, HTTPStatus.OK)
                 # A run is active control of the filaments and the rails, same
                 # as the per-board arm in shv_op: renew both dead-man timers.
                 safety_touch_hv()
@@ -3506,17 +3540,33 @@ class CtHandler(BaseHTTPRequestHandler):
                 # relay bank instantly via ctrl_->clearAll() (74HC595 /SRCLR
                 # pin), independent of whatever per-channel state
                 # HV_SET_BIT/HV_SET_MULTI_CHANNEL last commanded.
+                # body {controllers?}: only those boards. Each board is its own
+                # link, so they are disarmed IN PARALLEL -- one slow board no
+                # longer delays the others.
+                want = body.get("controllers")
+                targets = [(cid, link) for cid, link in CONTROLLERS.items()
+                           if link.client.connected
+                           and (want is None or cid in {int(c) for c in want})]
                 results = {}
-                for cid, link in CONTROLLERS.items():
-                    if not link.client.connected:
-                        continue
+
+                def _disarm_one(cid, link):
+                    link.hold_monitor()
                     try:
                         results[str(cid)] = {"ok": _status_ok(link.request(SHV_DISARM, b"", flags=0))}
                     except Exception as exc:
                         results[str(cid)] = {"ok": False, "error": str(exc)}
-                if results and all(r.get("ok") for r in results.values()):
+                threads = [threading.Thread(target=_disarm_one, args=t, daemon=True) for t in targets]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                connected = {cid for cid, link in CONTROLLERS.items() if link.client.connected}
+                if (results and all(r.get("ok") for r in results.values())
+                        and {cid for cid, _ in targets} == connected):
                     note_grid_commanded(False, clear_all=True)
-                self._json({"ok": True, "results": results})
+                self._json({"ok": all(r.get("ok") for r in results.values()) if results else False,
+                            "results": results,
+                            **({} if results else {"error": "no controller connected"})})
             elif path == "/api/safety":
                 # Dead-man watchdog: read the state, or change the rules.
                 # POST with any of enabled / active_timeout_s /

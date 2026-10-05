@@ -64,6 +64,26 @@ class _ScheduleMixin:
                 self._last_plan[cid] = plan
                 self._last_crc[cid] = int(crc)
 
+    @staticmethod
+    def _name_heating_states(plan: dict) -> tuple[dict, str | None]:
+        """Heating rows may name their state -- PowerState.ACTIVE, or "ACTIVE" /
+        "active" -- instead of a bare 5. Converted to the number the wire
+        carries; an unknown name is an error, never a guess."""
+        rows = plan.get("heating")
+        if not isinstance(rows, list):
+            return plan, None
+        out = []
+        for n, row in enumerate(rows):
+            st = row.get("state") if isinstance(row, dict) else None
+            if isinstance(st, str):
+                try:
+                    st = PowerState[st.strip().upper()]
+                except KeyError:
+                    return plan, (f"heating[{n}]: unknown state {row['state']!r} -- use "
+                                  f"{', '.join(p.name for p in PowerState)} (or PowerState.X)")
+            out.append({**row, "state": int(st)} if st is not None else row)
+        return {**plan, "heating": out}, None
+
     def _plan_to_fids(self, plan: dict) -> tuple[dict, list]:
         """Translate a schedule plan's filament indices USER_INDEX -> FID and
         drop dead-masked entries. Returns (translated_plan, dead_skipped).
@@ -714,6 +734,7 @@ class _ScheduleMixin:
             "config": {"interPulseMs", "maxOnMs", "totalMs", "triggerEdge"},
             "emission": [{"filament", "numPulses", "widthUs"}, ...],
             "heating": [{"filament", "triggerIndex", "state", "milliamps"}, ...],  # optional
+                        # state: IDLE / ACTIVE (PowerState, or the name "IDLE"/"ACTIVE")
             "currents": {filament: {"idle_mA", "active_mA"}},  # optional
         }
 
@@ -739,6 +760,9 @@ class _ScheduleMixin:
                     "error": "plan has no emission rows — nothing would be "
                              "downloaded, and reporting that as a successful "
                              "download hides the empty plan until arm rejects it."}
+        plan, err = self._name_heating_states(plan)
+        if err:
+            return {"ok": False, "results": [], "error": err}
         wire_plan, dead_skipped = self._plan_to_fids(plan)
         if isinstance(plan.get("emission"), list) and plan["emission"] and not wire_plan["emission"]:
             return {"ok": False, "results": [], "dead_skipped": dead_skipped,
@@ -817,6 +841,9 @@ class _ScheduleMixin:
                     "error": "plan has no emission rows — there is nothing to "
                              "verify, which is not the same as verified. Build "
                              "one with build_scan_schedule()/build_scan_plan()."}
+        plan, err = self._name_heating_states(plan)
+        if err:
+            return {"ok": False, "results": {}, "error": err}
         wire_plan, dead_skipped = self._plan_to_fids(plan)
         r = self._post("/api/verify-schedule", {"plan": wire_plan}, timeout=10.0)
         # SAY that entries were dropped. Without this a dead filament in the
@@ -1577,12 +1604,13 @@ class _ScheduleMixin:
         return int(master) if row.get("connected") else None
 
     def _disarm_all(self, controllers) -> None:
-        for c in controllers:
-            try:
-                self.shv_disarm(c)
-            except Exception:
-                pass    # best effort: a disarm that fails leaves an armed engine
-                        # waiting for a trigger, which the next arm resets
+        # ONE request, the boards disarmed in parallel by the backend: a slow
+        # board no longer holds up the other (a fire used to pay for both).
+        try:
+            self._post("/api/disarm", {"controllers": [int(c) for c in controllers]})
+        except Exception:
+            pass    # best effort: a disarm that fails leaves an armed engine
+                    # waiting for a trigger, which the next arm resets
 
     def _companion_check(self, companion: int, want: int) -> dict:
         """Confirm the master actually ran the plan -- i.e. that a window was
@@ -1749,22 +1777,23 @@ class _ScheduleMixin:
                     if row.get("crc") is not None:
                         self._last_crc[controller] = row["crc"]
 
-        arm_r = self.shv_arm(controller, repeats=1)
+        # Target and master in ONE request: the backend arms them master LAST
+        # (it is the head of the trigger chain -- armed first, an edge in
+        # between would advance it past entry 0 while the target was still
+        # disarmed), checks the trigger delay once for both instead of once per
+        # board, and puts back down whatever armed if the other fails.
+        arm_all = self._post("/api/arm", {"repeats": 1, "controllers": armed_set})
+        per = arm_all.get("results") or {}
+        arm_r = per.get(str(controller)) or ({} if per else arm_all)
         if not arm_r.get("ok"):
-            code, why = self._arm_failure(arm_r)
+            code, why = self._arm_failure(arm_r if per else arm_all)
             return {"ok": False,
                     "error": (f"arm rejected (code {code}): {why}" if code is not None
                               else why),
                     "arm_reject": code, "arm_reject_name": why,
                     "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
         if companion:
-            # The master LAST. It is the head of the trigger chain: once armed,
-            # the next edge fires its (empty) pulse and is forwarded on SyncOut
-            # to this controller. Arming it first would let an edge in between
-            # advance the master past entry 0 while the target was still
-            # disarmed -- the two would then disagree about which entry every
-            # later trigger belongs to.
-            c_arm = self.shv_arm(companion, repeats=1)
+            c_arm = per.get(str(companion)) or {}
             if not c_arm.get("ok"):
                 self._disarm_all(armed_set)
                 code, why = self._arm_failure(c_arm)
