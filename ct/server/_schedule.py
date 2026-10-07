@@ -262,6 +262,7 @@ _SIM_LOCK = threading.Lock()
 # "not defined" -- goto definition stopped working. tests/test_star_exports.py
 # fails if this falls out of step with the module's globals.
 __all__ = [
+    "DOWNLOAD_FRAME_TIMEOUTS_S",
     "RETRY_TIMEOUTS_S", "request_retry", "shv_status_retry",
     "deque",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",

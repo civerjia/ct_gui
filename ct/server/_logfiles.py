@@ -137,6 +137,7 @@ def read_log_file(rel: str, tail: int, grep: str | None) -> dict:
 # "not defined" -- goto definition stopped working. tests/test_star_exports.py
 # fails if this falls out of step with the module's globals.
 __all__ = [
+    "DOWNLOAD_FRAME_TIMEOUTS_S",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",
     "BaseHTTPRequestHandler", "CALIB_DIR", "CH_FILAMENT_CURRENTS",
     "CH_GET_BOARD_BITMAPS", "CH_GET_BOARD_CACHE", "CH_GET_BOARD_HEALTH",

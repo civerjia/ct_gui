@@ -457,6 +457,7 @@ def _with_dead_stopped(out: dict, stopped: dict) -> dict:
 # "not defined" -- goto definition stopped working. tests/test_star_exports.py
 # fails if this falls out of step with the module's globals.
 __all__ = [
+    "DOWNLOAD_FRAME_TIMEOUTS_S",
     "POWER_OWNER", "_REQUEST_OWNER", "set_request_owner", "request_owner", "owned_filaments",
     "RETRY_TIMEOUTS_S", "request_retry", "shv_status_retry",
     "deque",

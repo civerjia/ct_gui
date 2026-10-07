@@ -1937,9 +1937,13 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
             link.hold_monitor()
             r = None
             # Every download frame is idempotent (writes a table slot / config
-            # value). Three tries, each longer: 2026-10-06 nine downloads
-            # failed on two 3 s tries while the master ESP32 held replies.
-            for _tmo in (3.0, 4.0, 6.0):
+            # value). Three tries, each longer. The first is SHORT on purpose:
+            # a normal reply takes 20-200 ms, and a reply that has not come in
+            # 1 s has been LOST on the way back (2026-10-07: requests reached
+            # the RP2350 intact, its loop never stalled past 220 ms, yet
+            # replies never arrived) -- waiting 3 s for it made every lost
+            # reply a 4-5 s upload. Now a lost reply costs ~1 s.
+            for _tmo in DOWNLOAD_FRAME_TIMEOUTS_S:
                 try:
                     r = link.client.send_request(ft, payload, flags=flags, timeout=_tmo)
                     if _status_ok(r):

@@ -398,6 +398,8 @@ LOCK_TTL_MAX_S = 600.0
 WIFI_DIAG_PERIOD_S = 10.0  # bridge ESP32 /wifi/diag (RSSI) read period
 LINK_SILENT_S = 10.0      # connected but nothing received this long -> reconnect
 MONITOR_YIELD_S = 2.0     # board monitor stays off a link this long after a schedule op
+DOWNLOAD_FRAME_TIMEOUTS_S = (1.0, 2.0, 4.0)   # per download frame: first try short (a lost
+                                              # reply, not a slow one, is what a timeout means)
 POLL_PAUSE_MAX_S = 15.0   # max time a background-PING pause survives without a re-arm
 
 
@@ -553,6 +555,7 @@ ESPCMD = EspCmdClient()
 # "not defined" -- goto definition stopped working. tests/test_star_exports.py
 # fails if this falls out of step with the module's globals.
 __all__ = [
+    "DOWNLOAD_FRAME_TIMEOUTS_S",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",
     "BaseHTTPRequestHandler", "CALIB_DIR", "CH_FILAMENT_CURRENTS",
     "CH_GET_BOARD_BITMAPS", "CH_GET_BOARD_CACHE", "CH_GET_BOARD_HEALTH",

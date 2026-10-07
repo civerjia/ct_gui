@@ -343,6 +343,7 @@ def _note_client(client: str, addr: str, path: str) -> None:
 # "not defined" -- goto definition stopped working. tests/test_star_exports.py
 # fails if this falls out of step with the module's globals.
 __all__ = [
+    "DOWNLOAD_FRAME_TIMEOUTS_S",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "AUDIT_BODY_MAX", "AUDIT_DEDUP_S",
     "AUDIT_ERROR_MAX", "AUDIT_SKIP_PATHS", "AUDIT_SKIP_SHV_OPS", "Any",
     "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT", "BaseHTTPRequestHandler", "CALIB_DIR",
