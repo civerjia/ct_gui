@@ -18,6 +18,7 @@ bench laptop without dragging each other's transport deps along.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import socket
 import struct
@@ -348,6 +349,12 @@ class _PriorityLock:
         return False
 
 
+#: Timeouts in a row on one link before the RP2350 parser resync is sent, and
+#: how many zero bytes it is: the parser's largest payload (512) + 2 CRC + slack.
+RESYNC_AFTER_TIMEOUTS = 2
+RESYNC_FILL = 520
+
+
 class TcpProtocolClient:
     """
     TCP-transport equivalent of the UART GUI's `SerialProtocolClient`. The
@@ -368,6 +375,16 @@ class TcpProtocolClient:
         # took to ANSWER once it was sent. A slow fire is one or the other, and
         # they need opposite fixes. (monotonic t, type, wait_ms, rtt_ms, ok)
         self.timings: deque = deque(maxlen=400)
+        # Parser resync. The RP2350's frame parser has no inter-byte timeout:
+        # a frame that lost bytes in transit leaves it reading the NEXT frames
+        # as payload (up to 512 bytes) before the CRC fails, and on a quiet
+        # link that is tens of seconds of silence with the RP2350 alive
+        # (2026-10-07 08:42, Power 1: ~60 s, no reset). After this many
+        # timeouts in a row, RESYNC_FILL zero bytes are written: they finish
+        # any half-read frame (bad CRC -> reset), and in the hunting state
+        # they are console bytes that the console drops as overlong garbage.
+        self.consecutive_timeouts = 0
+        self.resync_flushes = 0
         self._pending: dict[tuple[int, int], Queue[Frame]] = {}
         self._seq = 1
         self._reader_thread: threading.Thread | None = None
@@ -486,14 +503,37 @@ class TcpProtocolClient:
                 self._pending.pop(key, None)
                 self.timings.append((t_sent, frame_type, (t_sent - t_queue) * 1000.0,
                                      (time.monotonic() - t_sent) * 1000.0, False))
+                self.consecutive_timeouts += 1
+                if self.consecutive_timeouts >= RESYNC_AFTER_TIMEOUTS:
+                    self._resync_flush()
                 raise TimeoutError(
                     f"Timed out waiting for response to {TYPE_NAMES.get(frame_type, hex(frame_type))}"
                 ) from exc
             self.timings.append((t_sent, frame_type, (t_sent - t_queue) * 1000.0,
                                  (time.monotonic() - t_sent) * 1000.0, True))
+            self.consecutive_timeouts = 0
             decoded = self._decode_frame(response)
             self._update_latest(decoded)
             return decoded
+
+    def _resync_flush(self) -> None:
+        """Write RESYNC_FILL zero bytes to put the RP2350's frame parser back to
+        hunting for a start-of-frame (see consecutive_timeouts). Never raises:
+        it runs on a request's failure path."""
+        sock = self._socket
+        if sock is None:
+            return
+        try:
+            with self._lock:
+                sock.sendall(bytes(RESYNC_FILL))
+            self.resync_flushes += 1
+            self.consecutive_timeouts = 0
+            logging.getLogger("ct_gui").warning(
+                "link %s: %d timeouts in a row -- sent %d zero bytes to resync the "
+                "RP2350 frame parser (flush #%d)", self._host, RESYNC_AFTER_TIMEOUTS,
+                RESYNC_FILL, self.resync_flushes)
+        except OSError:
+            pass
 
     def timing_summary(self, window_s: float = 60.0) -> dict:
         """Request timing over the last `window_s`: queue wait and answer time,
@@ -517,6 +557,7 @@ class TcpProtocolClient:
                        for t, v in by_type.items()), key=lambda x: -x[1])[:5]
         return {"window_s": window_s, "requests": len(rows),
                 "timeouts": sum(1 for r in rows if not r[4]),
+                "resync_flushes": self.resync_flushes,
                 "wait_ms": {"p50": pct(waits, 0.5), "p95": pct(waits, 0.95),
                             "max": round(max(waits), 1) if waits else None},
                 "answer_ms": {"avg": round(sum(ok_rtts) / len(ok_rtts), 1) if ok_rtts else None,
