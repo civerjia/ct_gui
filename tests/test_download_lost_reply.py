@@ -61,7 +61,7 @@ plan = {"config": {"interPulseMs": 100, "maxOnMs": 165, "totalMs": 6000, "trigge
 # Clean link: one try per frame, all with the short first timeout.
 cl = Client()
 t0 = time.monotonic()
-r = S.download_to_controller(Link(cl), 0, plan)
+r = S.download_to_controller(Link(cl), 0, plan, window=1)   # the serial path
 check("clean download ok", r.get("ok"), r)
 check("every frame's first try uses the short timeout",
       all(t == S.DOWNLOAD_FRAME_TIMEOUTS_S[0] for _, t in cl.calls), cl.calls)
@@ -69,7 +69,7 @@ check("every frame's first try uses the short timeout",
 # One lost reply (the active list): ~1 s extra, then OK on the retry.
 cl = Client(lose=S.SHV_SET_ACTIVE_LIST)
 t0 = time.monotonic()
-r = S.download_to_controller(Link(cl), 0, plan)
+r = S.download_to_controller(Link(cl), 0, plan, window=1)   # the serial path
 took = time.monotonic() - t0
 print(f"   one lost reply: {took:.2f} s")
 check("lost reply -> retried and ok", r.get("ok"), r)
@@ -78,7 +78,7 @@ check("lost reply costs ~1 s (was 3 s)", 0.9 <= took < 2.0, took)
 # The frame lost on every try still fails after 1 + 2 + 4 s, named.
 cl = Client(lose=S.SHV_SET_ACTIVE_LIST, lose_times=99)
 t0 = time.monotonic()
-r = S.download_to_controller(Link(cl), 0, plan)
+r = S.download_to_controller(Link(cl), 0, plan, window=1)   # the serial path
 took = time.monotonic() - t0
 check("always lost -> fails, naming the frame", not r.get("ok") and "active_list" in str(r), r)
 check("...after the full retry ladder", abs(took - sum(S.DOWNLOAD_FRAME_TIMEOUTS_S)) < 1.0, took)

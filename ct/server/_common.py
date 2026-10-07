@@ -407,8 +407,13 @@ POLL_PAUSE_MAX_S = 15.0   # max time a background-PING pause survives without a 
 # every frame it has buffered each main-loop pass, so with the filaments
 # heating (a pass takes 100-200 ms) a window of N lands ~N frames per pass
 # instead of one. parallel = both controllers at once (separate bridges).
-DOWNLOAD_WINDOW = 1
-DOWNLOAD_PARALLEL = False
+# Pipelining needs RP2350 fw 3fd1ff5+ (2026-10-07): before it, a reply written
+# while a request arrived ate bytes of that request and a pipelined download
+# re-sent 19 of 20 frames (9 s). With it: 0 re-sent, a 20-frame table in
+# 0.13-0.2 s per controller vs ~0.4 s serial. Older firmware still works --
+# the first unconfirmed frame falls back to serial from there on.
+DOWNLOAD_WINDOW = 8
+DOWNLOAD_PARALLEL = True
 
 
 # ---------------------------------------------------------------------------
