@@ -644,7 +644,7 @@ Avoid `tps 4500`, `scan` and `test` on a live rig: they energise outputs.
 | A whole channel vanished from the GUI | `board_health()` | DARK → `i2c_stats()`: timeouts = bus; NAK streak only = cable/supply |
 | One board absent while on | `board_health()` | LOST: being probed and restored; check its cable |
 | Commands "did not land" on some boards | `i2c_stats(clear=True)`, repeat, `i2c_stats()` | NAKs under load = marginal bus |
-| HV "did not turn on / off" on pulses | `hv_switch_test()` | dead / stuck_on / inconclusive per switch |
+| "MOSFET read-back mismatch" (ON / OFF) on pulses | `hv_switch_test()` | dead / stuck_on / inconclusive per switch |
 | Every switch on a controller dead | `pin_report()`, `pin_probe()` | a pin that will not follow = RP2350 or its line |
 | Emission ~0 on one filament | `mosfet_sweep([f])` | dead = the path; pass = look at the filament |
 | Schedule fired but data looks off | `shv_pulse_log()`, `scan_report()` | heating at each pulse, fired_cold, counters |

@@ -127,7 +127,17 @@ check("...records of a failed shot is a no-op", ct.shot_records(shot) is shot)
 # 6. Switch read-back mismatch still judged by shot_records.
 ct, calls = make(on_mismatch=True)
 res = ct.shot_records(ct.shot_wait(ct.shot_trigger(ct.shot_arm(ct.shot_prepare(16, **KW))), 2.0))
-check("HV DID NOT TURN ON reported", not res["ok"] and "HV DID NOT TURN ON" in res["error"], res)
+check("MOSFET read-back mismatch (ON) reported, with bytes",
+      not res["ok"] and "MOSFET read-back mismatch (ON)" in res["error"]
+      and "commanded 0x04, read back 0x02" in res["error"], res)
+
+# 6b. ...and the measured current says which: MOSFET closed (read-back wrong) or not.
+for em, want in ((20.0, "READ-BACK is wrong"), (None, "MOSFET did NOT close")):
+    ct, calls = make(on_mismatch=True)
+    ct._collect_pulse_events = lambda since, n, *a, em=em: ([{"id": 42, "emission_ma": em}], 1228)
+    r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **KW)
+    check(f"mismatch + emission {em} mA -> '{want}', measured kept",
+          not r["ok"] and want in r["error"] and r["measured"] and r["mosfet_conducted"] == (em is not None), r)
 
 # 7. Two controllers: the master is armed and triggered too.
 ct, calls = make(master=2)

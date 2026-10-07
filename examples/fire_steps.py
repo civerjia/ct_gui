@@ -113,10 +113,14 @@ with ct.lease(ttl=120, note="fire_steps example"):
             r = fire_one(f)
             if not r.get("ok"):
                 print(f"filament {f}: FAILED -- {r.get('error')}")
-                continue
+                if not r.get("measured"):
+                    continue
+            # printed for a failed shot too: the measured current is the
+            # evidence of what actually happened to the pulse
             ev = (r.get("measured") or [{}])[0]
-            print(f"filament {f}: ok  fired={r['fired']}  "
-                  f"setup {r['timing']['setup_s']} s at IDLE, ACTIVE {r['timing']['active_s']} s  "
+            print(f"filament {f}: {'ok' if r.get('ok') else 'FAILED'}  fired={r.get('fired')}  "
+                  f"setup {(r.get('timing') or {}).get('setup_s')} s at IDLE, "
+                  f"ACTIVE {(r.get('timing') or {}).get('active_s')} s  "
                   f"heat {(r.get('heating') or {}).get('measured_ma')} mA  "
                   f"plateau {ev.get('plateau_ma')} mA  emission {ev.get('emission_ma')} mA")
     finally:

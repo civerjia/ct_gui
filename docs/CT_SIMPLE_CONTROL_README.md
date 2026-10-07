@@ -2447,7 +2447,7 @@ so two identical runs both reporting 1 is not accumulation:
 | `underfed` | triggers that arrived with nothing staged |
 | `mismatches` | pulses whose 165 read-back disagreed with the commanded byte — **see the warning below** |
 | `rbSaturated` | times the 165 read-back FIFO was full when a pulse was accounted |
-| `off_mismatches` | pulses whose OFF read-back was non-zero — **the HV did not turn off**. The per-run count of the pulse log's `hv_stuck_on` |
+| `off_mismatches` | pulses whose OFF read-back was non-zero — **MOSFET read-back mismatch (OFF): the grid MOSFET may still be closed**. The per-run count of the pulse log's `hv_stuck_on` |
 | `unsafeSlots` | bitmap of power slots `arm` SKIPPED as unsafe. **Non-zero means those filaments did not fire even though the run looks normal** |
 
 Two more, and they are **cumulative** rather than per-run — see the warning below:
@@ -2516,8 +2516,8 @@ equally serious:
 
 | bit | field | meaning |
 |---|---|---|
-| `0x01` | **`on_mismatch`** | **the ON read-back did not equal the commanded byte — the switch did not close** |
-| `0x02` | **`hv_stuck_on`** | **the OFF read-back was non-zero — the HV did not turn off** |
+| `0x01` | **`on_mismatch`** | **MOSFET read-back mismatch (ON): the read-back did not equal the commanded byte — the MOSFET did not close, or the read-back is wrong** |
+| `0x02` | **`hv_stuck_on`** | **the OFF read-back was non-zero — MOSFET read-back mismatch (OFF), the grid MOSFET may still be closed** |
 | `0x04` | `unverified` | a read-back was unavailable: the pulse fired, the firmware has no evidence either way |
 
 > ⚠️ **`hv_stuck_on` is the most dangerous of the three.** A non-zero OFF read-back means the grid switch
@@ -2526,10 +2526,18 @@ equally serious:
 > before: `flags` was a raw byte nobody decoded, so this could occur and be
 > reported as a fully successful shot.
 
-> ⚠️ **`on_mismatch` fails the shot too.** The switch the pulse was meant to
-> close was not closed, but the trigger was still counted and the envelope still
-> opened, so fired=1 and the measured event look like a normal shot — of a pulse
-> that never reached the filament. `fire_single_pulse` returns `ok: False` with
+> ⚠️ **`on_mismatch` fails the shot too** — reported as "MOSFET read-back
+> mismatch (ON)" with the commanded and read-back bytes. It is about the grid
+> MOSFET, not the emission/focus rails. Two causes look the same in the flag: the
+> MOSFET did not close (filament 50, 2026-09-23: read 0x00, ≈0 mA), or the
+> read-back is wrong while the MOSFET did close (P1, 2026-10-07: the NEIGHBOURING
+> bit read back, 0x02 for 0x01). With `measure=True` the measured current
+> decides: the error ends with "current FLOWED ... the READ-BACK is wrong" or
+> "no current flowed ... the MOSFET did NOT close", and `mosfet_conducted` is
+> True / False. The measured events are kept on a failed shot — print them.
+> Without a measurement, the trigger was still counted and the envelope still
+> opened, so fired=1 looks like a normal shot of a pulse that may never have
+> reached the filament. `fire_single_pulse` returns `ok: False` with
 > `on_mismatch: [filament, ...]`, and `mosfet_test` reports such a filament as
 > `inconclusive` rather than `dead`: the MOSFET was never put across the rail,
 > so ≈0 mA says nothing about it. (Filament 50, 2026-09-23: read165=0, ≈0 mA,

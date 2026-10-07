@@ -491,11 +491,11 @@ class _ScheduleMixin:
               else {str(c): v for c, v in st_by.items()})
         stuck = sorted({r["filament"] for r in logs if r.get("hv_stuck_on")})
         if stuck:
-            problems.append(f"HV did not turn off on filament(s) {stuck}")
+            problems.append(f"MOSFET read-back mismatch (OFF, may still be closed) "
+                            f"on filament(s) {stuck}")
         mism = sorted({r["filament"] for r in logs if r.get("on_mismatch")})
         if mism:
-            problems.append(f"read-back did not match the commanded byte on "
-                            f"filament(s) {mism}")
+            problems.append(f"MOSFET read-back mismatch (ON) on filament(s) {mism}")
         dropped_dead = []
         if expected:
             # Filaments the dead mask removed are EXPECTED to be missing -- the
@@ -1977,9 +1977,39 @@ class _ScheduleMixin:
                 "error": f"timed out after {timeout_s} s (state={state})",
                 "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
 
+    @staticmethod
+    def _hex8(v) -> str:
+        return f"0x{int(v) & 0xFF:02X}" if isinstance(v, int) else str(v)
+
+    def _mosfet_bit(self, filament):
+        """The grid-MOSFET byte a pulse on `filament` commands (one bit per
+        board position), or None if the filament has no board."""
+        try:
+            site = self.filament_to_board(int(filament))
+        except Exception:
+            site = None
+        if not site:
+            return None
+        pos = site.get("position")
+        return 1 << int(pos if pos is not None else int(site["slot"]) % 8)
+
+    def _mosfet_site(self, filament) -> str:
+        try:
+            site = self.filament_to_board(int(filament))
+        except Exception:
+            site = None
+        if not site:
+            return ""
+        slot = site.get("slot")
+        ch = site.get("channel", None if slot is None else int(slot) // 8)
+        pos = site.get("position", None if slot is None else int(slot) % 8)
+        if ch is None or pos is None:
+            return f" (P{site.get('controller')})"
+        return f" (P{site.get('controller')} CH{int(ch) + 1}.{int(pos) + 1})"
+
     def shot_records(self, shot: dict) -> dict:
         """Step 5: read the pulse log for a completed shot and judge it: fired
-        count, HV DID NOT TURN OFF / DID NOT TURN ON from the switch read-backs,
+        count, MOSFET read-back mismatch (ON / OFF) from the switch read-backs,
         and (two controllers) whether the master framed every pulse. Returns
         the result in fire_single_pulse()'s shape."""
         if not shot.get("ok") or not shot.get("complete"):
@@ -1991,42 +2021,45 @@ class _ScheduleMixin:
         fired = [r for r in logs if r.get("filament") == filament]
         out = {"ok": bool(fired), "fired": len(fired),
                "records": fired, "status": st, "schedule": reuse_note}
-        # HV DID NOT TURN OFF (flags bit 0x02): the OFF read-back came
-        # back non-zero. This is the only pulse-log flag that is about
-        # the PULSE rather than about the verification of it, and it is
-        # the one that matters -- a switch that stayed closed leaves HV
-        # on the filament after the pulse. Surfaced at the top level
-        # because it was previously invisible: `flags` was a raw byte
-        # nobody decoded, so this condition could occur and be reported
-        # as a perfectly successful shot.
-        stuck = [r.get("filament") for r in fired if r.get("hv_stuck_on")]
+        # MOSFET READ-BACK MISMATCH, OFF (flags bit 0x02): after the pulse the
+        # 74HC165 read-back of the grid MOSFETs was non-zero. This is the only
+        # pulse-log flag that is about the PULSE rather than about the
+        # verification of it, and it is the one that matters -- a MOSFET that
+        # stayed closed leaves the filament on the emission rail after the
+        # pulse. Surfaced at the top level because it was previously
+        # invisible: `flags` was a raw byte nobody decoded, so this condition
+        # could occur and be reported as a perfectly successful shot. The
+        # emission/focus rails themselves are a separate thing (hv_status).
+        stuck = [r for r in fired if r.get("hv_stuck_on")]
         if stuck:
-            out["hv_stuck_on"] = sorted(set(stuck))
+            out["hv_stuck_on"] = sorted({r.get("filament") for r in stuck})
             out["ok"] = False
-            out["error"] = (f"HV DID NOT TURN OFF after the pulse on "
-                            f"filament(s) {sorted(set(stuck))} — the OFF "
-                            f"read-back was non-zero, so the grid switch "
-                            f"may still be closed. Check before firing "
-                            f"again.")
-        # HV DID NOT TURN ON (flags bit 0x01): the ON read-back did not
-        # match the commanded byte, so the switch the pulse was meant
-        # to close was not closed. The trigger was counted and the
-        # envelope opened, so everything else -- fired=1, a measured
-        # event, a heating current -- looks like a normal shot, and the
-        # measured current is of a pulse that never reached the
-        # filament. Measured 2026-09-23: filament 50, read165=0,
-        # ≈0 mA, reported ok=True.
+            rb = ", ".join(f"filament {r.get('filament')}{self._mosfet_site(r.get('filament'))} "
+                           f"read back {self._hex8(r.get('read165'))} after the pulse"
+                           for r in stuck)
+            out["error"] = (f"MOSFET read-back mismatch (OFF): {rb} -- should be 0x00. "
+                            f"The grid MOSFET may still be closed: check before "
+                            f"firing again.")
+        # MOSFET READ-BACK MISMATCH, ON (flags bit 0x01): during the pulse
+        # the 74HC165 read-back of the grid MOSFETs did not match the byte
+        # commanded. Either the MOSFET did not close (no HV reached the
+        # filament -- 2026-09-23: filament 50, read 0x00, ~0 mA, had been
+        # reported ok) or the read-back itself is wrong (2026-10-07: P1 read
+        # the NEIGHBOURING bit, 0x02 for 0x01, while current flowed).
+        # shot_measured() tells which from the measured current. Not about
+        # the emission/focus rails, which are on regardless.
         no_on = [r for r in fired if r.get("on_mismatch")]
         if no_on:
             out["on_mismatch"] = sorted({r.get("filament") for r in no_on})
             out["ok"] = False
-            rb = ", ".join(f"filament {r.get('filament')} read back "
-                           f"{r.get('read165')}" for r in no_on)
+            rb = ", ".join(f"filament {r.get('filament')}{self._mosfet_site(r.get('filament'))} "
+                           f"commanded {self._hex8(self._mosfet_bit(r.get('filament')))}, "
+                           f"read back {self._hex8(r.get('read165'))}"
+                           for r in no_on)
             out["error"] = ((out["error"] + "; ") if out.get("error") else "") + (
-                f"HV DID NOT TURN ON: the ON read-back did not match the "
-                f"commanded switch ({rb}) — the grid switch was not closed, "
-                f"so no HV reached the filament and any measured current "
-                f"is not this filament's")
+                f"MOSFET read-back mismatch (ON): {rb}. Either the grid MOSFET "
+                f"did not close, or the read-back is wrong -- the measured "
+                f"current of this pulse tells which (measure=True)")
         # Unverified (0x04) is NOT a failure: the pulse fired, the
         # firmware just has no read-back evidence about it. Reported so
         # a caller can tell "verified good" from "no evidence", which
@@ -2129,6 +2162,18 @@ class _ScheduleMixin:
             out["error"] = (f"fired {base.get('fired')} pulse(s) but the detector "
                             f"reported {len(measured)} of {want} — measurement "
                             f"incomplete, so the result is not trustworthy")
+        # A MOSFET read-back mismatch (ON) is either a MOSFET that did not
+        # close or a wrong read-back. The emission current of the pulse says
+        # which: through the sub-board's diode path a closed MOSFET always
+        # draws current (emission_ma is None when it drew none).
+        if base.get("on_mismatch") and measured:
+            em = measured[0].get("emission_ma")
+            out["mosfet_conducted"] = em is not None
+            out["error"] = (out.get("error") or "") + (
+                f" -- measured {em} mA in this pulse: current FLOWED, so the "
+                f"MOSFET did close and the READ-BACK is wrong"
+                if em is not None else
+                " -- no current flowed in this pulse: the MOSFET did NOT close")
         return out
 
     def shot_abort(self, shot: dict) -> None:

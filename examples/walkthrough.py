@@ -368,7 +368,7 @@ def s9(ct, args):
         print(f"  fired={r.get('fired')} ok={r.get('ok')} "
               f"{(r.get('error') or '')[:60]}")
         if r.get("hv_stuck_on"):
-            print(f"  !! HV DID NOT TURN OFF on {r['hv_stuck_on']}")
+            print(f"  !! MOSFET read-back mismatch (OFF, may still be closed) on {r['hv_stuck_on']}")
         for rec in (r.get("records") or [])[:3]:
             print(f"    pulse: {rec}")
         if args.measure:

@@ -64,14 +64,19 @@ def print_ads(ct):
 
 
 def print_result(f, result):
-    """The same per-pulse line liuxing_api.py prints, plus the ACTIVE time."""
+    """The same per-pulse line liuxing_api.py prints, plus the ACTIVE time.
+    A failed shot prints its error AND, when the detector measured the pulse,
+    the measured line too: the current is the evidence of what happened (e.g.
+    a MOSFET read-back mismatch with current flowing = the read-back is wrong,
+    the MOSFET did close)."""
+    events = result.get("measured") or []
+    records = result.get("records") or []
     if not result.get("ok"):
         print(f"fire FAILED (filament {f}, fired={result.get('fired')}): "
               f"{result.get('error') or 'no reason given'}")
-        return
-    events = result.get("measured") or []
-    records = result.get("records") or []
-    if not events:
+        if not events:
+            return
+    elif not events:
         print(f"fire ok but NO measured event came back (filament {f})")
         return
     e = events[0]
@@ -79,6 +84,7 @@ def print_result(f, result):
     rec = records[0] if paired else {}
     print(f"filament {f} pulse:"
           f" active_s={result.get('active_s')}"
+          f" read165={rec.get('read165') if rec else None}"
           f" on_us={e.get('on_us')}"
           f" heat_meas_mA={rec.get('heat_meas_mA')}"
           f" heat_target_mA={rec.get('heat_target_mA')}"
