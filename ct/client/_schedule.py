@@ -1588,79 +1588,24 @@ class _ScheduleMixin:
         # Arm BEFORE firing -- a detector armed afterwards has already missed
         # the pulses. If it can't arm we fire nothing: silently firing HV that
         # nobody is measuring is the opposite of what measure=True asked for.
-        #
-        # This arms the RELAY, not just the detector. The STM32 times each pulse
-        # from the real envelope on its PA4 pin, and PA4 only moves while the
-        # ESP32 is mirroring the RP2350's pulse signal onto it. pulse_arm() alone
-        # arms the detector and leaves the relay off, so the detector sits there
-        # sampling and never sees a pulse start: measured on hardware, a 3-pulse
-        # fire came back "0 of 3 measured" while the RP2350 fired correctly and
-        # the STM32 took 7.2M samples. With the relay armed the same fire gives
-        # 3 events whose measured widths (1009/1002/1000 us) match the commanded
-        # 1000 us. See pulse_arm()'s note for the detector-only form.
-        # Size the relay's abandonment TTL from THIS run rather than taking the
-        # firmware default. The firmware renews the TTL on every relayed edge,
-        # so an active run cannot be reclaimed -- but the renewal is driven by
-        # PULSES, so a gap wider than the TTL still looks abandoned. The binding
-        # gap is inter_pulse_ms; give it room, and never go below the firmware
-        # default. Also covers the head of the run, before the first pulse.
-        arm_ttl_ms = max(self._READY_TTL_FLOOR_MS,
-                         int(inter_pulse_ms) * self._READY_TTL_GAP_FACTOR,
-                         int(timeout_s * 1000))
-        arm = self.ready_arm(rate_hz, ttl_ms=arm_ttl_ms,
-                             bg_gap_us=bg_gap_us,
-                             bg_window_us=bg_window_us)
-        if not arm.get("ok"):
-            hint = ""
-            if "already armed" in str(arm.get("error", "")):
-                st = self.ready_status()
-                # Armed at the SAME rate is no longer an error (the firmware's
-                # resting state is armed), so reaching here means the rate
-                # differs -- say which, because "already armed" on its own sends
-                # people looking for a stale arm that isn't the problem.
-                armed_rate = st.get("rate_hz")
-                if armed_rate and int(armed_rate) != int(rate_hz):
-                    hint = (f" — the relay is armed at {armed_rate} Hz and this "
-                            f"fire asked for {rate_hz} Hz. Measuring at a rate "
-                            f"you did not ask for would be worse than failing, "
-                            f"so it refuses. ct.ready_disarm() first, or fire at "
-                            f"{armed_rate} Hz.")
-                else:
-                    hint = (" — the relay is already armed. The usual cause is a "
-                            "previous run that was KILLED between arming and its "
-                            "cleanup (the disarm is in a finally, so an exception "
-                            "is fine; SIGKILL is not). If nothing else is using "
-                            "it, clear it with ct.ready_disarm(). Not stolen "
-                            "automatically: the relay is a single global resource "
-                            "with no owner recorded, so another client could be "
-                            f"mid-run. Current: {st}")
-            return {"ok": False, "fired": 0, "records": [], "status": {},
-                    "measured": [], "ref_mv": None,
-                    "error": f"detector arm failed, nothing fired: "
-                             f"{arm.get('error')}{hint}"}
+        # See shot_measure_arm() for why it is the RELAY that is armed.
+        m = self.shot_measure_arm({"ok": True, "inter_pulse_ms": int(inter_pulse_ms),
+                                   "num_pulses": int(num_pulses)},
+                                  rate_hz, bg_gap_us=bg_gap_us,
+                                  bg_window_us=bg_window_us, timeout_s=timeout_s)
+        if not m.get("ok"):
+            return m
         try:
-            # Take the cursor BEFORE firing so we collect only what THIS fire
-            # produces and never a stale backlog. Via pulse_cursor() rather
-            # than a huge `since`: that shortcut saturates at 2**31-1 in the
-            # ESP32's query parsing, and past that id it would stop excluding
-            # old events silently. See pulse_cursor().
-            since = self.pulse_cursor()
             fired = self._fire_core(
                 filament, num_pulses=num_pulses, width_us=width_us,
                 inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
                 total_ms=total_ms, controller=controller, trigger=trigger,
                 timeout_s=timeout_s, verify=verify, reuse=reuse,
                 on_armed=on_armed, after_fire=after_fire)
-            measured, ref_mv = self._collect_pulse_events(since, int(num_pulses))
-            out = {**fired, "measured": measured, "ref_mv": ref_mv,
-                   "ok": bool(fired.get("ok")) and len(measured) >= int(num_pulses)}
-            if not out["ok"] and fired.get("ok") and not out.get("error"):
-                out["error"] = (f"fired {fired.get('fired')} pulse(s) but the detector "
-                                f"reported {len(measured)} of {num_pulses} — measurement "
-                                f"incomplete, so the result is not trustworthy")
-            return out
-        finally:
+        except BaseException:
             self.ready_disarm()
+            raise
+        return self.shot_measured(m, fired)   # collects, then disarms the detector
 
     def _collect_pulse_events(self, since: int, want: int,
                               grace_s: float = 3.0) -> tuple[list, float | None]:
@@ -1734,39 +1679,27 @@ class _ScheduleMixin:
                 f"so a missing measurement there is not evidence about the pulse")
         return out
 
-    def _fire_core(
-        self,
-        filament: int,
-        num_pulses: int = 1,
-        width_us: int = 1000,
-        inter_pulse_ms: int = 3000,
-        max_on_ms: int = 40,
-        total_ms: int = 15000,       # RP2350 FIRMWARE's own schedule timeout (ms)
-                                      # — see docstring, "total_ms vs timeout_s"
-        controller: int | None = None,   # None = auto-infer from `filament` via
-                                          # the active-list mapping — see docstring,
-                                          # "why controller exists at all"
-        trigger: str = "sim",
-        timeout_s: float = 15.0,     # PYTHON CLIENT's polling timeout (seconds)
-                                      # — see docstring, "total_ms vs timeout_s"
-        verify: bool = True,
-        on_armed=None,         # callable() run after arming, immediately before
-                                # the trigger — the only place a caller can start
-                                # something CONCURRENT with the firing
-        reuse: bool = False,   # skip re-download if unchanged since your last
-                                # call — see docstring, "reuse — skipping the
-                                # download when nothing changed"; OFF by
-                                # default because it has a real, documented
-                                # safety gap (see the docstring) — opt in only
-                                # when you understand it.
-        after_fire=None,       # callable() run the moment the run is over
-                                # (complete, fault or timeout), before the
-                                # pulse log is read -- drops ACTIVE early
-    ) -> dict:
-        """Fire one schedule entry and wait for it. The body of
-        fire_single_pulse() -- see that method for the full contract;
-        this exists only so the public method can wrap it with the
-        detector arm/correlate step without duplicating any of it."""
+    def shot_prepare(self, filament: int, num_pulses: int = 1, width_us: int = 1000,
+                     inter_pulse_ms: int = 3000, max_on_ms: int = 40,
+                     total_ms: int = 15000, controller: int | None = None,
+                     trigger: str = "sim", verify: bool = True,
+                     reuse: bool = False) -> dict:
+        """Step 1 of a shot: check the arguments, pick the controller (and the
+        master that frames its envelope), disarm both, and put the one-entry
+        schedule on the RP2350s (or confirm by CRC that it is already there,
+        reuse=True). Touches no heating and no HV. Returns the SHOT dict that
+        every later step takes and returns (ok False = stop; see "error").
+
+        The steps, in the order fire_single_pulse() runs them:
+            shot = ct.shot_prepare(f, ...)      # schedule on the board
+            shot = ct.shot_measure_arm(shot)    # optional: STM32 detector
+            shot = ct.shot_arm(shot)            # arm; checks the slot is safe
+            shot = ct.shot_trigger(shot)        # "sim": fire now; "ext": no-op
+            shot = ct.shot_wait(shot)           # until complete / fault / timeout
+            res  = ct.shot_records(shot)        # pulse log, ON/OFF read-backs
+            res  = ct.shot_measured(shot, res)  # optional: detector events
+        Anything else (heating, reads) can go between them; ct.shot_abort(shot)
+        disarms everything (put it in a finally). See examples/fire_steps.py."""
         if self._is_dead(filament):
             return self._dead_result(filament, {"fired": 0, "records": [], "status": {}})
 
@@ -1886,6 +1819,27 @@ class _ScheduleMixin:
                     if row.get("crc") is not None:
                         self._last_crc[controller] = row["crc"]
 
+        return {"ok": True, "filament": int(filament), "controller": int(controller),
+                "companion": companion, "armed_set": armed_set,
+                "num_pulses": int(num_pulses), "inter_pulse_ms": int(inter_pulse_ms),
+                "trigger": trigger, "schedule": reuse_note,
+                "fired": 0, "records": [], "status": {}}
+
+    def shot_arm(self, shot: dict) -> dict:
+        """Step 2: arm the shot's controller (and the master, for an envelope),
+        then confirm the filament was not skipped as unsafe. Nothing fires until
+        shot_trigger() (or the external edge). On failure everything is disarmed."""
+        if not shot.get("ok"):
+            return shot          # an earlier step failed: do nothing
+        r = self._shot_arm(shot)
+        return r if r.get("ok") else {**shot, **r}
+
+    def _shot_arm(self, shot: dict) -> dict:
+        if not shot.get("ok"):
+            return shot
+        filament, controller = shot["filament"], shot["controller"]
+        companion, armed_set = shot["companion"], shot["armed_set"]
+        reuse_note = shot.get("schedule")
         # Target and master in ONE request: the backend arms them master LAST
         # (it is the head of the trigger chain -- armed first, an edge in
         # between would advance it past entry 0 while the target was still
@@ -1943,6 +1897,294 @@ class _ScheduleMixin:
                              f"(sleep_one({filament}) is enough — it enables iso "
                              f"without heating current) and fire again."}
 
+        return {**shot, "armed": True, "status": st_after}
+
+    def shot_trigger(self, shot: dict) -> dict:
+        """Step 3: start the pulses. trigger="sim": the ESP32 drives SyncIn now,
+        through the head of the chain. trigger="ext": nothing to do -- the
+        board waits for the external edge (shot_wait() then waits for it)."""
+        if not shot.get("ok"):
+            return shot          # an earlier step failed: do nothing
+        r = self._shot_trigger(shot)
+        return r if r.get("ok") else {**shot, **r}
+
+    def _shot_trigger(self, shot: dict) -> dict:
+        if not shot.get("ok"):
+            return shot
+        trigger = shot.get("trigger", "sim")
+        num_pulses, inter_pulse_ms = shot["num_pulses"], shot["inter_pulse_ms"]
+        controller, companion = shot["controller"], shot["companion"]
+        armed_set = shot["armed_set"]
+        if trigger == "sim":
+            # Through the HEAD of the chain. The master's ReadyIn ISR fires the
+            # master and forwards the edge on SyncOut, exactly like an external
+            # trigger; aimed at the target controller directly, the master
+            # would never see it and never open the window.
+            r = self._post("/api/sync/simulate", {
+                "count": int(num_pulses),
+                "interval_ms": float(max(inter_pulse_ms, 10)),
+                "controller": int(companion or controller),
+            }, timeout=10.0)
+            if not r.get("ok"):
+                self._disarm_all(armed_set)
+                return {"ok": False, "error": f"could not start SyncIn simulation: "
+                                              f"{r.get('error', r)}",
+                        "fired": 0, "records": [], "status": {}}
+
+        return {**shot, "triggered": trigger == "sim"}
+
+    def shot_wait(self, shot: dict, timeout_s: float = 15.0) -> dict:
+        """Step 4: poll the controller until the run completes (ok True,
+        "complete": True), faults or times out (ok False, everything disarmed).
+        Reads nothing else -- drop the heating right after it, before
+        shot_records(), to keep ACTIVE short."""
+        if not shot.get("ok"):
+            return shot          # an earlier step failed: do nothing
+        r = self._shot_wait(shot, timeout_s)
+        return r if r.get("ok") else {**shot, **r}
+
+    def _shot_wait(self, shot: dict, timeout_s: float = 15.0) -> dict:
+        if not shot.get("ok"):
+            return shot
+        controller, armed_set = shot["controller"], shot["armed_set"]
+        reuse_note = shot.get("schedule")
+        deadline = time.monotonic() + timeout_s
+        state = SHV_IDLE
+        # This loop runs WHILE the schedule is firing, on the same single
+        # RP2350 link that is carrying the run and the 20 fps telemetry push.
+        # A flat sleep(0.05) was ~15 requests/s of pure contention (the status
+        # round trip is 15 ms, so the sleep was smaller than the request).
+        # Fast at first so an immediate fault or a 1-pulse completion is still
+        # seen at once, then backing off to 2 requests/s.
+        naps = self._poll_intervals(0.05, 0.5)
+        while time.monotonic() < deadline:
+            st = self.shv_status(controller)
+            state = st.get("state", SHV_IDLE)
+            if state == SHV_FAULT:
+                self._disarm_all(armed_set)
+                return {"ok": False,
+                        "error": f"SHV fault on controller {controller}: "
+                                f"filament {st.get('faultFilament')}, reason "
+                                f"{self._SHV_STOP_REASON_NAMES.get(st.get('stopReason'), st.get('stopReason'))}"
+                                f" ({st.get('stopReason')})",
+                        "fired": 0, "records": [], "status": st, "schedule": reuse_note}
+            if state == SHV_COMPLETE:
+                return {**shot, "complete": True, "status": st}
+            time.sleep(next(naps))
+
+        self._disarm_all(armed_set)
+        return {"ok": False, "timeout": True,
+                "error": f"timed out after {timeout_s} s (state={state})",
+                "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
+
+    def shot_records(self, shot: dict) -> dict:
+        """Step 5: read the pulse log for a completed shot and judge it: fired
+        count, HV DID NOT TURN OFF / DID NOT TURN ON from the switch read-backs,
+        and (two controllers) whether the master framed every pulse. Returns
+        the result in fire_single_pulse()'s shape."""
+        if not shot.get("ok") or not shot.get("complete"):
+            return shot
+        filament, controller = shot["filament"], shot["controller"]
+        companion, num_pulses = shot["companion"], shot["num_pulses"]
+        reuse_note, st = shot.get("schedule"), shot.get("status") or {}
+        logs = self.shv_pulse_log(controller)
+        fired = [r for r in logs if r.get("filament") == filament]
+        out = {"ok": bool(fired), "fired": len(fired),
+               "records": fired, "status": st, "schedule": reuse_note}
+        # HV DID NOT TURN OFF (flags bit 0x02): the OFF read-back came
+        # back non-zero. This is the only pulse-log flag that is about
+        # the PULSE rather than about the verification of it, and it is
+        # the one that matters -- a switch that stayed closed leaves HV
+        # on the filament after the pulse. Surfaced at the top level
+        # because it was previously invisible: `flags` was a raw byte
+        # nobody decoded, so this condition could occur and be reported
+        # as a perfectly successful shot.
+        stuck = [r.get("filament") for r in fired if r.get("hv_stuck_on")]
+        if stuck:
+            out["hv_stuck_on"] = sorted(set(stuck))
+            out["ok"] = False
+            out["error"] = (f"HV DID NOT TURN OFF after the pulse on "
+                            f"filament(s) {sorted(set(stuck))} — the OFF "
+                            f"read-back was non-zero, so the grid switch "
+                            f"may still be closed. Check before firing "
+                            f"again.")
+        # HV DID NOT TURN ON (flags bit 0x01): the ON read-back did not
+        # match the commanded byte, so the switch the pulse was meant
+        # to close was not closed. The trigger was counted and the
+        # envelope opened, so everything else -- fired=1, a measured
+        # event, a heating current -- looks like a normal shot, and the
+        # measured current is of a pulse that never reached the
+        # filament. Measured 2026-09-23: filament 50, read165=0,
+        # ≈0 mA, reported ok=True.
+        no_on = [r for r in fired if r.get("on_mismatch")]
+        if no_on:
+            out["on_mismatch"] = sorted({r.get("filament") for r in no_on})
+            out["ok"] = False
+            rb = ", ".join(f"filament {r.get('filament')} read back "
+                           f"{r.get('read165')}" for r in no_on)
+            out["error"] = ((out["error"] + "; ") if out.get("error") else "") + (
+                f"HV DID NOT TURN ON: the ON read-back did not match the "
+                f"commanded switch ({rb}) — the grid switch was not closed, "
+                f"so no HV reached the filament and any measured current "
+                f"is not this filament's")
+        # Unverified (0x04) is NOT a failure: the pulse fired, the
+        # firmware just has no read-back evidence about it. Reported so
+        # a caller can tell "verified good" from "no evidence", which
+        # the ok flag alone cannot.
+        unver = [r.get("filament") for r in fired if r.get("unverified")]
+        if unver:
+            out["unverified"] = sorted(set(unver))
+        if companion:
+            out["envelope_from"] = companion
+            out.update(self._companion_check(companion, int(num_pulses)))
+            self._disarm_all([companion])
+        return out
+
+    def shot_measure_arm(self, shot: dict, rate_hz: int = 1000000,
+                         bg_gap_us: float | None = None,
+                         bg_window_us: float | None = None,
+                         timeout_s: float = 15.0) -> dict:
+        """Optional, before shot_arm(): arm the STM32 detector (via the ESP32
+        relay) so every pulse of this shot is measured, and remember where the
+        event stream stands. Fails -> nothing has been armed; do not fire."""
+        if not shot.get("ok"):
+            return shot
+        inter_pulse_ms = shot["inter_pulse_ms"]
+        rate_hz = int(rate_hz)
+        # This arms the RELAY, not just the detector. The STM32 times each pulse
+        # from the real envelope on its PA4 pin, and PA4 only moves while the
+        # ESP32 is mirroring the RP2350's pulse signal onto it. pulse_arm() alone
+        # arms the detector and leaves the relay off, so the detector sits there
+        # sampling and never sees a pulse start: measured on hardware, a 3-pulse
+        # fire came back "0 of 3 measured" while the RP2350 fired correctly and
+        # the STM32 took 7.2M samples. With the relay armed the same fire gives
+        # 3 events whose measured widths (1009/1002/1000 us) match the commanded
+        # 1000 us. See pulse_arm()'s note for the detector-only form.
+        # Size the relay's abandonment TTL from THIS run rather than taking the
+        # firmware default. The firmware renews the TTL on every relayed edge,
+        # so an active run cannot be reclaimed -- but the renewal is driven by
+        # PULSES, so a gap wider than the TTL still looks abandoned. The binding
+        # gap is inter_pulse_ms; give it room, and never go below the firmware
+        # default. Also covers the head of the run, before the first pulse.
+        arm_ttl_ms = max(self._READY_TTL_FLOOR_MS,
+                         int(inter_pulse_ms) * self._READY_TTL_GAP_FACTOR,
+                         int(timeout_s * 1000))
+        arm = self.ready_arm(rate_hz, ttl_ms=arm_ttl_ms,
+                             bg_gap_us=bg_gap_us,
+                             bg_window_us=bg_window_us)
+        if not arm.get("ok"):
+            hint = ""
+            if "already armed" in str(arm.get("error", "")):
+                st = self.ready_status()
+                # Armed at the SAME rate is no longer an error (the firmware's
+                # resting state is armed), so reaching here means the rate
+                # differs -- say which, because "already armed" on its own sends
+                # people looking for a stale arm that isn't the problem.
+                armed_rate = st.get("rate_hz")
+                if armed_rate and int(armed_rate) != int(rate_hz):
+                    hint = (f" — the relay is armed at {armed_rate} Hz and this "
+                            f"fire asked for {rate_hz} Hz. Measuring at a rate "
+                            f"you did not ask for would be worse than failing, "
+                            f"so it refuses. ct.ready_disarm() first, or fire at "
+                            f"{armed_rate} Hz.")
+                else:
+                    hint = (" — the relay is already armed. The usual cause is a "
+                            "previous run that was KILLED between arming and its "
+                            "cleanup (the disarm is in a finally, so an exception "
+                            "is fine; SIGKILL is not). If nothing else is using "
+                            "it, clear it with ct.ready_disarm(). Not stolen "
+                            "automatically: the relay is a single global resource "
+                            "with no owner recorded, so another client could be "
+                            f"mid-run. Current: {st}")
+            return {"ok": False, "fired": 0, "records": [], "status": {},
+                    "measured": [], "ref_mv": None,
+                    "error": f"detector arm failed, nothing fired: "
+                             f"{arm.get('error')}{hint}"}
+        # The cursor BEFORE firing, so only THIS shot's events are collected,
+        # never a stale backlog (via pulse_cursor(): a huge `since` saturates
+        # at 2**31-1 in the ESP32's query parsing).
+        try:
+            since = self.pulse_cursor()
+        except BaseException:
+            self.ready_disarm()
+            raise
+        return {**shot, "measuring": True, "since": since, "rate_hz": rate_hz}
+
+    def shot_measured(self, shot: dict, result: dict | None = None,
+                      grace_s: float = 3.0) -> dict:
+        """Optional, last: collect the detector events this shot produced and
+        disarm the detector. `result` is shot_records()'s return; the merged
+        result is ok only if every fired pulse was measured."""
+        base = dict(result if result is not None else shot)
+        if not shot.get("measuring"):
+            return base
+        try:
+            want = int(shot["num_pulses"])
+            measured, ref_mv = self._collect_pulse_events(int(shot["since"]), want, grace_s)
+        finally:
+            self.ready_disarm()
+        out = {**base, "measured": measured, "ref_mv": ref_mv,
+               "ok": bool(base.get("ok")) and len(measured) >= want}
+        if not out["ok"] and base.get("ok") and not out.get("error"):
+            out["error"] = (f"fired {base.get('fired')} pulse(s) but the detector "
+                            f"reported {len(measured)} of {want} — measurement "
+                            f"incomplete, so the result is not trustworthy")
+        return out
+
+    def shot_abort(self, shot: dict) -> None:
+        """Disarm everything the shot armed (both controllers, the detector).
+        Safe to call at any point and more than once -- put it in a finally."""
+        if shot.get("armed_set"):
+            self._disarm_all(shot["armed_set"])
+        if shot.get("measuring"):
+            try:
+                self.ready_disarm()
+            except Exception:
+                pass
+
+    def _fire_core(
+        self,
+        filament: int,
+        num_pulses: int = 1,
+        width_us: int = 1000,
+        inter_pulse_ms: int = 3000,
+        max_on_ms: int = 40,
+        total_ms: int = 15000,       # RP2350 FIRMWARE's own schedule timeout (ms)
+                                      # — see docstring, "total_ms vs timeout_s"
+        controller: int | None = None,   # None = auto-infer from `filament` via
+                                          # the active-list mapping — see docstring,
+                                          # "why controller exists at all"
+        trigger: str = "sim",
+        timeout_s: float = 15.0,     # PYTHON CLIENT's polling timeout (seconds)
+                                      # — see docstring, "total_ms vs timeout_s"
+        verify: bool = True,
+        on_armed=None,         # callable() run after arming, immediately before
+                                # the trigger — the only place a caller can start
+                                # something CONCURRENT with the firing
+        reuse: bool = False,   # skip re-download if unchanged since your last
+                                # call — see docstring, "reuse — skipping the
+                                # download when nothing changed"; OFF by
+                                # default because it has a real, documented
+                                # safety gap (see the docstring) — opt in only
+                                # when you understand it.
+        after_fire=None,       # callable() run the moment the run is over
+                                # (complete, fault or timeout), before the
+                                # pulse log is read -- drops ACTIVE early
+    ) -> dict:
+        """Fire one schedule entry and wait for it. The body of
+        fire_single_pulse() -- see that method for the full contract;
+        this exists only so the public method can wrap it with the
+        detector arm/correlate step without duplicating any of it."""
+        shot = self.shot_prepare(filament, num_pulses=num_pulses, width_us=width_us,
+                                 inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                                 total_ms=total_ms, controller=controller,
+                                 trigger=trigger, verify=verify, reuse=reuse)
+        if not shot.get("ok"):
+            return shot
+        shot = self.shot_arm(shot)
+        if not shot.get("ok"):
+            return shot
+        armed_set = shot["armed_set"]
         # Everything above is setup -- download, detector arm, schedule arm,
         # safety checks -- and none of it is time-critical. The trigger below
         # is. `on_armed` runs in the gap between the two, which is the only
@@ -1965,21 +2207,9 @@ class _ScheduleMixin:
                                  f"({type(exc).__name__}: {exc}) — disarmed "
                                  f"without firing"}
 
-        if trigger == "sim":
-            # Through the HEAD of the chain. The master's ReadyIn ISR fires the
-            # master and forwards the edge on SyncOut, exactly like an external
-            # trigger; aimed at the target controller directly, the master
-            # would never see it and never open the window.
-            r = self._post("/api/sync/simulate", {
-                "count": int(num_pulses),
-                "interval_ms": float(max(inter_pulse_ms, 10)),
-                "controller": int(companion or controller),
-            }, timeout=10.0)
-            if not r.get("ok"):
-                self._disarm_all(armed_set)
-                return {"ok": False, "error": f"could not start SyncIn simulation: "
-                                              f"{r.get('error', r)}",
-                        "fired": 0, "records": [], "status": {}}
+        shot = self.shot_trigger(shot)
+        if not shot.get("ok"):
+            return shot
 
         def _after():
             # The run is over: hand back to the caller (e.g. drop ACTIVE) before
@@ -1990,85 +2220,8 @@ class _ScheduleMixin:
                 except Exception:
                     pass      # its owner records its own outcome
 
-        deadline = time.monotonic() + timeout_s
-        state = SHV_IDLE
-        # This loop runs WHILE the schedule is firing, on the same single
-        # RP2350 link that is carrying the run and the 20 fps telemetry push.
-        # A flat sleep(0.05) was ~15 requests/s of pure contention (the status
-        # round trip is 15 ms, so the sleep was smaller than the request).
-        # Fast at first so an immediate fault or a 1-pulse completion is still
-        # seen at once, then backing off to 2 requests/s.
-        naps = self._poll_intervals(0.05, 0.5)
-        while time.monotonic() < deadline:
-            st = self.shv_status(controller)
-            state = st.get("state", SHV_IDLE)
-            if state == SHV_FAULT:
-                self._disarm_all(armed_set)
-                _after()
-                return {"ok": False,
-                        "error": f"SHV fault on controller {controller}: "
-                                f"filament {st.get('faultFilament')}, reason "
-                                f"{self._SHV_STOP_REASON_NAMES.get(st.get('stopReason'), st.get('stopReason'))}"
-                                f" ({st.get('stopReason')})",
-                        "fired": 0, "records": [], "status": st, "schedule": reuse_note}
-            if state == SHV_COMPLETE:
-                _after()
-                logs = self.shv_pulse_log(controller)
-                fired = [r for r in logs if r.get("filament") == filament]
-                out = {"ok": bool(fired), "fired": len(fired),
-                       "records": fired, "status": st, "schedule": reuse_note}
-                # HV DID NOT TURN OFF (flags bit 0x02): the OFF read-back came
-                # back non-zero. This is the only pulse-log flag that is about
-                # the PULSE rather than about the verification of it, and it is
-                # the one that matters -- a switch that stayed closed leaves HV
-                # on the filament after the pulse. Surfaced at the top level
-                # because it was previously invisible: `flags` was a raw byte
-                # nobody decoded, so this condition could occur and be reported
-                # as a perfectly successful shot.
-                stuck = [r.get("filament") for r in fired if r.get("hv_stuck_on")]
-                if stuck:
-                    out["hv_stuck_on"] = sorted(set(stuck))
-                    out["ok"] = False
-                    out["error"] = (f"HV DID NOT TURN OFF after the pulse on "
-                                    f"filament(s) {sorted(set(stuck))} — the OFF "
-                                    f"read-back was non-zero, so the grid switch "
-                                    f"may still be closed. Check before firing "
-                                    f"again.")
-                # HV DID NOT TURN ON (flags bit 0x01): the ON read-back did not
-                # match the commanded byte, so the switch the pulse was meant
-                # to close was not closed. The trigger was counted and the
-                # envelope opened, so everything else -- fired=1, a measured
-                # event, a heating current -- looks like a normal shot, and the
-                # measured current is of a pulse that never reached the
-                # filament. Measured 2026-09-23: filament 50, read165=0,
-                # ≈0 mA, reported ok=True.
-                no_on = [r for r in fired if r.get("on_mismatch")]
-                if no_on:
-                    out["on_mismatch"] = sorted({r.get("filament") for r in no_on})
-                    out["ok"] = False
-                    rb = ", ".join(f"filament {r.get('filament')} read back "
-                                   f"{r.get('read165')}" for r in no_on)
-                    out["error"] = ((out["error"] + "; ") if out.get("error") else "") + (
-                        f"HV DID NOT TURN ON: the ON read-back did not match the "
-                        f"commanded switch ({rb}) — the grid switch was not closed, "
-                        f"so no HV reached the filament and any measured current "
-                        f"is not this filament's")
-                # Unverified (0x04) is NOT a failure: the pulse fired, the
-                # firmware just has no read-back evidence about it. Reported so
-                # a caller can tell "verified good" from "no evidence", which
-                # the ok flag alone cannot.
-                unver = [r.get("filament") for r in fired if r.get("unverified")]
-                if unver:
-                    out["unverified"] = sorted(set(unver))
-                if companion:
-                    out["envelope_from"] = companion
-                    out.update(self._companion_check(companion, int(num_pulses)))
-                    self._disarm_all([companion])
-                return out
-            time.sleep(next(naps))
-
-        self._disarm_all(armed_set)
+        shot = self.shot_wait(shot, timeout_s)
         _after()
-        return {"ok": False, "timeout": True,
-                "error": f"timed out after {timeout_s} s (state={state})",
-                "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
+        if not shot.get("complete"):
+            return shot
+        return self.shot_records(shot)

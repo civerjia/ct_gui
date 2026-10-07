@@ -64,7 +64,7 @@ def make(active_ok=True, run="complete", idle_ok=True):
     ct.ready_arm = lambda *a, **k: (calls.append("ready_arm"), {"ok": True})[1]
     ct.ready_disarm = lambda *a, **k: calls.append("ready_disarm")
     ct.pulse_cursor = lambda: 0
-    ct._collect_pulse_events = lambda since, n: (calls.append("collect"), ([{"plateau_ma": 40}], 1228))[1]
+    ct._collect_pulse_events = lambda since, n, *a: (calls.append("collect"), ([{"plateau_ma": 40}], 1228))[1]
     return ct, calls, seen
 
 

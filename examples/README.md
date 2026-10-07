@@ -14,6 +14,24 @@ an edge sent earlier is lost. Always ends with HV off and filament F at STOP.
 The callback and its timing rules are documented in `fire_single_pulse`'s
 docstring ("EXTERNAL TRIGGER").
 
+## `fire_steps.py` — fire_single_pulse's steps called one by one
+
+```bash
+python3 fire_steps.py --host 192.168.8.218 -f 16 55 70
+python3 fire_steps.py --host 192.168.8.218 -f 16 --trigger ext
+```
+
+`fire_single_pulse()` is `shot_prepare` → `shot_measure_arm` (optional) →
+`shot_arm` → `shot_trigger` → `shot_wait` → `shot_records` → `shot_measured`
+(optional). Each takes and returns the SHOT dict; a failed step returns it with
+`ok=False` and every later step passes it through, and `shot_abort(shot)`
+disarms whatever was armed (use it in a `finally`). This script prepares and
+arms at IDLE, raises ACTIVE right before the trigger and goes back to IDLE
+before reading the results, and prints how long each filament was at ACTIVE.
+For the one-call version of the same order:
+`fire_single_pulse(..., active_ma=2700, idle_ma=1300)`. Both are shown, with
+liuxing_api.py's settings, in `../liuxing_api_example.py` (`MODE`).
+
 ## `step_fire_schedule.py` — a short schedule, one filament per trigger, heated by the firmware
 
 ```bash
