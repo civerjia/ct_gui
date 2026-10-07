@@ -15,6 +15,7 @@ STM32 = the device's HTTP /stm32 status (age_ms).
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import csv
 import enum
@@ -1809,7 +1810,7 @@ def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) ->
 
 
 def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
-                           channels=None) -> dict:
+                           channels=None, window: int | None = None) -> dict:
     # PIPELINED download: build the whole ordered frame list, then fire it with a
     # sliding window so the ~per-frame round-trip latencies overlap instead of
     # serializing. Order only matters within emit/heat (CLEAR must precede its
@@ -1932,8 +1933,23 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
         # Serial send: each frame round-trips in ~20 ms (with the interrupt RX ring the
         # RP2350 answers immediately), so a full ~14 KB schedule downloads in ~2 s and is
         # reliable (Verify/CRC confirms). One retry per frame covers a rare transient.
+        #
+        # window > 1: the first pass keeps `window` frames in flight. Any frame
+        # not confirmed there sends everything from the FIRST such frame on
+        # again, serially -- not just the failed ones, because a re-sent CLEAR
+        # would wipe the entries already written after it.
+        win = max(1, int(DOWNLOAD_WINDOW if window is None else window))
         results = []
-        for i, (ft, payload, flags) in enumerate(reqs):
+        start = 0
+        if win > 1:
+            first = link.client.send_pipeline(reqs, window=win,
+                                              timeout=DOWNLOAD_FRAME_TIMEOUTS_S[0],
+                                              on_progress=_on_prog)
+            bad = [i for i, r in enumerate(first) if not (isinstance(r, dict) and _status_ok(r))]
+            start = bad[0] if bad else len(reqs)
+            results = list(first[:start])
+            pipeline_resent = len(reqs) - start
+        for i, (ft, payload, flags) in enumerate(reqs[start:], start):
             link.hold_monitor()
             r = None
             # Every download frame is idempotent (writes a table slot / config
@@ -1972,6 +1988,10 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     with _DL_LOCK:
         _DL_PROGRESS[controller] = {"phase": "done", "done": total, "total": total}
     per_frame = total_ms / max(1, total)
+    if win > 1:
+        timing_extra = {"window": win, "resent": pipeline_resent}
+    else:
+        timing_extra = {"window": 1}
     print(f"[download] P{controller + 1}: {total_ms} ms, {total} frames "
           f"({per_frame:.0f} ms/frame) | currents {cur_n}f (+{cur_skipped} cached) · emit {emit_frames}f · heat {hn // SHV_HEAT_CHUNK + 1}f"
           + (f" · {len(fails)} FAILED: {fails[:6]}" if fails else ""), flush=True)
@@ -1992,7 +2012,7 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
     out = {"controller": controller, "ok": ok, "emit": n, "heat": hn,
            "frames": total, "curSent": cur_n, "curCached": cur_skipped,
            "fails": len(fails), "failLabels": fails[:12],
-           "timing": {"total": total_ms}}
+           "timing": {"total": total_ms, **timing_extra}}
     if not ok:
         # Why, per failed frame (the firmware's error or "no answer"), so a
         # failed download reads as more than "failed".
@@ -3743,13 +3763,21 @@ class CtHandler(BaseHTTPRequestHandler):
                 links = [(cid, link) for cid, link in CONTROLLERS.items() if link.client.connected]
                 with _DL_LOCK:
                     _DL_PROGRESS.clear()   # fresh progress for the GUI poller
-                results = []
-                for cid, link in links:
+                window = body.get("window")
+                parallel = bool(body.get("parallel", DOWNLOAD_PARALLEL))
+
+                def _one(cid, link):
                     try:
-                        results.append(download_to_controller(link, cid - 1, plan, channels))
+                        return download_to_controller(link, cid - 1, plan, channels, window=window)
                     except Exception as exc:
                         link.set_poll_paused(False)   # ensure poll resumes even on exception
-                        results.append({"controller": cid - 1, "ok": False, "error": str(exc)})
+                        return {"controller": cid - 1, "ok": False, "error": str(exc)}
+                if parallel and len(links) > 1:
+                    # Separate bridges, separate links: nothing shared but WiFi.
+                    with concurrent.futures.ThreadPoolExecutor(len(links)) as pool:
+                        results = list(pool.map(lambda cl: _one(*cl), links))
+                else:
+                    results = [_one(cid, link) for cid, link in links]
                 if not results:
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
                 ok_all = all(r.get("ok") for r in results)

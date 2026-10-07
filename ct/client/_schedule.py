@@ -1202,8 +1202,30 @@ class _ScheduleMixin:
         on_armed=None,               # callable() run after arming,
                                       # immediately before the trigger
                                       # -- see emission_ramp()
+        active_ma: float | None = None,  # heat to ACTIVE at this current
+                                          # only AFTER the arm, fire, and
+                                          # drop to idle_ma at once -- see
+                                          # "active_ma" in the docstring
+        idle_ma: float | None = None,    # active_ma only: IDLE current to
+                                          # return to right after the pulse
+        heat_timeout_s: float = 5.0,     # active_ma only: longest wait for
+                                          # the ACTIVE current to arrive
     ) -> dict:
         """Download a one-entry schedule, arm it, fire, and verify.
+
+        active_ma: keep the filament at ACTIVE only for the shot. Without it
+        the caller raises ACTIVE first and every setup step below (detector
+        arm, schedule check/download, arm, safety read) runs while the
+        filament sits at firing current -- 4-9 s per filament measured
+        2026-10-07, against a 2-3 s heat-up. With it, the filament must be at
+        IDLE; everything is prepared at IDLE, ACTIVE is raised after the arm
+        (and verified, up to heat_timeout_s), the trigger follows at once,
+        and the filament goes back to idle_ma as soon as the run is over --
+        before the pulse log and the detector events are read. ACTIVE time
+        is then the heat-up plus the pulses. The firmware's total_ms clock
+        starts at ARM, so heat_timeout_s is added to it here. As a backstop
+        the ACTIVE is timed in the backend (active_s), so a client that dies
+        mid-shot still drops back to idle_ma.
 
         IT DOES NOT HEAT THE FILAMENT. The schedule it builds carries an EMPTY
         heating table and this method calls nothing in the power-state ladder,
@@ -1471,13 +1493,97 @@ class _ScheduleMixin:
                               f"{self._BG_WINDOW_US:.0f} us on each side). Fire "
                               f"further apart, shorten bg_gap_us/bg_window_us, or "
                               f"pass measure=False if you do not need the charge.")}
+        if active_ma is not None:
+            return self._fire_heated(
+                filament, active_ma, idle_ma, heat_timeout_s,
+                dict(num_pulses=num_pulses, width_us=width_us,
+                     inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                     total_ms=total_ms, controller=controller, trigger=trigger,
+                     timeout_s=timeout_s, verify=verify, reuse=reuse,
+                     measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
+                     bg_window_us=bg_window_us, on_armed=on_armed))
+        return self._fire_single(
+            filament, num_pulses=num_pulses, width_us=width_us,
+            inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+            total_ms=total_ms, controller=controller, trigger=trigger,
+            timeout_s=timeout_s, verify=verify, reuse=reuse, measure=measure,
+            rate_hz=rate_hz, bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
+            on_armed=on_armed)
+
+    def _fire_heated(self, filament: int, active_ma: float, idle_ma, heat_timeout_s: float,
+                     kw: dict) -> dict:
+        """fire_single_pulse(active_ma=...): prepare at IDLE, ACTIVE only
+        between the arm and the end of the run. See its docstring."""
+        if idle_ma is None:
+            return {"ok": False, "fired": 0, "records": [], "status": {},
+                    "error": "active_ma needs idle_ma: the IDLE current to drop "
+                             "back to as soon as the pulse is done"}
+        user_on_armed = kw.pop("on_armed", None)
+        heat = {"raised": False, "dropped": False, "active": None, "idle": None,
+                "t_active": None, "t_idle": None}
+
+        def raise_active():
+            if callable(user_on_armed):
+                user_on_armed()
+            heat["raised"] = True        # from here on, the finally drops it
+            heat["t_active"] = time.monotonic()
+            # Backstop in the BACKEND: held while the run is armed/running,
+            # applied when it ends -- so a client that dies after this line
+            # still returns the filament to idle_ma.
+            r = self.active_one(filament, active_ma, verify=True,
+                                timeout_s=heat_timeout_s,
+                                active_s=float(heat_timeout_s) + float(kw["timeout_s"]) + 5.0,
+                                then_idle_ma=idle_ma)
+            heat["active"] = r
+            if not r.get("ok"):
+                # Refused (not at IDLE, dead, ...): ACTIVE never applied, so
+                # there is nothing to drop -- an IDLE here could even heat a
+                # filament that was below IDLE. An exception above (outcome
+                # unknown) keeps "raised" and gets the drop.
+                heat["raised"] = False
+                raise RuntimeError(f"ACTIVE {active_ma} mA not accepted: "
+                                   f"{r.get('error') or r}")
+
+        def drop_idle():
+            # Called when the run ends and again from the finally: a failed
+            # drop gets one more try there.
+            if heat["raised"] and not heat["dropped"]:
+                try:
+                    heat["idle"] = self.idle_one(filament, idle_ma)
+                except Exception as exc:
+                    heat["idle"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                heat["dropped"] = bool(heat["idle"].get("ok"))
+                heat["t_idle"] = time.monotonic()
+
+        # The firmware's total clock runs from ARM; the heat-up is now inside it.
+        kw["total_ms"] = int(kw["total_ms"]) + int(float(heat_timeout_s) * 1000) + 1000
+        try:
+            out = self._fire_single(filament, on_armed=raise_active,
+                                    after_fire=drop_idle, **kw)
+        finally:
+            drop_idle()
+        out["heating"] = (heat["active"] or {}).get("heating")
+        if heat["t_active"] is not None and heat["t_idle"] is not None:
+            out["active_s"] = round(heat["t_idle"] - heat["t_active"], 2)
+        if heat["idle"] is not None and not heat["idle"].get("ok"):
+            out["ok"] = False
+            out["error"] = ((out["error"] + "; ") if out.get("error") else "") + (
+                f"could not return filament {filament} to IDLE {idle_ma} mA after "
+                f"the shot: {heat['idle'].get('error') or heat['idle']} -- the "
+                f"backend's timed ACTIVE will still drop it")
+        return out
+
+    def _fire_single(self, filament: int, num_pulses, width_us, inter_pulse_ms,
+                     max_on_ms, total_ms, controller, trigger, timeout_s, verify,
+                     reuse, measure, rate_hz, bg_gap_us, bg_window_us,
+                     on_armed=None, after_fire=None) -> dict:
         if not measure:
             return self._fire_core(
                 filament, num_pulses=num_pulses, width_us=width_us,
                 inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
                 total_ms=total_ms, controller=controller, trigger=trigger,
                 timeout_s=timeout_s, verify=verify, reuse=reuse,
-                on_armed=on_armed)
+                on_armed=on_armed, after_fire=after_fire)
 
         # Arm BEFORE firing -- a detector armed afterwards has already missed
         # the pulses. If it can't arm we fire nothing: silently firing HV that
@@ -1544,7 +1650,7 @@ class _ScheduleMixin:
                 inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
                 total_ms=total_ms, controller=controller, trigger=trigger,
                 timeout_s=timeout_s, verify=verify, reuse=reuse,
-                on_armed=on_armed)
+                on_armed=on_armed, after_fire=after_fire)
             measured, ref_mv = self._collect_pulse_events(since, int(num_pulses))
             out = {**fired, "measured": measured, "ref_mv": ref_mv,
                    "ok": bool(fired.get("ok")) and len(measured) >= int(num_pulses)}
@@ -1653,6 +1759,9 @@ class _ScheduleMixin:
                                 # default because it has a real, documented
                                 # safety gap (see the docstring) — opt in only
                                 # when you understand it.
+        after_fire=None,       # callable() run the moment the run is over
+                                # (complete, fault or timeout), before the
+                                # pulse log is read -- drops ACTIVE early
     ) -> dict:
         """Fire one schedule entry and wait for it. The body of
         fire_single_pulse() -- see that method for the full contract;
@@ -1872,6 +1981,15 @@ class _ScheduleMixin:
                                               f"{r.get('error', r)}",
                         "fired": 0, "records": [], "status": {}}
 
+        def _after():
+            # The run is over: hand back to the caller (e.g. drop ACTIVE) before
+            # the slower read-backs. Its failure must not lose the shot result.
+            if callable(after_fire):
+                try:
+                    after_fire()
+                except Exception:
+                    pass      # its owner records its own outcome
+
         deadline = time.monotonic() + timeout_s
         state = SHV_IDLE
         # This loop runs WHILE the schedule is firing, on the same single
@@ -1886,6 +2004,7 @@ class _ScheduleMixin:
             state = st.get("state", SHV_IDLE)
             if state == SHV_FAULT:
                 self._disarm_all(armed_set)
+                _after()
                 return {"ok": False,
                         "error": f"SHV fault on controller {controller}: "
                                 f"filament {st.get('faultFilament')}, reason "
@@ -1893,6 +2012,7 @@ class _ScheduleMixin:
                                 f" ({st.get('stopReason')})",
                         "fired": 0, "records": [], "status": st, "schedule": reuse_note}
             if state == SHV_COMPLETE:
+                _after()
                 logs = self.shv_pulse_log(controller)
                 fired = [r for r in logs if r.get("filament") == filament]
                 out = {"ok": bool(fired), "fired": len(fired),
@@ -1948,6 +2068,7 @@ class _ScheduleMixin:
             time.sleep(next(naps))
 
         self._disarm_all(armed_set)
+        _after()
         return {"ok": False, "timeout": True,
                 "error": f"timed out after {timeout_s} s (state={state})",
                 "fired": 0, "records": [], "status": {}, "schedule": reuse_note}

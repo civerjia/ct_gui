@@ -402,6 +402,14 @@ DOWNLOAD_FRAME_TIMEOUTS_S = (1.0, 2.0, 4.0)   # per download frame: first try sh
                                               # reply, not a slow one, is what a timeout means)
 POLL_PAUSE_MAX_S = 15.0   # max time a background-PING pause survives without a re-arm
 
+# Schedule download pacing (overridable per /api/download request: "window",
+# "parallel"). window = frames in flight per controller: the RP2350 handles
+# every frame it has buffered each main-loop pass, so with the filaments
+# heating (a pass takes 100-200 ms) a window of N lands ~N frames per pass
+# instead of one. parallel = both controllers at once (separate bridges).
+DOWNLOAD_WINDOW = 1
+DOWNLOAD_PARALLEL = False
+
 
 # ---------------------------------------------------------------------------
 # Logging. There was none: everything went to stdout and died with the terminal,
@@ -556,6 +564,8 @@ ESPCMD = EspCmdClient()
 # fails if this falls out of step with the module's globals.
 __all__ = [
     "DOWNLOAD_FRAME_TIMEOUTS_S",
+    "DOWNLOAD_WINDOW",
+    "DOWNLOAD_PARALLEL",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",
     "BaseHTTPRequestHandler", "CALIB_DIR", "CH_FILAMENT_CURRENTS",
     "CH_GET_BOARD_BITMAPS", "CH_GET_BOARD_CACHE", "CH_GET_BOARD_HEALTH",

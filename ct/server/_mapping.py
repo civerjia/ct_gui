@@ -218,6 +218,8 @@ def order_validate(seq) -> str | None:
 # fails if this falls out of step with the module's globals.
 __all__ = [
     "DOWNLOAD_FRAME_TIMEOUTS_S",
+    "DOWNLOAD_WINDOW",
+    "DOWNLOAD_PARALLEL",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",
     "BaseHTTPRequestHandler", "CALIB_DIR", "CH_FILAMENT_CURRENTS",
     "CH_GET_BOARD_BITMAPS", "CH_GET_BOARD_CACHE", "CH_GET_BOARD_HEALTH",

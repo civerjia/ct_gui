@@ -384,6 +384,8 @@ def invalidate_currents_cache(controller: int | None = None) -> None:
 # fails if this falls out of step with the module's globals.
 __all__ = [
     "DOWNLOAD_FRAME_TIMEOUTS_S",
+    "DOWNLOAD_WINDOW",
+    "DOWNLOAD_PARALLEL",
     "RETRY_TIMEOUTS_S", "request_retry", "shv_status_retry",
     "deque",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",

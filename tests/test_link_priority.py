@@ -174,7 +174,7 @@ check("a failed disarm names the board and the reason",
       not r["ok"] and "Power 1" in (r.get("error") or "") and "0x78" in r["error"], str(r))
 S.CONTROLLERS[1] = FakeLink("P1", 0)
 real_dl = S.download_to_controller
-S.download_to_controller = lambda link, c0, plan, ch: (
+S.download_to_controller = lambda link, c0, plan, ch, **k: (
     {"controller": c0, "ok": False, "error": "Power 1: 1 of 6 frames not accepted (config: no answer)"}
     if c0 == 0 else {"controller": c0, "ok": True})
 r = post("/api/download", {"plan": {"emission": [{"filament": 1, "numPulses": 1, "widthUs": 100}],
