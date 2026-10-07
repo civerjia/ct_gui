@@ -1094,7 +1094,7 @@ const TESTS_HTML = `
   </div>
 
   <div class="test-block" id="testBlock7">
-    <div class="block-title" title="Emission −V and focus −V up and read back; every filament cold (STANDBY) except the one under test, which is heated at IDLE for the set time while focus is watched. Focus pulled to the emission voltage (|focus| &lt; 1.15 × |emission|) = SHORT: that filament goes to SLEEP at once and the test waits for focus to come back. No grid switch is closed, nothing is fired. Runs in the backend (also ct.heat_short_test()); refuses to start with emission or focus on.">7 · Heat-short test <span class="hint">ⓘ</span></div>
+    <div class="block-title" title="Emission −V and focus −V up and read back; every filament cold (STANDBY) except the one under test, which is heated at IDLE for the set time while focus is watched. Focus falling from its own cold baseline by more than max(20 V, 10 %) = SHORT (never compared with emission: focus below emission is a legal setting): that filament goes to SLEEP at once and the test waits for focus to come back. No grid switch is closed, nothing is fired. Runs in the backend (also ct.heat_short_test()); refuses to start with emission or focus on.">7 · Heat-short test <span class="hint">ⓘ</span></div>
     <div class="test-params">
       <label class="numlabel">heat mA<input id="t7Ma" type="number" min="100" max="3000" step="50" value="1300" /></label>
       <label class="numlabel">heat s<input id="t7S" type="number" min="1" max="120" step="1" value="8" /></label>

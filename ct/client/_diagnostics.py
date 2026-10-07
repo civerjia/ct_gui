@@ -298,8 +298,12 @@ class _DiagnosticsMixin:
     # heats ONE filament at a time with both rails up and watches for exactly
     # that, so the filament can be named.
 
-    #: |focus| below this x |emission| = focus pulled to the emission rail.
-    _HEAT_SHORT_RATIO = 1.15
+    #: A SHORT is focus falling away from its own cold baseline by more than
+    #: max(_HEAT_SHORT_DROP_V, _HEAT_SHORT_DROP_FRAC x |baseline|). Never a
+    #: comparison with emission: focus is sometimes run below emission on
+    #: purpose, and that is not a fault.
+    _HEAT_SHORT_DROP_V = 20.0
+    _HEAT_SHORT_DROP_FRAC = 0.10
 
     def heat_short_test(self, filaments=None,
                         heat_ma: float = 1300.0,
@@ -325,7 +329,10 @@ class _DiagnosticsMixin:
         Then it goes back to SLEEP (heater off) before the next one. No grid
         switch is ever closed and nothing is fired.
 
-        A SHORT is |focus| < 1.15 x |emission|. The filament goes to SLEEP at
+        A SHORT is focus falling from its cold baseline (read with every
+        filament cold, rails up) by more than max(20 V, 10 %). Not a comparison
+        with emission -- focus below emission is a legal setting. The filament
+        goes to SLEEP at
         once, and the test waits up to recover_s for focus to come back: a
         focus that does not come back means the next filament cannot be judged,
         so the test stops there and says so. stop_on_short=True stops at the
@@ -352,7 +359,8 @@ class _DiagnosticsMixin:
         out NEGATIVE (-1.5 to -2.2 mA seen). A positive step of ~2 mA per path
         would instead mean a grid MOSFET conducting.
         """
-        ratio = self._HEAT_SHORT_RATIO
+        drop_v, drop_frac = self._HEAT_SHORT_DROP_V, self._HEAT_SHORT_DROP_FRAC
+        f0_holder = {"f0": None}       # |focus| cold baseline, set once read
         params = {"heat_ma": heat_ma, "heat_s": heat_s, "emission_v": -abs(emission_v),
                   "limit_ma": limit_ma, "focus_v": -abs(focus_v), "recover_s": recover_s}
         wanted, problems = self._mosfet_targets(filaments)
@@ -375,9 +383,10 @@ class _DiagnosticsMixin:
                 return None
             f, e = float(a["focus_v"]), float(a["emiss_v"])
             i = a.get("emiss_i_ma")
+            f0 = f0_holder["f0"]
             return {"focus_v": f, "emission_v": e,
                     "emission_i_ma": None if i is None else float(i),
-                    "short": abs(e) > 50 and abs(f) < ratio * abs(e)}
+                    "short": f0 is not None and abs(f) < f0 - max(drop_v, drop_frac * f0)}
 
         def wait_recovered(limit_s):
             t0 = time.time()
@@ -422,6 +431,7 @@ class _DiagnosticsMixin:
                         return {"ok": False, "params": params, "baseline": baseline,
                                 "results": {}, "counts": {}, "problems": problems}
                     i0 = baseline["emission_i_ma"]
+                    f0_holder["f0"] = abs(baseline["focus_v"])
 
                     for f in wanted:
                         if callable(abort) and abort():

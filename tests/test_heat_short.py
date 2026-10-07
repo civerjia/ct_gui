@@ -101,7 +101,8 @@ class Rig:
         if not self.hv["focus_on"]:
             return {"ok": True, "focus_v": 0.0, "emiss_v": -197.8, "emiss_i_ma": 11.6}
         if self.shorted():
-            return {"ok": True, "focus_v": -196.0, "emiss_v": -197.8, "emiss_i_ma": 10.1}
+            return {"ok": True, "focus_v": getattr(self, "collapse_to", -196.0),
+                    "emiss_v": -197.8, "emiss_i_ma": 10.1}
         return {"ok": True, "focus_v": -self.focus_set + 2, "emiss_v": -197.8, "emiss_i_ma": 11.6}
 
 
@@ -148,6 +149,24 @@ check("stop_on_short -> stops after the first", list(r["results"]) == [0], r["re
 rig = Rig(hv_on=True)
 r = run(rig, filaments=[0])
 check("HV already on -> refused", not r["ok"] and "already ON" in r["problems"][-1] and not rig.calls, (r, rig.calls))
+
+# 5b. Focus deliberately BELOW emission (150 V vs 200 V) and healthy: no short.
+rig = Rig()
+ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
+rig.install(ct)
+r = ct.heat_short_test(filaments=[0, 1], heat_s=0.5, sample_s=0.05, recover_s=1.0,
+                       focus_v=150, emission_v=200)
+check("focus below emission on purpose -> not a short", r["ok"] and r["counts"]["short"] == 0, r)
+
+# 5c. ...and a real collapse from that lower focus is still caught.
+rig = Rig(culprit=1, after=0.2, recover=0.2)
+rig.collapse_to = -60.0
+ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
+rig.install(ct)
+r = ct.heat_short_test(filaments=[0, 1], heat_s=1.0, sample_s=0.05, recover_s=1.0,
+                       focus_v=150, emission_v=200)
+check("collapse from a low focus setting still caught", r["results"][1]["verdict"] == "short"
+      and r["results"][0]["verdict"] == "ok", r["results"])
 
 # 6. Abort between filaments.
 rig = Rig()
