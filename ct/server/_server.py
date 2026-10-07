@@ -2299,6 +2299,59 @@ def heat_short_status() -> dict:
         return {"ok": True, **copy.deepcopy({k: v for k, v in _HEAT_SHORT.items()})}
 
 
+def hv_preflight_switches(reason: str) -> dict:
+    """Before a rail goes ON: every grid switch on every connected controller
+    must READ open (real 165 read + the firmware's desired byte). Any that is
+    closed is forced open and confirmed (force_grid_off); if that cannot be
+    confirmed the rail must not come on.
+
+    2026-10-07 10:16: after P1 was power-cycled three of its switches (CH1.1,
+    CH1.2, CH5.1) read CLOSED while the firmware's desired byte was 0 -- most
+    likely the 595s powered up after the RP2350 had cleared them. Emission came
+    on, three unrelated sub-boards conducted (+6 mA) and focus could not rise.
+    Whatever closed them, they are opened here, before HV, and it is logged.
+
+    A controller running a schedule is skipped (the PIO owns the shift chain;
+    closed switches are its job), and so is a disconnected one -- both are
+    listed under "unchecked" rather than passed silently."""
+    opened, unchecked, problems = {}, [], []
+    for cid, link in sorted(CONTROLLERS.items()):
+        if not link or not link.client.connected:
+            unchecked.append(f"Power {cid}: not connected")
+            continue
+        try:
+            st = shv_status_retry(link)
+            if st and st.get("state") in (1, 2):
+                unchecked.append(f"Power {cid}: schedule {'running' if st.get('state') == 2 else 'armed'}")
+                continue
+            got = _hv_bytes(link)
+        except Exception as exc:
+            problems.append(f"Power {cid}: switch state unreadable ({exc})")
+            continue
+        if got is None:
+            problems.append(f"Power {cid}: switch state unreadable")
+            continue
+        desired, feedback = got
+        closed = {ch: desired[ch] | feedback[ch] for ch in range(8) if desired[ch] | feedback[ch]}
+        if not closed:
+            continue
+        log.warning("HV preflight %s: Power %d switch(es) %s CLOSED (desired %s, read-back %s) "
+                    "-- opening before the rail comes on", reason, cid, _masks_text(closed),
+                    desired, feedback)
+        r = force_grid_off(link, cid, closed, reason=f"HV preflight {reason}")
+        if r.get("ok"):
+            _note_forced_open(cid, closed)
+            opened[str(cid)] = _masks_text(closed)
+        else:
+            problems.append(r.get("error") or f"Power {cid}: could not open {_masks_text(closed)}")
+    out = {"ok": not problems, "opened": opened, "unchecked": unchecked}
+    if problems:
+        out["error"] = ("HV NOT turned on: grid switch(es) closed or unreadable before the "
+                        "rail came on -- " + "; ".join(problems))
+        log.error("HV preflight %s refused: %s", reason, out["error"])
+    return out
+
+
 def hv_write_off_masks(command: str, body: dict) -> dict[int, int] | None:
     """Switches a raw HV write could have left in an unknown state, or None if
     `command` does not write the HV grid. Used when the write did not come back
@@ -4988,9 +5041,18 @@ class CtHandler(BaseHTTPRequestHandler):
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 _hv_ch, _hv_on = str(body.get("ch", "emission")), bool(body.get("on"))
+                preflight = None
+                if _hv_on:
+                    preflight = hv_preflight_switches(f"before {_hv_ch} ON (by {self._client(body)})")
+                    if not preflight["ok"]:
+                        return self._json({"ok": False, "error": preflight["error"],
+                                           "preflight": preflight}, HTTPStatus.OK)
                 # Not watched by the dead-man timer: the rails are only ever
                 # turned off by a person (see SAFETY_HV_TIMEOUT_S).
-                self._json(stm32_hv_enable_set(host, _hv_ch, _hv_on))
+                out = stm32_hv_enable_set(host, _hv_ch, _hv_on)
+                if preflight and (preflight.get("opened") or preflight.get("unchecked")):
+                    out = {**out, "preflight": preflight}
+                self._json(out)
             elif path == "/api/stm32/hv-set-target":
                 # Proxy to `/stm32/hv_set_target` — starts the STM32's closed
                 # HV loop for one channel: it steps the DS3502 wiper by
