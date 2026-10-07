@@ -311,13 +311,41 @@ def note_active_transition(fid: int, old_state, new_state: int, when: float) -> 
         IDLE_SINCE.pop(int(fid), None)
 
 
+# Who last commanded each filament's power state (the "owner"). A keepalive
+# with no explicit filament list renews ONLY its sender's filaments: it used to
+# renew every filament, so when the client that held a filament at ACTIVE
+# crashed, any other client that had ever energised anything (a monitor that
+# once set IDLE) kept that ACTIVE alive forever (2026-10-07, two
+# combined_clients). The owner is the request's session (X-CT-Session, set by
+# backend-side remote sessions) or its X-CT-Client, captured per request thread.
+POWER_OWNER: dict[int, str] = {}
+_REQUEST_OWNER = threading.local()
+
+
+def set_request_owner(owner: str | None) -> None:
+    """Called at the top of every POST: whose commands this thread carries."""
+    _REQUEST_OWNER.owner = owner
+
+
+def request_owner() -> str | None:
+    return getattr(_REQUEST_OWNER, "owner", None)
+
+
+def owned_filaments(owner: str) -> list[int]:
+    with _SAFETY_LOCK:
+        return [f for f, o in POWER_OWNER.items() if o == owner]
+
+
 def note_power_state(fids, state: int, args=None) -> None:
     """Record CONFIRMED power-state commands. `args`: the mA each FID was given
     ({fid: mA}, or one number for all) -- kept for IDLE, as a timed ACTIVE's
     default return current."""
     now = time.monotonic()
+    owner = request_owner()
     with _SAFETY_LOCK:
         for f in fids:
+            if owner:
+                POWER_OWNER[int(f)] = owner
             prev = LAST_POWER_STATE.get(int(f))
             note_active_transition(int(f), prev[0] if prev else None, int(state), now)
             LAST_POWER_STATE[int(f)] = (int(state), now)
@@ -429,6 +457,7 @@ def _with_dead_stopped(out: dict, stopped: dict) -> dict:
 # "not defined" -- goto definition stopped working. tests/test_star_exports.py
 # fails if this falls out of step with the module's globals.
 __all__ = [
+    "POWER_OWNER", "_REQUEST_OWNER", "set_request_owner", "request_owner", "owned_filaments",
     "RETRY_TIMEOUTS_S", "request_retry", "shv_status_retry",
     "deque",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",

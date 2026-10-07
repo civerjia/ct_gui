@@ -3471,6 +3471,8 @@ class CtHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         client = self._client(body)
         self._audit_client = client
+        sess = self.headers.get("X-CT-Session")
+        set_request_owner(f"{client}#{str(sess)[:12]}" if sess else client)
         _note_client(client, self.client_address[0], path)
         held = self._lease_guard(path, body, client)
         if held is not None:
@@ -3999,8 +4001,11 @@ class CtHandler(BaseHTTPRequestHandler):
                 changed = {}
                 if body.get("keepalive"):
                     fids = body.get("filaments")
+                    # No list = THIS client's own filaments only (POWER_OWNER),
+                    # never everyone's: a monitor's keepalive must not hold up
+                    # a crashed client's ACTIVE filament.
                     safety_touch_filaments([int(f) for f in fids] if fids
-                                           else list(LAST_POWER_STATE.keys()))
+                                           else owned_filaments(request_owner() or ""))
                     safety_touch_hv()
                     changed["keepalive"] = True
                 bad = []

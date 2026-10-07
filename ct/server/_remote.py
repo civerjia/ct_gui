@@ -46,6 +46,9 @@ class _Session:
         self.sid = uuid.uuid4().hex
         self.client_id = client_id
         self.ct = CTClient("127.0.0.1", port=port, client_id=client_id, _local=True, **kw)
+        # Two scripts may share a client_id (two combined_clients): the session
+        # id tells their filaments apart for the dead-man keepalive.
+        self.ct._s.headers["X-CT-Session"] = self.sid
         self.lock = threading.RLock()
         self.last = time.monotonic()
         self.cms: dict[int, Any] = {}           # open/openable context managers
