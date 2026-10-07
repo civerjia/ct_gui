@@ -39,6 +39,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    fetch_wifi_diag,
     mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
@@ -346,7 +347,7 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
     # Status: every tick while idle (cheap, no I2C), 1 Hz while a run owns it.
     if not owns or (now - snap["status_at"]) >= MONITOR_RUN_STATUS_S:
         try:
-            st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+            st = shv_status_retry(link)
         except Exception:
             st = None
         if st is not None:
@@ -858,7 +859,10 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
         reject = raw[1] if len(raw) > 1 else None
         return {"ok": bool(raw) and raw[0] == 0 and reject == 0, "reject": reject}
     if op == "disarm":
-        return {"ok": _status_ok(link.request(SHV_DISARM, b""))}
+        try:
+            return {"ok": _status_ok(request_retry(link, SHV_DISARM, b"", ok=_status_ok))}
+        except Exception as exc:
+            return {"ok": False, "error": f"disarm got no OK after {len(RETRY_TIMEOUTS_S)} tries: {exc}"}
     if op == "status":
         return {"ok": True, "status": decode_shv_status(link.request(SHV_GET_STATUS, b""))}
     if op == "pulse_log":
@@ -1932,9 +1936,12 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
         for i, (ft, payload, flags) in enumerate(reqs):
             link.hold_monitor()
             r = None
-            for _try in range(2):
+            # Every download frame is idempotent (writes a table slot / config
+            # value). Three tries, each longer: 2026-10-06 nine downloads
+            # failed on two 3 s tries while the master ESP32 held replies.
+            for _tmo in (3.0, 4.0, 6.0):
                 try:
-                    r = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
+                    r = link.client.send_request(ft, payload, flags=flags, timeout=_tmo)
                     if _status_ok(r):
                         break
                 except Exception as exc:
@@ -1982,6 +1989,18 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
            "frames": total, "curSent": cur_n, "curCached": cur_skipped,
            "fails": len(fails), "failLabels": fails[:12],
            "timing": {"total": total_ms}}
+    if not ok:
+        # Why, per failed frame (the firmware's error or "no answer"), so a
+        # failed download reads as more than "failed".
+        why = []
+        for i, x in enumerate(oks):
+            if x:
+                continue
+            r = results[i] if isinstance(results[i], dict) else {}
+            why.append(f"{labels[i]}: {r.get('error') or ('status ' + str(r.get('status_code'))) if r else 'no answer'}")
+        out["error"] = (f"Power {controller + 1}: {len(fails)} of {total} frames not accepted "
+                        f"({'; '.join(why[:4])}{' …' if len(why) > 4 else ''}) after {total_ms / 1000:.1f} s "
+                        f"-- the schedule on this controller is NOT the one sent")
     dropped = sorted(set(emit_dead) | set(heat_dead))
     if dropped:
         out["dead_skipped"] = dropped
@@ -2216,6 +2235,162 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         dead_stopped)
 
 
+# ── Heat-short test job (CTClient.heat_short_test, run for the GUI) ─────────
+# One filament heated at a time with both rails up, watching focus for a short
+# to emission (see CTClient.heat_short_test). It takes minutes, so the GUI
+# starts it here and polls; a script can call ct.heat_short_test() directly.
+HEAT_SHORT_CLIENT = "heat-short-test"
+_HEAT_SHORT_LOCK = threading.Lock()
+_HEAT_SHORT: dict[str, Any] = {"running": False, "rows": [], "result": None,
+                                "error": None, "params": None, "started": None,
+                                "finished": None, "abort": False}
+_HEAT_SHORT_KEYS = ("filaments", "heat_ma", "heat_s", "emission_v", "limit_ma",
+                    "focus_v", "recover_s", "stop_on_short")
+
+
+def heat_short_start(body: dict) -> dict:
+    """Start the heat-short test in a backend thread. Refused while one runs."""
+    kw = {k: body[k] for k in _HEAT_SHORT_KEYS if body.get(k) is not None}
+    with _HEAT_SHORT_LOCK:
+        if _HEAT_SHORT["running"]:
+            return {"ok": False, "error": "a heat-short test is already running"}
+        _HEAT_SHORT.update(running=True, rows=[], result=None, error=None, params=kw,
+                           started=time.strftime("%Y-%m-%d %H:%M:%S"), finished=None,
+                           abort=False)
+
+    def _run():
+        from ct.client._client import CTClient
+        result, err = None, None
+        try:
+            port = int(os.environ.get("CT_GUI_PORT", "8770"))
+            ct = CTClient("127.0.0.1", port=port, client_id=HEAT_SHORT_CLIENT, _local=True)
+
+            def _progress(f, row):
+                with _HEAT_SHORT_LOCK:
+                    _HEAT_SHORT["rows"].append({"filament": int(f), **row})
+
+            with ct.lease(ttl=60, note="heat-short test"):
+                result = ct.heat_short_test(progress=_progress,
+                                            abort=lambda: _HEAT_SHORT["abort"], **kw)
+            try:
+                CALIB_DIR.mkdir(exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                (CALIB_DIR / f"heat_short_test_{ts}.json").write_text(
+                    json.dumps(result, indent=2, default=str))
+            except Exception as exc:
+                log.warning("heat-short test: result not saved: %s", exc)
+            shorts = [f for f, r in (result.get("results") or {}).items()
+                      if r.get("verdict") == "short"]
+            log.warning("heat-short test done: %s short(s) %s; problems: %s",
+                        len(shorts), shorts, "; ".join(result.get("problems") or []) or "none")
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            log.exception("heat-short test failed")
+        with _HEAT_SHORT_LOCK:
+            _HEAT_SHORT.update(running=False, result=result, error=err,
+                               finished=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    threading.Thread(target=_run, name="heat-short-test", daemon=True).start()
+    return {"ok": True, "started": _HEAT_SHORT["started"], "params": kw}
+
+
+def heat_short_status() -> dict:
+    with _HEAT_SHORT_LOCK:
+        return {"ok": True, **copy.deepcopy({k: v for k, v in _HEAT_SHORT.items()})}
+
+
+def hv_write_off_masks(command: str, body: dict) -> dict[int, int] | None:
+    """Switches a raw HV write could have left in an unknown state, or None if
+    `command` does not write the HV grid. Used when the write did not come back
+    OK: every bit it touched is then forced OPEN -- an ON that timed out may
+    still land later, and an OFF that timed out may never have landed."""
+    if command == "HV_SET_BIT":
+        return {int(body["channel"]): 1 << int(body["bit"])}
+    if command == "HV_SET_CHANNEL_BYTE":
+        return {int(body["channel"]): 0xFF}
+    if command == "HV_SET_MULTI_CHANNEL":
+        chmask = int(body.get("channel_mask", 0)) & 0xFF
+        return {c: 0xFF for c in range(8) if chmask & (1 << c)}
+    return None
+
+
+def _note_raw_grid(controller: int, command: str, body: dict) -> None:
+    """Tell the dead-man watchdog what a raw HV write closed and opened, so a
+    switch closed by hand (/api/cmd, /api/power-cmd) is timed like one closed
+    by /api/hv-grid. A board with no filament mapped is tracked under its own
+    negative key, -(1 + controller*64 + channel*8 + position): unmapped is not
+    a reason to leave a closed switch untimed."""
+    if command == "HV_SET_BIT":
+        bytes_by_ch = None
+        bits = {(int(body["channel"]), int(body["bit"])): bool(body.get("value"))}
+    else:
+        if command == "HV_SET_CHANNEL_BYTE":
+            bytes_by_ch = {int(body["channel"]): int(body["value"]) & 0xFF}
+        else:
+            chmask = int(body.get("channel_mask", 0)) & 0xFF
+            values = list(body.get("values") or [0] * 8)
+            bytes_by_ch = {c: int(values[c]) & 0xFF for c in range(8) if chmask & (1 << c)}
+        bits = {(c, b): bool(v & (1 << b)) for c, v in bytes_by_ch.items() for b in range(8)}
+    closed, opened = [], []
+    for (ch, pos), on in bits.items():
+        fid = MAPPING.filament_for_board(controller, ch, pos)
+        key = int(fid) if fid is not None else -(1 + controller * 64 + ch * 8 + pos)
+        (closed if on else opened).append(key)
+    if opened:
+        note_grid_commanded(False, opened)
+    if closed:
+        note_grid_commanded(True, closed)
+
+
+def _note_forced_open(controller: int, masks: dict[int, int] | None) -> None:
+    """force_grid_off confirmed these open (None = every switch on the
+    controller): drop them from the watchdog's closed set."""
+    masks = masks or {c: 0xFF for c in range(8)}
+    keys = []
+    for ch, m in masks.items():
+        for pos in range(8):
+            if m & (1 << pos):
+                fid = MAPPING.filament_for_board(controller, ch, pos)
+                keys.append(int(fid) if fid is not None else -(1 + controller * 64 + ch * 8 + pos))
+    note_grid_commanded(False, keys)
+
+
+def hv_raw_write(link: "ControllerLink", controller: int, command: str, body: dict,
+                 builder, timeout: float) -> dict:
+    """A raw HV grid write (/api/cmd, /api/power-cmd) that never leaves a switch
+    in an unknown state. Not OK (timeout, refused, bad status) -> every switch it
+    touched is forced OPEN and confirmed (force_grid_off). An OFF that came back
+    OK but whose own read-back still shows the bit closed -> forced too."""
+    masks = hv_write_off_masks(command, body)
+    resp, err = None, None
+    try:
+        ft, flags, payload = builder(command, body)
+        resp = link.request(ft, payload, flags=flags, timeout=timeout)
+        if not _status_ok(resp):
+            err = "the controller refused it"
+    except Exception as exc:
+        err = str(exc)
+    if err is None and command == "HV_SET_BIT" and not body.get("value"):
+        raw = resp.get("raw") or b""
+        bit = 1 << int(body["bit"])
+        if len(raw) >= 4 and (raw[2] | raw[3]) & bit:
+            err = "its read-back still shows the switch closed"
+    if err is None:
+        _note_raw_grid(controller, command, body)
+        return {"ok": True, "response": resp}
+    forced = force_grid_off(link, controller, masks,
+                            reason=f"{command} {body.get('channel', '')}/{body.get('bit', '')} "
+                                   f"value={body.get('value', '')}: {err}")
+    out = {"ok": False, "response": resp, "forced_off": forced}
+    if forced.get("ok"):
+        _note_forced_open(controller, masks)
+        out["error"] = (f"{command} did not complete ({err}); the switch(es) it touched, "
+                        f"{_masks_text(masks)}, were forced OPEN and confirmed open")
+    else:
+        out["error"] = f"{command} did not complete ({err}). " + forced["error"]
+    return out
+
+
 def hv_grid_set(link: "ControllerLink", controller: int, filaments,
                 on: bool, force: bool) -> dict:
     """Set the ISO HV-grid switch bit for a batch of filaments (this
@@ -2282,7 +2457,20 @@ def hv_grid_set(link: "ControllerLink", controller: int, filaments,
     ft, flags, payload = build_payload("HV_SET_MULTI_CHANNEL", {
         "channel_mask": chmask, "values": values, "force": force,
     })
-    resp = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
+    try:
+        resp = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
+    except Exception as exc:
+        # Unknown outcome: the frame may still land (an ON closing switches
+        # later) or never land (an OFF leaving them closed). Either way every
+        # switch on the touched channels is forced OPEN and confirmed.
+        forced = force_grid_off(link, controller, {ch: 0xFF for ch in by_ch},
+                                reason=f"hv-grid {'on' if on else 'off'} {touched}: {exc}")
+        return {"controller": controller, "ok": False, "applied": [], "failed": touched,
+                "touched": touched, "not_this_controller": not_this_controller,
+                "unslotted": unslotted, "dead_skipped": dead_skipped, "forced_off": forced,
+                "error": f"HV grid write did not complete ({exc}); "
+                         + ("the touched channels were forced OPEN and confirmed open"
+                            if forced.get("ok") else forced["error"])}
     raw = resp.get("raw") if isinstance(resp, dict) else None
     # Response: status, appliedMask, verifiedMask, failedMask, desired[8], feedback[8]
     # (firmware handleHvSetMultiChannel_). appliedMask is per-CHANNEL, so on its own
@@ -2336,7 +2524,7 @@ def hv_grid_set(link: "ControllerLink", controller: int, filaments,
         # therefore the same no-op as 0x13, so don't attempt it: an unconfirmable
         # suspicion is UNKNOWN, not proven-failed.
         try:
-            st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+            st = shv_status_retry(link)
             pio_busy = bool(st) and st.get("state") == 2
         except Exception:
             pio_busy = True          # can't establish it's safe -> assume it isn't
@@ -2389,6 +2577,24 @@ def hv_grid_set(link: "ControllerLink", controller: int, filaments,
         out["verified"] = False
     if dead_skipped:
         out["dead_skipped"] = dead_skipped
+    if not on and not out["ok"]:
+        # An OFF that is not confirmed is not an OFF: force those switches open.
+        bad = set(failed) | set(mismatched) | set(unstable)
+        masks: dict[int, int] = {}
+        for f in bad:
+            _, ch, pos, _ = filament_to_board(f)
+            masks[ch] = masks.get(ch, 0) | (1 << pos)
+        if masks:
+            forced = force_grid_off(link, controller, masks,
+                                    reason=f"hv-grid off not confirmed for {sorted(bad)}")
+            out["forced_off"] = forced
+            if forced.get("ok"):
+                out["ok"] = True
+                out.pop("error", None)
+                out.pop("warning", None)
+                out["note"] = f"filaments {sorted(bad)} needed a forced OFF; now confirmed open"
+            else:
+                out["error"] = forced["error"]
     return out
 
 
@@ -2769,6 +2975,8 @@ class CtHandler(BaseHTTPRequestHandler):
                                   f"it, so this count is not a presence result"
                                   if iso_errors else None),
                         "note": "boards left at Sleep (iso on) after the scan"})
+        elif path == "/api/tests/heat-short":
+            self._json(heat_short_status())
         elif path == "/api/hv-snapshot":
             # Raw per-channel ISO-grid bitmap for one controller (?controller=1|2,
             # via _target_link — not MASTER). HV_GET_ALL_BYTES (0x13) returns two
@@ -3160,7 +3368,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     # stops the RP2350 is dead/hung even though the ESP32 TCP link is up.
                     rp_age = None if c.rp_last == 0 else (time.time() - c.rp_last) * 1000.0
                     try:
-                        st = decode_shv_status(c.request(SHV_GET_STATUS, b"", timeout=1.0))
+                        st = shv_status_retry(c)
                         out[str(k)] = {"connected": True, "status": st, "rp_age_ms": rp_age}
                     except Exception as exc:
                         out[str(k)] = {"connected": True, "error": str(exc), "rp_age_ms": rp_age}
@@ -3434,6 +3642,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 if refusal:
                     log.warning("/api/cmd %s refused: %s", command, refusal["error"])
                     return self._json(refusal, HTTPStatus.OK)
+                if hv_write_off_masks(command, body) is not None:
+                    return self._json(hv_raw_write(link, cid, command, body, build_payload, 2.0))
                 try:
                     frame_type, flags, payload = build_payload(command, body)
                     resp = link.client.send_request(frame_type, payload, flags=flags, timeout=2.0)
@@ -3483,7 +3693,13 @@ class CtHandler(BaseHTTPRequestHandler):
                         results.append({"controller": cid - 1, "ok": False, "error": str(exc)})
                 if not results:
                     return self._json({"ok": False, "error": "no controller connected"}, HTTPStatus.OK)
-                self._json({"ok": all(r.get("ok") for r in results), "results": results})
+                ok_all = all(r.get("ok") for r in results)
+                out = {"ok": ok_all, "results": results}
+                if not ok_all:
+                    out["error"] = "download failed: " + "; ".join(
+                        r.get("error") or f"Power {int(r.get('controller', -1)) + 1}: failed"
+                        for r in results if not r.get("ok"))
+                self._json(out)
             elif path == "/api/verify-schedule":
                 # Read the emission/heat tables back out of each controller and
                 # compare counts to the loaded plan — confirms the download landed.
@@ -3607,7 +3823,7 @@ class CtHandler(BaseHTTPRequestHandler):
                         if results.get(str(cid), {}).get("ok"):
                             try:
                                 results[str(cid)]["disarmed"] = _status_ok(
-                                    CONTROLLERS[cid].request(SHV_DISARM, b"", flags=0))
+                                    request_retry(CONTROLLERS[cid], SHV_DISARM, b"", ok=_status_ok))
                             except Exception as exc:
                                 results[str(cid)]["disarmed"] = False
                                 results[str(cid)]["disarm_error"] = str(exc)
@@ -3635,6 +3851,48 @@ class CtHandler(BaseHTTPRequestHandler):
                     out["error"] = ("arm failed, nothing left armed: " if results else "arm failed: ") \
                         + ("; ".join(why) or "no controller connected")
                 self._json(out)
+            elif path == "/api/tests/heat-short":
+                # Heat-short test: body {action: "start", filaments?, heat_ma?,
+                # heat_s?, emission_v?, limit_ma?, focus_v?, recover_s?,
+                # stop_on_short?} or {action: "abort"} (stops after the
+                # filament being heated; rails off, filaments STOPped).
+                if body.get("action") == "abort":
+                    with _HEAT_SHORT_LOCK:
+                        running = _HEAT_SHORT["running"]
+                        _HEAT_SHORT["abort"] = True
+                    return self._json({"ok": True, "running": running})
+                self._json(heat_short_start(body))
+            elif path == "/api/hv-all-off":
+                # Open EVERY HV grid switch and confirm it from the 165 read-back
+                # (force_grid_off). body {controllers?}. Every bench test ends
+                # with this, whatever happened inside it.
+                want = body.get("controllers")
+                targets = [(cid, link) for cid, link in CONTROLLERS.items()
+                           if link.client.connected
+                           and (want is None or cid in {int(c) for c in want})]
+                results = {}
+
+                def _off_one(cid, link):
+                    results[str(cid)] = force_grid_off(link, cid, None,
+                                                       reason=str(body.get("reason") or ""))
+                    if results[str(cid)].get("ok"):
+                        _note_forced_open(cid, None)
+                threads = [threading.Thread(target=_off_one, args=t, daemon=True) for t in targets]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                missing = sorted({int(c) for c in want} - set(CONTROLLERS)) if want else []
+                down = [cid for cid, link in CONTROLLERS.items()
+                        if (want is None or cid in {int(c) for c in want}) and not link.client.connected]
+                ok_all = bool(results) and all(r.get("ok") for r in results.values()) and not down
+                out = {"ok": ok_all, "results": results}
+                if not ok_all:
+                    why = [r["error"] for r in results.values() if not r.get("ok")]
+                    why += [f"Power {c}: not connected -- its switches could not be opened" for c in down]
+                    why += [f"Power {c}: no such controller" for c in missing]
+                    out["error"] = "; ".join(why) or "no controller connected"
+                self._json(out)
             elif path == "/api/disarm":
                 # Disarm the schedule engine on every connected controller
                 # (SHV_DISARM, 0x78) — the firmware clears the ENTIRE HV ISO
@@ -3653,9 +3911,13 @@ class CtHandler(BaseHTTPRequestHandler):
                 def _disarm_one(cid, link):
                     link.hold_monitor()
                     try:
-                        results[str(cid)] = {"ok": _status_ok(link.request(SHV_DISARM, b"", flags=0))}
+                        # Disarming twice is harmless; giving up on a slow
+                        # reply left "disarm failed" with the board idle.
+                        results[str(cid)] = {"ok": _status_ok(
+                            request_retry(link, SHV_DISARM, b"", ok=_status_ok))}
                     except Exception as exc:
-                        results[str(cid)] = {"ok": False, "error": str(exc)}
+                        results[str(cid)] = {"ok": False, "error": f"no OK after "
+                                             f"{len(RETRY_TIMEOUTS_S)} tries: {exc}"}
                 threads = [threading.Thread(target=_disarm_one, args=t, daemon=True) for t in targets]
                 for t in threads:
                     t.start()
@@ -3665,9 +3927,15 @@ class CtHandler(BaseHTTPRequestHandler):
                 if (results and all(r.get("ok") for r in results.values())
                         and {cid for cid, _ in targets} == connected):
                     note_grid_commanded(False, clear_all=True)
-                self._json({"ok": all(r.get("ok") for r in results.values()) if results else False,
-                            "results": results,
-                            **({} if results else {"error": "no controller connected"})})
+                ok_all = all(r.get("ok") for r in results.values()) if results else False
+                out = {"ok": ok_all, "results": results}
+                if not results:
+                    out["error"] = "no controller connected" + (f" among {sorted(want)}" if want else "")
+                elif not ok_all:
+                    out["error"] = "disarm failed -- the schedule may still be ARMED on: " + "; ".join(
+                        f"Power {c}: {r.get('error') or 'refused'}"
+                        for c, r in sorted(results.items()) if not r.get("ok"))
+                self._json(out)
             elif path == "/api/safety":
                 # Dead-man watchdog: read the state, or change the rules.
                 # POST with any of enabled / active_timeout_s /
@@ -3833,7 +4101,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # passed -- the one case where the answer matters most is
                 # exactly when the link is sick enough to fail the read.
                 try:
-                    st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+                    st = shv_status_retry(link)
                 except Exception as exc:
                     return self._json(
                         {"ok": False, "error": f"cannot confirm controller {cid} is "
@@ -3898,7 +4166,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     if not link.client.connected:
                         continue
                     try:
-                        st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+                        st = shv_status_retry(link)
                         if st and st.get("state") == 2:
                             results[str(cid)] = {"ok": False, "error": "running — disarm first"}
                             continue
@@ -4169,7 +4437,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     if not link.client.connected:
                         continue
                     try:
-                        st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+                        st = shv_status_retry(link)
                         if st and st.get("state") == 2:
                             out[str(cid)] = {"selftest_error": "controller is running a schedule — disarm first"}
                             continue
@@ -4272,9 +4540,16 @@ class CtHandler(BaseHTTPRequestHandler):
                 with _DEAD_LOCK:
                     before = set(DEAD_FIDS)
                     if op == "set":
+                        # Replace the SET of dead filaments, not their history: a
+                        # filament already dead keeps the reason/by/at it was
+                        # marked with. Scripts call set_dead() at every start-up,
+                        # and this used to stamp their boilerplate reason over
+                        # every entry -- 2026-10-06 every reason read "heat-short
+                        # survey ..." and the original ones were gone.
+                        kept = {f: DEAD_FIDS[f] for f in fids if f in DEAD_FIDS}
                         DEAD_FIDS.clear()
                         for f in fids:
-                            DEAD_FIDS[f] = dict(entry)
+                            DEAD_FIDS[f] = kept.get(f) or dict(entry)
                     elif op == "add":
                         for f in fids:
                             DEAD_FIDS.setdefault(f, dict(entry))   # keep the ORIGINAL provenance
@@ -4379,6 +4654,9 @@ class CtHandler(BaseHTTPRequestHandler):
                 if refusal:
                     log.warning("/api/power-cmd %s refused: %s", body.get("command"), refusal["error"])
                     return self._json(refusal, HTTPStatus.OK)
+                if hv_write_off_masks(str(body.get("command", "")), body) is not None:
+                    return self._json(hv_raw_write(link, cid, str(body.get("command", "")), body,
+                                                   build_command_payload, 2.5))
                 try:
                     ft, flags, payload = build_command_payload(str(body.get("command", "")), body)
                     resp = link.client.send_request(ft, payload, flags=flags, timeout=2.5)
@@ -4495,7 +4773,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     if not link.client.connected:
                         continue
                     try:
-                        sh = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+                        sh = shv_status_retry(link)
                         found[f"schedule_{cid}"] = ({"state": sh.get("state"),
                                                      "unsafeSlots": sh.get("unsafeSlots")}
                                                     if sh else None)
@@ -4503,7 +4781,7 @@ class CtHandler(BaseHTTPRequestHandler):
                         # schedule is the one thing here that stops work in
                         # progress, so it is reported distinctly.
                         if sh and sh.get("state") in (1, 2):
-                            link.request(SHV_DISARM, b"", flags=0)
+                            request_retry(link, SHV_DISARM, b"", ok=_status_ok)
                             cleared.append(f"schedule on controller {cid} "
                                            f"(was {'running' if sh.get('state') == 2 else 'armed'})")
                     except Exception as exc:
@@ -5127,7 +5405,7 @@ def _slew_keeper_loop() -> None:
             if not link.client.connected:
                 continue
             try:
-                st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+                st = shv_status_retry(link)
                 if st and st.get("state") in (1, 2):
                     continue                     # armed/running: no ramp change mid-run
                 r = _slew_check_one(link)

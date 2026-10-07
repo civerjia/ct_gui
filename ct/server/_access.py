@@ -26,6 +26,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    fetch_wifi_diag,
     mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
@@ -205,7 +206,7 @@ def is_read_post(path: str, body: dict) -> bool:
 
 #: POSTs that only take the bench DOWN. Never refused by the lease.
 _DEENERGISE_PATHS = frozenset({
-    "/api/disarm", "/api/sync/abort", "/api/sync/simulate-stop",
+    "/api/disarm", "/api/hv-all-off", "/api/sync/abort", "/api/sync/simulate-stop",
     "/api/stm32/hv-clear-target", "/api/adc/ready-disarm", "/api/adc/pulse-disarm",
     "/api/adc/ring-stop", "/api/ringpulse/disarm", "/api/record/stop",
 })
@@ -220,6 +221,8 @@ def is_deenergising_post(path: str, body: dict) -> bool:
     "another client holds the write lease"."""
     if path in _DEENERGISE_PATHS:
         return True
+    if path == "/api/tests/heat-short":
+        return body.get("action") == "abort"
 
     def low_state(v) -> bool:
         try:
@@ -230,8 +233,23 @@ def is_deenergising_post(path: str, body: dict) -> bool:
     if path in ("/api/filament-prep", "/api/filament-state"):
         return low_state(body.get("state"))
     if path in ("/api/cmd", "/api/power-cmd"):
-        return (str(body.get("command", "")) == "CH_SET_POWER_STATE"
-                and low_state(body.get("state")))
+        cmd = str(body.get("command", ""))
+        # Opening HV grid switches: a write of zeros only. A lease must never
+        # stand between anyone and an open switch (2026-10-06: the stray closed
+        # switches could only be cleared by whoever held the lease).
+        try:
+            if cmd == "HV_SET_BIT":
+                return not body.get("value")
+            if cmd == "HV_SET_CHANNEL_BYTE":
+                return int(body.get("value", 1)) & 0xFF == 0
+            if cmd == "HV_SET_MULTI_CHANNEL":
+                chmask = int(body.get("channel_mask", 0)) & 0xFF
+                values = list(body.get("values") or [])
+                return bool(chmask) and all(int(values[c]) & 0xFF == 0
+                                            for c in range(8) if chmask & (1 << c))
+        except (TypeError, ValueError, IndexError, KeyError):
+            return False
+        return cmd == "CH_SET_POWER_STATE" and low_state(body.get("state"))
     if path in ("/api/hv-grid", "/api/stm32/hv-enable"):
         return "on" in body and not bool(body.get("on"))
     if path == "/api/shv":
@@ -337,7 +355,7 @@ __all__ = [
     "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE", "GEOMETRY",
     "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ", "IDLE_CEILING_MA",
     "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S", "LOG_DIR",
-    "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "MONITOR_YIELD_S", "POLL_PAUSE_MAX_S", "POWER_SLOTS",
+    "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "LINK_SILENT_S", "MONITOR_YIELD_S", "WIFI_DIAG_PERIOD_S", "POLL_PAUSE_MAX_S", "POWER_SLOTS",
     "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES", "POWER_STATE_SLEEP",
     "POWER_STATE_STANDBY", "POWER_STATE_STOP", "POWER_STATE_VOLTAGE", "Path",
     "PowerState", "RECORD_DIR", "RUN_REPORT_DIR", "SAFETY_ACTIVE_FALLBACK",
@@ -363,7 +381,7 @@ __all__ = [
     "adc_ring_stop", "adc_ring_window", "adc_ring_window_data", "adc_spi_shot_arm",
     "adc_spi_shot_data", "annotations", "audit_post", "build_command_payload",
     "build_payload", "copy", "csv", "datetime", "decode_shv_status", "enum",
-    "fetch_bridge_info", "fetch_stm32_status", "mark_low_priority", "is_deenergising_post", "is_read_post",
+    "fetch_bridge_info", "fetch_stm32_status", "fetch_wifi_diag", "mark_low_priority", "is_deenergising_post", "is_read_post",
     "json", "log", "logging", "os", "parse_power_state", "power_state_name",
     "primary_local_ip", "pulse_events_get", "scan_for_bridge", "stm32_adc_window",
     "stm32_ads1115", "stm32_ds3502_get", "stm32_ds3502_set", "stm32_hv_clear_target",

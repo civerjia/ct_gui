@@ -1123,7 +1123,7 @@ async function hvSwitchTest() {
   const btn = $p('hvSelTest'); if (btn) btn.disabled = true;
   const stop = $p('hvSelTestStop'); if (stop) stop.disabled = false;
   const fails = [], inconc = [], stuck = [];
-  let aborted = false;
+  let aborted = false, allOff = null;
   await pollPause(true);
   try {
     let i = 0;
@@ -1154,6 +1154,9 @@ async function hvSwitchTest() {
       renderHvGrid();
     }
   } finally {
+    // Whatever happened above (abort, a lost reply mid-toggle): every switch on
+    // this controller open, confirmed from the 165 read-back.
+    allOff = await postJ('/api/hv-all-off', { controllers: [pwTarget], reason: 'toggle test end' });
     await pollPause(false);                              // always resume the PING
   }
   if (btn) btn.disabled = false;
@@ -1167,6 +1170,7 @@ async function hvSwitchTest() {
   if (stuck.length) parts.push(`STUCK ON ${stuck.join(' ')} (actuated but did NOT release — grid still connected)`);
   if (fails.length) parts.push(`FAILED ${fails.join(' ')} (did not actuate)`);
   if (inconc.length) parts.push(`INCONCLUSIVE ${inconc.join(' ')} (link busy or flaky switch — re-run)`);
+  if (!(allOff && allOff.ok)) parts.unshift(`⚠ switches NOT confirmed OFF at the end: ${(allOff && allOff.error) || 'no reply'}`);
   $p('hvStatus').textContent = aborted
     ? `toggle test ABORTED at ${done}/${keys.length}${parts.length ? ' · ' + parts.join(' · ') : ''}`
     : parts.length
@@ -1197,10 +1201,16 @@ function wireHv() {
   $p('hvSelTest').onclick = () => hvSwitchTest();
   $p('hvSelTestStop').onclick = () => { hvTestAbort = true; $p('hvStatus').textContent = 'aborting toggle test…'; };
   $p('hvTestClear').onclick = () => { hvTest = null; renderHvGrid(); $p('hvStatus').textContent = 'toggle test marks cleared'; };
-  // All OFF: drive every bit OFF unconditionally — do NOT trust the (possibly
-  // stale, monitor-off) hvDesired cache, or a switch that's actually ON could be
-  // skipped and left energized.
-  $p('hvAllOff').onclick = async () => { for (let c = 0; c < 8; c++) for (let b = 0; b < 8; b++) await powerCmd('HV_SET_BIT', { channel: c, bit: b, value: false, verify: true }); refreshHv(true); };
+  // All OFF: every switch on this controller, whatever the (possibly stale)
+  // hvDesired cache says. The backend retries, escalates to SHV_DISARM, and only
+  // answers ok once the 165 read-back shows every switch open.
+  $p('hvAllOff').onclick = async () => {
+    $p('hvStatus').textContent = 'all OFF…';
+    const r = await postJ('/api/hv-all-off', { controllers: [pwTarget], reason: 'GUI All OFF' });
+    $p('hvStatus').textContent = (r && r.ok) ? 'all switches confirmed OFF'
+      : `⚠ NOT confirmed OFF: ${(r && r.error) || 'no reply'}`;
+    refreshHv(true);
+  };
   $p('hvRefresh').onclick = () => refreshHv(true);
   $p('hvMonitor').onclick = () => {
     hvMonitorOn = !hvMonitorOn;

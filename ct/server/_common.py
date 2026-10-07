@@ -26,6 +26,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    fetch_wifi_diag,
     mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
@@ -394,6 +395,8 @@ LOCK_TTL_DEFAULT_S = 30.0
 LOCK_TTL_MAX_S = 600.0
 
 
+WIFI_DIAG_PERIOD_S = 10.0  # bridge ESP32 /wifi/diag (RSSI) read period
+LINK_SILENT_S = 10.0      # connected but nothing received this long -> reconnect
 MONITOR_YIELD_S = 2.0     # board monitor stays off a link this long after a schedule op
 POLL_PAUSE_MAX_S = 15.0   # max time a background-PING pause survives without a re-arm
 
@@ -561,7 +564,7 @@ __all__ = [
     "FILAMENT_COUNT", "FLAG_SINGLE", "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK",
     "HV_SET_SHIFT_HZ", "IDLE_CEILING_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S",
     "LOCK_TTL_MAX_S", "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE",
-    "MONITOR_YIELD_S", "POLL_PAUSE_MAX_S", "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE",
+    "LINK_SILENT_S", "MONITOR_YIELD_S", "WIFI_DIAG_PERIOD_S", "POLL_PAUSE_MAX_S", "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE",
     "POWER_STATE_NAMES", "POWER_STATE_SLEEP", "POWER_STATE_STANDBY", "POWER_STATE_STOP",
     "POWER_STATE_VOLTAGE", "Path", "PowerState", "RECORD_DIR", "RUN_REPORT_DIR",
     "SAFETY_ACTIVE_FALLBACK", "SAFETY_ACTIVE_TIMEOUT_S", "SAFETY_HV_TIMEOUT_S",
@@ -581,7 +584,7 @@ __all__ = [
     "adc_ring_peek", "adc_ring_start", "adc_ring_stop", "adc_ring_window",
     "adc_ring_window_data", "adc_spi_shot_arm", "adc_spi_shot_data", "annotations",
     "build_command_payload", "copy", "csv", "datetime", "enum", "fetch_bridge_info",
-    "fetch_stm32_status", "mark_low_priority", "json", "log", "logging", "os", "parse_power_state",
+    "fetch_stm32_status", "fetch_wifi_diag", "mark_low_priority", "json", "log", "logging", "os", "parse_power_state",
     "power_state_name", "primary_local_ip", "pulse_events_get", "scan_for_bridge",
     "stm32_adc_window", "stm32_ads1115", "stm32_ds3502_get", "stm32_ds3502_set",
     "stm32_hv_clear_target", "stm32_hv_enable_set", "stm32_hv_get_target",

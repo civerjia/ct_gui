@@ -199,6 +199,28 @@ r = json.loads(urllib.request.urlopen(req, timeout=10).read())
 check("a real HV grid failure reads as a sentence naming the board",
       not r.get("ok") and f"CH{lch + 1}.{lpos + 1}" in (r.get("error") or ""), str(r.get("error")))
 print("   hv-grid error:", r.get("error"))
+
+
+def _dead(body):
+    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/dead-fids",
+                                 data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "X-CT-Client": "script"})
+    return json.loads(urllib.request.urlopen(req, timeout=10).read())
+
+
+# A script re-asserting the dead list at start-up must not wipe the reasons it
+# was marked with (2026-10-06: every reason became "heat-short survey ...").
+S.DEAD_FIDS.clear()
+S.DEAD_FIDS[dead_f] = {"reason": "open circuit (2 mA capped)", "by": "gui", "at": "2026-10-05"}
+_dead({"op": "set", "fids": [dead_f, other_f], "reason": "script boilerplate"})
+check("set keeps an already-dead filament's original reason",
+      S.DEAD_FIDS[dead_f].get("reason") == "open circuit (2 mA capped)"
+      and S.DEAD_FIDS[dead_f].get("by") == "gui", str(S.DEAD_FIDS.get(dead_f)))
+check("set gives a newly dead filament this call's reason",
+      S.DEAD_FIDS[other_f].get("reason") == "script boilerplate", str(S.DEAD_FIDS.get(other_f)))
+_dead({"op": "set", "fids": [other_f], "reason": "again"})
+check("set still removes what is not in the list", dead_f not in S.DEAD_FIDS
+      and S.DEAD_FIDS[other_f].get("reason") == "script boilerplate", str(S.DEAD_FIDS))
 srv.shutdown()
 
 S.DEAD_FIDS.clear()

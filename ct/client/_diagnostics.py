@@ -288,6 +288,215 @@ class _DiagnosticsMixin:
                 "tolerance_frac": tol, "results": results, "counts": counts,
                 "problems": problems}
 
+    # ── Heat-short test: does a HOT filament short focus to emission? ────────
+    # 2026-10-06: with every Power-1 filament at IDLE 1300 mA (no ACTIVE, no
+    # pulse, every grid switch open) focus collapsed from -348 V to emission
+    # +~2 V after 30-120 s. Toggling focus off/on collapsed it again at once (a
+    # real path, not a latched supply); with the heaters off it sat at emission
+    # -0.2 V (the ~2 V had been the heater drop) and snapped back 5.7 s later.
+    # A filament that, hot, touches or reaches the focus electrode. This test
+    # heats ONE filament at a time with both rails up and watches for exactly
+    # that, so the filament can be named.
+
+    #: |focus| below this x |emission| = focus pulled to the emission rail.
+    _HEAT_SHORT_RATIO = 1.15
+
+    def heat_short_test(self, filaments=None,
+                        heat_ma: float = 1300.0,
+                        heat_s: float = 8.0,
+                        emission_v: float = 200.0,
+                        limit_ma: float = 55.0,
+                        focus_v: float = 350.0,
+                        recover_s: float = 30.0,
+                        sample_s: float = 0.25,
+                        stop_on_short: bool = False,
+                        progress=None,
+                        abort=None) -> dict:
+        """Heat each filament on its own and watch focus for a short to emission.
+
+            r = ct.heat_short_test()                       # every live filament
+            r = ct.heat_short_test([3, 15], heat_s=15)
+            print(r)
+
+        Emission -emission_v (limit limit_ma) and focus -focus_v are brought
+        up and READ BACK first; every filament is cold (STANDBY) except the one
+        under test, which goes STANDBY -> IDLE at heat_ma for heat_s while
+        focus, emission and the emission current are sampled every sample_s.
+        Then it goes back to SLEEP (heater off) before the next one. No grid
+        switch is ever closed and nothing is fired.
+
+        A SHORT is |focus| < 1.15 x |emission|. The filament goes to SLEEP at
+        once, and the test waits up to recover_s for focus to come back: a
+        focus that does not come back means the next filament cannot be judged,
+        so the test stops there and says so. stop_on_short=True stops at the
+        first short anyway.
+
+        Refuses to start with emission or focus already on (it sets both, and
+        does not write setpoints under a rail somebody else left live).
+        abort: optional callable; returning True stops after the current
+        filament. progress(filament, row) is called after each one.
+
+        Returns
+            {"ok":        no short and nothing unmeasured,
+             "params":    what was run,
+             "baseline":  {"focus_v", "emission_v", "emission_i_ma"} all cold,
+             "results":   {user_index: {"verdict": "ok" | "short" | "unmeasured",
+                                        "short_after_s", "focus_v_min",
+                                        "emission_v", "di_ma", "recovered_s",
+                                        "note"}},
+             "counts":    {"ok", "short", "unmeasured"},
+             "problems":  [str]}
+
+        di_ma is the emission current at the short minus the cold baseline: a
+        short draws focus-supply current into the cathode network, so it comes
+        out NEGATIVE (-1.5 to -2.2 mA seen). A positive step of ~2 mA per path
+        would instead mean a grid MOSFET conducting.
+        """
+        ratio = self._HEAT_SHORT_RATIO
+        params = {"heat_ma": heat_ma, "heat_s": heat_s, "emission_v": -abs(emission_v),
+                  "limit_ma": limit_ma, "focus_v": -abs(focus_v), "recover_s": recover_s}
+        wanted, problems = self._mosfet_targets(filaments)
+        if not wanted:
+            return {"ok": False, "params": params, "results": {}, "counts": {},
+                    "problems": problems + ["no live filament on a connected controller"]}
+        hv = self.hv_status()
+        if not hv.get("ok"):
+            return {"ok": False, "params": params, "results": {}, "counts": {},
+                    "problems": problems + [f"cannot read the HV state ({hv.get('error')}) "
+                                            f"-- not writing setpoints blind"]}
+        if hv.get("emission_on") or hv.get("focus_on"):
+            return {"ok": False, "params": params, "results": {}, "counts": {},
+                    "problems": problems + ["emission or focus is already ON -- turn both "
+                                            "off first; this test sets its own voltages"]}
+
+        def read():
+            a = self.read_ads_all()
+            if not a.get("ok") or a.get("focus_v") is None or a.get("emiss_v") is None:
+                return None
+            f, e = float(a["focus_v"]), float(a["emiss_v"])
+            i = a.get("emiss_i_ma")
+            return {"focus_v": f, "emission_v": e,
+                    "emission_i_ma": None if i is None else float(i),
+                    "short": abs(e) > 50 and abs(f) < ratio * abs(e)}
+
+        def wait_recovered(limit_s):
+            t0 = time.time()
+            while time.time() - t0 < limit_s:
+                s = read()
+                if s and not s["short"]:
+                    return round(time.time() - t0, 1)
+                time.sleep(0.5)
+            return None
+
+        results: dict[int, dict] = {}
+        baseline = None
+        hv_off = None
+        try:
+            with self.energised(*wanted):
+                try:
+                    self.stop_all(wanted)
+                    self.sleep_all(wanted)
+                    sb = self.standby_all(wanted)
+                    if not sb.get("ok"):
+                        problems.append(f"not every filament reached STANDBY "
+                                        f"({self.describe(sb)[:120]})")
+                    # Rails up, and READ BACK before anything is heated.
+                    self.set_emission_i(limit_ma)
+                    self.enable_emission(True)
+                    v_em, rail_problem = self._mosfet_rail(emission_v)
+                    if rail_problem:
+                        problems.append(rail_problem)
+                        return {"ok": False, "params": params, "results": {},
+                                "counts": {}, "problems": problems}
+                    self.set_focus_v(abs(focus_v))
+                    self.enable_focus(True)
+                    time.sleep(1.0)
+                    baseline = read()
+                    if baseline is None:
+                        problems.append("ADS1115 read failed -- no cold baseline, nothing judged")
+                        return {"ok": False, "params": params, "results": {},
+                                "counts": {}, "problems": problems}
+                    if abs(abs(baseline["focus_v"]) - abs(focus_v)) > 0.10 * abs(focus_v):
+                        problems.append(f"focus did not reach -{abs(focus_v):g} V cold "
+                                        f"(read {baseline['focus_v']:.1f} V) -- nothing judged")
+                        return {"ok": False, "params": params, "baseline": baseline,
+                                "results": {}, "counts": {}, "problems": problems}
+                    i0 = baseline["emission_i_ma"]
+
+                    for f in wanted:
+                        if callable(abort) and abort():
+                            problems.append("aborted")
+                            break
+                        row = {"verdict": "unmeasured", "short_after_s": None,
+                               "focus_v_min": None, "emission_v": None, "di_ma": None,
+                               "recovered_s": None, "note": None}
+                        r = self.idle_one(f, current_ma=heat_ma)
+                        if not r.get("ok"):
+                            row["note"] = f"could not heat it: {self.describe(r)[:160]}"
+                            results[int(f)] = row
+                            if callable(progress):
+                                progress(int(f), row)
+                            continue
+                        t0 = time.time()
+                        fmin, reads = None, 0
+                        while time.time() - t0 < heat_s:
+                            s = read()
+                            if s:
+                                reads += 1
+                                if fmin is None or abs(s["focus_v"]) < abs(fmin):
+                                    fmin = s["focus_v"]
+                                if s["short"]:
+                                    row.update(verdict="short",
+                                               short_after_s=round(time.time() - t0, 1),
+                                               emission_v=s["emission_v"],
+                                               di_ma=(None if s["emission_i_ma"] is None or i0 is None
+                                                      else round(s["emission_i_ma"] - i0, 2)))
+                                    break
+                            time.sleep(sample_s)
+                        self.sleep_one(f)                      # heater off at once
+                        row["focus_v_min"] = None if fmin is None else round(fmin, 1)
+                        if row["verdict"] == "short":
+                            row["recovered_s"] = wait_recovered(recover_s)
+                            row["note"] = (f"focus fell to {row['focus_v_min']} V (emission "
+                                           f"{row['emission_v']} V) {row['short_after_s']} s into "
+                                           f"heating at {heat_ma:g} mA; "
+                                           + (f"back {row['recovered_s']} s after the heater went off"
+                                              if row["recovered_s"] is not None else
+                                              f"NOT back {recover_s:g} s after the heater went off"))
+                        elif reads:
+                            row["verdict"] = "ok"
+                        else:
+                            row["note"] = "no ADS1115 reading while it was hot"
+                        results[int(f)] = row
+                        if callable(progress):
+                            progress(int(f), row)
+                        if row["verdict"] == "short" and (stop_on_short or row["recovered_s"] is None):
+                            if row["recovered_s"] is None:
+                                problems.append(f"focus did not recover after filament {f} -- "
+                                                f"stopped: the rest cannot be judged")
+                            break
+                finally:
+                    # Rails down FIRST, then energised() STOPs the filaments.
+                    off_f = self.enable_focus(False)
+                    hv_off = self._hv_off_problem()
+                    if not off_f.get("ok"):
+                        hv_off = ((hv_off + "; ") if hv_off else "") + \
+                            f"turning focus OFF failed ({off_f.get('error')}) -- it may still be LIVE"
+        finally:
+            if hv_off is None:
+                hv_off = self._hv_off_problem()
+        if hv_off:
+            problems.append(hv_off)
+        counts = {"ok": 0, "short": 0, "unmeasured": 0}
+        for row in results.values():
+            counts[row["verdict"]] += 1
+        for f, row in sorted(results.items()):
+            if row["verdict"] != "ok":
+                problems.append(f"filament {f}: {row['verdict']} -- {row['note']}")
+        return {"ok": not problems and bool(results), "params": params,
+                "baseline": baseline, "results": results, "counts": counts,
+                "problems": problems}
+
     def mosfet_sweep(self, filaments=None,
                      v_start: float = 50.0,
                      v_step: float = 10.0,

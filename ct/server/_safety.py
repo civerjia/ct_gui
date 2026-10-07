@@ -26,6 +26,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    fetch_wifi_diag,
     mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
@@ -123,10 +124,105 @@ def _safety_record(kind: str, detail: dict) -> None:
     log.warning("safety-watchdog: %s %s", kind, detail)
 
 
+FORCE_OFF_DEADLINE_S = 15.0      # keep trying this long before reporting a switch stuck ON
+
+
+def _hv_bytes(link: "ControllerLink") -> tuple[list[int], list[int]] | None:
+    """(desired[8], feedback[8]) with feedback REALLY re-read from the 165s
+    (0x14 mask 0xFF), desired from 0x13. None if either read fails."""
+    fb = link.request(HV_REFRESH_FEEDBACK, bytes([0xFF]), flags=0, timeout=2.0)
+    fraw = fb.get("raw") if isinstance(fb, dict) else None
+    if not fraw or len(fraw) < 9 or fraw[0] != 0x00:
+        return None
+    cur = link.request(0x13, b"", flags=0, timeout=2.0)
+    craw = cur.get("raw") if isinstance(cur, dict) else None
+    if not craw or len(craw) < 9 or craw[0] != 0x00:
+        return None
+    return list(craw[1:9]), list(fraw[1:9])
+
+
+def force_grid_off(link: "ControllerLink", controller: int, masks: dict[int, int] | None = None,
+                   reason: str = "") -> dict:
+    """Open HV grid switches and do not stop until the hardware SAYS they are open.
+
+    `masks` = {channel: bitmask} to open; None = every switch on the controller.
+    An OFF whose outcome is unknown (timeout, refused, no read-back) is never
+    taken as done: a switch left closed puts HV on a filament nobody asked for.
+    Each round writes the zeros, then confirms with a real 165 read-back AND the
+    firmware's desired byte. From the second round on it also sends SHV_DISARM
+    first -- the /SRCLR clear-all, which works even while the PIO owns the shift
+    pins (when HV_SET_* is refused) -- and keeps going until FORCE_OFF_DEADLINE_S.
+    Returns {ok, rounds, disarmed, still_on: {ch: mask}, error?}."""
+    want = {int(c): int(m) & 0xFF for c, m in (masks or {c: 0xFF for c in range(8)}).items()
+            if int(m) & 0xFF}
+    link.hold_monitor()
+    deadline = time.monotonic() + FORCE_OFF_DEADLINE_S
+    rounds, disarmed, still_on, last_err = 0, False, dict(want), None
+    while True:
+        rounds += 1
+        last_err = None
+        try:
+            if rounds > 1:
+                link.request(SHV_DISARM, b"", flags=0, timeout=2.0)
+                disarmed = True
+            if set(want) == set(range(8)) and all(m == 0xFF for m in want.values()):
+                link.request(0x15, bytes([0xFF]) + bytes(8) + bytes([2]), flags=0, timeout=3.0)
+            else:
+                for ch, m in want.items():
+                    for bit in range(8):
+                        if m & (1 << bit):
+                            link.request(0x10, bytes([ch, bit, 0, 2]), flags=0, timeout=2.0)
+            got = _hv_bytes(link)
+            if got is None:
+                last_err = "read-back failed"
+            else:
+                desired, feedback = got
+                still_on = {ch: (desired[ch] | feedback[ch]) & m for ch, m in want.items()
+                            if (desired[ch] | feedback[ch]) & m}
+                if not still_on:
+                    break
+                last_err = "switch still reads ON"
+        except Exception as exc:
+            last_err = str(exc)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+    ok = not still_on and last_err is None
+    out = {"ok": ok, "rounds": rounds, "disarmed": disarmed}
+    if ok:
+        if rounds > 1 or reason:
+            log.warning("HV force-off P%d %s: confirmed OPEN after %d round(s)%s (%s)",
+                        controller, _masks_text(want), rounds,
+                        ", SHV_DISARM used" if disarmed else "", reason or "requested")
+    else:
+        out["still_on"] = {str(c): m for c, m in still_on.items()}
+        out["error"] = (f"Power {controller}: could NOT confirm HV switch(es) "
+                        f"{_masks_text(still_on)} open after {rounds} tries in "
+                        f"{FORCE_OFF_DEADLINE_S:.0f} s ({last_err}) -- treat them as CLOSED; "
+                        f"turn emission/focus off")
+        log.error("HV force-off FAILED: %s (%s)", out["error"], reason or "requested")
+    return out
+
+
+def _masks_text(masks: dict[int, int]) -> str:
+    """{0: 0b1100} -> 'CH1.3, CH1.4' (1-based, as the GUI names them); a whole
+    channel is 'CH2 (all)', every channel 'all switches'."""
+    if len(masks) == 8 and all(m & 0xFF == 0xFF for m in masks.values()):
+        return "all switches"
+    names = []
+    for c, m in sorted(masks.items()):
+        if m & 0xFF == 0xFF:
+            names.append(f"CH{c + 1} (all)")
+        else:
+            names += [f"CH{c + 1}.{b + 1}" for b in range(8) if m & (1 << b)]
+    return ", ".join(names) or "none"
+
+
 def _safety_open_grid() -> None:
-    """Open EVERY HV grid MOSFET on every connected controller: SHV_DISARM,
-    which the firmware turns into the 74HC595 /SRCLR clear-all. The emission
-    and focus rails are NOT touched -- see SAFETY_HV_TIMEOUT_S."""
+    """Open EVERY HV grid MOSFET on every connected controller, confirmed from
+    the 165 read-back (force_grid_off: zero write, then SHV_DISARM's /SRCLR
+    clear-all if that does not take). The emission and focus rails are NOT
+    touched -- see SAFETY_HV_TIMEOUT_S."""
     with _SAFETY_LOCK:
         closed = sorted(_GRID_CLOSED)
     results, all_ok = {}, True
@@ -135,14 +231,9 @@ def _safety_open_grid() -> None:
             results[str(cid)] = {"ok": False, "error": "not connected"}
             all_ok = False
             continue
-        try:
-            ok = _status_ok(link.request(SHV_DISARM, b"", flags=0))
-        except Exception as exc:
-            results[str(cid)] = {"ok": False, "error": str(exc)}
-            all_ok = False
-            continue
-        results[str(cid)] = {"ok": ok}
-        all_ok = all_ok and ok
+        r = force_grid_off(link, cid, None, reason="dead-man: no HV grid command within the timeout")
+        results[str(cid)] = r
+        all_ok = all_ok and bool(r.get("ok"))
     if all_ok:
         with _SAFETY_LOCK:
             _GRID_CLOSED.clear()
@@ -172,7 +263,7 @@ def _safety_schedule_running() -> tuple[bool, str | None]:
         if not link or not link.client.connected:
             continue
         try:
-            st = decode_shv_status(link.request(SHV_GET_STATUS, b"", timeout=1.0))
+            st = shv_status_retry(link)
         except Exception as exc:
             return False, f"controller {cid}: {exc}"
         if st and st.get("state") in (1, 2):   # 1 = armed, 2 = running
@@ -338,6 +429,8 @@ def _with_dead_stopped(out: dict, stopped: dict) -> dict:
 # "not defined" -- goto definition stopped working. tests/test_star_exports.py
 # fails if this falls out of step with the module's globals.
 __all__ = [
+    "RETRY_TIMEOUTS_S", "request_retry", "shv_status_retry",
+    "deque",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",
     "BaseHTTPRequestHandler", "CALIB_DIR", "CH_FILAMENT_CURRENTS",
     "CH_GET_BOARD_BITMAPS", "CH_GET_BOARD_CACHE", "CH_GET_BOARD_HEALTH",
@@ -349,7 +442,7 @@ __all__ = [
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
     "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "IDLE_SINCE", "IDLE_WARM_HOLD_S", "IDLE_WARM_TOL_FRAC", "IDLE_WARM_TOL_MA", "LAST_ACTIVE_LEFT", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
-    "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "MONITOR_YIELD_S", "POLL_PAUSE_MAX_S",
+    "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "LINK_SILENT_S", "MONITOR_YIELD_S", "WIFI_DIAG_PERIOD_S", "POLL_PAUSE_MAX_S",
     "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES",
     "POWER_STATE_SLEEP", "POWER_STATE_STANDBY", "POWER_STATE_STOP",
     "POWER_STATE_VOLTAGE", "Path", "PowerState", "RECORD_DIR", "RUN_REPORT_DIR",
@@ -367,7 +460,7 @@ __all__ = [
     "_OCP_SENSE_RESISTOR_OHMS", "_ORDER_LOCK", "_SAFETY", "_SAFETY_EVENTS",
     "_SAFETY_LOCK", "_SAFETY_TOUCH_FIL", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG",
     "_coerce_bytes", "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable",
-    "_popcount", "_safety_open_grid", "_safety_record", "_safety_schedule_running",
+    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "force_grid_off", "_masks_text", "_safety_record", "_safety_schedule_running",
     "_setup_logging", "_status_err", "_status_ok", "_suppress", "_u16", "_u32",
     "_unpack_spi_shot", "_with_dead_stopped", "adc_get_burst", "adc_pulse_arm",
     "adc_pulse_diag", "adc_pulse_disarm", "adc_ready_arm", "adc_ready_disarm",
@@ -375,7 +468,7 @@ __all__ = [
     "adc_ring_stop", "adc_ring_window", "adc_ring_window_data", "adc_spi_shot_arm",
     "adc_spi_shot_data", "annotations", "build_command_payload", "build_payload",
     "copy", "csv", "datetime", "decode_shv_status", "enum", "fetch_bridge_info",
-    "fetch_stm32_status", "mark_low_priority", "json", "ladder_blocks_active", "log", "logging",
+    "fetch_stm32_status", "fetch_wifi_diag", "mark_low_priority", "json", "ladder_blocks_active", "log", "logging",
     "WARM_AFTER_ACTIVE_S", "note_active_transition", "note_power_state", "os",
     "set_active_deadlines", "parse_power_state", "power_state_name",
     "primary_local_ip", "pulse_events_get", "safety_touch_filaments", "scan_for_bridge",

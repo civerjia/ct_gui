@@ -14,6 +14,7 @@ import logging
 import logging.handlers
 import os
 import threading
+from collections import deque
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,7 @@ from ct.protocol import (
     build_command_payload,
     fetch_bridge_info,
     fetch_stm32_status,
+    fetch_wifi_diag,
     mark_low_priority,
     scan_for_bridge,
     sync_post_fire,
@@ -90,6 +92,40 @@ def _pipeline_reliable(link, reqs, window=8, timeout=2.5, retries=2, on_progress
     return results
 
 
+#: Timeouts for successive tries of a request that is safe to repeat. A late
+#: reply is the normal failure on this link -- the master ESP32 has been seen
+#: holding an RP2350 reply for 0.72 s while it served STM32 HTTP traffic, and
+#: the RP2350 itself answers in >1 s while every board runs its CC loop -- so a
+#: single 1 s try turned a slow answer into "cannot confirm", "disarm failed"
+#: and failed downloads (2026-10-06, liuxing_api run: 9 + 7 + many).
+RETRY_TIMEOUTS_S = (1.0, 2.0, 3.0)
+
+
+def request_retry(link, frame_type: int, payload: bytes = b"", flags: int = 0,
+                  timeouts=RETRY_TIMEOUTS_S, ok=None):
+    """link.request() for a frame that is safe to send again (a read, a disarm,
+    an idempotent write): one try per entry of `timeouts`, each longer than the
+    last. `ok(resp)` decides success (default: any decoded response). Raises the
+    last error if every try fails -- never returns a made-up answer."""
+    last: Exception | None = None
+    for t in timeouts:
+        try:
+            resp = link.request(frame_type, payload, flags=flags, timeout=t)
+        except Exception as exc:
+            last = exc
+            continue
+        if ok is None or ok(resp):
+            return resp
+        last = RuntimeError(f"0x{frame_type:02X} answered but not OK: {resp.get('raw') if isinstance(resp, dict) else resp}")
+    raise last if last else RuntimeError("no try made")
+
+
+def shv_status_retry(link):
+    """ShvGetStatus (0x79), retried (request_retry). Raises if no try answered:
+    callers that gate on "is a schedule running?" must still FAIL CLOSED."""
+    return decode_shv_status(request_retry(link, SHV_GET_STATUS, b""))
+
+
 class ControllerLink:
     """One ESP32 bridge + its RP2350B/STM32 liveness."""
 
@@ -116,6 +152,13 @@ class ControllerLink:
         # monitor read the RP2350 answers slowly made each fire step wait
         # behind it. Until this deadline the monitor sends nothing here.
         self.monitor_hold_until = 0.0
+        # The bridge ESP32's own link: /wifi/diag every WIFI_DIAG_PERIOD_S, and
+        # the round trip of every HTTP request made to it (the 1 Hz /stm32
+        # read included) -- the ESP32 alone, to tell a weak WiFi from a busy
+        # RP2350 behind it. (monotonic t, ms or None for a failed request)
+        self.wifi: dict[str, Any] = {}
+        self._wifi_at = 0.0
+        self._http_hist: deque = deque(maxlen=240)
 
     def hold_monitor(self, seconds: float = MONITOR_YIELD_S) -> None:
         """Keep the board monitor off this link for `seconds` (renewed by every
@@ -211,6 +254,8 @@ class ControllerLink:
         down_since = 0.0
         attempts = 0
         reminded = 0.0
+        connected_at = time.monotonic()
+        silent_noted = 0.0
         while self._running:
             if not self.client.connected:
                 host = self.host
@@ -227,6 +272,7 @@ class ControllerLink:
                     reconnecting = False
                     self.rp_last = 0.0
                     self.rp_rtt_ms = None
+                    connected_at = time.monotonic()
                 except Exception as exc:
                     now = time.monotonic()
                     attempts += 1
@@ -252,14 +298,46 @@ class ControllerLink:
                     self.rp_rtt_ms = (time.monotonic() - t0) * 1000.0
                 except Exception:
                     pass
+                # A link that is "connected" but carries nothing: the TCP socket
+                # to the bridge is open, yet no frame of any kind (PING answer,
+                # command answer, pushed telemetry) has come back for
+                # LINK_SILENT_S. Seen 2026-10-05 17:20 on Power 1 after two power
+                # cycles: nothing reconnected it, because reconnecting only
+                # happens when the socket closes and auto-connect only fills
+                # EMPTY slots. Close it here; the branch above reconnects.
+                # Not while the PING is paused (a GUI test holds it off).
+                last_rx = max(self.rp_last, getattr(self.client, "_last_controller_rx_ts", 0.0) or 0.0)
+                silent = time.time() - last_rx if last_rx else time.monotonic() - connected_at
+                if silent >= LINK_SILENT_S and time.monotonic() - connected_at >= LINK_SILENT_S:
+                    now = time.monotonic()
+                    if now - silent_noted >= BRIDGE_DOWN_REMIND_S:
+                        silent_noted = now
+                        log.warning("%s: bridge %s connected but SILENT for %.0f s (no "
+                                    "answer from the RP2350) -- closing it to reconnect",
+                                    self.name, self.host, silent)
+                    try:
+                        self.client.disconnect()
+                    except Exception:
+                        pass
+                    continue
             host = self.host
             if host:
+                t_http = time.monotonic()
                 try:
                     stm = fetch_stm32_status(host)
                     self._note_stm_reset(stm)
                     self.stm = stm
                 except Exception as exc:
-                    self.stm = {"ever_seen": False, "error": str(exc)}
+                    stm = self.stm = {"ever_seen": False, "error": str(exc)}
+                err = str(stm.get("error") or "")
+                failed = "timed out" in err or "refused" in err or "unreachable" in err.lower()
+                self._http_hist.append((time.monotonic(),
+                                        None if failed else (time.monotonic() - t_http) * 1000.0))
+                if time.monotonic() - self._wifi_at >= WIFI_DIAG_PERIOD_S:
+                    self._wifi_at = time.monotonic()
+                    w = fetch_wifi_diag(host)
+                    w["at"] = time.time()
+                    self.wifi = w
             time.sleep(1.0)
 
     def _note_stm_reset(self, stm: dict) -> None:
@@ -292,6 +370,31 @@ class ControllerLink:
         log.warning("%s: STM32 RESET #%d — cause=%s%s (uptime %s -> %s ms)",
                     self.name, self._stm_resets, cause, detail, prev, up)
 
+    def link_quality(self, window_s: float = 60.0) -> dict[str, Any]:
+        """WiFi signal and recent latency, the ESP32 alone and the RP2350
+        behind it. None fields when there is nothing to report, never 0."""
+        cut = time.monotonic() - window_s
+        h = [ms for t, ms in list(self._http_hist) if t >= cut]
+        ok = sorted(ms for ms in h if ms is not None)
+        w = self.wifi or {}
+        t = self.client.timing_summary(window_s)
+        return {
+            "window_s": window_s,
+            "rssi_dbm": w.get("rssi"), "ap_rssi_dbm": w.get("ap_rssi"),
+            "channel": w.get("channel"), "bandwidth": w.get("sta_bandwidth") or w.get("bandwidth"),
+            "power_save": w.get("ps"),
+            "wifi_error": w.get("error"),
+            "wifi_age_s": round(time.time() - w["at"], 1) if w.get("at") else None,
+            "esp32_http_avg_ms": round(sum(ok) / len(ok), 1) if ok else None,
+            "esp32_http_p95_ms": round(ok[min(len(ok) - 1, int(0.95 * (len(ok) - 1) + 0.5))], 1) if ok else None,
+            "esp32_http_failed": sum(1 for ms in h if ms is None),
+            "esp32_http_requests": len(h),
+            "rp2350_avg_ms": (t.get("answer_ms") or {}).get("avg"),
+            "rp2350_p95_ms": (t.get("answer_ms") or {}).get("p95"),
+            "rp2350_timeouts": t.get("timeouts"),
+            "rp2350_requests": t.get("requests"),
+        }
+
     def status(self) -> dict[str, Any]:
         now = time.time()
         rp_age = None if self.rp_last == 0 else (now - self.rp_last) * 1000.0
@@ -305,6 +408,7 @@ class ControllerLink:
                        # rtt_ms above includes queueing behind other requests;
                        # this splits queue wait from the controller's answer time.
                        "timing": self.client.timing_summary()},
+            "link": self.link_quality(),
             "stm32": {
                 "ever_seen": bool(stm.get("ever_seen")),
                 "age_ms": stm.get("age_ms"),
@@ -345,7 +449,7 @@ __all__ = [
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
     "IDLE_CEILING_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
-    "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "MONITOR_YIELD_S", "POLL_PAUSE_MAX_S",
+    "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "LINK_SILENT_S", "MONITOR_YIELD_S", "WIFI_DIAG_PERIOD_S", "POLL_PAUSE_MAX_S",
     "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES",
     "POWER_STATE_SLEEP", "POWER_STATE_STANDBY", "POWER_STATE_STOP",
     "POWER_STATE_VOLTAGE", "Path", "PowerState", "RECORD_DIR", "RUN_REPORT_DIR",
@@ -362,13 +466,14 @@ __all__ = [
     "_HV_DS_CH", "_HV_FULL_V", "_OCP_MA_PER_CODE", "_OCP_SENSE_RESISTOR_OHMS",
     "_ORDER_LOCK", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG", "_coerce_bytes",
     "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable", "_popcount",
+    "RETRY_TIMEOUTS_S", "request_retry", "shv_status_retry",
     "_setup_logging", "_status_err", "_status_ok", "_suppress", "_u16", "_u32",
     "_unpack_spi_shot", "adc_get_burst", "adc_pulse_arm", "adc_pulse_diag",
     "adc_pulse_disarm", "adc_ready_arm", "adc_ready_disarm", "adc_ready_renew",
     "adc_ready_status", "adc_ring_peek", "adc_ring_start", "adc_ring_stop",
     "adc_ring_window", "adc_ring_window_data", "adc_spi_shot_arm", "adc_spi_shot_data",
-    "annotations", "build_command_payload", "build_payload", "copy", "csv", "datetime",
-    "decode_shv_status", "enum", "fetch_bridge_info", "fetch_stm32_status", "mark_low_priority", "json",
+    "annotations", "build_command_payload", "build_payload", "copy", "csv", "datetime", "deque",
+    "decode_shv_status", "enum", "fetch_bridge_info", "fetch_stm32_status", "fetch_wifi_diag", "mark_low_priority", "json",
     "log", "logging", "os", "parse_power_state", "power_state_name", "primary_local_ip",
     "pulse_events_get", "scan_for_bridge", "stm32_adc_window", "stm32_ads1115",
     "stm32_ds3502_get", "stm32_ds3502_set", "stm32_hv_clear_target",

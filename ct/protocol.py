@@ -501,6 +501,7 @@ class TcpProtocolClient:
         types by answer time. None fields when nothing was sent."""
         cut = time.monotonic() - window_s
         rows = [t for t in list(self.timings) if t[0] >= cut]
+        ok_rtts = [r[3] for r in rows if r[4]]
 
         def pct(vals, q):
             if not vals:
@@ -518,7 +519,8 @@ class TcpProtocolClient:
                 "timeouts": sum(1 for r in rows if not r[4]),
                 "wait_ms": {"p50": pct(waits, 0.5), "p95": pct(waits, 0.95),
                             "max": round(max(waits), 1) if waits else None},
-                "answer_ms": {"p50": pct(rtts, 0.5), "p95": pct(rtts, 0.95),
+                "answer_ms": {"avg": round(sum(ok_rtts) / len(ok_rtts), 1) if ok_rtts else None,
+                              "p50": pct(rtts, 0.5), "p95": pct(rtts, 0.95),
                               "max": round(max(rtts), 1) if rtts else None},
                 "slowest_types": [{"type": n, "max_ms": m, "count": c} for n, m, c in slow]}
 
@@ -1746,6 +1748,31 @@ def fetch_stm32_status(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> 
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError,
             json.JSONDecodeError) as exc:
         return {"ever_seen": False, "age_ms": 0, "error": str(exc)}
+
+
+def fetch_wifi_diag(host: str, timeout: float = 2.0) -> dict[str, Any]:
+    """GET the bridge ESP32's own WiFi link (/wifi/diag): rssi (dBm, this
+    station), ap_rssi, channel, sta_bandwidth, ps (power save). Adds http_ms,
+    the round trip of this request -- the ESP32 alone, no RP2350/STM32 behind
+    it. On failure {"error": ...}, never a made-up reading."""
+    if not host:
+        return {"error": "no host"}
+    t0 = time.monotonic()
+    try:
+        status, body, _ = _http_get(f"http://{host}:{BRIDGE_HTTP_PORT}/wifi/diag", timeout)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        return {"error": str(exc)}
+    ms = (time.monotonic() - t0) * 1000.0
+    if status == 404:
+        return {"error": "this bridge firmware has no /wifi/diag", "http_ms": ms}
+    if status != 200:
+        return {"error": f"HTTP {status}", "http_ms": ms}
+    try:
+        out = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return {"error": f"bad /wifi/diag reply: {exc}", "http_ms": ms}
+    out["http_ms"] = ms
+    return out
 
 
 def _post_result(status: int, text: str) -> dict[str, Any]:

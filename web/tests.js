@@ -80,6 +80,25 @@ const setState = (ctrl, ch, pos, state, arg) =>
   tPostJ('/api/cmd', withDead({ controller: ctrl, command: 'CH_SET_POWER_STATE', channel: ch, mux_port: pos, state, arg: arg || 0 }));
 const firePulse = (ctrl, ch, pos, widthUs) =>
   tPostJ('/api/cmd', { controller: ctrl, command: 'HV_PULSE', channel: ch, bit: pos, width_us: widthUs });
+// Every test that closes grid switches ends here: open EVERY switch on these
+// controllers and confirm it from the 165 read-back (backend force_grid_off).
+const hvAllOff = (ctrls, reason) => tPostJ('/api/hv-all-off', { controllers: [...new Set(ctrls)], reason });
+// An OFF that is not confirmed is not an OFF. When the plain write fails the
+// backend has already forced the switch open and checked it; here we say so, and
+// stop the test outright when even that could not confirm it.
+async function hvOffChecked(ctrl, ch, pos) {
+  const r = await tPostJ('/api/cmd', { controller: ctrl, command: 'HV_SET_BIT', channel: ch, bit: pos, value: 0, force: true });
+  if (r && r.ok) return;
+  const at = `P${ctrl}·CH${ch + 1}.${pos + 1}`;
+  if (r && r.forced_off && r.forced_off.ok) { tMsg(`${at}: OFF failed once — forced open and confirmed`, 'bad'); return; }
+  throw new Error(`${at}: switch could NOT be confirmed OFF — ${(r && r.error) || 'no reply'}. Turn emission and focus off.`);
+}
+// The finally-block half: all off, and a loud message if that failed.
+async function hvAllOffOrWarn(ctrls, reason) {
+  if (!ctrls.length) return;
+  const r = await hvAllOff(ctrls, reason);
+  if (!r || !r.ok) tMsg(`⚠ HV switches NOT confirmed open: ${(r && r.error) || 'no reply'} — turn emission and focus off`, 'bad');
+}
 // Per-pulse tests only need the STM32 detector armed (EVT_PULSE over UART), NOT
 // the ESP32 continuous SPI ring read — the ring's 20 MHz read competes with WiFi
 // and drops the link mid-test. pulse-arm arms the STM32 ADC alone.
@@ -505,10 +524,8 @@ async function test2() {
   const hvBit = (ctrl, ch, bit, val) =>
     tPostJ('/api/cmd', { controller: ctrl, command: 'HV_SET_BIT', channel: ch, bit, value: val, force: true });
 
-  // Track every bit we turn on so finally() can clean up even if we abort mid-channel.
-  const bitsOn = new Set();
-  const bitOn  = async (ctrl, ch, pos) => { await hvBit(ctrl, ch, pos, 1); bitsOn.add(`${ctrl}-${ch}-${pos}`); };
-  const bitOff = async (ctrl, ch, pos) => { await hvBit(ctrl, ch, pos, 0); bitsOn.delete(`${ctrl}-${ch}-${pos}`); };
+  const bitOn  = (ctrl, ch, pos) => hvBit(ctrl, ch, pos, 1);
+  const bitOff = (ctrl, ch, pos) => hvOffChecked(ctrl, ch, pos);
 
   const emWasOn = await hvIsOn('emission');
   let priorWiper = null;
@@ -588,13 +605,9 @@ async function test2() {
     tMsg(`Scan done — ${shorts.length ? shorts.length + ' short' : 'all green'}.`, shorts.length ? 'bad' : '');
 
   } finally {
-    // Turn off any bits still on (abort or exception mid-channel)
-    if (bitsOn.size) {
-      await Promise.all([...bitsOn].map((k) => {
-        const [ctrl, ch, pos] = k.split('-').map(Number);
-        return hvBit(ctrl, ch, pos, 0);
-      }));
-    }
+    // Every switch on every controller scanned, not just the ones we think are
+    // on: a command that never came back may have closed one we never recorded.
+    await hvAllOffOrWarn(chanList.map((c) => c.ctrl), 'emission short scan end');
     if (emWasOn) {
       if (priorWiper != null) await dsWrite('ev', priorWiper);
     } else {
@@ -643,7 +656,7 @@ async function test3() {
     return k ? { foc: sf / k, em: se / k } : null;
   };
 
-  let lastBit = null, prepped = [];
+  let prepped = [];
   const items = [], leaks = [], results = {};
   let base0 = null, base1 = null, railRead = null, nLeak = 0, nOk = 0, nSkip = 0;
   drawBars('t3Plot', [], { yLabel: 'Vfocus (V)', yMax: emV * 1.1, fmt: (v) => v.toFixed(1) });
@@ -678,12 +691,10 @@ async function test3() {
       if (abortFlag) { tMsg('Aborted.'); break; }
       const f = fils[i], m = fmap[f];
       tMsg(`Focus leak: ${i + 1}/${fils.length} (F${f} · ${filBoard(m)})…`);
-      lastBit = { ctrl: m.ctrl, ch: m.ch, pos: m.pos };
       const on = await hvBit(m.ctrl, m.ch, m.pos, 1);
       await tSleep(settleMs);
       const r = (on && on.ok) ? await readBoth(2) : null;
-      await hvBit(m.ctrl, m.ch, m.pos, 0);
-      lastBit = null;
+      await hvOffChecked(m.ctrl, m.ch, m.pos);
       const span = r ? r.em - base0.foc : 0;           // what a full leak would add
       if (!on || !on.ok || !r || span < 5) {
         const why = !on || !on.ok ? `switch command failed (${(on && on.error) || 'no reply'})`
@@ -703,7 +714,7 @@ async function test3() {
     }
     base1 = await readBoth(3);
   } finally {
-    if (lastBit) await hvBit(lastBit.ctrl, lastBit.ch, lastBit.pos, 0);
+    await hvAllOffOrWarn(fils.map((f) => fmap[f].ctrl), 'focus leak scan end');
     // HV comes down FIRST, then the filaments.
     await hvEnable('emission', false); await lutZeroV('emission');
     if (prepped.length) await prepPost({ state: 1, filaments: prepped });
@@ -990,6 +1001,7 @@ const TESTS_HTML = `
     <button class="seg-btn" data-test="4" title="Emission current test">Emis I</button>
     <button class="seg-btn" data-test="5" title="Emission current calibration">Calib</button>
     <button class="seg-btn" data-test="6" title="Impedance sweep (per filament)">Imped</button>
+    <button class="seg-btn" data-test="7" title="Heat-short test: does a hot filament short focus to emission?">Heat-S</button>
   </div>
   <div class="test-block show" id="testBlock1">
     <div class="block-title" title="Drives every filament to STANDBY (0.8 V), settles, then reads each board's INA219 V/I and computes R = V/I. Near-zero R or an OCP trip = short; no current = open.">1 · Filament Resistance <span class="hint">ⓘ</span></div>
@@ -1081,13 +1093,83 @@ const TESTS_HTML = `
     <div id="t6Result" class="summary"></div>
   </div>
 
+  <div class="test-block" id="testBlock7">
+    <div class="block-title" title="Emission −V and focus −V up and read back; every filament cold (STANDBY) except the one under test, which is heated at IDLE for the set time while focus is watched. Focus pulled to the emission voltage (|focus| &lt; 1.15 × |emission|) = SHORT: that filament goes to SLEEP at once and the test waits for focus to come back. No grid switch is closed, nothing is fired. Runs in the backend (also ct.heat_short_test()); refuses to start with emission or focus on.">7 · Heat-short test <span class="hint">ⓘ</span></div>
+    <div class="test-params">
+      <label class="numlabel">heat mA<input id="t7Ma" type="number" min="100" max="3000" step="50" value="1300" /></label>
+      <label class="numlabel">heat s<input id="t7S" type="number" min="1" max="120" step="1" value="8" /></label>
+      <label class="numlabel">emission −V<input id="t7EmV" type="number" min="50" max="350" value="200" /></label>
+      <label class="numlabel">limit mA<input id="t7Limit" type="number" min="1" max="85" value="55" /></label>
+      <label class="numlabel">focus −V<input id="t7FoV" type="number" min="0" max="495" value="350" /></label>
+      <label class="numlabel" title="Stop at the first short instead of testing every filament"><input id="t7Stop" type="checkbox" /> stop at 1st</label>
+      <button class="xs quick test-run" id="t7Run">Run</button>
+    </div>
+    <canvas id="t7Plot" class="test-plot" title="Lowest |focus| seen while each filament was hot."></canvas>
+    <div class="test-legend"><span><i class="sw ok"></i>ok</span><span><i class="sw short"></i>focus shorted to emission</span><span><i class="sw skip"></i>unmeasured</span></div>
+    <div id="t7Result" class="summary"></div>
+  </div>
+
   <div class="row compact test-foot">
     <button class="xs" id="testAbort" disabled title="Stop after the current step and tear down HV (calibration saves the partial set).">Abort</button>
     <span id="testStatus" class="summary"></span>
   </div>`;
 
+// 7 — Heat-short test. Runs in the BACKEND (POST /api/tests/heat-short, the
+// same code as ct.heat_short_test()): it takes minutes and holds its own write
+// lease, so this page only starts it, polls, and can abort it -- it must NOT
+// wrap it in runTest's lease, or the backend job could not take one.
+async function test7() {
+  if (!(await guard(false))) return;
+  const ma = parseFloat($t('t7Ma').value) || 1300, secs = parseFloat($t('t7S').value) || 8;
+  const emV = parseFloat($t('t7EmV').value) || 200, foV = parseFloat($t('t7FoV').value) || 350;
+  if (!confirm(`Heat-short test: emission −${emV} V and focus −${foV} V ON, then every filament `
+    + `heated one at a time at ${ma} mA for ${secs} s. Continue?`)) return;
+  abortFlag = false; setRunning(true);
+  let abortSent = false;
+  try {
+    const st = await tPostJ('/api/tests/heat-short', {
+      action: 'start', heat_ma: ma, heat_s: secs, emission_v: emV, focus_v: foV,
+      limit_ma: parseFloat($t('t7Limit').value) || 55, stop_on_short: $t('t7Stop').checked });
+    if (!st || !st.ok) { tMsg('Heat-short test not started: ' + ((st && st.error) || 'no reply'), 'bad'); return; }
+    tMsg('Heat-short test: rails coming up…');
+    let j = null;
+    for (;;) {
+      await tSleep(1000);
+      if (abortFlag && !abortSent) { abortSent = true; await tPostJ('/api/tests/heat-short', { action: 'abort' }); }
+      j = await tGetJ('/api/tests/heat-short');
+      if (!j || !j.ok) continue;
+      const rows = j.rows || [];
+      drawBars('t7Plot', rows.map((r) => ({ f: r.filament, value: Math.abs(r.focus_v_min || 0),
+        cls: r.verdict === 'short' ? 'short' : r.verdict === 'ok' ? 'ok' : 'skip' })),
+      { yLabel: '|focus| min (V)', yMax: foV * 1.1, fmt: (v) => v.toFixed(0) });
+      const last = rows[rows.length - 1];
+      if (j.running) {
+        tMsg(`Heat-short: ${rows.length} done${last ? ` · last F${last.filament} ${last.verdict}` : ''}`
+          + (abortSent ? ' · aborting after this filament…' : ''));
+        continue;
+      }
+      break;
+    }
+    const res = (j && j.result) || {};
+    const counts = res.counts || {};
+    const shorts = Object.entries(res.results || {}).filter(([, r]) => r.verdict === 'short')
+      .map(([f, r]) => `F${f}: ${r.note}`);
+    testResult('t7Result', {
+      title: 'Heat-short test', pass: !!res.ok,
+      counts: [{ n: counts.ok || 0, label: 'ok' }, { n: counts.short || 0, label: 'short', bad: (counts.short || 0) > 0 },
+               { n: counts.unmeasured || 0, label: 'unmeasured', bad: (counts.unmeasured || 0) > 0 }],
+      note: j && j.error ? 'test error: ' + j.error
+        : (res.baseline ? `cold: focus ${res.baseline.focus_v} V, emission ${res.baseline.emission_v} V, `
+           + `${res.baseline.emission_i_ma} mA · ${ma} mA × ${secs} s each` : undefined),
+      flagged: shorts.length ? shorts : (res.problems || []),
+    });
+    tMsg(`Heat-short test done — ${counts.short || 0} short` + (j && j.error ? ' · ERROR' : '') + ' · saved to calibration/',
+      (counts.short || (j && j.error)) ? 'bad' : '');
+  } finally { setRunning(false); }
+}
+
 function showTest(n) {
-  for (let i = 1; i <= 6; i++) { const b = $t('testBlock' + i); if (b) b.classList.toggle('show', i === n); }
+  for (let i = 1; i <= 7; i++) { const b = $t('testBlock' + i); if (b) b.classList.toggle('show', i === n); }
   document.querySelectorAll('#testSeg .seg-btn').forEach((x) => x.classList.toggle('active', +x.dataset.test === n));
 }
 
@@ -1170,6 +1252,7 @@ export function initTests() {
   $t('t4Run').onclick = () => runTest(test4, true);
   $t('t5Run').onclick = () => runTest(test5, true);
   $t('t6Run').onclick = () => runTest(test6, false);   // voltage-mode, no HV
+  $t('t7Run').onclick = () => test7();
   $t('testAbort').onclick = () => { abortFlag = true; tMsg('Aborting after the current step…'); };
   $t('deadAddBtn').onclick = addDead;
   $t('tIncludeDead').addEventListener('change', toggleIncludeDead);

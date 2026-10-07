@@ -286,6 +286,8 @@ export function initControllers() {
       stm.title = hasStm
         ? 'STM32 detected on this bridge (HTTP /stm32 age)' + (cid === master ? ' — master' : '')
         : 'No STM32 seen on this bridge';
+      const chip = hbGroup.querySelector('[data-link]');
+      if (chip) renderLinkChip(chip, c, cid);
       if (!c.connected) {
         rp.className = 'hb idle';
         stm.className = 'hb idle';
@@ -300,6 +302,34 @@ export function initControllers() {
     // Keep datalists and field values consistent on every tick — clears a slot
     // that shows an IP already claimed by a connected slot.
     updateHostLists();
+  }
+
+  // WiFi signal + recent latency of one bridge. Two latencies on purpose: the
+  // ESP32 alone (its HTTP) and the RP2350 behind it -- slow ESP32 too = the
+  // WiFi; ESP32 fast but RP2350 slow = the controller / its UART.
+  function renderLinkChip(chip, c, cid) {
+    const L = c.link || {};
+    const rssi = L.rssi_dbm, esp = L.esp32_http_avg_ms, rp = L.rp2350_avg_ms;
+    const failed = (L.esp32_http_failed || 0) + (L.rp2350_timeouts || 0);
+    if (!c.connected && rssi == null && esp == null) {
+      chip.className = 'link-chip idle'; chip.textContent = '—';
+      chip.title = `Power ${cid} — not connected`; return;
+    }
+    const sig = rssi == null ? 'unknown' : rssi >= -60 ? 'good' : rssi >= -70 ? 'fair' : 'poor';
+    const slow = (esp != null && esp > 200) || (rp != null && rp > 200) || failed > 0;
+    const bad = sig === 'poor' || (L.esp32_http_requests && L.esp32_http_failed >= L.esp32_http_requests / 2);
+    chip.className = 'link-chip ' + (bad ? 'bad' : slow || sig === 'fair' ? 'warn' : sig === 'unknown' ? 'idle' : 'ok');
+    const ms = (v) => (v == null ? '—' : `${Math.round(v)} ms`);
+    chip.textContent = `${rssi == null ? '? dBm' : rssi + ' dBm'} · ${ms(esp)}`;
+    chip.title = [
+      `Power ${cid} link, last ${L.window_s || 60} s`,
+      `WiFi signal: ${rssi == null ? (L.wifi_error || 'unknown') : `${rssi} dBm (${sig})`}`
+        + (L.channel != null ? ` · ch ${L.channel}` : '') + (L.bandwidth ? ` · ${L.bandwidth}` : '')
+        + (L.power_save && L.power_save !== 'none' ? ` · power save ${L.power_save}` : ''),
+      `ESP32 itself (HTTP): avg ${ms(esp)}, p95 ${ms(L.esp32_http_p95_ms)}, ${L.esp32_http_failed || 0} of ${L.esp32_http_requests || 0} failed`,
+      `RP2350 behind it: avg ${ms(rp)}, p95 ${ms(L.rp2350_p95_ms)}, ${L.rp2350_timeouts || 0} of ${L.rp2350_requests || 0} timed out`,
+      'Both slow = the WiFi. ESP32 fast, RP2350 slow = the controller or its UART.',
+    ].join('\n');
   }
 
   setInterval(refresh, 1500);

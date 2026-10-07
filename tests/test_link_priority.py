@@ -161,6 +161,27 @@ check("arm of one board leaves the other alone",
 r = post("/api/arm", {"repeats": 1, "controllers": [3]})
 check("arm naming a board that is not connected arms nothing", not r.get("ok")
       and "not connected" in (r.get("error") or ""), str(r))
+
+# Failures say which board and why -- they were logged as "FAILED: failed".
+class Dead(FakeLink):
+    def request(self, *a, **k):
+        raise TimeoutError("Timed out waiting for response to 0x78")
+
+
+S.CONTROLLERS[1] = Dead("P1", 0)
+r = post("/api/disarm", {"controllers": [1]})
+check("a failed disarm names the board and the reason",
+      not r["ok"] and "Power 1" in (r.get("error") or "") and "0x78" in r["error"], str(r))
+S.CONTROLLERS[1] = FakeLink("P1", 0)
+real_dl = S.download_to_controller
+S.download_to_controller = lambda link, c0, plan, ch: (
+    {"controller": c0, "ok": False, "error": "Power 1: 1 of 6 frames not accepted (config: no answer)"}
+    if c0 == 0 else {"controller": c0, "ok": True})
+r = post("/api/download", {"plan": {"emission": [{"filament": 1, "numPulses": 1, "widthUs": 100}],
+                                    "config": {}, "heating": []}})
+S.download_to_controller = real_dl
+check("a failed download says which controller and which frame",
+      not r["ok"] and "Power 1" in (r.get("error") or "") and "config" in r["error"], str(r))
 srv.shutdown()
 
 print("\nALL PASS" if not FAILS else f"\n{len(FAILS)} FAILED: {FAILS}")
