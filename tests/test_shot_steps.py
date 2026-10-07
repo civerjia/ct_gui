@@ -144,5 +144,14 @@ ct, calls = make(master=2)
 r = ct.fire_single_pulse(16, timeout_s=6.0, **KW)
 check("two controllers: arm both, master last", ("/api/arm", (1, 2)) in calls, calls)
 
+# 8. shot_wait_timeout_s (new name) and timeout_s (old name) both reach shot_wait.
+for kw, want in (({"shot_wait_timeout_s": 7.5}, 7.5), ({"timeout_s": 8.5}, 8.5), ({}, 15.0)):
+    ct, calls = make()
+    seen = {}
+    real = ct._shot_wait
+    ct._shot_wait = lambda shot, t, real=real, seen=seen: (seen.setdefault("t", t), real(shot, t))[1]
+    ct.fire_single_pulse(16, **KW, **kw)
+    check(f"{kw or 'default'} -> shot_wait waits {want} s", seen.get("t") == want, seen)
+
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

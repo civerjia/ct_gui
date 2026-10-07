@@ -90,7 +90,7 @@ with ct.lease(ttl=120, note=f"external trigger example, filament {F}"):
             width_us=args.width_us,
             total_ms=args.total_ms,
             trigger="ext",
-            timeout_s=args.total_ms / 1000 + 5,   # longer than total_ms
+            shot_wait_timeout_s=args.total_ms / 1000 + 5,   # longer than total_ms
             measure=True,
             on_armed=on_armed,                    # the function itself, no ()
         )

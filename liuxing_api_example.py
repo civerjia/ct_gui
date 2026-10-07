@@ -121,7 +121,7 @@ def fire_single(ct, f):
         total_ms=6000,
         controller=None,
         trigger=trigger_type,
-        timeout_s=6.0,
+        shot_wait_timeout_s=6.0,         # from READY: wait for the trigger + the run (was timeout_s)
         verify=True,
         reuse=True,
         measure=True,

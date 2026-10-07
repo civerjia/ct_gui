@@ -290,14 +290,14 @@ with ct.session():
     #     upstream controller's chained SyncOut. This call does not
     #     generate anything itself; make sure whatever supplies the real
     #     edge is ready to fire before (or shortly after) calling this,
-    #     within timeout_s.
+    #     within shot_wait_timeout_s.
     result = ct.fire_single_pulse(
         filament=0,
         num_pulses=1,
         width_us=1000,
         controller=1,
         trigger="ext",
-        timeout_s=30.0,       # give the external source enough time to fire
+        shot_wait_timeout_s=30.0,   # give the external source enough time to fire
     )
     print(result)
 
@@ -2097,18 +2097,20 @@ ct.fire_single_pulse(filament=50, controller=2) # explicit override
 **`trigger`** (default `"sim"`) — `"sim"` or `"ext"`; see the dedicated
 section right below for the full explanation and examples of each.
 
-**`timeout_s`** (default `15.0`) — how long, in seconds, the Python call
-itself polls before giving up and returning
-`{"ok": False, "timeout": True, ...}` (it does **not** raise — see the
-exceptions table). This is a
-**client-side** poll timeout, separate from `total_ms` (the firmware's own
-schedule timeout). Set it comfortably above `total_ms / 1000` so the
-firmware gets to report COMPLETE/FAULT before Python gives up waiting.
+**`shot_wait_timeout_s`** (default `15.0`; old name `timeout_s`, still
+accepted) — `shot_wait`'s timeout: how long, in seconds, the Python call
+waits from READY (armed) for the trigger AND the run to finish, before giving
+up, disarming and returning `{"ok": False, "timeout": True, ...}` (it does
+**not** raise — see the exceptions table). With an external trigger it
+includes the wait for the edge. This is a **client-side** limit, separate
+from `total_ms` (the firmware's own limit, counted from arm). Set it
+comfortably above `total_ms / 1000` so the firmware gets to report
+COMPLETE/FAULT before Python gives up waiting.
 
 ```python
 # total_ms=40000 (40 s) -> give the client poll a bit more headroom
 ct.fire_single_pulse(filament=0, num_pulses=10, inter_pulse_ms=3000,
-                     total_ms=40000, timeout_s=45.0)
+                     total_ms=40000, shot_wait_timeout_s=45.0)
 ```
 
 **`verify`** (default `True`) — after `download()`, call `verify_schedule()`
@@ -2213,11 +2215,11 @@ trigger is out of the Python API's control entirely.
 # Arm and wait for a real external SyncIn edge (e.g. someone presses a
 # hardware trigger button, or an encoder pulse arrives from the gantry).
 # fire_single_pulse blocks (polling) until the RP2350 reports COMPLETE,
-# FAULT, or timeout_s elapses.
+# FAULT, or shot_wait_timeout_s elapses.
 result = ct.fire_single_pulse(
     filament=0,
     trigger="ext",
-    timeout_s=30.0,     # give the external source enough time to fire
+    shot_wait_timeout_s=30.0,   # give the external source enough time to fire
 )
 print(result)  # {"ok": True, "fired": 1, "records": [...], "status": {...}}
 ```
@@ -2367,10 +2369,11 @@ process:
   schedule, arm to last pulse; exceeding it faults the run
   (`stopReason` `"total timeout"`) **independent of whether any Python
   process is even watching**. This is a completely separate clock from
-  `fire_single_pulse`'s `timeout_s`, which lives in *this* process and
-  only bounds how long *it* polls over HTTP — see `fire_single_pulse`'s
-  docstring ("total_ms vs timeout_s") for the full two-clocks explanation
-  and why `timeout_s` should be set a bit larger than `total_ms / 1000`.
+  `fire_single_pulse`'s `shot_wait_timeout_s` (old name `timeout_s`),
+  which lives in *this* process and only bounds how long *it* waits — see
+  `fire_single_pulse`'s docstring ("total_ms vs shot_wait_timeout_s") for
+  the full two-clocks explanation and why it should be set a bit larger
+  than `total_ms / 1000`.
 - **`trigger_edge`** — `0` = rising, `1` = falling: which SyncIn edge
   fires the schedule. Match this to whatever actually drives SyncIn (the
   ESP32 bridge's own Sync I/O "ext edge" setting, or an external pulse
@@ -4128,7 +4131,7 @@ r = ct.set_emission_v(30)
 if not r["ok"]:
     print(f"HV set failed: {r['error']}")
 
-r = ct.fire_single_pulse(filament=5, timeout_s=5)
+r = ct.fire_single_pulse(filament=5, shot_wait_timeout_s=5)
 if not r["ok"]:
     reason = "timed out" if r.get("timeout") else r.get("error")
     print(f"pulse did not complete: {reason}")

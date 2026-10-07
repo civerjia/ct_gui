@@ -1174,13 +1174,15 @@ class _ScheduleMixin:
         inter_pulse_ms: int = 3000,
         max_on_ms: int = 40,
         total_ms: int = 15000,       # RP2350 FIRMWARE's own schedule timeout (ms)
-                                      # — see docstring, "total_ms vs timeout_s"
+                                      # — see docstring, "total_ms vs shot_wait_timeout_s"
         controller: int | None = None,   # None = auto-infer from `filament` via
                                           # the active-list mapping — see docstring,
                                           # "why controller exists at all"
         trigger: str = "sim",
-        timeout_s: float = 15.0,     # PYTHON CLIENT's polling timeout (seconds)
-                                      # — see docstring, "total_ms vs timeout_s"
+        shot_wait_timeout_s: float = 15.0,   # shot_wait's timeout: how long THIS
+                                      # script waits, from READY (armed), for
+                                      # the trigger and the run to finish (s) --
+                                      # see docstring, "total_ms vs shot_wait_timeout_s"
         verify: bool = True,
         reuse: bool = False,   # skip re-download if unchanged since your last
                                 # call — see docstring, "reuse — skipping the
@@ -1210,6 +1212,7 @@ class _ScheduleMixin:
                                           # return to right after the pulse
         heat_timeout_s: float = 5.0,     # active_ma only: longest wait for
                                           # the ACTIVE current to arrive
+        timeout_s: float | None = None,  # old name of shot_wait_timeout_s, still accepted
     ) -> dict:
         """Download a one-entry schedule, arm it, fire, and verify.
 
@@ -1254,7 +1257,7 @@ class _ScheduleMixin:
         "ok" yourself. Best-effort disarms the schedule before returning on
         any failure path, so a failed fire doesn't leave it armed.
 
-        `total_ms` vs `timeout_s` — two DIFFERENT timeouts, on two DIFFERENT
+        `total_ms` vs `shot_wait_timeout_s` — two DIFFERENT timeouts, on two DIFFERENT
         machines, watching two DIFFERENT things:
 
             total_ms   -> lives on the RP2350. Downloaded as part of the
@@ -1263,7 +1266,9 @@ class _ScheduleMixin:
                           pulse) — if exceeded, the RP2350 itself declares
                           the schedule timed out/faulted, independent of
                           whether Python is even still watching.
-            timeout_s  -> lives in THIS Python process. How long the local
+            shot_wait_timeout_s -> lives in THIS Python process; counts from
+                          READY (armed), so with an external trigger it
+                          includes waiting for the edge. How long the local
                           while-loop below keeps polling shv_status() over
                           HTTP before giving up and returning
                           {"ok": False, "timeout": True, ...} on its own —
@@ -1272,10 +1277,10 @@ class _ScheduleMixin:
                           fine on the hardware, or keep polling a schedule
                           the RP2350 already abandoned.
 
-        Rule of thumb: timeout_s should be a bit LARGER than total_ms/1000,
+        Rule of thumb: shot_wait_timeout_s should be a bit LARGER than total_ms/1000,
         so Python doesn't give up right before the firmware would have
         reported COMPLETE/FAULT on its own — e.g. total_ms=40000 (40 s)
-        pairs with timeout_s=45.0, not timeout_s=15.0 (the default, sized
+        pairs with shot_wait_timeout_s=45.0, not shot_wait_timeout_s=15.0 (the default, sized
         for total_ms's own 15000 ms default).
 
         Why `controller` exists at all, and why it's separate from
@@ -1362,7 +1367,9 @@ class _ScheduleMixin:
                             convenience wrapper doesn't expose). Use
                             download()+shv_set_config(trigger_edge=1)+
                             shv_arm() directly if you need falling-edge.
-            timeout_s:      CLIENT polling timeout (seconds) — see above.
+            shot_wait_timeout_s: seconds this script waits, from READY (armed), for
+                            the trigger and the run to finish (old name:
+                            timeout_s) — see above.
             verify:         confirm the downloaded table's entry count/CRC
                             match before arming (recommended; costs one
                             extra round-trip). Ignored (always effectively
@@ -1398,7 +1405,7 @@ class _ScheduleMixin:
 
             r = ct.fire_single_pulse(filament=8, width_us=1000, trigger="ext",
                                      total_ms=30000,   # edge + whole run within 30 s of ARMING
-                                     timeout_s=35.0,   # this script waits a bit longer
+                                     shot_wait_timeout_s=35.0,   # this script waits a bit longer
                                      measure=True, on_armed=on_armed)   # the function, no ()
             print(r)
 
@@ -1414,7 +1421,7 @@ class _ScheduleMixin:
 
             threading.Thread(target=trigger_source, daemon=True).start()
             r = ct.fire_single_pulse(filament=8, trigger="ext", total_ms=30000,
-                                     timeout_s=35.0, measure=True,
+                                     shot_wait_timeout_s=35.0, measure=True,
                                      on_armed=ready.set)   # already a no-argument function
 
         on_armed runs in THIS thread, between arming and waiting: return
@@ -1422,7 +1429,7 @@ class _ScheduleMixin:
         the schedule is disarmed and nothing fires ({"ok": False, "error": ...}).
         Timing: total_ms counts from ARMING and bounds both the wait for your
         edge and the whole run (firmware TotalTimeout); inter_pulse_ms only
-        applies between pulses once firing has started; timeout_s counts from
+        applies between pulses once firing has started; shot_wait_timeout_s counts from
         when on_armed returns and should be longer than total_ms.
         examples/external_trigger.py is a complete script.
 
@@ -1474,6 +1481,9 @@ class _ScheduleMixin:
         fired at all and the error says so, so measure=True never leaves you
         guessing whether HV went out.
         """
+        if timeout_s is not None:        # the old name wins if a script passes it
+            shot_wait_timeout_s = timeout_s
+
         # Both backgrounds need gap + window of quiet on each side of the pulse.
         # Fire tighter than that and one pulse's background is measured over its
         # neighbour's tail: no error, no flag, just a biased charge -- which is
@@ -1499,14 +1509,14 @@ class _ScheduleMixin:
                 dict(num_pulses=num_pulses, width_us=width_us,
                      inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
                      total_ms=total_ms, controller=controller, trigger=trigger,
-                     timeout_s=timeout_s, verify=verify, reuse=reuse,
+                     timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
                      measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
                      bg_window_us=bg_window_us, on_armed=on_armed))
         return self._fire_single(
             filament, num_pulses=num_pulses, width_us=width_us,
             inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
             total_ms=total_ms, controller=controller, trigger=trigger,
-            timeout_s=timeout_s, verify=verify, reuse=reuse, measure=measure,
+            timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse, measure=measure,
             rate_hz=rate_hz, bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
             on_armed=on_armed)
 
@@ -1592,7 +1602,7 @@ class _ScheduleMixin:
         m = self.shot_measure_arm({"ok": True, "inter_pulse_ms": int(inter_pulse_ms),
                                    "num_pulses": int(num_pulses)},
                                   rate_hz, bg_gap_us=bg_gap_us,
-                                  bg_window_us=bg_window_us, timeout_s=timeout_s)
+                                  bg_window_us=bg_window_us, shot_wait_timeout_s=timeout_s)
         if not m.get("ok"):
             return m
         try:
@@ -1934,7 +1944,8 @@ class _ScheduleMixin:
         return {**shot, "triggered": trigger == "sim"}
 
     def shot_wait(self, shot: dict, timeout_s: float = 15.0) -> dict:
-        """Step 4: poll the controller until the run completes (ok True,
+        """Step 4: wait, up to timeout_s from now, for the trigger AND the run
+        it starts to finish -- poll the controller until it completes (ok True,
         "complete": True), faults or times out (ok False, everything disarmed).
         Reads nothing else -- drop the heating right after it, before
         shot_records(), to keep ACTIVE short."""
@@ -1974,7 +1985,9 @@ class _ScheduleMixin:
 
         self._disarm_all(armed_set)
         return {"ok": False, "timeout": True,
-                "error": f"timed out after {timeout_s} s (state={state})",
+                "error": f"shot_wait timed out: the trigger and the run did not "
+                         f"finish within {timeout_s} s of READY (state={state}) "
+                         f"-- disarmed",
                 "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
 
     @staticmethod
@@ -2076,7 +2089,8 @@ class _ScheduleMixin:
     def shot_measure_arm(self, shot: dict, rate_hz: int = 1000000,
                          bg_gap_us: float | None = None,
                          bg_window_us: float | None = None,
-                         timeout_s: float = 15.0) -> dict:
+                         shot_wait_timeout_s: float = 15.0,
+                         timeout_s: float | None = None) -> dict:
         """Optional, before shot_arm(): arm the STM32 detector (via the ESP32
         relay) so every pulse of this shot is measured, and remember where the
         event stream stands. Fails -> nothing has been armed; do not fire."""
@@ -2084,6 +2098,8 @@ class _ScheduleMixin:
             return shot
         inter_pulse_ms = shot["inter_pulse_ms"]
         rate_hz = int(rate_hz)
+        if timeout_s is not None:      # old name of shot_wait_timeout_s
+            shot_wait_timeout_s = timeout_s
         # This arms the RELAY, not just the detector. The STM32 times each pulse
         # from the real envelope on its PA4 pin, and PA4 only moves while the
         # ESP32 is mirroring the RP2350's pulse signal onto it. pulse_arm() alone
@@ -2101,7 +2117,7 @@ class _ScheduleMixin:
         # default. Also covers the head of the run, before the first pulse.
         arm_ttl_ms = max(self._READY_TTL_FLOOR_MS,
                          int(inter_pulse_ms) * self._READY_TTL_GAP_FACTOR,
-                         int(timeout_s * 1000))
+                         int(shot_wait_timeout_s * 1000))
         arm = self.ready_arm(rate_hz, ttl_ms=arm_ttl_ms,
                              bg_gap_us=bg_gap_us,
                              bg_window_us=bg_window_us)
@@ -2195,13 +2211,12 @@ class _ScheduleMixin:
         inter_pulse_ms: int = 3000,
         max_on_ms: int = 40,
         total_ms: int = 15000,       # RP2350 FIRMWARE's own schedule timeout (ms)
-                                      # — see docstring, "total_ms vs timeout_s"
+                                      # — see docstring, "total_ms vs shot_wait_timeout_s"
         controller: int | None = None,   # None = auto-infer from `filament` via
                                           # the active-list mapping — see docstring,
                                           # "why controller exists at all"
         trigger: str = "sim",
-        timeout_s: float = 15.0,     # PYTHON CLIENT's polling timeout (seconds)
-                                      # — see docstring, "total_ms vs timeout_s"
+        timeout_s: float = 15.0,     # = fire_single_pulse's shot_wait_timeout_s (s)
         verify: bool = True,
         on_armed=None,         # callable() run after arming, immediately before
                                 # the trigger — the only place a caller can start
