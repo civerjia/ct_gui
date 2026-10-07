@@ -353,6 +353,10 @@ class _PriorityLock:
 #: how many zero bytes it is: the parser's largest payload (512) + 2 CRC + slack.
 RESYNC_AFTER_TIMEOUTS = 2
 RESYNC_FILL = 520
+#: How long one request may hold its link while waiting for its reply. A
+#: normal reply takes 20-200 ms; after this the request waits on WITHOUT the
+#: link, so one lost reply no longer stalls every other request behind it.
+LINK_HOLD_S = 0.25
 
 
 class TcpProtocolClient:
@@ -480,7 +484,10 @@ class TcpProtocolClient:
         if not self.connected or sock is None:
             raise RuntimeError("Bridge is not connected")
         t_queue = time.monotonic()
-        with self._request_lock:
+        lock = self._request_lock
+        lock.__enter__()
+        held = True
+        try:
             t_sent = time.monotonic()
             with self._lock:
                 seq = self._seq & 0xFF
@@ -497,24 +504,40 @@ class TcpProtocolClient:
                     self._transport_error = str(exc)
                     raise RuntimeError(f"TCP send failed: {exc}") from exc
                 self._append_history("tx", frame)
+            # Hold the link only while a reply is still LIKELY. A normal one
+            # takes 20-200 ms; past LINK_HOLD_S this request keeps waiting for
+            # its own reply (matched by seq), but stops holding everyone else
+            # off the link -- a lost reply used to block every other request on
+            # this controller for the whole timeout (2026-10-07: queue waits of
+            # 3.6 s behind replies that never came).
             try:
-                response = queue.get(timeout=timeout)
-            except Empty as exc:
-                self._pending.pop(key, None)
-                self.timings.append((t_sent, frame_type, (t_sent - t_queue) * 1000.0,
-                                     (time.monotonic() - t_sent) * 1000.0, False))
-                self.consecutive_timeouts += 1
-                if self.consecutive_timeouts >= RESYNC_AFTER_TIMEOUTS:
-                    self._resync_flush()
-                raise TimeoutError(
-                    f"Timed out waiting for response to {TYPE_NAMES.get(frame_type, hex(frame_type))}"
-                ) from exc
+                response = queue.get(timeout=min(timeout, LINK_HOLD_S))
+            except Empty:
+                response = None
+            if response is None:
+                lock.__exit__(None, None, None)
+                held = False
+                try:
+                    response = queue.get(timeout=max(0.0, timeout - (time.monotonic() - t_sent)))
+                except Empty as exc:
+                    self._pending.pop(key, None)
+                    self.timings.append((t_sent, frame_type, (t_sent - t_queue) * 1000.0,
+                                         (time.monotonic() - t_sent) * 1000.0, False))
+                    self.consecutive_timeouts += 1
+                    if self.consecutive_timeouts >= RESYNC_AFTER_TIMEOUTS:
+                        self._resync_flush()
+                    raise TimeoutError(
+                        f"Timed out waiting for response to {TYPE_NAMES.get(frame_type, hex(frame_type))}"
+                    ) from exc
             self.timings.append((t_sent, frame_type, (t_sent - t_queue) * 1000.0,
                                  (time.monotonic() - t_sent) * 1000.0, True))
             self.consecutive_timeouts = 0
             decoded = self._decode_frame(response)
             self._update_latest(decoded)
             return decoded
+        finally:
+            if held:
+                lock.__exit__(None, None, None)
 
     def _resync_flush(self) -> None:
         """Write RESYNC_FILL zero bytes to put the RP2350's frame parser back to
