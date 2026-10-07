@@ -19,6 +19,16 @@ Two ways to do it -- pick one with MODE:
 
 Both print the same per-pulse line as liuxing_api.py, plus how long the
 filament spent at ACTIVE.
+
+Where the code is:
+  ct/client/_schedule.py   the shot_* methods (shot_prepare, shot_measure_arm,
+                           shot_arm, shot_trigger, shot_wait, shot_records,
+                           shot_measured, shot_abort) and fire_single_pulse,
+                           which is just those steps in order -- each has a
+                           docstring (help(ct.shot_prepare) lists them all).
+  examples/fire_steps.py   the same steps as MODE = "steps", as a stand-alone
+                           script with command-line options (-f 16 55 70); it
+                           does not touch HV.
 """
 import time
 
