@@ -106,8 +106,9 @@ check("all open -> ok, nothing opened", r["ok"] and not r["opened"], r)
 check("all open -> no write sent", not any(op in (0x10, 0x15, 0x78) for op in a.sent + b.sent), a.sent)
 
 # 3. A welded switch -> rail refused, named.
-r = run({1: Rp(stuck=[0, 0, 0, 0, 0, 0, 0, 0x40])})
-check("welded switch -> HV refused", not r["ok"] and "HV NOT turned on" in r["error"] and "CH8.7" in r["error"], r)
+# (CH6: a used channel -- CH7/CH8 carry no boards and are not checked.)
+r = run({1: Rp(stuck=[0, 0, 0, 0, 0, 0x40, 0, 0])})
+check("welded switch -> HV refused", not r["ok"] and "HV NOT turned on" in r["error"] and "CH6.7" in r["error"], r)
 
 # 4. Unreadable controller -> refused (fail closed).
 r = run({1: Rp(silent=True)})

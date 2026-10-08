@@ -145,9 +145,13 @@ def used_channel_mask(controller: int) -> int:
     """Bitmask of the channels that carry boards on Power `controller` (1-based),
     from the active-list mapping; 0xFF when the mapping names none (unknown --
     then every channel counts). CH7/CH8 are unused on this rig."""
+    # The live mapping object is _server.MAPPING (reassigned when the mapping
+    # is edited), so it is looked up at call time -- importing it from
+    # _mapping found nothing and every channel counted (2026-10-08).
+    import sys
+    srv = sys.modules.get("ct.server._server")
     try:
-        from ._mapping import MAPPING
-        m = int(MAPPING.channel_mask(int(controller) - 1)) & 0xFF
+        m = int(srv.MAPPING.channel_mask(int(controller) - 1)) & 0xFF if srv else 0
     except Exception:
         m = 0
     return m or 0xFF
