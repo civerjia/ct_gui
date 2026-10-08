@@ -141,6 +141,18 @@ def _hv_bytes(link: "ControllerLink") -> tuple[list[int], list[int]] | None:
     return list(craw[1:9]), list(fraw[1:9])
 
 
+def used_channel_mask(controller: int) -> int:
+    """Bitmask of the channels that carry boards on Power `controller` (1-based),
+    from the active-list mapping; 0xFF when the mapping names none (unknown --
+    then every channel counts). CH7/CH8 are unused on this rig."""
+    try:
+        from ._mapping import MAPPING
+        m = int(MAPPING.channel_mask(int(controller) - 1)) & 0xFF
+    except Exception:
+        m = 0
+    return m or 0xFF
+
+
 def force_grid_off(link: "ControllerLink", controller: int, masks: dict[int, int] | None = None,
                    reason: str = "") -> dict:
     """Open HV grid switches and do not stop until the hardware SAYS they are open.
@@ -155,6 +167,14 @@ def force_grid_off(link: "ControllerLink", controller: int, masks: dict[int, int
     Returns {ok, rounds, disarmed, still_on: {ch: mask}, error?}."""
     want = {int(c): int(m) & 0xFF for c, m in (masks or {c: 0xFF for c in range(8)}).items()
             if int(m) & 0xFF}
+    # What must READ open to call it done: everything written, except that a
+    # whole-controller clear (masks=None) is judged only on the channels in
+    # use. An unused channel has no boards, its 165 inputs float, and it reads
+    # 0xFF -- P2 CH8 after the 2026-10-08 power-up -- which no write can change.
+    confirm = dict(want)
+    if masks is None:
+        used = used_channel_mask(controller)
+        confirm = {c: m for c, m in want.items() if (used >> c) & 1}
     link.hold_monitor()
     deadline = time.monotonic() + FORCE_OFF_DEADLINE_S
     rounds, disarmed, still_on, last_err = 0, False, dict(want), None
@@ -177,7 +197,7 @@ def force_grid_off(link: "ControllerLink", controller: int, masks: dict[int, int
                 last_err = "read-back failed"
             else:
                 desired, feedback = got
-                still_on = {ch: (desired[ch] | feedback[ch]) & m for ch, m in want.items()
+                still_on = {ch: (desired[ch] | feedback[ch]) & m for ch, m in confirm.items()
                             if (desired[ch] | feedback[ch]) & m}
                 if not still_on:
                     break
@@ -492,7 +512,7 @@ __all__ = [
     "_OCP_SENSE_RESISTOR_OHMS", "_ORDER_LOCK", "_SAFETY", "_SAFETY_EVENTS",
     "_SAFETY_LOCK", "_SAFETY_TOUCH_FIL", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG",
     "_coerce_bytes", "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable",
-    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "force_grid_off", "_masks_text", "_safety_record", "_safety_schedule_running",
+    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "force_grid_off", "used_channel_mask", "_masks_text", "_safety_record", "_safety_schedule_running",
     "_setup_logging", "_status_err", "_status_ok", "_suppress", "_u16", "_u32",
     "_unpack_spi_shot", "_with_dead_stopped", "adc_get_burst", "adc_pulse_arm",
     "adc_pulse_diag", "adc_pulse_disarm", "adc_ready_arm", "adc_ready_disarm",

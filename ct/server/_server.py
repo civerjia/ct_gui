@@ -2460,7 +2460,19 @@ def hv_preflight_switches(reason: str) -> dict:
             problems.append(f"Power {cid}: switch state unreadable")
             continue
         desired, feedback = got
-        closed = {ch: desired[ch] | feedback[ch] for ch in range(8) if desired[ch] | feedback[ch]}
+        # Only channels that carry boards: an unused one (CH7/CH8 here) has
+        # floating 165 inputs and reads 0xFF -- after the 2026-10-08 power-up
+        # P2 CH8 did, and every emission ON was refused for switches that do
+        # not exist.
+        used = used_channel_mask(cid)
+        closed = {ch: desired[ch] | feedback[ch] for ch in range(8)
+                  if (used >> ch) & 1 and desired[ch] | feedback[ch]}
+        ignored = {ch: feedback[ch] for ch in range(8)
+                   if not (used >> ch) & 1 and feedback[ch]}
+        if ignored:
+            log.info("HV preflight %s: Power %d unused channel(s) %s read %s -- no boards "
+                     "there, ignored", reason, cid, sorted(c + 1 for c in ignored),
+                     [ignored[c] for c in sorted(ignored)])
         if not closed:
             continue
         log.warning("HV preflight %s: Power %d switch(es) %s CLOSED (desired %s, read-back %s) "
