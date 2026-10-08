@@ -330,6 +330,76 @@ def _adopt_firmware_power_states(c0: int, cache: dict, read_at: float) -> list:
     return adopted
 
 
+# Below this output the TPS has not come up at all: its own floor is 0.8 V.
+COLD_OUTPUT_MV = 800
+# A board at least this far up that still draws less than this is open.
+COLD_OPEN_MA = 50
+
+
+def _board_reading_text(fid: int, board: dict | None) -> str:
+    """"P1 CH2.1: 536 mV, 2 mA, TPS output enable OFF" -- the measured state
+    of a filament's board, for an error a person will read. "" if unknown."""
+    if not board:
+        return ""
+    c0 = filament_to_board(int(fid))[0]
+    if not board.get("present"):
+        return f"P{(c0 or 0) + 1} {board.get('label')}: board not present"
+    mv, ma = board.get("bus_mV"), board.get("current_mA")
+    parts = [f"{mv} mV" if mv is not None else "voltage unread",
+             f"{ma} mA" if ma is not None else "current unread"]
+    if board.get("oe") is False:
+        parts.append("TPS output enable OFF")
+    if board.get("tps_fault"):
+        parts.append("TPS FAULT")
+    if board.get("iso_enabled") is False:
+        parts.append("isolated rail OFF")
+    return f"P{(c0 or 0) + 1} {board.get('label')}: " + ", ".join(parts)
+
+
+def _cold_board_cause(fid: int) -> tuple[dict | None, str]:
+    """(board row, cause) for a filament the warm guard just refused, from the
+    board monitor's latest readings (no request of its own).
+
+    The firmware's own fault for a board that draws nothing is "open"
+    (cc_mode 2) whether the filament is open or the output never rose -- on
+    2026-10-08 filament 8 reported "open" with its output at 536 mV, i.e. the
+    voltage was never applied. The bus voltage tells the two apart."""
+    c0, ch, pos, _ = filament_to_board(int(fid))
+    if c0 is None or ch is None:
+        return None, ""
+    try:
+        rows, meta = monitor_board_rows(c0 + 1)
+    except Exception:
+        return None, ""
+    row = next((r for r in rows if r.get("channel") == ch and r.get("mux_port") == pos), None)
+    if not row or not meta.get("fresh"):
+        return row, ""
+    keep = ("label", "present", "bus_mV", "current_mA", "oe", "tps_present",
+            "tps_enabled", "tps_fault", "iso_enabled", "power_state")
+    board = {k: row.get(k) for k in keep if k in row}
+    mv, ma = row.get("bus_mV"), row.get("current_mA")
+    where = f"P{c0 + 1} {row.get('label')}"
+    if not row.get("present"):
+        return board, f"its board ({where}) is not present"
+    if mv is None:
+        return board, ""
+    extras = []
+    if row.get("oe") is False:
+        extras.append("TPS output enable OFF")
+    if row.get("tps_fault"):
+        extras.append("TPS FAULT")
+    if row.get("iso_enabled") is False:
+        extras.append("isolated rail OFF")
+    tail = f" ({', '.join(extras)})" if extras else ""
+    if mv < COLD_OUTPUT_MV:
+        return board, (f"the output voltage never came up on {where}: {mv} mV "
+                       f"(the TPS floor is {COLD_OUTPUT_MV} mV), {ma} mA{tail}")
+    if ma is not None and ma < COLD_OPEN_MA:
+        return board, (f"OPEN on {where}: the output is up ({mv} mV) but draws "
+                       f"only {ma} mA -- open filament or connection{tail}")
+    return board, ""
+
+
 def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict) -> dict:
     snap = dict(prev) if prev else {"boards": {}, "boards_at": 0.0, "bitmaps": {},
                                     "bitmaps_at": 0.0, "status": None, "status_at": 0.0}
@@ -4241,11 +4311,23 @@ class CtHandler(BaseHTTPRequestHandler):
                             pass   # unreadable -> fall back to the state-only check
                     why = ladder_blocks_active(filament, arr, arr_known, cur_ma, tgt_ma)
                     if why:
+                        # Every refusal carries the board's measured voltage and
+                        # current, so whoever reads it can judge for themselves:
+                        # refusing alone left filament 8 (2026-10-08) looking like
+                        # a slow warm-up when its output had never come up. When
+                        # the reading points at a cause, that is named too.
+                        board, cause = _cold_board_cause(filament)
+                        reading = _board_reading_text(filament, board)
+                        if cause and why.startswith("not warm yet"):
+                            why = f"{cause} -- {why}"
+                        elif reading:
+                            why = f"{why} [measured {reading}]"
                         log.warning("filament-state: refused ACTIVE for %d — %s", filament, why)
-                        return self._json({"ok": False, "ladder_blocked": True,
-                                           "filament": filament, "error":
-                                           f"filament {filament} may not go to ACTIVE: {why}"},
-                                          HTTPStatus.OK)
+                        out = {"ok": False, "ladder_blocked": True, "filament": filament,
+                               "error": f"filament {filament} may not go to ACTIVE: {why}"}
+                        if board:
+                            out["board"] = board
+                        return self._json(out, HTTPStatus.OK)
                 cid0, ch, pos, _ = filament_to_board(filament)
                 if cid0 is None or ch is None:
                     return self._json({"ok": False, "error": f"filament {filament} has no board"}, HTTPStatus.OK)
