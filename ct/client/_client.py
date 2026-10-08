@@ -521,6 +521,12 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
             r = self._one_post(path, body, timeout)
         if attempt:
             r["retries"] = attempt
+        if r.get("order_stale") and isinstance(r.get("order"), dict):
+            # Refused because another client changed the filament order. Adopt
+            # the order now in force so the NEXT command is translated right;
+            # this one is not re-sent -- part of an operation done under the
+            # old order and part under the new would split it across filaments.
+            self._adopt_order(r["order"])
         # Wrapped HERE, not only in _parse(): the refusals and connection
         # errors built locally never touch _parse, and those are exactly the
         # results a reader is squinting at.
@@ -1549,15 +1555,29 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
             # never got one, so filament_order_status() can say so rather than
             # reporting a confident identity.
             self._order, self._order_rev, self._order_epoch = {}, {}, None
+            self._set_order_token(None)
             return
         seq = list(snap.get("order") or range(self.FILAMENT_COUNT))
         self._order = {i: int(v) for i, v in enumerate(seq) if int(v) != i}
         self._order_rev = {v: k for k, v in self._order.items()}
         self._order_epoch = snap.get("epoch")
+        # Every POST says which order its filament numbers were translated
+        # with; the backend refuses one made under an order changed since.
+        self._set_order_token(snap.get("token"))
         # The dead cache holds USER_INDEX values translated under the PREVIOUS
         # order, so it now names the wrong filaments. Drop it rather than
         # translate.
         self._dead_fetched_at = 0.0
+
+    def _set_order_token(self, token) -> None:
+        """Send `token` as X-CT-Order on every request (None: send none)."""
+        session = getattr(self, "_s", None)
+        if session is None:
+            return
+        if token:
+            session.headers["X-CT-Order"] = str(token)
+        else:
+            session.headers.pop("X-CT-Order", None)
 
     def reload_filament_order(self) -> list[int]:
         """Re-read the order from the backend and adopt it, discarding this

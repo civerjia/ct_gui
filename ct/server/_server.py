@@ -1001,11 +1001,30 @@ def _dead_load() -> None:
                          f"empty mask, which would re-enable disabled filaments.")
 
 
-def _dead_save() -> None:
+def _atomic_write(path, text: str, tries: int = 15, wait_s: float = 0.2) -> None:
+    """Write `text` to `path` through a temp file + rename, so a crash mid-write
+    can never leave it truncated. The rename is retried: state/ lives under
+    OneDrive on the rig, and while the sync client holds the file the rename
+    fails with "Access is denied" (WinError 5, 2026-10-08 09:40). Raises if it
+    still fails after tries x wait_s -- the caller must then treat the change
+    as NOT made."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = DEAD_STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"dead": {str(k): v for k, v in sorted(DEAD_FIDS.items())}}, indent=2))
-    tmp.replace(DEAD_STATE_PATH)   # atomic: a crash mid-write must not truncate the mask
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(text)
+    for i in range(tries):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(wait_s)
+
+
+def _dead_save() -> None:
+    # atomic: a crash mid-write must not truncate the mask
+    _atomic_write(DEAD_STATE_PATH,
+                  json.dumps({"dead": {str(k): v for k, v in sorted(DEAD_FIDS.items())}}, indent=2))
 
 
 # PowerState values that put power ON the filament, so the ones a dead filament
@@ -1056,6 +1075,14 @@ FILAMENT_ORDER: list[int] | None = None       # None = identity
 ORDER_SET_BY: str = ""
 ORDER_SET_AT: float = 0.0
 ORDER_SAVED_FP: str | None = None             # wiring the current order was set against
+# Bumped on every change of the order (reported as "rev"). The check itself
+# uses order_token(), a fingerprint of the mapping: every POST sends the token
+# its numbers were translated with, and one made under a different mapping is
+# refused (see _order_stale). 2026-10-08: one CTClient
+# set a new order while another kept its old snapshot, so a pre-heat and the
+# shot that followed it went to NEIGHBOURING filaments (60 heated, 61 fired)
+# for over an hour. The epoch alone only changes when the backend restarts.
+ORDER_REV: int = 0
 
 
 def _mapping_fingerprint() -> str:
@@ -1071,13 +1098,10 @@ def _order_save() -> None:
     """Caller holds _ORDER_LOCK. Atomic, like _dead_save."""
     global ORDER_SAVED_FP
     ORDER_SAVED_FP = _mapping_fingerprint()
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = ORDER_STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({
+    _atomic_write(ORDER_STATE_PATH, json.dumps({
         "order": FILAMENT_ORDER, "set_by": ORDER_SET_BY,
         "saved_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "mapping_fingerprint": ORDER_SAVED_FP}, indent=2))
-    tmp.replace(ORDER_STATE_PATH)
 
 
 def _order_load() -> None:
@@ -1114,11 +1138,21 @@ def _order_load() -> None:
              sum(1 for i, v in enumerate(FILAMENT_ORDER) if v != i))
 
 
+def order_token() -> str:
+    """A fingerprint of the mapping in force: two clients hold the same token
+    exactly when every USER_INDEX names the same filament for both -- so a
+    backend restart, or the same order set again, does not invalidate anyone,
+    and any real change does."""
+    order = list(FILAMENT_ORDER) if FILAMENT_ORDER else list(range(FILAMENT_COUNT))
+    return hashlib.sha1(json.dumps(order).encode()).hexdigest()[:12]
+
+
 def order_snapshot() -> dict:
     with _ORDER_LOCK:
         order = list(FILAMENT_ORDER) if FILAMENT_ORDER else list(range(FILAMENT_COUNT))
         return {"ok": True, "order": order, "identity": FILAMENT_ORDER is None,
                 "epoch": ORDER_EPOCH, "set_by": ORDER_SET_BY,
+                "rev": ORDER_REV, "token": order_token(),
                 # The wiring changed since this order was set: it may now point
                 # at other filaments. Set it again.
                 "mapping_changed": (FILAMENT_ORDER is not None and ORDER_SAVED_FP is not None
@@ -3489,6 +3523,37 @@ class CtHandler(BaseHTTPRequestHandler):
                 audit_post(self.path.split("?", 1)[0], self._audit_client,
                            self._audit_body, self._audit_resp, self._audit_note)
 
+    # Paths whose bodies carry no filament numbers, or that must always get
+    # through: the order itself, the lease, keepalives, remote-session plumbing.
+    _ORDER_CHECK_EXEMPT = ("/api/filament-order", "/api/lock", "/api/safety")
+
+    def _order_stale(self, path: str, body: dict) -> dict | None:
+        """The refusal for a POST made under an older filament order, else None.
+
+        A client sends X-CT-Order = the token of the order it translated its
+        filament numbers with. If the order has changed since, those numbers
+        may name other filaments -- so the command is refused, and the reply
+        carries the order now in force for the client to adopt. Commands that
+        only turn things OFF, and reads, still pass: refusing a SLEEP would be
+        worse than sending it to a stale number. No header (the GUI, curl): no
+        check."""
+        token = self.headers.get("X-CT-Order")
+        if not token or path in self._ORDER_CHECK_EXEMPT or path.startswith("/api/remote"):
+            return None
+        if token == order_token() or is_deenergising_post(path, body) or is_read_post(path, body):
+            return None
+        with _ORDER_LOCK:
+            by, at = ORDER_SET_BY, ORDER_SET_AT
+        ago = f"{time.monotonic() - at:.0f} s ago" if at else "at start-up"
+        log.warning("refused %s: sent under filament order %s, now %s (changed by %s %s)",
+                    path, token, order_token(), by or "?", ago)
+        return {"ok": False, "order_stale": True,
+                "error": f"refused: the filament order changed ({by or '?'}, {ago}) after "
+                         f"this client read it, so its filament numbers may name other "
+                         f"filaments. The new order has been adopted; issue the command "
+                         f"again if it is still what you mean.",
+                "order": order_snapshot()}
+
     def _do_post(self) -> None:
         global SCAN_MASK   # read (diagnosis branch) + written (channel-mask branch)
         path = self.path.split("?", 1)[0]
@@ -3505,6 +3570,9 @@ class CtHandler(BaseHTTPRequestHandler):
                                        + (f" ({held['note']})" if held["note"] else ""),
                  "lock": held},
                 HTTPStatus.CONFLICT)
+        stale = self._order_stale(path, body)
+        if stale is not None:
+            return self._json(stale, HTTPStatus.CONFLICT)
         try:
             if path == "/api/lock":
                 # Cooperative exclusive-write lease. {action: acquire|renew|release|
@@ -4565,31 +4633,44 @@ class CtHandler(BaseHTTPRequestHandler):
                 # {"order": [96 ints]} to set, {"order": null} to clear back to
                 # identity. Validated here too -- every other client reads this
                 # back, so a non-permutation stored here corrupts all of them.
-                global FILAMENT_ORDER, ORDER_SET_BY, ORDER_SET_AT
+                global FILAMENT_ORDER, ORDER_SET_BY, ORDER_SET_AT, ORDER_REV
                 order = body.get("order")
-                if order is None:
+                why = None if order is None else order_validate(order)
+                if why:
+                    self._json({"ok": False, "error": f"bad order: {why}"})
+                else:
+                    new_order = (None if order is None
+                                 or list(map(int, order)) == list(range(FILAMENT_COUNT))
+                                 else [int(v) for v in order])
                     with _ORDER_LOCK:
-                        FILAMENT_ORDER = None
+                        before = (FILAMENT_ORDER, ORDER_SET_BY, ORDER_SET_AT)
+                        FILAMENT_ORDER = new_order
                         ORDER_SET_BY = self._client()
                         ORDER_SET_AT = time.monotonic()
-                        _order_save()
-                    log.info("filament order cleared to identity by %s", self._client())
-                    self._json(order_snapshot())
-                else:
-                    why = order_validate(order)
-                    if why:
-                        self._json({"ok": False, "error": f"bad order: {why}"})
-                    else:
-                        with _ORDER_LOCK:
-                            FILAMENT_ORDER = ([int(v) for v in order]
-                                              if list(map(int, order)) != list(range(FILAMENT_COUNT))
-                                              else None)
-                            ORDER_SET_BY = self._client()
-                            ORDER_SET_AT = time.monotonic()
+                        try:
                             _order_save()
-                        swapped = sum(1 for i, v in enumerate(order) if int(v) != i)
-                        log.info("filament order set by %s (%d entries differ from identity)",
-                                 self._client(), swapped)
+                            err = None
+                        except OSError as exc:
+                            # Not saved -> not set. Applying it in memory while
+                            # telling the caller it failed is what left two
+                            # clients on different orders.
+                            FILAMENT_ORDER, ORDER_SET_BY, ORDER_SET_AT = before
+                            err = exc
+                        if err is None and FILAMENT_ORDER != before[0]:
+                            ORDER_REV += 1
+                    if err is not None:
+                        log.warning("filament order NOT changed (could not save it): %s", err)
+                        self._json({"ok": False, "error": f"filament order not changed: could "
+                                                          f"not save it ({err}); the order in "
+                                                          f"force is unchanged",
+                                    "order": order_snapshot()})
+                    else:
+                        if order is None:
+                            log.info("filament order cleared to identity by %s", self._client())
+                        else:
+                            swapped = sum(1 for i, v in enumerate(order) if int(v) != i)
+                            log.info("filament order set by %s (%d entries differ from identity)",
+                                     self._client(), swapped)
                         self._json(order_snapshot())
             elif path == "/api/dead-fids":
                 # Mark filaments as must-not-energise, or clear them. FID space.

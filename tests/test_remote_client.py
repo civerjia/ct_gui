@@ -80,8 +80,11 @@ try:
         check("missing method raises AttributeError", True)
 
     calls = []
-    ct.__dict__["_rp_local_client"] = type("L", (), {"status": lambda self, cb=None: calls.append(cb) or "local"})()
+    ct.__dict__["_rp_local_client"] = type("L", (), {
+        "status": lambda self, cb=None: calls.append(cb) or "local",
+        "reload_filament_order": lambda self: calls.append("reload")})()
     check("a call given a callable runs locally", ct.status(cb=lambda: None) == "local" and calls)
+    check("...after re-reading the backend's filament order", calls[0] == "reload", calls)
     ct.__dict__["_rp_local_client"] = None
 
     # Calls from different threads run concurrently, as on a local client.

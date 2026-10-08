@@ -303,7 +303,17 @@ class RemoteCTClient:
 
         def method(*args, **kwargs):
             if _has_callable(args) or _has_callable(kwargs):
-                return getattr(self._rp_local(), name)(*args, **kwargs)
+                # The local client keeps its own copy of the filament order,
+                # read once. Every other call runs in the backend session, so
+                # an order set through this object (or by anyone) after that
+                # read left the two on DIFFERENT orders: 2026-10-08 the
+                # pre-heat (active_one, in the session) went to filament 60
+                # and the fire (fire_single_pulse with on_armed, local) to 61.
+                # Re-read the order the backend has in force before every
+                # local call so both paths translate filament numbers alike.
+                local = self._rp_local()
+                local.reload_filament_order()
+                return getattr(local, name)(*args, **kwargs)
             return self._rp_request({"kind": "call", "name": name,
                                      "args": encode(list(args), self_obj=self),
                                      "kwargs": encode(kwargs, self_obj=self)})
