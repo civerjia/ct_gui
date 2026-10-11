@@ -1222,7 +1222,9 @@ class _ScheduleMixin:
         filament sits at firing current -- 4-9 s per filament measured
         2026-10-07, against a 2-3 s heat-up. With it, the filament must be at
         IDLE; everything is prepared at IDLE, ACTIVE is raised after the arm
-        (and verified, up to heat_timeout_s), the trigger follows at once,
+        (and verified, up to heat_timeout_s: a current that has not arrived
+        by then means NOT fired, ok=False), then on_armed is called and the
+        trigger follows at once,
         and the filament goes back to idle_ma as soon as the run is over --
         before the pulse log and the detector events are read. ACTIVE time
         is then the heat-up plus the pulses. The firmware's total_ms clock
@@ -1393,7 +1395,9 @@ class _ScheduleMixin:
         that moment: after the schedule is downloaded and verified, the STM32
         detector armed (measure=True), this filament's controller armed (and
         the master, last), and the check that the filament was not skipped as
-        unsafe. An edge sent BEFORE that is lost. After on_armed returns, this
+        unsafe -- and, with active_ma, after the ACTIVE current has been
+        measured at its target (so the pulse never lands mid-ramp). An edge
+        sent BEFORE that is lost, or fires an unheated filament. After on_armed returns, this
         call waits for the run to finish.
 
         Same script, a person or another instrument sends the edge:
@@ -1533,8 +1537,10 @@ class _ScheduleMixin:
                 "t_active": None, "t_idle": None}
 
         def raise_active():
-            if callable(user_on_armed):
-                user_on_armed()
+            # The caller's on_armed means "send the trigger NOW", so it runs
+            # only after the ACTIVE current has ARRIVED -- calling it before
+            # active_one (as until 2026-10-11) let an external edge fire the
+            # pulse mid-ramp, on a filament still heating up.
             heat["raised"] = True        # from here on, the finally drops it
             heat["t_active"] = time.monotonic()
             # Backstop in the BACKEND: held while the run is armed/running,
@@ -1553,6 +1559,17 @@ class _ScheduleMixin:
                 heat["raised"] = False
                 raise RuntimeError(f"ACTIVE {active_ma} mA not accepted: "
                                    f"{r.get('error') or r}")
+            # Accepted is not arrived: verify's wait gives up after
+            # heat_timeout_s with r["ok"] still True. Do not fire a filament
+            # that never reached firing current (the finally drops it).
+            h = r.get("heating") or {}
+            if not h.get("ok"):
+                raise RuntimeError(
+                    f"ACTIVE {active_ma} mA not reached within {heat_timeout_s} s "
+                    f"(measured {h.get('measured_ma')} mA"
+                    f"{': ' + str(h['error']) if h.get('error') else ''}) -- not fired")
+            if callable(user_on_armed):
+                user_on_armed()
 
         def drop_idle():
             # Called when the run ends and again from the finally: a failed

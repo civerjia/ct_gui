@@ -27,7 +27,7 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-def make(active_ok=True, run="complete", idle_ok=True):
+def make(active_ok=True, run="complete", idle_ok=True, heat_ok=True):
     ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
     calls = []
     seen = {}
@@ -35,7 +35,8 @@ def make(active_ok=True, run="complete", idle_ok=True):
     def active_one(f, ma, **k):
         calls.append("active")
         seen["active_kw"] = k
-        return ({"ok": True, "heating": {"ok": True, "measured_ma": ma}} if active_ok
+        return ({"ok": True, "heating": {"ok": heat_ok, "measured_ma": ma if heat_ok else 1900}}
+                if active_ok
                 else {"ok": False, "error": "ladder"})
 
     def idle_one(f, ma, **k):
@@ -88,6 +89,26 @@ check("backend backstop: timed ACTIVE back to idle_ma",
       and seen["active_kw"].get("verify") is True, seen["active_kw"])
 check("heating feedback and ACTIVE time reported",
       r.get("heating", {}).get("ok") and isinstance(r.get("active_s"), float), r)
+
+# 1b. 2026-10-11: on_armed ("send the external edge NOW") fired BEFORE
+#     active_one, so the pulse landed mid-ramp. It must come after the
+#     current is verified, and right before the trigger.
+ct, calls, seen = make()
+r = ct.fire_single_pulse(16, measure=False, active_ma=2700, idle_ma=1300,
+                         on_armed=lambda: calls.append("user_on_armed"), **KW)
+check("user on_armed after ACTIVE is verified, then trigger",
+      calls == ["setup", "active", "user_on_armed", "trigger", "idle", "pulse_log"], calls)
+
+# 1c. ACTIVE accepted but the current never arrived (verify gave up):
+#     not fired, user's on_armed never called, dropped back to IDLE.
+ct, calls, seen = make(heat_ok=False)
+r = ct.fire_single_pulse(16, measure=False, active_ma=2700, idle_ma=1300,
+                         on_armed=lambda: calls.append("user_on_armed"), **KW)
+check("current not reached -> no trigger, no on_armed",
+      "trigger" not in calls and "user_on_armed" not in calls and not r["ok"], calls)
+check("...says why, with the measured current",
+      "not reached" in r.get("error", "") and "1900" in r.get("error", ""), r)
+check("...and drops back to IDLE", calls[-1] == "idle" and calls.count("idle") == 1, calls)
 
 # 2. measure=False path too.
 ct, calls, seen = make()
