@@ -246,6 +246,18 @@ run(rig, emission_v=180, limit_ma=40)
 check("emission: limit -> voltage -> ON (no moment at an old setpoint)",
       rig.calls[:3] == [("limit", 40.0), ("emission_v", 180.0), ("emission", True)], rig.calls[:4])
 
+# 7c. Pulse width: any width up to 65535 us goes into the shot; above it is clamped and said.
+rig = Rig({0: IDLE})
+r = run(rig, width_us=20000, pulse_gap_ms=100)
+check("width 20 ms: passed through, max_on_ms covers it, gap kept",
+      rig.shots[0]["k"]["width_us"] == 20000 and rig.shots[0]["k"]["max_on_ms"] >= 20
+      and rig.shots[0]["k"]["inter_pulse_ms"] == 100 and not r["notes"], (rig.shots[0]["k"], r["notes"]))
+rig = Rig({0: IDLE})
+r = run(rig, width_us=100000, pulse_gap_ms=50)
+check("width 100 ms: clamped to 65535 us, gap 50 raised to 71 ms, both said",
+      rig.shots[0]["k"]["width_us"] == 65535 and r["params"]["pulse_gap_ms"] == 71
+      and len(r["notes"]) == 2 and r["results"][0]["points"], (r["params"], r["notes"]))
+
 # 8. Focus as asked; both rails off at the end.
 rig = Rig({0: IDLE}, focus_reads=-348.0)
 r = run(rig, focus_on=True, focus_v=350)

@@ -1074,7 +1074,7 @@ const TESTS_HTML = `
       <label class="numlabel" title="ACTIVE, commanded in one go as the train starts">end mA<input id="t5To" type="number" min="1500" max="3200" step="50" value="2500" /></label>
       <label class="numlabel" title="pulses in the train (≤ 255) — make it last longer than the climb">pulses<input id="t5Shots" type="number" min="1" max="255" value="40" /></label>
       <label class="numlabel" title="pulse spacing (raised to pulse width + 5 ms if shorter)">gap ms<input id="t5Gap" type="number" min="10" max="5000" value="100" /></label>
-      <label class="numlabel">pulse µs<input id="t5Width" type="number" min="1" max="1000000" value="1000" /></label>
+      <label class="numlabel" title="pulse width, ≤ 65535 µs (the schedule's 16-bit field); the gap is raised to width + 5 ms if shorter">pulse µs<input id="t5Width" type="number" min="1" max="65535" value="1000" /></label>
       <label class="numlabel">emis −V<input id="t5V" type="number" min="0" max="350" value="200" /></label>
       <label class="numlabel" title="emission supply current limit">limit mA<input id="t5Limit" type="number" min="1" max="85" value="55" /></label>
       <label class="numlabel" title="focus ON at −V during the calibration (unchecked = focus OFF)"><input id="t5FocusOn" type="checkbox" /> focus −V<input id="t5FocusV" type="number" min="0" max="1000" value="350" /></label>

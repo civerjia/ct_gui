@@ -403,6 +403,11 @@ class _EmissionMixin:
             notes.append(f"{pulses} pulses is over the {self._U8_MAX}-pulse schedule limit; "
                          f"using {self._U8_MAX}")
             pulses = self._U8_MAX
+        width_us = max(1, int(width_us))
+        if width_us > self._U16_MAX:
+            notes.append(f"pulse width {width_us} us is over the {self._U16_MAX} us the schedule "
+                         f"can carry; using {self._U16_MAX}")
+            width_us = self._U16_MAX
         width_ms = width_us / 1000.0
         if pulse_gap_ms < width_ms + 5:
             gap = int(math.ceil(width_ms + 5))
