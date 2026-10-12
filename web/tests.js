@@ -391,14 +391,17 @@ function drawCurve(canvasId, pts, opt) {
   const W = c.width = c.clientWidth || 680, H = c.height = 132, ctx = c.getContext('2d');
   ctx.clearRect(0, 0, W, H); ctx.fillStyle = '#070b0e'; ctx.fillRect(0, 0, W, H);
   const padL = 38, padB = 16, padT = 8, x0 = padL, y0 = H - padB, plotW = W - padL - 6, plotH = H - padB - padT;
+  const xMin = opt.xMin || 0;
   const xMax = opt.xMax || Math.max(0.001, ...pts.map((p) => p.x)) * 1.05;
   const yMax = Math.max(0.001, ...pts.map((p) => p.y)) * 1.15;
   ctx.strokeStyle = '#243038'; ctx.beginPath(); ctx.moveTo(x0, padT); ctx.lineTo(x0, y0); ctx.lineTo(W - 4, y0); ctx.stroke();
   ctx.fillStyle = '#8b97a0'; ctx.font = '9px monospace';
   ctx.textAlign = 'right'; ctx.fillText(yMax.toFixed(yMax < 10 ? 2 : 0), x0 - 3, padT + 6); ctx.fillText('0', x0 - 3, y0);
   ctx.textAlign = 'left'; ctx.fillText(opt.yLabel || '', x0 + 2, padT + 8);
-  ctx.textAlign = 'center'; ctx.fillText(xMax.toFixed(2) + ' ' + (opt.xUnit || 'A'), W - 22, H - 5);
-  const X = (x) => x0 + (x / xMax) * plotW, Y = (y) => y0 - (y / yMax) * plotH;
+  const xFmt = (v) => (xMax >= 100 ? v.toFixed(0) : v.toFixed(2));
+  ctx.textAlign = 'center'; ctx.fillText(xFmt(xMax) + ' ' + (opt.xUnit || 'A'), W - 22, H - 5);
+  if (xMin) { ctx.textAlign = 'left'; ctx.fillText(xFmt(xMin), x0 + 2, H - 5); }
+  const X = (x) => x0 + ((x - xMin) / (xMax - xMin)) * plotW, Y = (y) => y0 - (y / yMax) * plotH;
   ctx.strokeStyle = '#3fb6a0'; ctx.lineWidth = 1.4; ctx.beginPath();
   pts.forEach((p, i) => { i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y)); });
   ctx.stroke();
@@ -870,66 +873,66 @@ async function test4() {
 // 5 — Emission current calibration (heat sweep per filament → curve → disk)
 // =========================================================================
 async function test5() {
-  const fromA = parseFloat($t('t5From').value) || 1.0, toA = parseFloat($t('t5To').value) || 2.5;
-  const stepA = Math.max(0.001, parseFloat($t('t5Step').value) || 0.25), settle = Math.max(0, parseInt($t('t5Settle').value, 10) || 200);
-  const emV = Math.abs(parseFloat($t('t5V').value) || 200), widthUs = parseInt($t('t5Width').value, 10) || 1000;
-  const nLevels = Math.max(1, Math.round((toA - fromA) / stepA) + 1);   // integer index avoids float drift dropping the top level
-  const levels = []; for (let k = 0; k < nLevels; k++) levels.push(+(fromA + k * stepA).toFixed(3));
-  const fmap = await loadFilMap(), fils = Object.keys(fmap).map(Number).sort((a, b) => a - b);
-  const curves = {}, cur = { id: await pulseCursor() }; let cer = null, skipped = 0;
-  const params = { fromA, toA, stepA, settleMs: settle, emissionV: -emV, pulseUs: widthUs, levels };
+  if (!(await guard(false))) return;
+  const num = (id) => { const v = $t(id).value.trim(); return v === '' ? null : Number(v); };
+  const body = {
+    action: 'start', first: num('t5First'), last: num('t5Last'),
+    start_ma: num('t5From') ?? 1800, end_ma: num('t5To') || 2500,
+    pulses: num('t5Shots') || 40, pulse_gap_ms: num('t5Gap') || 100, width_us: num('t5Width') || 1000,
+    emission_v: Math.abs(num('t5V') || 200), limit_ma: num('t5Limit') || 55, idle_ma: num('t5Idle') ?? 1200,
+    focus_on: $t('t5FocusOn').checked, focus_v: Math.abs(num('t5FocusV') || 0),
+  };
+  const range = body.first == null && body.last == null ? 'every live filament'
+    : `filaments ${body.first ?? 'first'}–${body.last ?? 'last'}`;
+  if (!confirm(`Emission calibration on ${range}: emission −${body.emission_v} V ON (limit ${body.limit_ma} mA), `
+    + `focus ${body.focus_on ? '−' + body.focus_v + ' V ON' : 'OFF'}, each filament ACTIVE ${body.start_ma} mA until stable, `
+    + `then ACTIVE ${body.end_ma} mA with ${body.pulses} pulses ${body.pulse_gap_ms} ms apart fired through the climb, `
+    + `left at IDLE ${body.idle_ma} mA. Continue?`)) return;
+  abortFlag = false; setRunning(true);
+  let abortSent = false;
   try {
-    tMsg(`Calibration — emission → −${emV} V (${fils.length} filaments × ${levels.length} levels)…`);
-    if (!(await setHvAndWait('emission', emV))) return;
-    await hvEnable('emission', true);
-    await pulseArm(); await tSleep(150);
-    for (let i = 0; i < fils.length; i++) {
-      if (abortFlag) { tMsg('Aborted — saving partial…'); break; }
-      const f = fils[i], m = fmap[f]; cer = m; const pts = []; curves[f] = [];
-      // The ladder: never straight to firing current. STANDBY, then IDLE; a
-      // level up to the IDLE ceiling is held in IDLE, above it ACTIVE (which
-      // the backend only allows from IDLE).
-      await setState(m.ctrl, m.ch, m.pos, 3, 0); await tSleep(300);
-      for (const a of levels) {
-        if (abortFlag) break;
-        tMsg(`Calibration: F${f} (${i + 1}/${fils.length}) @ ${a.toFixed(2)} A…`);
-        const heatMa = Math.round(a * 1000), st = heatMa <= IDLE_CEILING_MA ? 4 : 5;
-        const sr = await setState(m.ctrl, m.ch, m.pos, st, heatMa);
-        if (!sr || !sr.ok) {
-          tMsg(`Calibration: F${f} @ ${a.toFixed(2)} A not applied — ${(sr && sr.error) || 'no reply'}. Skipping the rest of F${f}.`);
-          break;
-        }
-        await tSleep(settle);
-        const r = await fireAndMeasure(cur, m.ctrl, m.ch, m.pos, widthUs);
-        // A point with no trustworthy current is saved as mA null + the reason,
-        // and is not plotted or fitted. Writing 0 instead drew it as a real
-        // "no emission at this heating current" reading, and the saved curve
-        // gave no way to tell that apart afterwards.
-        if (r.unusable) { curves[f].push({ heatA: a, mA: null, peak: r.peak, unmeasured: r.unusable }); skipped++; continue; }
-        const mA = r.mA;
-        curves[f].push({ heatA: a, mA: +mA.toFixed(2), peak: r.peak });
-        pts.push({ x: a, y: Math.max(0, mA) });
-        drawCurve('t5Plot', pts, { xMax: toA, yLabel: `Ie (mA) · F${f}` });
+    const st = await tPostJ('/api/tests/emission-cal', body);
+    if (!st || !st.ok) { tMsg('Calibration not started: ' + ((st && st.error) || 'no reply'), 'bad'); return; }
+    tMsg('Calibration: emission rail coming up…');
+    let j = null;
+    for (;;) {
+      await tSleep(1000);
+      if (abortFlag && !abortSent) { abortSent = true; await tPostJ('/api/tests/emission-cal', { action: 'abort' }); }
+      j = await tGetJ('/api/tests/emission-cal');
+      if (!j || !j.ok) continue;
+      const shots = j.shots || [];
+      const f = shots.length ? shots[shots.length - 1].filament : null;
+      if (f != null) {
+        const pts = shots.filter((p) => p.filament === f && p.usable && p.heat_mA != null && p.emission_ma != null)
+          .map((p) => ({ x: p.heat_mA, y: Math.max(0, p.emission_ma) })).sort((a, b) => a.x - b.x);
+        drawCurve('t5Plot', pts, { xMin: Math.max(0, body.start_ma - 100), xMax: body.end_ma + 100, xUnit: 'mA',
+          yLabel: `Ie (mA) · F${f}` });
       }
-      await setState(m.ctrl, m.ch, m.pos, 2, 0);   // SLEEP (heating off) before the next filament
+      if (!j.running) break;
+      const lastF = j.done[j.done.length - 1];
+      tMsg(`Calibration: ${j.done.length} filament(s) done`
+        + (lastF ? ` · F${lastF.filament}: ${lastF.fired || 0} pulses, ${lastF.active_s ?? '?'} s at ACTIVE, ${lastF.end}` : '')
+        + (abortSent ? ' · aborting after this filament…' : ''));
     }
-  } finally {
-    if (cer) await setState(cer.ctrl, cer.ch, cer.pos, 2, 0);
-    await hvEnable('emission', false); await lutZeroV('emission'); await pulseDisarm();
-  }
-  // persist whatever we collected (full or partial)
-  if (Object.keys(curves).length) {
-    const save = await tPostJ('/api/calibration/save', { name: 'emission_calibration', data: { params, curves } });
+    const res = (j && j.result) || {};
+    const done = (j && j.done) || [];
+    const bad = done.filter((d) => d.error);
+    const cut = done.filter((d) => !d.error && d.stop_reason && d.stop_reason !== 'aborted');
+    const saved = res.saved || {};
     testResult('t5Result', {
-      title: 'Emission calibration', pass: save.ok ? null : false,
-      counts: [{ n: save.filaments != null ? save.filaments : Object.keys(curves).length, label: 'curves' },
-               { n: skipped, label: 'unmeasured pts', bad: skipped > 0 }],
-      note: (save.ok ? `saved · ${save.csv || 'disk'}` : `save failed: ${save.error || ''}`)
-        + (skipped ? ` · ${skipped} point(s) had no trustworthy current — saved blank, NOT 0` : ''),
+      title: 'Emission calibration', pass: j && j.error ? false : !!res.ok,
+      counts: [{ n: done.length, label: 'filaments' }, { n: bad.length, label: 'STOPPED (error)', bad: bad.length > 0 },
+               { n: cut.length, label: 'ended early', bad: cut.length > 0 },
+               { n: ((j && j.shots) || []).length, label: 'pulses measured' }],
+      note: j && j.error ? 'error: ' + j.error
+        : (saved.ok ? `saved · ${saved.csv || saved.json || 'calibration/'}` : (res.saved ? `NOT saved: ${saved.error || ''}` : 'nothing saved'))
+          + (res.params && res.params.emission_v_read != null ? ` · rail read ${res.params.emission_v_read} V` : ''),
+      flagged: [...(res.notes || []), ...(res.problems || []),
+        ...cut.map((d) => `F${d.filament}: ${d.stop_reason}`)],
     });
-    tMsg(`Calibration done — ${Object.keys(curves).length} filaments ${save.ok ? 'saved to disk' : 'NOT saved'}`
-      + `${skipped ? `, ${skipped} point(s) unmeasured` : ''}.`, save.ok ? '' : 'bad');
-  } else { tMsg('Calibration produced no data.', 'bad'); }
+    tMsg(`Calibration done — ${done.length} filament(s)` + (res.aborted ? ' (aborted)' : '')
+      + (saved.ok ? ', saved' : ''), (j && j.error) || bad.length ? 'bad' : '');
+  } finally { setRunning(false); }
 }
 
 // =========================================================================
@@ -1063,18 +1066,23 @@ const TESTS_HTML = `
   </div>
 
   <div class="test-block" id="testBlock5">
-    <div class="block-title" title="LONG. Per filament, sweeps the heating current from→to in steps (200 ms settle each), fires a pulse at each level, and records the emission-current curve. Slow. Saves all curves to the host disk (JSON + CSV).">5 · Emission current calibration <span class="hint">ⓘ</span></div>
+    <div class="block-title" title="Runs in the BACKEND (ct.emission_calibration -- the same code a script calls); closing this page does not stop it. Sets its own starting conditions (emission on at −V and focus as chosen, both read back; filaments brought up, never cooled if already warm). Per filament, all at ACTIVE: ACTIVE start mA held until stable, then ACTIVE end mA commanded in one go and the pulse train fired straight through the climb, nothing stopping in between; each pulse is paired with the heating current recorded at that pulse. Back to IDLE as soon as the train ends, results read after. STOP only on a heating fault or an exception. Emission and focus OFF at the end. Saves JSON + CSV to calibration/.">5 · Emission current calibration <span class="hint">ⓘ</span></div>
     <div class="test-params">
-      <label class="numlabel">from A<input id="t5From" type="number" min="0" max="4" step="0.05" value="1.0" /></label>
-      <label class="numlabel">to A<input id="t5To" type="number" min="0" max="4" step="0.05" value="2.5" /></label>
-      <label class="numlabel">step A<input id="t5Step" type="number" min="0.05" max="2" step="0.05" value="0.25" /></label>
-      <label class="numlabel">settle ms<input id="t5Settle" type="number" min="0" max="5000" value="200" /></label>
+      <label class="numlabel" title="first filament (USER_INDEX); blank = lowest">F from<input id="t5First" type="number" min="0" max="95" placeholder="all" /></label>
+      <label class="numlabel" title="last filament, inclusive; blank = highest">F to<input id="t5Last" type="number" min="0" max="95" placeholder="all" /></label>
+      <label class="numlabel" title="ACTIVE current held until stable before the train (≥ 1500)">start mA<input id="t5From" type="number" min="1500" max="3200" step="50" value="1800" /></label>
+      <label class="numlabel" title="ACTIVE, commanded in one go as the train starts">end mA<input id="t5To" type="number" min="1500" max="3200" step="50" value="2500" /></label>
+      <label class="numlabel" title="pulses in the train (≤ 255) — make it last longer than the climb">pulses<input id="t5Shots" type="number" min="1" max="255" value="40" /></label>
+      <label class="numlabel" title="pulse spacing (raised to pulse width + 5 ms if shorter)">gap ms<input id="t5Gap" type="number" min="10" max="5000" value="100" /></label>
+      <label class="numlabel">pulse µs<input id="t5Width" type="number" min="1" max="1000000" value="1000" /></label>
       <label class="numlabel">emis −V<input id="t5V" type="number" min="0" max="350" value="200" /></label>
-      <label class="numlabel">pulse µs<input id="t5Width" type="number" min="1" max="100000" value="1000" /></label>
+      <label class="numlabel" title="emission supply current limit">limit mA<input id="t5Limit" type="number" min="1" max="85" value="55" /></label>
+      <label class="numlabel" title="focus ON at −V during the calibration (unchecked = focus OFF)"><input id="t5FocusOn" type="checkbox" /> focus −V<input id="t5FocusV" type="number" min="0" max="1000" value="350" /></label>
+      <label class="numlabel" title="IDLE rung a cold filament passes through before ACTIVE, and where every filament is left">idle mA<input id="t5Idle" type="number" min="0" max="2000" step="50" value="1200" /></label>
       <button class="xs quick test-run" id="t5Run">Run</button>
     </div>
     <canvas id="t5Plot" class="test-plot"></canvas>
-    <div class="hint">Live curve = the filament being calibrated. Full set is written to <code>tools/ct_gui/calibration/</code>.</div>
+    <div class="hint">Plot = the last filament done: every pulse, emission mA (pedestal subtracted) vs the heating current recorded at that pulse. Saved to <code>calibration/</code>.</div>
     <div id="t5Result" class="summary"></div>
   </div>
 
@@ -1250,7 +1258,8 @@ export function initTests() {
   $t('t2Run').onclick = () => runTest(test2, true);
   $t('t3Run').onclick = () => runTest(test3, true);
   $t('t4Run').onclick = () => runTest(test4, true);
-  $t('t5Run').onclick = () => runTest(test5, true);
+  // Like test7: the backend job holds its own lease, so NOT wrapped in runTest's.
+  $t('t5Run').onclick = () => test5().catch((e) => tMsg('Test error: ' + ((e && e.message) || e), 'bad'));
   $t('t6Run').onclick = () => runTest(test6, false);   // voltage-mode, no HV
   $t('t7Run').onclick = () => test7();
   $t('testAbort').onclick = () => { abortFlag = true; tMsg('Aborting after the current step…'); };

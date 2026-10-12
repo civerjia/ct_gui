@@ -2203,7 +2203,7 @@ class _ScheduleMixin:
         return {**shot, "measuring": True, "since": since, "rate_hz": rate_hz}
 
     def shot_measured(self, shot: dict, result: dict | None = None,
-                      grace_s: float = 3.0) -> dict:
+                      grace_s: float = 3.0, prefetched: tuple | None = None) -> dict:
         """Optional, last: collect the detector events this shot produced and
         disarm the detector. `result` is shot_records()'s return; the merged
         result is ok only if every fired pulse was measured."""
@@ -2212,7 +2212,12 @@ class _ScheduleMixin:
             return base
         try:
             want = int(shot["num_pulses"])
-            measured, ref_mv = self._collect_pulse_events(int(shot["since"]), want, grace_s)
+            # prefetched = (events, ref_mv) already read while the train ran (a
+            # long train overruns the ESP32's 128-event ring); collect the rest.
+            got, ref0 = prefetched if prefetched else ([], None)
+            since = got[-1]["id"] if got else int(shot["since"])
+            more, ref_mv = self._collect_pulse_events(since, want - len(got), grace_s)
+            measured, ref_mv = list(got) + more, ref_mv or ref0
         finally:
             self.ready_disarm()
         out = {**base, "measured": measured, "ref_mv": ref_mv,

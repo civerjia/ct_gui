@@ -2427,6 +2427,92 @@ def heat_short_status() -> dict:
         return {"ok": True, **copy.deepcopy({k: v for k, v in _HEAT_SHORT.items()})}
 
 
+# ── Emission calibration job (CTClient.emission_calibration, run for the GUI) ─
+# Same shape as the heat-short job: minutes to hours, so the GUI starts it here
+# and polls; a closed browser does not stop it. A script can call
+# ct.emission_calibration() directly.
+EMISSION_CAL_CLIENT = "emission-calibration"
+_EMISSION_CAL_LOCK = threading.Lock()
+_EMISSION_CAL: dict[str, Any] = {"running": False, "shots": [], "done": [],
+                                 "current": None, "result": None, "error": None,
+                                 "params": None, "started": None, "finished": None,
+                                 "abort": False}
+_EMISSION_CAL_KEYS = ("filaments", "first", "last", "start_ma", "end_ma", "pulses",
+                      "pulse_gap_ms", "width_us", "emission_v", "limit_ma", "focus_on",
+                      "focus_v", "idle_ma")
+
+
+def emission_cal_start(body: dict) -> dict:
+    """Start the emission calibration in a backend thread. Refused while one runs."""
+    kw = {k: body[k] for k in _EMISSION_CAL_KEYS if body.get(k) is not None}
+    # The only refusals: another job. Any other starting condition (rail on or
+    # off, filaments at any state) the calibration sets up itself.
+    if _HEAT_SHORT["running"]:
+        return {"ok": False, "error": "the heat-short test is running"}
+    held = _lease_blocking(EMISSION_CAL_CLIENT)
+    if held:
+        return {"ok": False, "error": f"the write lease is held by {held['owner']}"
+                                      + (f" ({held['note']})" if held.get("note") else "")}
+    running, why = _safety_schedule_running()
+    if running:
+        return {"ok": False, "error": "a schedule is armed or running -- disarm it first"}
+    with _EMISSION_CAL_LOCK:
+        if _EMISSION_CAL["running"]:
+            return {"ok": False, "error": "an emission calibration is already running"}
+        _EMISSION_CAL.update(running=True, shots=[], done=[], current=None, result=None,
+                             error=None, params=kw, finished=None, abort=False,
+                             started=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    def _run():
+        from ct.client._client import CTClient
+        result, err = None, None
+        try:
+            port = int(os.environ.get("CT_GUI_PORT", "8770"))
+            ct = CTClient("127.0.0.1", port=port, client_id=EMISSION_CAL_CLIENT, _local=True)
+
+            def _progress(f, points, row):
+                # Once per filament, after its ramp: every pulse as (its own
+                # heating current, its emission) -- that IS the curve.
+                with _EMISSION_CAL_LOCK:
+                    _EMISSION_CAL["shots"].extend(
+                        {"filament": int(f), "heat_mA": p.get("heat_mA"),
+                         "emission_ma": p.get("emission_ma"), "usable": p.get("usable")}
+                        for p in (points or []))
+                    if row is not None:
+                        _EMISSION_CAL["done"].append(
+                            {"filament": int(f), "end": row.get("end"),
+                             "error": row.get("error"), "stop_reason": row.get("stop_reason"),
+                             "active_s": row.get("active_s"), "fired": row.get("fired"),
+                             "start_settled_ma": row.get("start_settled_ma"),
+                             "n_points": len(row.get("points") or [])})
+
+            with ct.lease(ttl=60, note="emission calibration"):
+                result = ct.emission_calibration(progress=_progress,
+                                                 abort=lambda: _EMISSION_CAL["abort"], **kw)
+            # Every pulse is already on disk (saved) and in "shots"; keep the
+            # status small.
+            for r in (result.get("results") or {}).values():
+                r["n_points"] = len(r.pop("points", None) or [])
+            log.warning("emission calibration done: %s filament(s), saved %s; problems: %s",
+                        len(result.get("results") or {}),
+                        (result.get("saved") or {}).get("json"),
+                        "; ".join(result.get("problems") or []) or "none")
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            log.exception("emission calibration failed")
+        with _EMISSION_CAL_LOCK:
+            _EMISSION_CAL.update(running=False, result=result, error=err, current=None,
+                                 finished=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    threading.Thread(target=_run, name="emission-calibration", daemon=True).start()
+    return {"ok": True, "started": _EMISSION_CAL["started"], "params": kw}
+
+
+def emission_cal_status() -> dict:
+    with _EMISSION_CAL_LOCK:
+        return {"ok": True, **copy.deepcopy({k: v for k, v in _EMISSION_CAL.items()})}
+
+
 def hv_preflight_switches(reason: str) -> dict:
     """Before a rail goes ON: every grid switch on every connected controller
     must READ open (real 165 read + the firmware's desired byte). Any that is
@@ -3170,6 +3256,8 @@ class CtHandler(BaseHTTPRequestHandler):
                         "note": "boards left at Sleep (iso on) after the scan"})
         elif path == "/api/tests/heat-short":
             self._json(heat_short_status())
+        elif path == "/api/tests/emission-cal":
+            self._json(emission_cal_status())
         elif path == "/api/hv-snapshot":
             # Raw per-channel ISO-grid bitmap for one controller (?controller=1|2,
             # via _target_link — not MASTER). HV_GET_ALL_BYTES (0x13) returns two
@@ -4099,6 +4187,18 @@ class CtHandler(BaseHTTPRequestHandler):
                         _HEAT_SHORT["abort"] = True
                     return self._json({"ok": True, "running": running})
                 self._json(heat_short_start(body))
+            elif path == "/api/tests/emission-cal":
+                # Emission calibration: body {action: "start", filaments? |
+                # first?/last?, start_ma?, end_ma?, pulses?, pulse_gap_ms?,
+                # width_us?, emission_v?, limit_ma?, focus_on?, focus_v?,
+                # idle_ma?} or {action: "abort"} (stops after the current
+                # filament; rails off, curves saved).
+                if body.get("action") == "abort":
+                    with _EMISSION_CAL_LOCK:
+                        running = _EMISSION_CAL["running"]
+                        _EMISSION_CAL["abort"] = True
+                    return self._json({"ok": True, "running": running})
+                self._json(emission_cal_start(body))
             elif path == "/api/hv-all-off":
                 # Open EVERY HV grid switch and confirm it from the 165 read-back
                 # (force_grid_off). body {controllers?}. Every bench test ends

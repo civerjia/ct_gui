@@ -51,6 +51,16 @@ class _EmissionMixin:
     #: filament is no longer at firing current when the call returns.
     _END_STATES = {"stop": STOP, "sleep": SLEEP, "standby": STANDBY, "idle": IDLE}
 
+    def _walk_to_end_state(self, fil: int, end_state: str, idle_ma, why: str) -> None:
+        """From the STOP energised() left, climb the ladder rung by rung to
+        end_state. Commanding IDLE straight from STOP skipped SLEEP and
+        STANDBY -- the order every other path keeps (STOP->SLEEP->STANDBY)."""
+        target = self._END_STATES[end_state]
+        for st in (SLEEP, STANDBY, IDLE):
+            if st > target:
+                break
+            self._state_one(fil, st, idle_ma if st == IDLE else 0, why)
+
     def emission_vs_heating(
         self,
         filament: int,                     # USER_INDEX, as everywhere
@@ -287,9 +297,7 @@ class _EmissionMixin:
             # not "STOP, then IDLE would have been nice" -- and so the STOP
             # still happens on the paths where this one fails.
             if end_state != "stop":
-                self._state_one(fil, self._END_STATES[end_state],
-                                idle_ma if end_state == "idle" else 0,
-                                "emission_vs_heating end_state")
+                self._walk_to_end_state(fil, end_state, idle_ma, "emission_vs_heating end_state")
 
         for p in points:
             p.pop("_fatal", None)
@@ -310,6 +318,371 @@ class _EmissionMixin:
                 "emission_v": self.read_emission_v(),
                 "focus_v": self.read_focus_v(), "ref_mv": ref_mv})
         return out
+
+    def emission_calibration(
+        self,
+        filaments=None,                    # list of USER_INDEX; None = first..last
+        first: int | None = None,          # range, inclusive; None = from the lowest
+        last: int | None = None,           #                    None = to the highest
+        start_ma: int = 1800,              # ACTIVE, held until stable, then ...
+        end_ma: int = 2500,                # ... ACTIVE end, commanded in one go
+        pulses: int = 40,                  # the train fired through the ramp
+        pulse_gap_ms: int = 100,
+        width_us: int = 1000,
+        emission_v: float = 200.0,
+        limit_ma: float = 55.0,
+        focus_on: bool = False,
+        focus_v: float = 0.0,
+        idle_ma: int = 1200,               # IDLE rung below ACTIVE; where all end
+        progress=None,                     # callable(filament, points | None, row | None)
+        abort=None,                        # callable() -> True: stop after this filament
+        save_as: str | None = "emission_calibration",
+    ) -> dict:
+        """Emission vs heating current for a RANGE of filaments, one ramp each.
+
+            r = ct.emission_calibration(first=0, last=11)        # 1800 -> 2500 mA
+            r = ct.emission_calibration([16, 55], end_ma=2700, pulses=60)
+
+        Per filament, all of it at ACTIVE: ACTIVE start_ma, held until the CC
+        loop is stable; then ACTIVE end_ma is commanded ONCE and the pulse
+        train fires straight away, `pulses` pulses `pulse_gap_ms` apart,
+        through the whole climb with nothing stopping in between. Each pulse
+        is paired with the heating current the firmware recorded AT that
+        pulse -- that is its x. (The same firing as emission_ramp().)
+
+        NOTHING IS REFUSED for a starting condition -- it is SET instead:
+        emission -emission_v at limit_ma, focus on/off at focus_v as asked
+        (both read back), filaments brought up from whatever state they are
+        in. Out-of-range arguments are clamped and listed in "notes". Only
+        another job (a schedule armed/running, the lease held by someone
+        else) stops it -- the backend job checks that.
+
+          1. ACTIVE start_ma, never cooling on the way: already ACTIVE ->
+             straight there; IDLE -> ACTIVE; below IDLE -> up the ladder to
+             IDLE idle_ma (stable), then ACTIVE. Waits until the loop reports
+             start_ma stable (40 s at most).
+          2. Arm the train (detector on), command ACTIVE end_ma, trigger.
+          3. Train over -> IDLE idle_ma at once; only then are the pulse log
+             and the detector events read (a train over 100 pulses is also
+             read in the background while it fires -- never in its way).
+          4. STOP only on an ERROR, named in row["error"]:
+               "heating fault"  the firmware reports the output FAULTED
+                                (cc_mode 2 open filament / 3 OCP-SCP on
+                                consecutive reads, or a fault kind on the
+                                board after the ramp) or STRUGGLING (the
+                                output cannot start = a short);
+               "exception"      a command raised; the filament's state is
+                                unknown -- STOPped, and the whole run stops
+                                (re-raised once the rails are off).
+             Not errors (-> IDLE, next filament): start_ma not stable within
+             40 s, ACTIVE refused, the train did not fire, abort.
+
+        Emission and focus go OFF at the end, whatever happens.
+
+        Returns {"ok", "params", "notes", "results": {f: row}, "problems",
+        "aborted", "saved"}; row = {"filament", "points": [one per pulse],
+        "end": "idle" | "stop", "stop_reason", "error", "active_s", "fired",
+        "start_settled_ma"}.
+        """
+        notes: list[str] = []
+        floor, ceil = self._ACTIVE_FLOOR_MA, self._IDLE_CEILING_MA
+        if start_ma < floor:
+            notes.append(f"start {start_ma} mA raised to the {floor} mA ACTIVE floor")
+            start_ma = floor
+        if end_ma <= start_ma:
+            notes.append(f"end {end_ma} mA is not above the start; using {start_ma + 100}")
+            end_ma = start_ma + 100
+        if idle_ma > start_ma:
+            notes.append(f"idle {idle_ma} mA lowered to the start, {start_ma} mA")
+            idle_ma = start_ma
+        if idle_ma > ceil:
+            notes.append(f"idle {idle_ma} mA lowered to the {ceil} mA IDLE ceiling")
+            idle_ma = ceil
+        pulses = max(1, int(pulses))
+        if pulses > self._U8_MAX:
+            notes.append(f"{pulses} pulses is over the {self._U8_MAX}-pulse schedule limit; "
+                         f"using {self._U8_MAX}")
+            pulses = self._U8_MAX
+        width_ms = width_us / 1000.0
+        if pulse_gap_ms < width_ms + 5:
+            gap = int(math.ceil(width_ms + 5))
+            notes.append(f"pulse gap {pulse_gap_ms} ms raised to {gap} ms (pulse is {width_ms:g} ms)")
+            pulse_gap_ms = gap
+        pulse_gap_ms = max(10, int(pulse_gap_ms))
+        params = {"start_ma": start_ma, "end_ma": end_ma, "pulses": pulses,
+                  "pulse_gap_ms": pulse_gap_ms, "width_us": width_us,
+                  "emission_v": -abs(float(emission_v)), "limit_ma": limit_ma,
+                  "focus_on": bool(focus_on), "focus_v": -abs(float(focus_v)),
+                  "idle_ma": idle_ma, "first": first, "last": last}
+        out = {"ok": False, "params": params, "notes": notes, "results": {},
+               "problems": [], "aborted": False, "saved": None}
+        problems = out["problems"]
+
+        if filaments is None:
+            filaments = [f for f in self._live_user_indices()
+                         if (first is None or f >= int(first)) and (last is None or f <= int(last))]
+        wanted, skipped = self._mosfet_targets(filaments)
+        notes.extend(skipped)
+        dead = [int(f) for f in filaments if self._is_dead(int(f))]
+        if dead:
+            notes.append(f"dead, skipped: {dead}")
+        if not wanted:
+            problems.append("no live filament on a connected controller in that range")
+            return out
+
+        hv0 = self.hv_status()
+        params["before"] = {k: hv0.get(k) for k in ("emission_on", "focus_on")}
+        stopped_by_exception = None
+        try:
+            # ---- the rails: set as asked, whatever they were -------------------
+            # Setpoints BEFORE the enable: a rail that was off comes up at the
+            # asked voltage, not for a moment at whatever its wiper last held.
+            for what, w in (("emission limit", self.set_emission_i(limit_ma)),
+                            ("emission voltage", self.set_emission_v(abs(float(emission_v))))):
+                if not w.get("ok"):
+                    problems.append(f"{what} could not be set: {w.get('error') or w}")
+                    return out
+            en = self.enable_emission(True)
+            if not en.get("ok"):
+                problems.append(f"emission could not be turned on: {en.get('error') or en}")
+                return out
+            v_read, bad = self._mosfet_rail(emission_v)
+            params["emission_v_read"] = None if v_read is None else round(float(v_read), 1)
+            if bad:
+                problems.append(bad)
+                return out
+            if focus_on:
+                w = self.set_focus_v(abs(float(focus_v)))
+                if not w.get("ok"):
+                    problems.append(f"focus voltage could not be set: {w.get('error') or w}")
+                    return out
+                fo = self.enable_focus(True)
+                if not fo.get("ok"):
+                    problems.append(f"focus could not be turned on: {fo.get('error') or fo}")
+                    return out
+                time.sleep(0.5)
+                fv = self.read_focus_v()
+                params["focus_v_read"] = None if fv is None else round(float(fv), 1)
+                if fv is None or abs(abs(fv) - abs(focus_v)) > 0.10 * abs(focus_v):
+                    problems.append(f"focus did not reach -{abs(focus_v):g} V "
+                                    f"(read {'nothing' if fv is None else f'{fv:.1f} V'})")
+                    return out
+            else:
+                fo = self.enable_focus(False)
+                if not fo.get("ok"):
+                    problems.append(f"focus could not be turned off: {fo.get('error') or fo}")
+                    return out
+            pedestal, ped = self._resolve_pedestal(None, wanted[0], idle_ma, None)
+            params["pedestal"] = ped
+            if pedestal is None:
+                notes.append("pedestal unknown -- nothing subtracted; emission_ma includes the "
+                             "grid's diode path (net_ma is the raw value either way)")
+                pedestal = 0.0
+            params["pedestal_ma"] = round(float(pedestal), 3)
+
+            for f in wanted:
+                if callable(abort) and abort():
+                    out["aborted"] = True
+                    break
+                try:
+                    row = self._cal_filament(int(f), params, float(pedestal))
+                except BaseException as exc:
+                    stopped_by_exception = exc
+                    row = {"filament": int(f), "points": [], "end": "stop",
+                           "stop_reason": None, "active_s": None, "fired": 0,
+                           "error": f"exception: {type(exc).__name__}: {exc}"}
+                    try:
+                        self.stop_one(int(f))
+                    except Exception:
+                        pass
+                out["results"][int(f)] = row
+                if callable(progress):
+                    progress(int(f), row["points"], row)
+                if stopped_by_exception is not None:
+                    break
+        finally:
+            off_f = self.enable_focus(False)
+            if not off_f.get("ok"):
+                problems.append(f"turning focus OFF failed ({off_f.get('error')}) -- it may still be LIVE")
+            hv_off = self._hv_off_problem()
+            if hv_off:
+                problems.append(hv_off)
+
+        for f, row in sorted(out["results"].items()):
+            if row.get("error"):
+                problems.append(f"filament {f}: {row['error']} -> STOPPED")
+        if out["aborted"]:
+            notes.append("aborted")
+        if save_as and out["results"]:
+            try:
+                out["saved"] = self.save_emission_curves(
+                    save_as, {f: {"points": r["points"], "ok": not r.get("error"),
+                                  "problems": [p for p in (r.get("error"), r.get("stop_reason")) if p],
+                                  "end_state": r.get("end"), "active_s": r.get("active_s"),
+                                  "pedestal_ma": params.get("pedestal_ma")}
+                              for f, r in out["results"].items()}, params)
+            except Exception as exc:
+                out["saved"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        out["ok"] = bool(out["results"]) and not problems
+        if stopped_by_exception is not None:
+            raise stopped_by_exception
+        return out
+
+    def _cal_to_start(self, f: int, start_ma: int, idle_ma: int) -> tuple[str | None, dict]:
+        """Bring one filament to ACTIVE start_ma and wait until it is stable,
+        never cooling it on the way: already ACTIVE -> straight to start_ma;
+        IDLE -> ACTIVE; below IDLE -> up the ladder to IDLE idle_ma (until
+        stable), then ACTIVE. (None, heating) when there, else (why, heating)."""
+        st = self.read_board_status(f)
+        if not st.get("ok"):
+            return f"power state unreadable: {st.get('error')}", {}
+        state = st.get("state")
+        if state not in (IDLE, ACTIVE):
+            for rung in (SLEEP, STANDBY):
+                if state is None or rung > state:
+                    r = self._state_one(f, rung, 0, "emission_calibration ladder")
+                    if not r.get("ok"):
+                        return f"{rung.name} refused: {self.describe(r)[:120]}", {}
+            r = self.idle_one(f, idle_ma, verify=True, timeout_s=40.0)
+            h = r.get("heating") or {}
+            if not (r.get("ok") and h.get("ok")):
+                return (f"IDLE {idle_ma} mA not stable in 40 s ({h.get('measured_ma')} mA, "
+                        f"{h.get('arrival')})"), h
+        r = self.active_one(f, start_ma, verify=True, timeout_s=40.0)
+        deadline = time.monotonic() + 30.0
+        while r.get("ladder_blocked") and not r.get("dead") and time.monotonic() < deadline:
+            time.sleep(1.0)                      # IDLE not warm yet: let it get there
+            r = self.active_one(f, start_ma, verify=True, timeout_s=40.0)
+        h = r.get("heating") or {}
+        if not r.get("ok"):
+            return f"ACTIVE {start_ma} mA refused: {self.describe(r)[:140]}", h
+        if not h.get("ok"):
+            return (f"ACTIVE {start_ma} mA not stable in 40 s ({h.get('measured_ma')} mA, "
+                    f"{h.get('arrival')})"), h
+        return None, h
+
+    def _cal_filament(self, f: int, params: dict, pedestal: float) -> dict:
+        """One filament of emission_calibration(); see its docstring."""
+        row = {"filament": f, "points": [], "end": None, "stop_reason": None,
+               "error": None, "active_s": None, "fired": 0, "start_settled_ma": None}
+        start, end, idle_ma = params["start_ma"], params["end_ma"], params["idle_ma"]
+        n, gap, width_us = params["pulses"], params["pulse_gap_ms"], params["width_us"]
+        train_s = n * gap / 1000.0
+        shot, t_active, res, collector = {}, None, None, None
+        try:
+            why, h = self._cal_to_start(f, start, idle_ma)
+            row["start_settled_ma"] = h.get("measured_ma")
+            if h.get("elapsed_s") is not None and not why:
+                # ACTIVE since the start command: verify's wait is that long
+                t_active = time.monotonic() - float(h["elapsed_s"])
+            if why:
+                if h.get("faulted") or h.get("cannot_start"):
+                    row["error"] = f"heating fault at {start} mA: {h.get('error')}"
+                else:
+                    row["stop_reason"] = why
+                return row
+            shot = self.shot_prepare(
+                f, num_pulses=n, width_us=width_us, inter_pulse_ms=gap,
+                max_on_ms=int(math.ceil(width_us / 1000.0)) + 1,
+                total_ms=int(train_s * 1000) + 30000,
+                trigger="sim", verify=True, reuse=True)
+            shot = self.shot_measure_arm(shot, shot_wait_timeout_s=train_s + 30.0)
+            shot = self.shot_arm(shot)
+            if not shot.get("ok"):
+                row["stop_reason"] = f"schedule not armed: {shot.get('error')}"
+                return row
+            # The end current in ONE command, then the train at once. Backend
+            # backstop: back to idle_ma when the run ends / if this client dies.
+            r = self.active_one(f, end, active_s=train_s + 30.0, then_idle_ma=idle_ma)
+            if not r.get("ok"):
+                row["stop_reason"] = f"ACTIVE {end} mA refused: {self.describe(r)[:160]}"
+                return row
+            if t_active is None:
+                t_active = time.monotonic()
+            if n > self._CAL_RING_SAFE:
+                collector = self._cal_event_collector(int(shot["since"]), gap)
+            shot = self.shot_trigger(shot)
+            shot = self.shot_wait(shot, timeout_s=train_s + 15.0)
+            # Train over: off ACTIVE before ANY read-back.
+            ir = self.idle_one(f, idle_ma)
+            row["end"] = "idle" if ir.get("ok") else f"IDLE failed: {ir.get('error')}"
+            row["active_s"] = round(time.monotonic() - t_active, 2)
+            t_active = None
+            res = self.shot_records(shot)
+            pre = collector() if collector else None
+            collector = None
+            res = self.shot_measured(shot, res, prefetched=pre)
+        finally:
+            if collector:
+                collector()
+            self.shot_abort(shot)
+            if t_active is not None:
+                row["active_s"] = round(time.monotonic() - t_active, 2)
+            if row["error"]:
+                st = self.stop_one(f)
+                row["end"] = "stop" if st.get("ok") else f"STOP failed: {st.get('error')}"
+            elif row["end"] is None:
+                # Left before the train ended (refused / not stable / raised).
+                st = self.idle_one(f, idle_ma)
+                row["end"] = "idle" if st.get("ok") else f"IDLE failed: {st.get('error')}"
+
+        row["fired"] = res.get("fired")
+        if not res.get("ok"):
+            row["stop_reason"] = res.get("error")
+        events = list(res.get("measured") or [])
+        log = [rec for rec in (self.shv_pulse_log(self._firing_controller(f, None)) or [])
+               if rec.get("filament") == f]
+        if events and len(log) == len(events):
+            row["points"] = self._ramp_points(events, log, pedestal, res.get("ref_mv"))
+        elif events:
+            # Without a 1:1 pairing no pulse has a heating current: keep the
+            # emission, x left empty, and say so -- never a guessed current.
+            row["points"] = [{**p, "heat_mA": None, "heat_target_mA": None, "usable": False,
+                              "heat_unavailable": "unpaired"}
+                             for p in self._ramp_points(events, [{}] * len(events), pedestal,
+                                                        res.get("ref_mv"))]
+            row["stop_reason"] = ((row["stop_reason"] + "; ") if row["stop_reason"] else "") + (
+                f"{len(log)} pulse-log records for {len(events)} events: cannot pair, "
+                f"no heating current per pulse")
+        st = self.read_board_status(f)
+        if st.get("ok") and st.get("fault"):
+            row["error"] = f"heating fault after the ramp: board reports {st.get('fault_name')}"
+            stp = self.stop_one(f)
+            row["end"] = "stop" if stp.get("ok") else f"STOP failed: {stp.get('error')}"
+        return row
+
+    # The ESP32 keeps the last 128 detector events. A train longer than this is
+    # also read WHILE it runs (in a background thread, not in the heating path).
+    _CAL_RING_SAFE = 100
+
+    def _cal_event_collector(self, since: int, gap_ms: int):
+        """Read detector events in the background, slowly enough to leave the
+        ESP32 alone (its HTTP server shares a loop with the RP2350 relay) and
+        fast enough that its 128-event ring never wraps. Returns stop(), which
+        joins and hands back (events, ref_mv)."""
+        got: list = []
+        state = {"cursor": since, "ref": None}
+        stop = threading.Event()
+        period = max(0.5, min(2.0, 0.5 * self._CAL_RING_SAFE * gap_ms / 1000.0))
+
+        def _run():
+            while not stop.wait(period):
+                try:
+                    ev = self.pulse_events_ma(state["cursor"])
+                except Exception:
+                    continue
+                if ev.get("ok") and ev.get("events"):
+                    got.extend(ev["events"])
+                    state["cursor"] = ev["events"][-1]["id"]
+                    state["ref"] = ev.get("ref_mv", state["ref"])
+        t = threading.Thread(target=_run, name="cal_events", daemon=True)
+        t.start()
+
+        def _stop():
+            stop.set()
+            t.join(timeout=5.0)
+            return list(got), state["ref"]
+        return _stop
 
     def save_emission_curves(self, name: str, results: dict,
                              params: dict | None = None) -> dict:
@@ -367,6 +740,45 @@ class _EmissionMixin:
             return None
         return (float(vi["bus_mV"]), float(vi["current_mA"]),
                 float(vi["bus_mV"]) / float(vi["current_mA"]))
+
+    def _ramp_points(self, events: list, log: list, pedestal_ma: float, ref_mv) -> list:
+        """One point per pulse of a ramp: the detector event paired 1:1, in
+        order, with the firmware's pulse-log record (the heating current AT
+        that pulse). Callers check len(events) == len(log) first."""
+        slope = (self.pulse_ma(1.0, ref_mv or 1200.0)
+                 - self.pulse_ma(0.0, ref_mv or 1200.0))
+        points = []
+        for i, (e, rec) in enumerate(zip(events, log)):
+            heat = rec.get("heat_meas_mA")
+            net = e.get("plateau_net_ma")
+            sigma4 = e.get("bg_sigma4")
+            emis = None if net is None else round(net - pedestal_ma, 3)
+            points.append({
+                "shot": i, "seq": rec.get("seq"),
+                "commanded_ma": None,          # there was no setpoint per shot
+                "settled_ma": None,
+                "heat_mA": heat,
+                "heat_unavailable": rec.get("heat_meas_unavailable"),
+                "heat_target_mA": rec.get("heat_target_mA"),
+                # No live V during a run, so no resistance and no temperature.
+                # None, not a value carried over from a neighbouring shot.
+                "bus_mV": None, "vi_current_mA": None, "r_total_ohm": None,
+                "r_drift_frac": None,
+                "pedestal_ma": round(float(pedestal_ma), 3),
+                "net_ma": net, "emission_ma": emis, "net_ma_sd": None,
+                "charge_mams": e.get("integral_mams"),
+                "emission_mams": self._emission_charge(
+                    e.get("integral_mams"), pedestal_ma, e.get("on_us")),
+                "on_us": e.get("on_us"),
+                "bg_ma": e.get("bg_ma"),
+                "sigma_ma": round((sigma4 / 4.0) * slope, 4) if sigma4 else None,
+                "n_used": 1 if (emis is not None and not e.get("empty_envelope")) else 0,
+                "n_fired": 1, "n_cold": 0,
+                "usable": bool(emis is not None and heat is not None
+                               and not e.get("empty_envelope")),
+                "pulses": [], "note": None,
+            })
+        return points
 
     def emission_ramp(
         self,
@@ -522,9 +934,7 @@ class _EmissionMixin:
                 ramp["active_s"] = round(time.monotonic() - t0, 2)
         finally:
             if end_state != "stop":
-                self._state_one(fil, self._END_STATES[end_state],
-                                idle_ma if end_state == "idle" else 0,
-                                "emission_ramp end_state")
+                self._walk_to_end_state(fil, end_state, idle_ma, "emission_ramp end_state")
 
         cmd = (ramp.get("command") or {})
         if not cmd.get("ok"):
@@ -553,39 +963,7 @@ class _EmissionMixin:
                     "problems": problems, "ramp": ramp,
                     "pedestal_ma": pedestal_ma, "pedestal": ped}
 
-        slope = (self.pulse_ma(1.0, fired.get("ref_mv") or 1200.0)
-                 - self.pulse_ma(0.0, fired.get("ref_mv") or 1200.0))
-        points = []
-        for i, (e, rec) in enumerate(zip(events, log)):
-            heat = rec.get("heat_meas_mA")
-            net = e.get("plateau_net_ma")
-            sigma4 = e.get("bg_sigma4")
-            emis = None if net is None else round(net - pedestal_ma, 3)
-            points.append({
-                "shot": i, "seq": rec.get("seq"),
-                "commanded_ma": None,          # there was no setpoint per shot
-                "settled_ma": None,
-                "heat_mA": heat,
-                "heat_unavailable": rec.get("heat_meas_unavailable"),
-                "heat_target_mA": rec.get("heat_target_mA"),
-                # No live V during a run, so no resistance and no temperature.
-                # None, not a value carried over from a neighbouring shot.
-                "bus_mV": None, "vi_current_mA": None, "r_total_ohm": None,
-                "r_drift_frac": None,
-                "pedestal_ma": round(float(pedestal_ma), 3),
-                "net_ma": net, "emission_ma": emis, "net_ma_sd": None,
-                "charge_mams": e.get("integral_mams"),
-                "emission_mams": self._emission_charge(
-                    e.get("integral_mams"), pedestal_ma, e.get("on_us")),
-                "on_us": e.get("on_us"),
-                "bg_ma": e.get("bg_ma"),
-                "sigma_ma": round((sigma4 / 4.0) * slope, 4) if sigma4 else None,
-                "n_used": 1 if (emis is not None and not e.get("empty_envelope")) else 0,
-                "n_fired": 1, "n_cold": 0,
-                "usable": bool(emis is not None and heat is not None
-                               and not e.get("empty_envelope")),
-                "pulses": [], "note": None,
-            })
+        points = self._ramp_points(events, log, float(pedestal_ma), fired.get("ref_mv"))
         # THERMAL LAG. On a ramp the current arrives before the temperature
         # does, so emission at a given heating current is not a function of
         # that current alone -- it depends on how long the filament has been
