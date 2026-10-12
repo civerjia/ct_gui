@@ -5708,6 +5708,12 @@ def _do_restart(keep: dict, server) -> None:
         server.server_close()
     except Exception:
         pass
+    # Before letting go of the bridges: nothing in THIS process may take them
+    # back (on Windows it stays alive, waiting for the new one). The lock waits
+    # out an auto-connect scan already in flight.
+    _STOPPING.set()
+    if _AUTO_LOCK.acquire(timeout=30.0):
+        _AUTO_LOCK.release()
     for link in CONTROLLERS.values():
         try:
             link.disconnect()
@@ -5808,6 +5814,12 @@ def _slew_keeper_loop() -> None:
 AUTO_CONNECT_MIN_S = 30.0          # first retry interval while a slot is empty
 AUTO_CONNECT_MAX_S = 300.0         # backs off to this when nothing new is found
 _AUTO_LOCK = threading.Lock()
+# Set once a restart has begun. On Windows the old process does not exit: it
+# WAITS for the new one (restart_in_place), and its daemon threads keep running
+# -- 2026-10-12 its auto-connect loop took both bridges straight back after
+# _do_restart let go of them, and the new backend (each bridge takes ONE
+# client) never got a controller.
+_STOPPING = threading.Event()
 _AUTO_MANUAL: set[int] = set()     # slots the user disconnected/connected by hand
 _AUTO_OWNED: set[int] = set()      # slots this code connected
 
@@ -5850,6 +5862,8 @@ def auto_connect(explicit: bool = False) -> dict:
     if not _AUTO_LOCK.acquire(blocking=explicit):
         return {"ok": False, "error": "an automatic scan is already running"}
     try:
+        if _STOPPING.is_set():
+            return {"ok": False, "error": "the backend is restarting"}
         if explicit:
             _AUTO_MANUAL.clear()
         found = scan_bridges()
@@ -5917,7 +5931,7 @@ def _auto_connect_loop() -> None:
     wait = 0.0
     while True:
         time.sleep(max(1.0, wait))
-        if os.environ.get("CT_NO_AUTO_CONNECT"):
+        if os.environ.get("CT_NO_AUTO_CONNECT") or _STOPPING.is_set():
             return
         try:
             if not any(_slot_free(c) and c not in _AUTO_MANUAL for c in CONTROLLERS):
@@ -5945,6 +5959,11 @@ def _reconnect_from_env() -> None:
             link = CONTROLLERS.get(int(cid_s))
             if link is None:
                 continue
+            if link.client.connected and str(link.host).strip() == host.strip():
+                # auto-connect got there first; connecting again would drop a
+                # working link (the bridge takes one client) and fail.
+                log.info("restart: %s already connected to %s", link.name, host)
+                continue
             link.connect(host)
             log.info("restart: reconnected %s to %s -> %s", link.name, host,
                      "ok" if link.client.connected else "FAILED")
@@ -5967,7 +5986,7 @@ def _update_watch_loop() -> None:
     from ct import update as ct_update
     time.sleep(UPDATE_FIRST_CHECK_S)
     announced = None
-    while True:
+    while not _STOPPING.is_set():
         try:
             st = ct_update.remote_check(_BACKEND_VERSION.get("commit"))
             st["error"] = None
