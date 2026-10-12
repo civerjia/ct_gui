@@ -1524,6 +1524,19 @@ class _ScheduleMixin:
             rate_hz=rate_hz, bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
             on_armed=on_armed)
 
+    # active_one(verify=True)'s default tolerance: "within this of the target".
+    _HEAT_BAND_MA = 150.0
+
+    @classmethod
+    def _heat_in_band(cls, h: dict, target_ma: float) -> bool:
+        """A heating result that timed out but whose last REAL measurement is
+        inside the band. Never for a fault/short verdict or a missing reading
+        (a 0.0 filler must not count)."""
+        if h.get("faulted") or h.get("cannot_start") or not h.get("measured_valid"):
+            return False
+        m = h.get("measured_ma")
+        return m is not None and abs(float(m) - float(target_ma)) <= cls._HEAT_BAND_MA
+
     def _fire_heated(self, filament: int, active_ma: float, idle_ma, heat_timeout_s: float,
                      kw: dict) -> dict:
         """fire_single_pulse(active_ma=...): prepare at IDLE, ACTIVE only
@@ -1563,6 +1576,19 @@ class _ScheduleMixin:
             # heat_timeout_s with r["ok"] still True. Do not fire a filament
             # that never reached firing current (the finally drops it).
             h = r.get("heating") or {}
+            if not h.get("ok") and self._heat_in_band(h, active_ma):
+                # Near miss, rescued: the loop still says "ramping" at the
+                # deadline but the measured current is inside the band
+                # (2026-10-11: 4 of 1265 shots refused at 2532-2575 mA of 2600).
+                # wait_for_current lets "ramping" overrule an in-band sample
+                # because a cold IDLE inrush passes THROUGH the band in the
+                # first ~0.4 s -- not a concern at the end of heat_timeout_s.
+                h = {**h, "ok": True, "accepted_in_band": True,
+                     "note": f"loop still '{h.get('arrival')}' at {heat_timeout_s} s, "
+                             f"but {h.get('measured_ma')} mA is within "
+                             f"{self._HEAT_BAND_MA:.0f} mA of {active_ma} -- fired"}
+                r = {**r, "heating": h}
+                heat["active"] = r
             if not h.get("ok"):
                 raise RuntimeError(
                     f"ACTIVE {active_ma} mA not reached within {heat_timeout_s} s "

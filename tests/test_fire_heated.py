@@ -27,7 +27,7 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-def make(active_ok=True, run="complete", idle_ok=True, heat_ok=True):
+def make(active_ok=True, run="complete", idle_ok=True, heat_ok=True, heating=None):
     ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
     calls = []
     seen = {}
@@ -35,7 +35,9 @@ def make(active_ok=True, run="complete", idle_ok=True, heat_ok=True):
     def active_one(f, ma, **k):
         calls.append("active")
         seen["active_kw"] = k
-        return ({"ok": True, "heating": {"ok": heat_ok, "measured_ma": ma if heat_ok else 1900}}
+        h = heating or {"ok": heat_ok, "measured_ma": ma if heat_ok else 1900,
+                        "measured_valid": True, "arrival": "settled" if heat_ok else "ramping"}
+        return ({"ok": True, "heating": h}
                 if active_ok
                 else {"ok": False, "error": "ladder"})
 
@@ -109,6 +111,29 @@ check("current not reached -> no trigger, no on_armed",
 check("...says why, with the measured current",
       "not reached" in r.get("error", "") and "1900" in r.get("error", ""), r)
 check("...and drops back to IDLE", calls[-1] == "idle" and calls.count("idle") == 1, calls)
+
+# 1d. Near miss (2026-10-11: 2532-2575 mA of 2600, loop still "ramping" at
+#     the deadline): inside the band -> fired, and marked as rescued.
+def near(m, **extra):
+    return {"ok": False, "measured_ma": m, "measured_valid": True,
+            "arrival": "ramping", "target_ma": 2600.0, **extra}
+
+ct, calls, seen = make(heating=near(2532.0))
+r = ct.fire_single_pulse(16, measure=False, active_ma=2600, idle_ma=1200,
+                         on_armed=lambda: calls.append("user_on_armed"), **KW)
+check("in band but 'ramping' at the deadline -> fired",
+      r["ok"] and calls == ["setup", "active", "user_on_armed", "trigger", "idle", "pulse_log"],
+      (r, calls))
+check("...marked accepted_in_band", (r.get("heating") or {}).get("accepted_in_band") is True, r)
+
+for name, h in (("below the band (2400)", near(2400.0)),
+                ("above the band (2800)", near(2800.0)),
+                ("no live reading (0.0 filler)", near(2600.0, measured_valid=False)),
+                ("faulted", near(2560.0, faulted=True)),
+                ("struggling / short", near(2560.0, cannot_start=True))):
+    ct, calls, seen = make(heating=h)
+    r = ct.fire_single_pulse(16, measure=False, active_ma=2600, idle_ma=1200, **KW)
+    check(f"{name} -> NOT fired", "trigger" not in calls and not r["ok"], calls)
 
 # 2. measure=False path too.
 ct, calls, seen = make()
