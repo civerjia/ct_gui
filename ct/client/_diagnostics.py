@@ -728,8 +728,9 @@ class _DiagnosticsMixin:
             drift = (base1["focus_v"] - base0["focus_v"]) if base1 else None
             out["drift_bad"] = drift is None or abs(drift) > 0.25 * max(5.0, rail - base0["focus_v"])
             if out["drift_bad"]:
+                after_txt = "?" if base1 is None else f"{base1['focus_v']:.1f}"
                 problems.append(f"focus baseline did not return ({base0['focus_v']:.1f} V before, "
-                                f"{'?' if base1 is None else f'{base1['focus_v']:.1f}'} V after) -- "
+                                f"{after_txt} V after) -- "
                                 f"the per-filament readings are unreliable")
         finally:
             self._scan_teardown(problems, "focus leak scan end")
