@@ -169,6 +169,17 @@ def build_payload(command: str, b: dict):
         return 0x15, 0, bytes([chmask]) + values + bytes([mode])
     if command == "HV_PULSE":                # 0x16: ch,bit,width_us32,verifyMode
         return 0x16, FLAG_SINGLE, bytes([ch, int(b.get("bit", mux)) & 0xFF]) + int(b.get("width_us", 0)).to_bytes(4, "little") + bytes([int(b.get("verify_mode", 0)) & 0xFF])
+    if command in ("CH_READ_TPS_REGISTER", "CH_WRITE_TPS_REGISTER"):
+        # 0x29 / 0x2A: one raw TPS55289 register on one board -- {channel,
+        # mux_port, reg, width_bytes, value}. Debug: e.g. 2026-10-13 clearing
+        # IOUT_LIMIT's enable bit to run a filament with its OCP off. A WRITE
+        # needs the lease; the firmware guardian restores the protection
+        # registers within ~2 s. Frame: [ch, mux, reg, width] (+ value16 to write),
+        # flags 0 -- the same bytes ct.protocol builds in its single-board form.
+        head = bytes([ch, mux, int(b["reg"]) & 0xFF, int(b.get("width_bytes", 1)) & 0xFF])
+        if command == "CH_READ_TPS_REGISTER":
+            return 0x29, 0, head
+        return 0x2A, 0, head + _u16(int(b["value"]))
     raise ValueError(f"unknown command {command}")
 
 
