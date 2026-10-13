@@ -76,7 +76,11 @@ def print_result(f, result):
               f"{result.get('error') or 'no reason given'}")
         if not events:
             return
-    elif not events:
+    elif result.get("warning"):
+        # ok, but something worth knowing -- e.g. the MOSFET read-back was
+        # wrong while current flowed (the data are good; check that cable)
+        print(f"fire ok, WARNING (filament {f}): {result['warning']}")
+    if result.get("ok") and not events:
         print(f"fire ok but NO measured event came back (filament {f})")
         return
     e = events[0]

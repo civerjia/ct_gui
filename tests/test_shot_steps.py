@@ -133,12 +133,37 @@ check("MOSFET read-back wrong reported: which pulse, bytes, neighbouring bit, no
       and "Not measured" in res["error"], res)
 
 # 6b. ...and the measured current says which: MOSFET closed (read-back wrong) or not.
-for em, want in ((20.0, "READ-BACK is wrong"), (None, "MOSFET did NOT close")):
-    ct, calls = make(on_mismatch=True)
-    ct._collect_pulse_events = lambda since, n, *a, em=em: ([{"id": 42, "emission_ma": em}], 1228)
-    r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **KW)
-    check(f"mismatch + emission {em} mA -> '{want}', measured kept",
-          not r["ok"] and want in r["error"] and r["measured"] and r["mosfet_conducted"] == (em is not None), r)
+# Current flowed -> the shot is GOOD: ok True, the read-back problem as a warning.
+ct, calls = make(on_mismatch=True)
+ct._collect_pulse_events = lambda since, n, *a: ([{"id": 42, "emission_ma": 20.0}], 1228)
+r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **KW)
+check("mismatch + current flowed -> ok True, warning, readback_unreliable, no error",
+      r["ok"] and "READ-BACK is wrong" in r.get("warning", "") and r.get("readback_unreliable")
+      and "error" not in r and r["mosfet_conducted"] is True and r["measured"], r)
+# No current -> the MOSFET did not close: still a failure.
+ct, calls = make(on_mismatch=True)
+ct._collect_pulse_events = lambda since, n, *a: ([{"id": 42, "emission_ma": None}], 1228)
+r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **KW)
+check("mismatch + no current -> ok False, 'did NOT close'",
+      not r["ok"] and "MOSFET did NOT close" in r["error"] and r["mosfet_conducted"] is False, r)
+# Current flowed, but ALSO read non-zero after the pulse (may still be closed): stays a failure.
+ct, calls = make(on_mismatch=True)
+ct.shv_pulse_log = lambda c: [{"filament": 16, "on_mismatch": True, "hv_stuck_on": True, "read165": 2}]
+ct._collect_pulse_events = lambda since, n, *a: ([{"id": 42, "emission_ma": 20.0}], 1228)
+r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **KW)
+check("current flowed but stuck-on after the pulse -> ok False", not r["ok"] and "error" in r, r)
+# Current flowed in the mismatched pulse, but a pulse went unmeasured: stays a failure.
+ct, calls = make(on_mismatch=True)
+ct.shv_pulse_log = lambda c: [{"filament": 16, "on_mismatch": True, "read165": 2},
+                              {"filament": 16, "on_mismatch": False, "read165": 4}]
+ct._collect_pulse_events = lambda since, n, *a: ([{"id": 42, "emission_ma": 20.0}], 1228)
+r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **{**KW, "num_pulses": 2})
+check("1 of 2 pulses measured -> ok False (cannot pair, incomplete)", not r["ok"], r)
+# Not measured -> unknown: still a failure.
+ct, calls = make(on_mismatch=True)
+r = ct.fire_single_pulse(16, measure=False, timeout_s=6.0, **KW)
+check("mismatch, not measured -> ok False, 'Not measured'",
+      not r["ok"] and "Not measured" in r["error"], r)
 
 # 6c. 2026-10-12, filament 8 (P1 CH2.1): 10 pulses, only some read back wrong.
 #     The verdict must be about THOSE pulses' own current (it used to look at

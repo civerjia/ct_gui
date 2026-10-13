@@ -1387,6 +1387,10 @@ class _ScheduleMixin:
         Returns:
             {"ok": bool, "fired": int, "records": [...], "status": {...},
              "error": str}   # "error" present only when "ok" is False
+            # ok True can carry "warning" + "readback_unreliable": True -- the
+            # grid MOSFET read-back (74HC165) was wrong on some pulses, but every
+            # one of them measured current, so the MOSFET did close and the data
+            # are good (measure=True only; unmeasured it stays ok False).
 
         EXTERNAL TRIGGER -- when to send it (on_armed)
 
@@ -2244,6 +2248,16 @@ class _ScheduleMixin:
             out["error"] = (out.get("error") or "").replace(
                 self._ON_MISMATCH_UNMEASURED, self._on_mismatch_verdict(base, measured))
             out["mosfet_conducted"] = self._on_mismatch_conducted(base, measured)
+            # Current flowed in EVERY mismatched pulse: the MOSFETs closed and
+            # the shot is good -- only the 165 read-back was wrong (signal
+            # integrity). That must not fail the shot: a macro waiting on ok
+            # would stop on good data. Only when the read-back was the SOLE
+            # problem (nothing stuck on, every pulse fired and measured).
+            if (out["mosfet_conducted"] is True and not base.get("hv_stuck_on")
+                    and len(measured) >= want and int(base.get("fired") or 0) >= want):
+                out["ok"] = True
+                out["readback_unreliable"] = True
+                out["warning"] = out.pop("error")
         return out
 
     _ON_MISMATCH_UNMEASURED = ("Not measured, so it is unknown whether the MOSFET did not "

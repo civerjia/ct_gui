@@ -111,6 +111,8 @@ with ct.lease(ttl=120, note="fire_steps example"):
 
         for f in args.filaments:
             r = fire_one(f)
+            if r.get("warning"):
+                print(f"filament {f}: WARNING -- {r['warning']}")
             if not r.get("ok"):
                 print(f"filament {f}: FAILED -- {r.get('error')}")
                 if not r.get("measured"):
