@@ -113,6 +113,13 @@ def build_payload(command: str, b: dict):
         return 0x62, 0, bytes([int(b.get("page", 0)) & 0xFF])
     if command == "PIN_PROBE":               # 0x63: drives the HV chain's SAFE pins (lease needed)
         return 0x63, 0, b""
+    if command == "CH_VOLTAGE_CAP":          # 0x3B: empty=GET, mV16=SET -> [status, cap16, ceiling16]
+        # Output-voltage cap for EVERY channel of the controller: clamps the CC,
+        # Voltage and Standby setpoints and the ramp's REF writes. A request
+        # above the hardware ceiling is clamped, not rejected -- read the reply.
+        if b.get("millivolts") is None:
+            return 0x3B, 0, b""
+        return 0x3B, 0, _u16(int(b["millivolts"]))
     if command == "CH_SLEW_RATE":            # 0x3C: empty=GET, 6 bytes=SET
         # Three voltage-ramp slew rates, runtime-settable. Out-of-range CLAMPS
         # rather than rejecting, and the response is always the values IN FORCE

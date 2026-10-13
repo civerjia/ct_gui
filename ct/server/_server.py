@@ -3966,6 +3966,8 @@ class CtHandler(BaseHTTPRequestHandler):
                     resp = link.client.send_request(frame_type, payload, flags=flags, timeout=2.0)
                     if command == "CH_SLEW_RATE" and body.get("below_mV_per_s") is not None:
                         _slew_note_set(resp)     # the rig's slew is now what was set
+                    if command == "CH_VOLTAGE_CAP" and body.get("millivolts") is not None:
+                        _vcap_note_set(resp)     # the rig's cap is now what was set
                     if pstate and fids and _status_ok(resp):
                         # Track it like /api/filament-state does, so the ladder
                         # and the ACTIVE dead-man see GUI/debug commands too.
@@ -5776,6 +5778,39 @@ def _slew_check_one(link) -> dict:
     return {"before": cur, "after": after}
 
 
+# ── Output-voltage cap kept at the rig's setting ────────────────────────────
+# The RP2350 boots with kDefaultVoltageCapMv (13 V); the rig runs a lower cap
+# (CT_VCAP_MV, default 10000 -- 2026-10-13, the user's choice), or whatever was
+# last SET through /api/cmd CH_VOLTAGE_CAP. Re-written by the slew keeper's tick
+# to any controller that reads differently (an RP2350 reset restores 13 V).
+VCAP_WANT: dict = {"mv": int(os.environ.get("CT_VCAP_MV", "10000"))}
+
+
+def _vcap_decode(resp) -> dict | None:
+    raw = (resp.get("raw") if isinstance(resp, dict) else None) or []
+    if len(raw) < 5 or raw[0] != 0:
+        return None
+    return {"mv": raw[1] | (raw[2] << 8), "ceiling_mv": raw[3] | (raw[4] << 8)}
+
+
+def _vcap_note_set(resp) -> None:
+    got = _vcap_decode(resp)
+    if got:
+        VCAP_WANT["mv"] = got["mv"]
+        log.info("voltage cap set to %s mV — kept on every controller from now on", got["mv"])
+
+
+def _vcap_check_one(link) -> dict:
+    """Read one controller's voltage cap; write the rig's if it differs."""
+    ft, flags, payload = build_payload("CH_VOLTAGE_CAP", {})
+    cur = _vcap_decode(link.client.send_request(ft, payload, flags=flags, timeout=2.0))
+    if cur is None or cur["mv"] == VCAP_WANT["mv"]:
+        return {"before": cur and cur["mv"], "after": cur and cur["mv"]}
+    ft, flags, payload = build_payload("CH_VOLTAGE_CAP", {"millivolts": VCAP_WANT["mv"]})
+    after = _vcap_decode(link.client.send_request(ft, payload, flags=flags, timeout=2.0))
+    return {"before": cur["mv"], "after": after and after["mv"]}
+
+
 def _slew_keeper_loop() -> None:
     while True:
         time.sleep(SLEW_KEEP_PERIOD_S)
@@ -5794,6 +5829,12 @@ def _slew_keeper_loop() -> None:
                                 "defaults) — set to the rig's %s -> %s", link.name,
                                 r["before"], SLEW_WANT,
                                 "ok" if r["after"] == SLEW_WANT else f"read back {r['after']}")
+                v = _vcap_check_one(link)
+                if v["before"] is not None and v["before"] != v["after"]:
+                    log.warning("%s: voltage cap was %s mV (an RP2350 reset restores "
+                                "13 V) — set to the rig's %s mV -> %s", link.name,
+                                v["before"], VCAP_WANT["mv"],
+                                "ok" if v["after"] == VCAP_WANT["mv"] else f"read back {v['after']}")
             except Exception as exc:
                 log.debug("slew keeper on %s: %s", getattr(link, "name", cid), exc)
 

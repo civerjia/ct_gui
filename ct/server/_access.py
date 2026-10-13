@@ -201,6 +201,8 @@ def is_read_post(path: str, body: dict) -> bool:
             return True
         if cmd == "CH_STARTUP_OCP" and not body.get("set"):
             return True
+        if cmd == "CH_VOLTAGE_CAP" and body.get("millivolts") is None:
+            return True
     return False
 
 

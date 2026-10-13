@@ -1500,6 +1500,36 @@ class _PowerMixin:
             controller, same=("below_mV_per_s", "above_mV_per_s", "warm_mV_per_s"),
             carry=("clamped", "floored_to_min"))
 
+    def get_voltage_cap(self, controller: int | None = None) -> dict:
+        """The output-voltage cap (mV) on every connected controller (or one):
+        {"ok", "mv", "ceiling_mv"}. It clamps every heating setpoint -- a filament
+        whose current needs more than this ends CAPPED."""
+        return self._rig_wide(lambda c: self._voltage_cap_one(c, None), controller,
+                              same=("mv",), carry=("ceiling_mv",))
+
+    def set_voltage_cap(self, millivolts: int, controller: int | None = None) -> dict:
+        """Set the output-voltage cap on every connected controller (or one).
+        Above the hardware ceiling it is CLAMPED -- the returned "mv" is the
+        value in force. The backend then keeps it there: an RP2350 reset (which
+        restores 13 V) is corrected on its next keeper tick."""
+        return self._rig_wide(lambda c: self._voltage_cap_one(c, int(millivolts)), controller,
+                              same=("mv",), carry=("ceiling_mv",))
+
+    def _voltage_cap_one(self, controller: int, millivolts) -> dict:
+        body = {"controller": int(controller), "command": "CH_VOLTAGE_CAP"}
+        if millivolts is not None:
+            body["millivolts"] = int(millivolts)
+        r = self._post("/api/cmd", body, timeout=10.0)
+        raw = ((r.get("response") or {}).get("raw")) if r.get("ok") else None
+        if not raw or len(raw) < 5 or raw[0] != 0:
+            return {"ok": False, "controller": int(controller),
+                    "error": r.get("error") or f"bad CH_VOLTAGE_CAP response {raw}"}
+        out = {"ok": True, "controller": int(controller), "mv": raw[1] | (raw[2] << 8),
+               "ceiling_mv": raw[3] | (raw[4] << 8)}
+        if millivolts is not None and out["mv"] != int(millivolts):
+            out["clamped"] = True
+        return out
+
     def set_hv_shift_hz(self, hz: int, controller: int | None = None) -> dict:
         """Set the 165 read-back bit-bang clock on every connected controller
         (or one). `actualHz` is hoisted only if every board landed on the same
