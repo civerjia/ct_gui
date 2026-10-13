@@ -507,6 +507,246 @@ class _DiagnosticsMixin:
                 "baseline": baseline, "results": results, "counts": counts,
                 "problems": problems}
 
+    # ── Emission short scan / focus leak scan (GUI tests 2 and 3) ─────────────
+    # Ported from web/tests.js 2026-10-13 so a script (or the backend) runs the
+    # same screen. Two differences from the JS, both because of the ADS1115,
+    # which refreshes every ~0.1-0.4 s: the reading is taken settle_s (0.5 s,
+    # not 60 ms) after the switch closes, so it is not the value from BEFORE
+    # it closed; and a short is judged on the INCREASE over the all-open
+    # baseline, because the ADS emission current has an offset (13.6 mA read
+    # at -200 V with every switch open).
+
+    def _ads_mean(self, n: int = 2, gap_s: float = 0.15):
+        """Mean |focus V|, |emission V|, emission mA over n ADS reads, or None."""
+        fs, es, cs = [], [], []
+        for i in range(n):
+            a = self.read_ads_all()
+            if a.get("ok") and a.get("focus_v") is not None and a.get("emiss_v") is not None:
+                fs.append(abs(float(a["focus_v"])))
+                es.append(abs(float(a["emiss_v"])))
+                if a.get("emiss_i_ma") is not None:
+                    cs.append(float(a["emiss_i_ma"]))
+            if i < n - 1:
+                time.sleep(gap_s)
+        if not fs:
+            return None
+        return {"focus_v": sum(fs) / len(fs), "emission_v": sum(es) / len(es),
+                "emission_ma": (sum(cs) / len(cs)) if cs else None}
+
+    def _scan_setup(self, filaments, emission_v: float, limit_ma: float, focus_off: bool):
+        """Cold (SLEEP), rail up and read back; focus OFF if asked. Returns
+        (wanted, problems, rail_v) -- wanted empty means do not scan."""
+        wanted, problems = self._mosfet_targets(filaments)
+        if not wanted:
+            return [], problems + ["no live filament on a connected controller"], None
+        self.stop_all(wanted)
+        sl = self.sleep_all(wanted)
+        if not sl.get("ok"):
+            problems.append(f"not every filament reached SLEEP ({self.describe(sl)[:120]})")
+        if focus_off:
+            self.enable_focus(False)
+        self.set_emission_i(limit_ma)
+        self.set_emission_v(abs(emission_v))
+        self.enable_emission(True)
+        v_read, bad = self._mosfet_rail(emission_v)
+        if bad:
+            return [], problems + [bad], v_read
+        return wanted, problems, v_read
+
+    def _scan_teardown(self, problems: list, reason: str) -> None:
+        """Every grid switch OPEN (confirmed by read-back), then the rail OFF."""
+        try:
+            r = self._post("/api/hv-all-off", {"reason": reason}, timeout=30.0)
+            if not r.get("ok"):
+                problems.append(f"grid switches not confirmed open after the scan: "
+                                f"{r.get('error') or r}")
+        except Exception as exc:
+            problems.append(f"grid all-off raised {type(exc).__name__}: {exc}")
+        off = self._hv_off_problem()
+        if off:
+            problems.append(off)
+
+    def emission_short_scan(self, filaments=None, emission_v: float = 30.0,
+                            limit_ma: float = 30.0, settle_s: float = 0.5,
+                            threshold_ma: float = 5.0, progress=None) -> dict:
+        """GUI test 2: find filaments whose grid MOSFET path draws real current
+        cold -- a short.
+
+            r = ct.emission_short_scan()          # every live filament
+            print(r)
+
+        Every filament cold (SLEEP), emission -emission_v at limit_ma (read
+        back). Phase 1: per controller channel, close ALL its filaments'
+        switches, wait settle_s, read the ADS emission current. A channel whose
+        current rose more than threshold_ma over the all-open baseline is a
+        suspect. Phase 2: each filament of a suspect channel alone; above the
+        threshold = short. A healthy path draws ~1 mA at -30 V per closed
+        switch (two diodes + 100 kOhm), so a whole clean channel stays well
+        under 5 mA. Ends with every switch confirmed open and the rail OFF;
+        filaments are left at SLEEP. progress(stage, filament_or_channel, row).
+
+        Returns {"ok", "params", "rail_v", "baseline_ma", "channels": {"P1 CH2":
+        {"di_ma", "suspect"}}, "results": {f: {"verdict": "ok" | "short",
+        "di_ma"}}, "counts", "problems"}. A filament in a clean channel gets the
+        channel's di_ma (it was never measured alone).
+        """
+        params = {"emission_v": -abs(emission_v), "limit_ma": limit_ma,
+                  "settle_s": settle_s, "threshold_ma": threshold_ma}
+        out = {"ok": False, "params": params, "rail_v": None, "baseline_ma": None,
+               "channels": {}, "results": {}, "counts": {}, "problems": []}
+        problems = out["problems"]
+        try:
+            wanted, setup_problems, out["rail_v"] = self._scan_setup(
+                filaments, emission_v, limit_ma, focus_off=False)
+            problems.extend(setup_problems)
+            if not wanted:
+                return out
+            groups: dict = {}
+            for f in wanted:
+                site = self.filament_to_board(f) or {}
+                key = f"P{site.get('controller')} CH{int(site.get('channel', 0)) + 1}"
+                groups.setdefault(key, []).append(int(f))
+            time.sleep(settle_s)
+            base = self._ads_mean(3)
+            if not base or base.get("emission_ma") is None:
+                problems.append("ADS1115 read failed -- no baseline, nothing judged")
+                return out
+            i0 = base["emission_ma"]
+            out["baseline_ma"] = round(i0, 3)
+
+            def measure(fils):
+                on = self.hv_grid_set_all(fils, on=True)
+                time.sleep(settle_s)
+                r = self._ads_mean(2)
+                self.hv_grid_off_all(fils)
+                if not on.get("ok") or not r or r.get("emission_ma") is None:
+                    return None, (on.get("error") or "switch command failed") if not on.get("ok") \
+                        else "ADS1115 read failed"
+                return round(r["emission_ma"] - i0, 3), None
+
+            suspects = []
+            for key, fils in sorted(groups.items()):
+                di, err = measure(fils)
+                row = {"filaments": fils, "di_ma": di, "suspect": err is None and di > threshold_ma}
+                if err:
+                    row["error"] = err
+                    problems.append(f"{key}: unmeasured ({err})")
+                out["channels"][key] = row
+                if callable(progress):
+                    progress("channel", key, row)
+                if row["suspect"]:
+                    suspects.append(key)
+                elif err is None:
+                    for f in fils:
+                        out["results"][f] = {"verdict": "ok", "di_ma": di, "alone": False}
+            for key in suspects:
+                for f in groups[key]:
+                    di, err = measure([f])
+                    row = ({"verdict": "unmeasured", "error": err} if err else
+                           {"verdict": "short" if di > threshold_ma else "ok", "di_ma": di,
+                            "alone": True})
+                    out["results"][f] = row
+                    if callable(progress):
+                        progress("filament", f, row)
+        finally:
+            self._scan_teardown(problems, "emission short scan end")
+        counts = {"ok": 0, "short": 0, "unmeasured": 0}
+        for row in out["results"].values():
+            counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
+        out["counts"] = counts
+        for f, row in sorted(out["results"].items()):
+            if row["verdict"] == "short":
+                problems.append(f"filament {f}{self._mosfet_site(f)}: SHORT -- +{row['di_ma']} mA "
+                                f"over the all-open baseline at -{abs(emission_v):g} V (threshold "
+                                f"{threshold_ma:g} mA)")
+        out["ok"] = bool(out["results"]) and not problems
+        return out
+
+    def focus_leak_scan(self, filaments=None, emission_v: float = 30.0,
+                        limit_ma: float = 20.0, settle_s: float = 0.5,
+                        leak_frac: float = 0.8, progress=None) -> dict:
+        """GUI test 3: find filaments whose focus side is connected to their
+        emission side -- a closed grid switch pulls FOCUS to the emission
+        voltage.
+
+            r = ct.focus_leak_scan()
+            print(r)
+
+        Every filament cold (SLEEP), focus OFF, emission -emission_v at limit_ma
+        (read back). Baseline: focus with every switch open. Per filament: close
+        its switch, wait settle_s, read focus and emission, open it. A leak is
+        focus moving at least leak_frac of the way from its baseline to the
+        emission voltage. The baseline is read again at the end: if focus did
+        not come back, every reading rode on something else and the result says
+        so. Ends with every switch confirmed open and the rail OFF; filaments
+        left at SLEEP. progress(filament, row).
+
+        Returns {"ok", "params", "rail_v", "baseline": {"before", "after"},
+        "results": {f: {"verdict": "ok" | "leak" | "unmeasured", "focus_v",
+        "emission_v", "ratio"}}, "counts", "drift_bad", "problems"}.
+        """
+        params = {"emission_v": -abs(emission_v), "limit_ma": limit_ma,
+                  "settle_s": settle_s, "leak_frac": leak_frac}
+        out = {"ok": False, "params": params, "rail_v": None,
+               "baseline": {"before": None, "after": None}, "results": {},
+               "counts": {}, "drift_bad": None, "problems": []}
+        problems = out["problems"]
+        try:
+            wanted, setup_problems, out["rail_v"] = self._scan_setup(
+                filaments, emission_v, limit_ma, focus_off=True)
+            problems.extend(setup_problems)
+            if not wanted:
+                return out
+            time.sleep(settle_s)
+            base0 = self._ads_mean(3)
+            out["baseline"]["before"] = base0
+            if not base0:
+                problems.append("ADS1115 read failed -- no focus baseline, nothing judged")
+                return out
+            for f in wanted:
+                on = self.hv_grid_set(f, True)
+                time.sleep(settle_s)
+                r = self._ads_mean(2) if on.get("ok") else None
+                self.hv_grid_set(f, False)
+                span = (r["emission_v"] - base0["focus_v"]) if r else 0.0
+                if not on.get("ok") or not r or span < 5.0:
+                    why = (f"switch command failed ({on.get('error')})" if not on.get("ok") else
+                           "ADS1115 read failed" if not r else
+                           f"emission {r['emission_v']:.1f} V too close to the focus baseline to judge")
+                    row = {"verdict": "unmeasured", "reason": why}
+                else:
+                    ratio = (r["focus_v"] - base0["focus_v"]) / span
+                    row = {"verdict": "leak" if ratio >= leak_frac else "ok",
+                           "focus_v": round(-r["focus_v"], 1), "emission_v": round(-r["emission_v"], 1),
+                           "ratio": round(ratio, 3)}
+                out["results"][int(f)] = row
+                if callable(progress):
+                    progress(int(f), row)
+            base1 = self._ads_mean(3)
+            out["baseline"]["after"] = base1
+            rail = abs(out["rail_v"]) if out["rail_v"] is not None else abs(emission_v)
+            drift = (base1["focus_v"] - base0["focus_v"]) if base1 else None
+            out["drift_bad"] = drift is None or abs(drift) > 0.25 * max(5.0, rail - base0["focus_v"])
+            if out["drift_bad"]:
+                problems.append(f"focus baseline did not return ({base0['focus_v']:.1f} V before, "
+                                f"{'?' if base1 is None else f'{base1['focus_v']:.1f}'} V after) -- "
+                                f"the per-filament readings are unreliable")
+        finally:
+            self._scan_teardown(problems, "focus leak scan end")
+        counts = {"ok": 0, "leak": 0, "unmeasured": 0}
+        for row in out["results"].values():
+            counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
+        out["counts"] = counts
+        for f, row in sorted(out["results"].items()):
+            if row["verdict"] == "leak":
+                problems.append(f"filament {f}{self._mosfet_site(f)}: LEAK -- focus {row['focus_v']} V "
+                                f"with emission {row['emission_v']} V ({round(row['ratio'] * 100)}% of "
+                                f"the way)")
+            elif row["verdict"] == "unmeasured":
+                problems.append(f"filament {f}: unmeasured -- {row['reason']}")
+        out["ok"] = bool(out["results"]) and not problems
+        return out
+
     def mosfet_sweep(self, filaments=None,
                      v_start: float = 50.0,
                      v_step: float = 10.0,
