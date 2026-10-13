@@ -589,6 +589,7 @@ class _PowerMixin:
         # cache immediately); the rate limit is only about the ones after it.
         last_live_read = start - 1e9
         fault_streak = 0            # consecutive mode 2/3 reads; see below
+        peak = 0.0                  # highest real reading this wait (see _not_arrived)
         deadline = start + timeout_s
         data: dict = {}
         while True:
@@ -678,6 +679,8 @@ class _PowerMixin:
                     if lraw is not None:
                         raw, valid, source = lraw, True, "ina219"
             measured = float(raw) if valid else 0.0
+            if valid and measured > peak:
+                peak = measured
             # The CC loop's OWN verdict, when it has one. cc_mode 2/3 means the
             # firmware faulted this channel -- it is not going to arrive, and
             # continuing to poll just burns the timeout and then reports a
@@ -721,7 +724,7 @@ class _PowerMixin:
                         "cc_mode": data.get("cc_mode"), "arrival": arrival,
                         "faulted": False}
             if arrival == "capped" and abs(float(target_ma)) > tolerance_ma:
-                return {"ok": False, "filament": int(filament),
+                return self._not_arrived(filament, peak, {"ok": False, "filament": int(filament),
                         "target_ma": float(target_ma), "measured_ma": measured,
                         "measured_valid": valid, "measured_from": source,
                         "elapsed_s": time.monotonic() - start,
@@ -732,7 +735,7 @@ class _PowerMixin:
                                  f"with {target_ma} mA unreached (holding "
                                  f"{measured} mA). Not a fault and not slow: "
                                  f"unreachable at this cap. Raise the cap or "
-                                 f"change the load; waiting will not help."}
+                                 f"change the load; waiting will not help."})
             # CANNOT START -- the only signal that catches a SHORT. A short
             # never sets the fault bits (they need feedbackMv >= 2000, which a
             # short cannot reach) and its arrival bits read "ramping" forever,
@@ -814,14 +817,82 @@ class _PowerMixin:
             else:
                 ok = valid and abs(measured - target_ma) <= tolerance_ma
             if ok or time.monotonic() >= deadline:
-                return {"ok": ok, "filament": int(filament), "target_ma": float(target_ma),
-                        "measured_ma": measured, "measured_valid": valid,
-                        "measured_from": source,
-                        "elapsed_s": time.monotonic() - start,
-                        "present": bool(data.get("present", False)),
-                        "cc_mode": data.get("cc_mode", 0),
-                        "arrival": data.get("arrival"), "faulted": False}
+                r = {"ok": ok, "filament": int(filament), "target_ma": float(target_ma),
+                     "measured_ma": measured, "measured_valid": valid,
+                     "measured_from": source,
+                     "elapsed_s": time.monotonic() - start,
+                     "present": bool(data.get("present", False)),
+                     "cc_mode": data.get("cc_mode", 0),
+                     "arrival": data.get("arrival"), "faulted": False}
+                if not ok and abs(float(target_ma)) > tolerance_ma:
+                    r = self._not_arrived(filament, peak, r)
+                return r
             time.sleep(poll_interval_s)
+
+    # The output dropped to (near) nothing after having carried real current.
+    _OUTPUT_OFF_PEAK_MA = 500.0      # it had climbed at least this far ...
+    _OUTPUT_OFF_NOW_MA = 50.0        # ... and now carries less than this
+    _OUTPUT_OFF_MV = 800             # the TPS cannot regulate below this: output off
+
+    def _board_output(self, filament: int) -> dict:
+        """The board monitor's latest row for this filament (bus_mV etc.), or {}
+        when it is not fresh -- e.g. while a schedule is armed the monitor
+        holds off and its numbers are old."""
+        try:
+            site = self.filament_to_board(int(filament)) or {}
+            b = self._get(f"/api/board-snapshot?controller={site.get('controller', 1)}",
+                          timeout=5.0)
+            if not b.get("fresh"):
+                return {}
+            fid = int(self._fid_of(filament))
+            return next((r for r in (b.get("boards") or []) if r.get("fid") == fid), {})
+        except Exception:
+            return {}
+
+    def _not_arrived(self, filament: int, peak: float, r: dict) -> dict:
+        """Say WHY a current did not arrive, from what the board actually did.
+
+        2026-10-13, filament 77 (P1 CH6.2) at ACTIVE 2700: the current climbed
+        to ~2.6 A at 7.5 V, then the board's output fell to 0 V / 5 mA and was
+        restarted, over and over. The firmware still reported CAPPED -- its
+        voltage SETPOINT was at the cap -- and this said "raise the cap", the
+        opposite of the truth: the TPS output had been switched off. A load
+        that carried 2.6 A does not fall to 5 mA because of a voltage cap.
+        """
+        target, now = float(r.get("target_ma") or 0.0), float(r.get("measured_ma") or 0.0)
+        r["peak_ma"] = round(peak)
+        board = self._board_output(filament)
+        mv = board.get("bus_mV")
+        r["output_mV"] = mv
+        site = self._mosfet_site(filament) if hasattr(self, "_mosfet_site") else ""
+        where = f"filament {int(filament)}{site}"
+        out_txt = f"output {mv} mV" if mv is not None else "output voltage not readable now"
+        collapsed = peak >= self._OUTPUT_OFF_PEAK_MA and now < self._OUTPUT_OFF_NOW_MA
+        if collapsed or (mv is not None and mv < self._OUTPUT_OFF_MV and peak >= self._OUTPUT_OFF_PEAK_MA):
+            r["output_off"] = True
+            r["capped"] = False
+            r["error"] = (f"{target:.0f} mA not reached on {where}: the current climbed to "
+                          f"{peak:.0f} mA, then the TPS OUTPUT SWITCHED OFF (now {now:.0f} mA, "
+                          f"{out_txt}). That is a trip on this board -- over-current, or its "
+                          f"supply dropping -- NOT the voltage cap: raising the cap will not "
+                          f"help.")
+        elif mv is not None and mv < self._OUTPUT_OFF_MV:
+            r["output_off"] = True
+            r["capped"] = False
+            r["error"] = (f"{target:.0f} mA not reached on {where}: the TPS output never came "
+                          f"up ({mv} mV, {now:.0f} mA, best {peak:.0f} mA) -- output off, not "
+                          f"the voltage cap.")
+        elif mv is not None and now < self._OUTPUT_OFF_NOW_MA:
+            r["error"] = (f"{target:.0f} mA not reached on {where}: the output is up ({mv} mV) "
+                          f"but carries only {now:.0f} mA -- the filament or its connection is "
+                          f"OPEN.")
+        elif r.get("error"):
+            r["error"] += f" ({out_txt}, best {peak:.0f} mA)"
+        else:
+            r["error"] = (f"{target:.0f} mA not reached on {where} in "
+                          f"{float(r.get('elapsed_s') or 0):.1f} s: {now:.0f} mA "
+                          f"(best {peak:.0f} mA), {out_txt}, loop {r.get('arrival')}.")
+        return r
 
     @staticmethod
     def _poll_intervals(first_s: float, cap_s: float, factor: float = 1.6):
