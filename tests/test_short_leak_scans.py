@@ -26,7 +26,10 @@ class Rig:
     """6 filaments: 0-2 on P1 CH1, 3-5 on P1 CH2. shorts: +mA each when closed;
     leaks: closing pulls focus to emission. ADS emission has a 2.0 mA offset."""
 
-    def __init__(self, shorts=(), leaks=(), rail_ok=True, focus_stuck=False, raise_on=None):
+    def __init__(self, shorts=(), leaks=(), rail_ok=True, focus_stuck=False, raise_on=None,
+                 focus_start=0.0, focus_never_drains=False):
+        self.focus_left = float(focus_start)
+        self.focus_never_drains = focus_never_drains
         self.shorts, self.leaks = set(shorts), set(leaks)
         self.rail_ok, self.focus_stuck, self.raise_on = rail_ok, focus_stuck, raise_on
         self.closed, self.calls = set(), []
@@ -59,7 +62,9 @@ class Rig:
 
         def ads():
             i = 2.0 + 1.0 * len(rig.closed) + sum(20.0 for f in rig.closed if f in rig.shorts)
-            focus = 30.0 if (rig.closed & rig.leaks) else (8.0 if rig.focus_stuck and C.count("x") else 1.0)
+            if rig.focus_left > 0 and not rig.focus_never_drains:
+                rig.focus_left = rig.focus_left / 4 if rig.focus_left > 0.5 else 0.0
+            focus = 30.0 if (rig.closed & rig.leaks) else max(1.0, rig.focus_left)
             return {"ok": True, "focus_v": -focus, "emiss_v": -rig.v, "emiss_i_ma": i}
         ct.read_ads_all = ads
 
@@ -128,6 +133,26 @@ check("leak: one switch at a time, each opened again",
 ct, rig = make()
 r = ct.focus_leak_scan(**fast())
 check("leak: clean rig -> ok", r["ok"] and r["counts"]["ok"] == 6, r)
+
+# 6. 2026-10-13: focus was at -210 V; switched off it bleeds down. The scan must
+#    wait for that, not read a 157 V "baseline" and judge nothing.
+import time as _t  # noqa: E402
+_orig_sleep = _t.sleep
+_t.sleep = lambda s: None
+try:
+    ct, rig = make(leaks=[2], focus_start=210.0)
+    r = ct.focus_leak_scan(**fast())
+    check("decaying focus: waited, baseline ~1 V, leak still found",
+          abs(r["baseline"]["before"]["focus_v"] - 1.0) < 0.01 and r["results"][2]["verdict"] == "leak"
+          and r["counts"]["unmeasured"] == 0, (r["baseline"], r["counts"]))
+    ct, rig = make(focus_start=210.0, focus_never_drains=True)
+    ct._wait_focus_discharged = lambda timeout_s=60.0: (False, -210.0)
+    r = ct.focus_leak_scan(**fast())
+    check("focus never drains: nothing judged, said, rails off",
+          not r["results"] and any("did not discharge" in p for p in r["problems"])
+          and rig.calls[-1] == ("emission", False), r["problems"])
+finally:
+    _t.sleep = _orig_sleep
 
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

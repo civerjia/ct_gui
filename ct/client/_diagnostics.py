@@ -46,6 +46,10 @@ class _DiagnosticsMixin:
     _MOSFET_TOL_FRAC = 0.35
     #: Below this fraction of expected, the switch is not conducting.
     _MOSFET_DEAD_FRAC = 0.30
+    #: At or above this multiple of the expected diode-path current, the path is
+    #: a SHORT. 2026-10-13: 81/90 drew 57-60 mA cold (58x) and came back
+    #: "inconclusive" (mosfet_test) and "dead / not conducting" (mosfet_sweep).
+    _MOSFET_SHORT_FRAC = 5.0
 
     @classmethod
     def mosfet_expected_ma(cls, emission_v: float,
@@ -254,6 +258,11 @@ class _DiagnosticsMixin:
                             row["ratio"] = round(mean / expected, 3)
                             if abs(mean - expected) <= tol * expected:
                                 row["verdict"] = "pass"
+                            elif mean >= self._MOSFET_SHORT_FRAC * expected:
+                                row["verdict"] = "short"
+                                row["note"] = (f"{mean:.1f} mA against {expected:.3f} mA "
+                                               f"expected ({mean / expected:.0f}x) -- a low-"
+                                               f"impedance path after the MOSFET (short)")
                             elif mean < self._MOSFET_DEAD_FRAC * expected:
                                 row["verdict"] = "dead"
                                 row["note"] = (f"{mean:.3f} mA against {expected:.3f} mA "
@@ -277,7 +286,7 @@ class _DiagnosticsMixin:
 
         if hv_off:
             problems.append(hv_off)
-        counts = {"pass": 0, "dead": 0, "inconclusive": 0}
+        counts = {"pass": 0, "dead": 0, "short": 0, "inconclusive": 0}
         for row in results.values():
             counts[row["verdict"]] += 1
         for f, row in sorted(results.items()):
@@ -338,8 +347,8 @@ class _DiagnosticsMixin:
         so the test stops there and says so. stop_on_short=True stops at the
         first short anyway.
 
-        Refuses to start with emission or focus already on (it sets both, and
-        does not write setpoints under a rail somebody else left live).
+        Emission or focus already on is not refused: both are set to this
+        test's values and read back (params["was_on"] records what they were).
         abort: optional callable; returning True stops after the current
         filament. progress(filament, row) is called after each one.
 
@@ -372,10 +381,11 @@ class _DiagnosticsMixin:
             return {"ok": False, "params": params, "results": {}, "counts": {},
                     "problems": problems + [f"cannot read the HV state ({hv.get('error')}) "
                                             f"-- not writing setpoints blind"]}
-        if hv.get("emission_on") or hv.get("focus_on"):
-            return {"ok": False, "params": params, "results": {}, "counts": {},
-                    "problems": problems + ["emission or focus is already ON -- turn both "
-                                            "off first; this test sets its own voltages"]}
+        # Rails already ON are not refused: both are SET to this test's values
+        # and read back below (2026-10-13, the user: measurements set their
+        # starting conditions).
+        params["was_on"] = {"emission": bool(hv.get("emission_on")),
+                            "focus": bool(hv.get("focus_on"))}
 
         def read():
             a = self.read_ads_all()
@@ -545,6 +555,14 @@ class _DiagnosticsMixin:
             problems.append(f"not every filament reached SLEEP ({self.describe(sl)[:120]})")
         if focus_off:
             self.enable_focus(False)
+            # Focus does not drop the moment it is switched off: it bleeds down
+            # from wherever it was (-210 V took tens of seconds, 2026-10-13 --
+            # a baseline read 0.5 s later said 157 V and ruined the scan).
+            # Wait until it is near 0 and settled.
+            settled, last = self._wait_focus_discharged()
+            if not settled:
+                return [], problems + [f"focus did not discharge after being switched off "
+                                       f"(still {last} V after 60 s) -- nothing judged"], None
         self.set_emission_i(limit_ma)
         self.set_emission_v(abs(emission_v))
         self.enable_emission(True)
@@ -552,6 +570,26 @@ class _DiagnosticsMixin:
         if bad:
             return [], problems + [bad], v_read
         return wanted, problems, v_read
+
+    _FOCUS_OFF_V = 5.0           # |focus| below this counts as discharged ...
+    _FOCUS_STABLE_V = 1.0        # ... once two reads 1 s apart agree to within this
+
+    def _wait_focus_discharged(self, timeout_s: float = 60.0):
+        """(True, V) once |focus| is below _FOCUS_OFF_V and steady; (False, last V)
+        after timeout_s."""
+        deadline = time.monotonic() + timeout_s
+        prev = None
+        last = None
+        while time.monotonic() < deadline:
+            a = self.read_ads_all()
+            v = a.get("focus_v") if a.get("ok") else None
+            if v is not None:
+                last = round(float(v), 1)
+                if abs(v) < self._FOCUS_OFF_V and prev is not None and abs(v - prev) < self._FOCUS_STABLE_V:
+                    return True, last
+                prev = float(v)
+            time.sleep(1.0)
+        return False, last
 
     def _scan_teardown(self, problems: list, reason: str) -> None:
         """Every grid switch OPEN (confirmed by read-back), then the rail OFF."""
@@ -799,10 +837,9 @@ class _DiagnosticsMixin:
         if not wanted:
             return {"ok": False, "results": {}, "counts": {},
                     "problems": problems + ["no live filament on a connected controller"]}
-        if self.hv_status().get("emission_on"):
-            return {"ok": False, "results": {}, "counts": {},
-                    "problems": problems + ["the emission rail is already ON -- turn it off "
-                                            "first; this test sets its own voltages"]}
+        # A rail already ON is not refused: this test SETS its own voltages
+        # (2026-10-13, the user: measurements set their starting conditions).
+        was_on = bool(self.hv_status().get("emission_on"))
         points: dict[int, list] = {f: [] for f in wanted}
         rail: list = []
         hv_off = None
@@ -842,7 +879,7 @@ class _DiagnosticsMixin:
             problems.append(hv_off)
 
         results: dict[int, dict] = {}
-        counts = {"pass": 0, "dead": 0, "odd": 0, "unmeasured": 0}
+        counts = {"pass": 0, "dead": 0, "short": 0, "odd": 0, "unmeasured": 0}
         vf_nom = sum(self._MOSFET_VF_V)
         for f in wanted:
             p = points[f]
@@ -864,7 +901,12 @@ class _DiagnosticsMixin:
                 if a > 0:
                     row["r_kohm"] = round(1.0 / a, 1)
                     row["vf_v"] = round(-b / a, 2)
-                if a <= 0 or 1.0 / a > 5 * r_nom or i_top < self._MOSFET_DEAD_FRAC * i_exp:
+                if i_exp > 0 and i_top >= self._MOSFET_SHORT_FRAC * i_exp:
+                    row["verdict"] = "short"
+                    row["note"] = (f"{i_top:.1f} mA at {xs[-1]:g} V against {i_exp:.2f} mA "
+                                   f"expected ({i_top / i_exp:.0f}x) -- a low-impedance path "
+                                   f"after the MOSFET (short)")
+                elif a <= 0 or 1.0 / a > 5 * r_nom or i_top < self._MOSFET_DEAD_FRAC * i_exp:
                     row["verdict"], row["note"] = "dead", "not conducting"
                 elif abs(1.0 / a - r_nom) <= tol * r_nom and r2 >= 0.9:
                     row["verdict"], row["note"] = "pass", None
@@ -877,7 +919,7 @@ class _DiagnosticsMixin:
                 problems.append(f"filament {f}: {row['verdict']} -- {row['note']}")
         return {"ok": not problems and bool(results), "volts": volts, "rail_v": rail,
                 "limit_ma": limit_ma, "results": results, "counts": counts,
-                "problems": problems}
+                "emission_was_on": was_on, "problems": problems}
 
     # ── Board self-test & I2C diagnostics ─────────────────────────────────────
     # The GUI's I2C panel, as API calls. These ask "is the hardware wired up and

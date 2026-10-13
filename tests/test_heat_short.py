@@ -145,10 +145,13 @@ rig = Rig(culprit=0, after=0.2, recover=0.2)
 r = run(rig, filaments=[0, 1], stop_on_short=True)
 check("stop_on_short -> stops after the first", list(r["results"]) == [0], r["results"])
 
-# 5. Refuses with HV already on, touches nothing.
+# 5. HV already on is NOT refused (2026-10-13, the user: measurements set their
+#    starting conditions): the rails are set to the test's values and it runs.
 rig = Rig(hv_on=True)
 r = run(rig, filaments=[0])
-check("HV already on -> refused", not r["ok"] and "already ON" in r["problems"][-1] and not rig.calls, (r, rig.calls))
+check("HV already on -> runs, records it, rails off at the end",
+      0 in r["results"] and r["params"].get("was_on") == {"emission": True, "focus": True}
+      and rig.hv == {"emission_on": False, "focus_on": False}, (r, rig.hv))
 
 # 5b. Focus deliberately BELOW emission (150 V vs 200 V) and healthy: no short.
 rig = Rig()
