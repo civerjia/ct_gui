@@ -1903,9 +1903,10 @@ class _ScheduleMixin:
         arm_r = per.get(str(controller)) or ({} if per else arm_all)
         if not arm_r.get("ok"):
             code, why = self._arm_failure(arm_r if per else arm_all)
+            who = f"filament {filament}{self._mosfet_site(filament)}"
             return {"ok": False,
-                    "error": (f"arm rejected (code {code}): {why}" if code is not None
-                              else why),
+                    "error": (f"arm rejected for {who} (code {code}): {why}" if code is not None
+                              else f"arm failed for {who}: {why}"),
                     "arm_reject": code, "arm_reject_name": why,
                     "fired": 0, "records": [], "status": {}, "schedule": reuse_note}
         if companion:
@@ -2104,18 +2105,27 @@ class _ScheduleMixin:
         # the NEIGHBOURING bit, 0x02 for 0x01, while current flowed).
         # shot_measured() tells which from the measured current. Not about
         # the emission/focus rails, which are on regardless.
-        no_on = [r for r in fired if r.get("on_mismatch")]
+        no_on = [(i, r) for i, r in enumerate(fired) if r.get("on_mismatch")]
         if no_on:
-            out["on_mismatch"] = sorted({r.get("filament") for r in no_on})
+            out["on_mismatch"] = sorted({r.get("filament") for _, r in no_on})
+            out["on_mismatch_pulses"] = [i for i, _ in no_on]      # index into records
             out["ok"] = False
-            rb = ", ".join(f"filament {r.get('filament')}{self._mosfet_site(r.get('filament'))} "
-                           f"commanded {self._hex8(self._mosfet_bit(r.get('filament')))}, "
-                           f"read back {self._hex8(r.get('read165'))}"
-                           for r in no_on)
+            cmd = self._mosfet_bit(filament)
+
+            def what(r):
+                rd = r.get("read165")
+                s = f"wrote {self._hex8(cmd)}, read back {self._hex8(rd)}"
+                if isinstance(rd, int) and isinstance(cmd, int):
+                    if rd == 0:
+                        s += " (no bit)"
+                    elif rd in ((cmd << 1) & 0xFF, cmd >> 1):
+                        s += " (the neighbouring bit)"
+                return s
+            lst = "; ".join(f"pulse {i + 1}: {what(r)}" for i, r in no_on)
             out["error"] = ((out["error"] + "; ") if out.get("error") else "") + (
-                f"MOSFET read-back mismatch (ON): {rb}. Either the grid MOSFET "
-                f"did not close, or the read-back is wrong -- the measured "
-                f"current of this pulse tells which (measure=True)")
+                f"MOSFET read-back wrong on {len(no_on)} of {len(fired)} pulse(s), "
+                f"filament {filament}{self._mosfet_site(filament)} -- {lst}. "
+                + self._ON_MISMATCH_UNMEASURED)
         # Unverified (0x04) is NOT a failure: the pulse fired, the
         # firmware just has no read-back evidence about it. Reported so
         # a caller can tell "verified good" from "no evidence", which
@@ -2231,14 +2241,48 @@ class _ScheduleMixin:
         # which: through the sub-board's diode path a closed MOSFET always
         # draws current (emission_ma is None when it drew none).
         if base.get("on_mismatch") and measured:
-            em = measured[0].get("emission_ma")
-            out["mosfet_conducted"] = em is not None
-            out["error"] = (out.get("error") or "") + (
-                f" -- measured {em} mA in this pulse: current FLOWED, so the "
-                f"MOSFET did close and the READ-BACK is wrong"
-                if em is not None else
-                " -- no current flowed in this pulse: the MOSFET did NOT close")
+            out["error"] = (out.get("error") or "").replace(
+                self._ON_MISMATCH_UNMEASURED, self._on_mismatch_verdict(base, measured))
+            out["mosfet_conducted"] = self._on_mismatch_conducted(base, measured)
         return out
+
+    _ON_MISMATCH_UNMEASURED = ("Not measured, so it is unknown whether the MOSFET did not "
+                               "close or only its read-back (74HC165) is wrong.")
+
+    @staticmethod
+    def _on_mismatch_currents(base: dict, measured: list):
+        """[(pulse index, emission mA or None)] for the mismatched pulses, or
+        None when records and events cannot be paired 1:1 by order."""
+        if len(measured) != int(base.get("fired") or 0):
+            return None
+        return [(i, measured[i].get("emission_ma")) for i in base.get("on_mismatch_pulses") or [0]
+                if i < len(measured)]
+
+    def _on_mismatch_conducted(self, base: dict, measured: list):
+        cur = self._on_mismatch_currents(base, measured)
+        return None if cur is None else all(em is not None for _, em in cur)
+
+    def _on_mismatch_verdict(self, base: dict, measured: list) -> str:
+        """The measured current of the MISMATCHED pulses themselves says which:
+        a closed MOSFET always draws current through the sub-board's diode path
+        (emission_ma is None when the path drew none)."""
+        cur = self._on_mismatch_currents(base, measured)
+        if cur is None:
+            return (f"The detector measured {len(measured)} of {base.get('fired')} pulses, so "
+                    f"the mismatched pulses cannot be matched to a current: it is unknown "
+                    f"whether the MOSFET closed.")
+        flowed = [(i, em) for i, em in cur if em is not None]
+        dead = [i for i, em in cur if em is None]
+        out = []
+        if flowed:
+            out.append(f"Current FLOWED in pulse(s) {', '.join(str(i + 1) for i, _ in flowed)} "
+                       f"({', '.join(f'{em:.2f}' for _, em in flowed)} mA): the MOSFET did close "
+                       f"and the READ-BACK is wrong (the 74HC165 read-back or its cable) -- "
+                       f"those pulses are good data.")
+        if dead:
+            out.append(f"No current in pulse(s) {', '.join(str(i + 1) for i in dead)}: the "
+                       f"MOSFET did NOT close -- those pulses never reached the filament.")
+        return " ".join(out)
 
     def shot_abort(self, shot: dict) -> None:
         """Disarm everything the shot armed (both controllers, the detector).

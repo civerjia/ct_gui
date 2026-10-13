@@ -127,9 +127,10 @@ check("...records of a failed shot is a no-op", ct.shot_records(shot) is shot)
 # 6. Switch read-back mismatch still judged by shot_records.
 ct, calls = make(on_mismatch=True)
 res = ct.shot_records(ct.shot_wait(ct.shot_trigger(ct.shot_arm(ct.shot_prepare(16, **KW))), 2.0))
-check("MOSFET read-back mismatch (ON) reported, with bytes",
-      not res["ok"] and "MOSFET read-back mismatch (ON)" in res["error"]
-      and "commanded 0x04, read back 0x02" in res["error"], res)
+check("MOSFET read-back wrong reported: which pulse, bytes, neighbouring bit, not measured",
+      not res["ok"] and "MOSFET read-back wrong on 1 of 1 pulse(s)" in res["error"]
+      and "pulse 1: wrote 0x04, read back 0x02 (the neighbouring bit)" in res["error"]
+      and "Not measured" in res["error"], res)
 
 # 6b. ...and the measured current says which: MOSFET closed (read-back wrong) or not.
 for em, want in ((20.0, "READ-BACK is wrong"), (None, "MOSFET did NOT close")):
@@ -138,6 +139,43 @@ for em, want in ((20.0, "READ-BACK is wrong"), (None, "MOSFET did NOT close")):
     r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **KW)
     check(f"mismatch + emission {em} mA -> '{want}', measured kept",
           not r["ok"] and want in r["error"] and r["measured"] and r["mosfet_conducted"] == (em is not None), r)
+
+# 6c. 2026-10-12, filament 8 (P1 CH2.1): 10 pulses, only some read back wrong.
+#     The verdict must be about THOSE pulses' own current (it used to look at
+#     pulse 1 only), name them, and say whether the data are usable.
+ct, calls = make(on_mismatch=True)
+log = [{"filament": 16, "on_mismatch": i in (2, 6), "read165": {2: 8, 6: 0}.get(i, 4)}
+       for i in range(10)]
+ct.shv_pulse_log = lambda c: log
+ems = [5.0] * 10
+ems[6] = None                                  # pulse 7: no current at all
+ct._collect_pulse_events = lambda since, n, *a: ([{"id": 50 + i, "emission_ma": ems[i]}
+                                                  for i in range(10)], 1228)
+r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **{**KW, "num_pulses": 10})
+e = r.get("error") or ""
+check("10 pulses: names the 2 mismatched ones and their bytes",
+      "wrong on 2 of 10 pulse(s)" in e and "pulse 3: wrote 0x04, read back 0x08 (the neighbouring bit)" in e
+      and "pulse 7: wrote 0x04, read back 0x00 (no bit)" in e, e)
+check("...pulse 3 current flowed: read-back wrong, good data",
+      "Current FLOWED in pulse(s) 3 (5.00 mA)" in e and "good data" in e, e)
+check("...pulse 7 no current: MOSFET did NOT close", "No current in pulse(s) 7" in e, e)
+check("...the 'not measured' placeholder is gone", "Not measured" not in e, e)
+check("...mosfet_conducted False (one did not)", r.get("mosfet_conducted") is False, r)
+
+# 6d. Events missing: cannot pair -> said, no verdict invented.
+ct, calls = make(on_mismatch=True)
+ct.shv_pulse_log = lambda c: log
+ct._collect_pulse_events = lambda since, n, *a: ([{"id": 50, "emission_ma": 5.0}] * 9, 1228)
+r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **{**KW, "num_pulses": 10})
+check("unpaired: unknown, said so", "cannot be matched" in (r.get("error") or "")
+      and r.get("mosfet_conducted") is None, r)
+
+# 6e. Arm refused: names the filament, its board, and what NotReady means.
+ct, calls = make(arm_ok=False)
+shot = ct.shot_arm(ct.shot_measure_arm(ct.shot_prepare(16, **KW)))
+check("arm refused message: filament + board + I2C/pre-arm check, nothing fired",
+      "arm rejected for filament 16 (" in shot["error"] and "pre-arm safety check" in shot["error"]
+      and "Nothing was fired" in shot["error"], shot["error"])
 
 # 7. Two controllers: the master is armed and triggered too.
 ct, calls = make(master=2)

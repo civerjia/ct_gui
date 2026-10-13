@@ -38,10 +38,13 @@ class _DecodeMixin:
         3: "EmptyTable — no schedule entries were loaded",
         4: "TpsDisabled — the board's TPS55289 is not enabled",
         5: "TpsFault — the board's TPS55289 reports a fault",
-        6: "IsoOff — the filament's board is not powered (isolated 12 V rail "
-           "off). Put it at SLEEP or above before arming",
-        7: "NotReady — the controller/channel is not initialised. Usually the "
-           "active list was never pushed, or the RP2350 reset since it was",
+        6: "IsoOff — the board's isolated 12 V rail reads OFF (the filament is "
+           "at STOP). Nothing was fired. Bring it to SLEEP or above, then arm",
+        7: "NotReady — the RP2350's pre-arm safety check could not confirm this "
+           "board: reading its ISO/FAULT expander over I2C failed, or its channel "
+           "is not initialised (e.g. the RP2350 reset). Nothing was fired. Usually "
+           "a passing I2C/cable problem on that channel -- retry; if it repeats, "
+           "check that channel's I2C",
         8: "StateConflict — already armed or running; disarm first",
     }
 
