@@ -410,6 +410,20 @@ def _start_reaper() -> None:
         t.start()
 
 
+def activity() -> list[str]:
+    """Sessions doing something a restart would cut: a call in progress, or a
+    `with` block open (lease, session(), energised()). For the auto-update."""
+    with _LOCK:
+        live = list(_SESS.values())
+    out = []
+    for s in live:
+        if s.busy:
+            out.append(f"{s.client_id}: a call in progress")
+        elif s.entered:
+            out.append(f"{s.client_id}: inside a with-block")
+    return out
+
+
 def sessions() -> list[dict]:
     now = time.monotonic()
     with _LOCK:

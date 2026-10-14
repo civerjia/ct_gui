@@ -6025,10 +6025,61 @@ _UPDATE_LOCK = threading.Lock()
 _UPDATE_STATUS: dict = {"checked": False}
 
 
+# Auto-update: an update found on GitHub is APPLIED (restart in place, which
+# updates on the way up) as soon as the rig is quiet -- no GUI button. Quiet =
+# nothing a restart (a few seconds without the backend) could cut:
+#   no lease held, no schedule armed/running, no remote call in progress or
+#   with-block open, no backend test job running, the grid commanded open, and
+#   no filament / HV COMMAND for AUTO_UPDATE_QUIET_S. Reads (combined_backend's
+#   emission poll, the GUI) never count: they do not touch the safety timers.
+# CT_AUTO_UPDATE=0 turns it off (the check then only announces, as before).
+AUTO_UPDATE = os.environ.get("CT_AUTO_UPDATE", "1") != "0"
+AUTO_UPDATE_QUIET_S = float(os.environ.get("CT_AUTO_UPDATE_QUIET_S", "300"))
+AUTO_UPDATE_POLL_S = 20.0
+
+
+def _rig_busy() -> list[str]:
+    """Why a restart now would cut someone's work; [] = quiet."""
+    why: list[str] = []
+    lease = _lease_snapshot()
+    if lease.get("held"):
+        why.append(f"lease held by {lease.get('owner')}")
+    busy = [cid for cid in CONTROLLERS if (board_monitor_snapshot(cid) or {}).get("run_owns")]
+    if busy:
+        why.append(f"schedule armed/running on {busy}")
+    why += _remote.activity()
+    for name, state in (("heat-short test", _HEAT_SHORT), ("emission calibration", _EMISSION_CAL)):
+        if state.get("running"):
+            why.append(f"{name} running")
+    if _GRID_CLOSED:
+        why.append(f"grid commanded closed on {sorted(_GRID_CLOSED)[:6]}")
+    now = time.monotonic()
+    with _SAFETY_LOCK:
+        last_fil = max(_SAFETY_TOUCH_FIL.values(), default=0.0)
+    last = max(last_fil, _SAFETY_TOUCH_HV)
+    if last and now - last < AUTO_UPDATE_QUIET_S:
+        why.append(f"filament/HV command {now - last:.0f} s ago "
+                   f"(quiet needs {AUTO_UPDATE_QUIET_S:.0f} s)")
+    return why
+
+
+def _auto_update_restart(latest: str) -> None:
+    """Restart in place onto `latest`. The new process updates first; if it
+    comes up still behind `latest`, CT_AUTOUPDATE_TRIED stops it trying again
+    for the same version (no restart loop)."""
+    keep = {cid: link.host for cid, link in CONTROLLERS.items()
+            if link.client.connected and getattr(link, "host", None)}
+    os.environ["CT_AUTOUPDATE_TRIED"] = str(latest)
+    log.warning("auto-update: rig quiet, restarting to apply %s (running %s) -- reconnecting %s",
+                latest, _BACKEND_VERSION.get("commit"), keep or "nothing")
+    _restart_self(keep)
+
+
 def _update_watch_loop() -> None:
     from ct import update as ct_update
     time.sleep(UPDATE_FIRST_CHECK_S)
     announced = None
+    gave_up = None
     while not _STOPPING.is_set():
         try:
             st = ct_update.remote_check(_BACKEND_VERSION.get("commit"))
@@ -6036,6 +6087,7 @@ def _update_watch_loop() -> None:
         except Exception as exc:          # offline, rate-limited, GitHub down
             st = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         st["checked"] = True
+        st["auto"] = AUTO_UPDATE
         st["checked_at"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
         with _UPDATE_LOCK:
             prev = dict(_UPDATE_STATUS)
@@ -6045,11 +6097,36 @@ def _update_watch_loop() -> None:
                 st = {**prev, "error": st["error"], "checked_at": st["checked_at"]}
             _UPDATE_STATUS.clear()
             _UPDATE_STATUS.update(st)
-        if st.get("available") and st.get("latest") != announced:
-            announced = st.get("latest")
-            log.warning("update available on GitHub: %s (running %s) -- restart the backend "
-                        "to apply it", st.get("latest"), st.get("current"))
-        time.sleep(max(60.0, UPDATE_CHECK_S))
+        latest = st.get("latest")
+        if st.get("available") and latest != announced:
+            announced = latest
+            log.warning("update available on GitHub: %s (running %s) -- %s", latest,
+                        st.get("current"),
+                        "applied automatically once the rig is quiet" if AUTO_UPDATE
+                        else "restart the backend to apply it (CT_AUTO_UPDATE=0)")
+        deadline = time.monotonic() + max(60.0, UPDATE_CHECK_S)
+        if (AUTO_UPDATE and st.get("available") and latest
+                and os.environ.get("CT_AUTOUPDATE_TRIED") == str(latest)):
+            if gave_up != latest:
+                gave_up = latest
+                log.warning("auto-update: already restarted once for %s and still not on it "
+                            "-- not retrying; see the start-up update messages", latest)
+        elif AUTO_UPDATE and st.get("available") and latest:
+            # Wait for a quiet moment until the next check.
+            reported = None
+            while not _STOPPING.is_set() and time.monotonic() < deadline:
+                why = _rig_busy()
+                with _UPDATE_LOCK:
+                    _UPDATE_STATUS["auto_waiting"] = why
+                if not why:
+                    _auto_update_restart(latest)
+                    return
+                if why[0].split(" ")[0] != reported:
+                    reported = why[0].split(" ")[0]
+                    log.info("auto-update to %s waiting: %s", latest, "; ".join(why))
+                time.sleep(AUTO_UPDATE_POLL_S)
+        while not _STOPPING.is_set() and time.monotonic() < deadline:
+            time.sleep(5.0)
 
 
 def _backend_already_running(port: int) -> str | None:
