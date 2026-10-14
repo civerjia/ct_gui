@@ -3864,6 +3864,30 @@ Two refusals are deliberate:
 
 ### Board self-test and I²C diagnostics
 
+**`firmware_selftest(controller=None, expect_vcap_mv=11000, expect_slew=None)`**
+— check every connected RP2350 **over the bridge, no USB**, read-only and safe
+at any time (nothing energised, nothing fired). Needs RP2350 firmware 98086b2+
+for the boot part (`GET_BOOT_INFO`, 0x64); on older firmware or an older
+backend that check is reported as not judged (`ok` None), not as a failure.
+
+| check | passes when |
+|---|---|
+| `boot` | no failed boots before this one, no hardfault recorded, this boot stable (else: how far it got) |
+| `firmware` | every controller runs the same git build, none built from uncommitted code |
+| `vcap` | the output-voltage cap in force is `expect_vcap_mv` |
+| `slew` | the slew rates in force are `expect_slew` (default `SLEW_DEFAULTS`) |
+| `pulse_log` | pulse records are 20 bytes (heating voltage recorded); only judged when the log has records |
+
+```python
+r = ct.firmware_selftest()
+r["ok"], r["problems"]           # e.g. ["P2 boot: 2 failed boot(s) before this one ..."]
+ct.firmware_info()["controllers"]["1"]   # git, failed_boots, prev_stage, stage, fault_pc, uptime_s
+```
+
+For a bench board on USB, `tools/fw_selftest.py` in the firmware repo runs
+the same checks on the console and can also fire `shvtest` and do a BOOTSEL
+round trip.
+
 "Is the hardware wired up and answering" — a different question from "is the
 filament good". All return `{controller: {...}}` keyed 1/2, covering only
 CONNECTED controllers.

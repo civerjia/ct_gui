@@ -61,6 +61,8 @@ started on a spare local port -- never the rig.
 | `test_auto_update.py` | the backend applies a GitHub update by itself only when the rig is quiet (`_rig_busy`), once per version, and not with `CT_AUTO_UPDATE=0` |
 | `test_pulse_heat_voltage.py` | pulse-log decode of 16- and 20-byte records: heating voltage (`heat_bus_mV`, `heat_cmd_mV`) and its reasons, and the pulse-table columns |
 | `test_fire_voltage.py` | `fire_single_pulse(active_mv=...)`: VOLTAGE after the arm, settle, one output check, fire, back to IDLE; refused / faulted / open cases |
+| `test_pulse_timing.py` | `pulse_interval_ms` / `trigger_timeout_ms` (old `inter_pulse_ms` keeps its per-mode meaning + a note); limits refused, not changed; one name and two defaults (SHOT 400 / TRAIN 100) across the library |
+| `test_firmware_selftest.py` | `firmware_info()` / `firmware_selftest()` over the bridge: GET_BOOT_INFO decode, failed boots / hardfault / unstable boot, builds that differ or are dirty, vcap / slew / pulse-record size; old firmware or backend = not judged |
 | `test_timed_voltage_backend.py` | backend guards on a timed VOLTAGE: cap / floor range, IDLE-first ladder, single-filament only; an untimed VOLTAGE unchanged |
 
 For a guided tour of the API rather than a stress test, see

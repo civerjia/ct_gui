@@ -1104,6 +1104,132 @@ class _DiagnosticsMixin:
             return None, f"{command}: firmware status 0x{raw[0]:02X} " + names.get(raw[0], "")
         return raw, None
 
+    # ── firmware identity + self-test, over the bridge (no USB) ───────────
+    #: Boot-guard stage that means "this boot ran 30 s: stable".
+    _BOOT_STAGE_STABLE = 0x64
+    _BOOT_STAGES = {1: "preinit", 2: "setup", 3: "serial up", 4: "constructing app",
+                    5: "app constructed", 6: "app begun", 10: "I2C init", 11: "I2C done",
+                    12: "HV init done", 0x64: "stable (30 s)", 0xBB: "entered BOOTSEL on purpose"}
+
+    def _firmware_info_one(self, c: int) -> dict:
+        raw, err = self._diag_cmd(c, "GET_BOOT_INFO")
+        if err:
+            if "unknown command" in err:
+                return {"ok": False, "controller": c, "unsupported": True,
+                        "error": "the backend predates GET_BOOT_INFO -- it updates itself "
+                                 "when the rig is quiet"}
+            if "0x02" in err:
+                return {"ok": False, "controller": c, "unsupported": True,
+                        "error": "this RP2350 firmware predates GET_BOOT_INFO "
+                                 "(0x64, fw 98086b2): no boot record over the bridge"}
+            return {"ok": False, "controller": c, "error": err}
+        if len(raw) < 24:
+            return {"ok": False, "controller": c, "error": f"short GET_BOOT_INFO reply {raw}"}
+        le32 = lambda o: raw[o] | (raw[o + 1] << 8) | (raw[o + 2] << 16) | (raw[o + 3] << 24)  # noqa: E731
+        git = bytes(raw[12:24]).split(b"\0", 1)[0].decode("ascii", "replace")
+        pc = le32(4)
+        return {"ok": True, "controller": c,
+                "git": git, "dirty": git.endswith("+"),
+                "failed_boots": raw[1],
+                "prev_stage": raw[2], "prev_stage_name": self._BOOT_STAGES.get(raw[2], "?"),
+                "stage": raw[3], "stage_name": self._BOOT_STAGES.get(raw[3], "?"),
+                "fault_pc": pc or None, "uptime_s": round(le32(8) / 1000.0, 1)}
+
+    def firmware_info(self, controller: int | None = None) -> dict:
+        """Which firmware each RP2350 runs and how it booted -- over the
+        bridge, no USB (RP2350 fw 98086b2+, GET_BOOT_INFO 0x64). Read-only.
+
+            r = ct.firmware_info()
+            r["controllers"]["1"]["git"]            # "98086b2d" ("+" = dirty build)
+            r["controllers"]["1"]["failed_boots"]   # boots that never became stable
+            r["controllers"]["1"]["fault_pc"]       # last hardfault pc, or None
+
+        per controller: git, dirty, failed_boots (unstable boots before this
+        one; 3 in a row make the chip enter BOOTSEL by itself), prev_stage(+
+        _name: how far the previous boot got), stage(+_name: this boot;
+        0x64 = stable), fault_pc, uptime_s. Older firmware: ok False,
+        "unsupported" True -- not a failure of the board."""
+        return self._per_controller(controller, self._firmware_info_one)
+
+    def firmware_selftest(self, controller: int | None = None,
+                          expect_vcap_mv: int = 11000,
+                          expect_slew: dict | None = None) -> dict:
+        """Check every connected RP2350 over the bridge -- no USB, read-only,
+        safe at any time (nothing is energised, nothing is fired):
+
+          boot       GET_BOOT_INFO: no failed boots before this one, no
+                     hardfault recorded, this boot stable (or how far it got)
+          firmware   the same git build on every controller, not a dirty one
+          vcap       the output-voltage cap in force (expect_vcap_mv, 11000)
+          slew       the slew rates in force (expect_slew, SLEW_DEFAULTS)
+          pulse_log  pulse records are 20 bytes (heating voltage recorded) --
+                     only judged when the log has records
+
+            print(ct.firmware_selftest())
+
+        Returns {"ok", "checks": [{"controller", "check", "ok", "detail"}],
+        "problems": [str], "controllers": {c: firmware_info row}}. A check
+        that could not be made (old firmware, empty log) is reported with
+        ok None, not counted as a failure."""
+        want_slew = dict(expect_slew or self.SLEW_DEFAULTS)
+        ctrls = [int(controller)] if controller is not None else self._connected_controllers()
+        checks, infos = [], {}
+
+        def add(c, name, ok, detail):
+            checks.append({"controller": c, "check": name, "ok": ok, "detail": detail})
+        if not ctrls:
+            return {"ok": False, "checks": [], "problems": ["no controller connected"],
+                    "controllers": {}}
+        for c in ctrls:
+            fi = self._firmware_info_one(c)
+            infos[str(c)] = fi
+            if fi.get("unsupported"):
+                add(c, "boot", None, fi["error"])
+            elif not fi.get("ok"):
+                add(c, "boot", False, fi.get("error"))
+            else:
+                bad = []
+                if fi["failed_boots"]:
+                    bad.append(f"{fi['failed_boots']} failed boot(s) before this one "
+                               f"(previous reached stage 0x{fi['prev_stage']:X} "
+                               f"{fi['prev_stage_name']})")
+                if fi["fault_pc"]:
+                    bad.append(f"hardfault recorded at pc 0x{fi['fault_pc']:08X} "
+                               f"(addr2line on the matching firmware.elf)")
+                if fi["stage"] != self._BOOT_STAGE_STABLE:
+                    bad.append(f"this boot is at stage 0x{fi['stage']:X} {fi['stage_name']} "
+                               f"after {fi['uptime_s']} s")
+                add(c, "boot", not bad, "; ".join(bad) or
+                    f"stable, up {fi['uptime_s']} s, fw {fi['git']}")
+            cap = self._voltage_cap_one(c, None)
+            add(c, "vcap", cap.get("mv") == int(expect_vcap_mv) if cap.get("ok") else False,
+                f"{cap.get('mv')} mV (want {int(expect_vcap_mv)})" if cap.get("ok") else cap.get("error"))
+            sl = self._get_slew_rates_one(c)
+            got = {k: sl.get(k) for k in want_slew}
+            add(c, "slew", got == want_slew if sl.get("ok") else False,
+                f"{got} (want {want_slew})" if sl.get("ok") else sl.get("error"))
+            pl = self._shv(c, {"op": "pulse_log", "start": 0})
+            recs = pl.get("records") or []
+            size = pl.get("record_bytes")
+            if size is None and recs:      # backend older than record_bytes
+                size = 16 if recs[0].get("heat_bus_unavailable") == "firmware_no_voltage" else 20
+            if not pl.get("ok"):
+                add(c, "pulse_log", False, pl.get("error") or "pulse log unreadable")
+            elif not recs:
+                add(c, "pulse_log", None, "log empty since the last reset -- record size not judged")
+            else:
+                add(c, "pulse_log", size == 20, f"{size}-byte records"
+                    + ("" if size == 20 else " -- this firmware does not record the heating voltage"))
+        gits = {c: fi.get("git") for c, fi in infos.items() if fi.get("ok")}
+        if len(gits) > 1:
+            add(None, "firmware", len(set(gits.values())) == 1, f"builds {gits}")
+        dirty = [c for c, fi in infos.items() if fi.get("dirty")]
+        if dirty:
+            add(None, "firmware", False, f"controller(s) {dirty} run a build from uncommitted code")
+        problems = [f"{'P' + str(x['controller']) if x['controller'] else 'rig'} {x['check']}: {x['detail']}"
+                    for x in checks if x["ok"] is False]
+        return {"ok": not problems, "checks": checks, "problems": problems, "controllers": infos}
+
     def _per_controller(self, controller, fn) -> dict:
         ctrls = [int(controller)] if controller is not None else self._connected_controllers()
         if not ctrls:

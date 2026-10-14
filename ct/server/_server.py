@@ -1016,7 +1016,8 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                              "heat_bus_mV": bus, "heat_bus_unavailable": bus_why,
                              "heat_cmd_mV": cmd, "heat_cmd_unavailable": cmd_why})
                 off += size
-            return {"ok": True, "total": _le(raw, 1, 2), "records": recs}
+            return {"ok": True, "total": _le(raw, 1, 2), "records": recs,
+                    "record_bytes": size if n else None}
         return {"ok": False}
     if op == "capability":
         ch = int(body.get("channel", 0)) & 0xFF
