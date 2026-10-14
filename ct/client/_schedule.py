@@ -1216,6 +1216,11 @@ class _ScheduleMixin:
                                           # return to right after the pulse
         heat_timeout_s: float = 5.0,     # active_ma only: longest wait for
                                           # the ACTIVE current to arrive
+        active_mv: float | None = None,  # INSTEAD of active_ma: heat at this
+                                          # VOLTAGE (no CC loop) -- see
+                                          # "active_mv" in the docstring
+        voltage_settle_s: float = 2.0,   # active_mv only: wait this long at
+                                          # the voltage, then fire
         timeout_s: float | None = None,  # old name of shot_wait_timeout_s, still accepted
     ) -> dict:
         """Download a one-entry schedule, arm it, fire, and verify.
@@ -1235,6 +1240,20 @@ class _ScheduleMixin:
         starts at ARM, so heat_timeout_s is added to it here. As a backstop
         the ACTIVE is timed in the backend (active_s), so a client that dies
         mid-shot still drops back to idle_ma.
+
+        active_mv: the same, but the heat-up is VOLTAGE mode at active_mv mV
+        instead of ACTIVE at a current -- no CC loop to converge, so it is
+        quicker once you know each filament's voltage. After the arm the
+        filament goes to a TIMED voltage (backend: IDLE-first guard, dead-man,
+        back to idle_ma), waits voltage_settle_s (the firmware slews the
+        output, and the filament warms at that voltage), checks once that the
+        output is up and not faulted, then fires and drops to idle_ma. There is
+        no current target to reach, so nothing is "not reached": the current
+        it ran at is in every pulse record (heat_meas_mA with heat_bus_mV /
+        heat_cmd_mV on firmware that records voltage) -- which is the data for
+        choosing each filament's voltage. Give active_ma OR active_mv.
+
+            ct.fire_single_pulse(f, active_mv=7600, idle_ma=1200, measure=True)
 
         IT DOES NOT HEAT THE FILAMENT. The schedule it builds carries an EMPTY
         heating table and this method calls nothing in the power-state ladder,
@@ -1515,6 +1534,19 @@ class _ScheduleMixin:
                               f"{self._BG_WINDOW_US:.0f} us on each side). Fire "
                               f"further apart, shorten bg_gap_us/bg_window_us, or "
                               f"pass measure=False if you do not need the charge.")}
+        if active_ma is not None and active_mv is not None:
+            return {"ok": False, "fired": 0, "records": [], "status": {},
+                    "error": "give active_ma OR active_mv, not both"}
+        if active_mv is not None:
+            return self._fire_heated(
+                filament, None, idle_ma, float(voltage_settle_s),
+                dict(num_pulses=num_pulses, width_us=width_us,
+                     inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                     total_ms=total_ms, controller=controller, trigger=trigger,
+                     timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
+                     measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
+                     bg_window_us=bg_window_us, on_armed=on_armed),
+                active_mv=active_mv)
         if active_ma is not None:
             return self._fire_heated(
                 filament, active_ma, idle_ma, heat_timeout_s,
@@ -1545,13 +1577,15 @@ class _ScheduleMixin:
         m = h.get("measured_ma")
         return m is not None and abs(float(m) - float(target_ma)) <= cls._HEAT_BAND_MA
 
-    def _fire_heated(self, filament: int, active_ma: float, idle_ma, heat_timeout_s: float,
-                     kw: dict) -> dict:
-        """fire_single_pulse(active_ma=...): prepare at IDLE, ACTIVE only
-        between the arm and the end of the run. See its docstring."""
+    def _fire_heated(self, filament: int, active_ma: float | None, idle_ma,
+                     heat_timeout_s: float, kw: dict, active_mv: float | None = None) -> dict:
+        """fire_single_pulse(active_ma=... | active_mv=...): prepare at IDLE,
+        heat only between the arm and the end of the run. See its docstring.
+        With active_mv, heat_timeout_s is the voltage settle time."""
         if idle_ma is None:
             return {"ok": False, "fired": 0, "records": [], "status": {},
-                    "error": "active_ma needs idle_ma: the IDLE current to drop "
+                    "error": f"{'active_mv' if active_mv is not None else 'active_ma'} "
+                             f"needs idle_ma: the IDLE current to drop "
                              "back to as soon as the pulse is done"}
         user_on_armed = kw.pop("on_armed", None)
         heat = {"raised": False, "dropped": False, "active": None, "idle": None,
@@ -1564,6 +1598,11 @@ class _ScheduleMixin:
             # pulse mid-ramp, on a filament still heating up.
             heat["raised"] = True        # from here on, the finally drops it
             heat["t_active"] = time.monotonic()
+            if active_mv is not None:
+                raise_voltage()
+                if callable(user_on_armed):
+                    user_on_armed()
+                return
             # Backstop in the BACKEND: held while the run is armed/running,
             # applied when it ends -- so a client that dies after this line
             # still returns the filament to idle_ma.
@@ -1604,6 +1643,36 @@ class _ScheduleMixin:
                     f"{': ' + str(h['error']) if h.get('error') else ''}) -- not fired")
             if callable(user_on_armed):
                 user_on_armed()
+
+        def raise_voltage():
+            r = self.voltage_one(filament, active_mv,
+                                 active_s=float(heat_timeout_s) + float(kw["timeout_s"]) + 5.0,
+                                 then_idle_ma=idle_ma)
+            heat["active"] = r
+            if not r.get("ok"):
+                heat["raised"] = False       # refused: nothing applied to drop
+                raise RuntimeError(f"VOLTAGE {active_mv} mV not accepted: "
+                                   f"{r.get('error') or r}")
+            time.sleep(float(heat_timeout_s))
+            # ONE cached read (no polling: in voltage mode the cache refreshes
+            # every ~2 s and single-board polling starves the shared link).
+            # It confirms the output is up and not faulted; it is not a target.
+            d = (self.read_filament_current_cached(filament) or {}).get(int(filament)) or {}
+            ma, mode = d.get("current_mA"), d.get("cc_mode")
+            h = {"ok": True, "mode": "voltage", "commanded_mv": int(active_mv),
+                 "settle_s": float(heat_timeout_s), "measured_ma": ma,
+                 "measured_valid": ma is not None, "cc_mode": mode,
+                 "measured_from": "cached"}
+            if mode in (2, 3):
+                h.update(ok=False, faulted=True,
+                         error=f"output faulted at {active_mv} mV (cc_mode {mode}: "
+                               f"{'open filament' if mode == 2 else 'OCP/short'})")
+            elif ma is not None and ma < 100:
+                h.update(ok=False, error=f"output at {active_mv} mV draws only {ma} mA "
+                                         f"-- open filament or output off")
+            heat["active"] = {**r, "heating": h}
+            if not h["ok"]:
+                raise RuntimeError(f"VOLTAGE {active_mv} mV: {h['error']} -- not fired")
 
         def drop_idle():
             # Called when the run ends and again from the finally: a failed

@@ -1376,8 +1376,13 @@ def _safety_loop() -> None:
                 hv_last = _SAFETY_TOUCH_HV
                 hv_on = bool(_GRID_CLOSED)
             stale = []
+            with _SAFETY_LOCK:
+                timed_v = set(ACTIVE_DEADLINES)
             for fid, (st, _w) in list(LAST_POWER_STATE.items()):
-                if st != POWER_STATE_ACTIVE:
+                # A TIMED VOLTAGE is heating like ACTIVE (see _parse_timed_active)
+                # and gets the same dead-man; an untimed one is a debug setting.
+                if st != POWER_STATE_ACTIVE and not (st == POWER_STATE_VOLTAGE
+                                                     and int(fid) in timed_v):
                     continue
                 t = touch.get(int(fid))
                 if t is None or (now - t) > a_to:
@@ -1439,12 +1444,19 @@ def _safety_loop() -> None:
 # watchdog above: that one still drops an ACTIVE nobody renews to SLEEP after
 # active_timeout_s, whichever comes first.
 ACTIVE_S_MAX = 3600.0              # longest timed ACTIVE accepted (s)
+TPS_MIN_OUTPUT_MV = 800            # the TPS55289 floor (bc::kTpsMinOutputMv)
 ACTIVE_DEADLINE_TICK_S = 0.1       # how often deadlines are checked
 ACTIVE_DEADLINE_RETRY_S = 1.0      # deferred (run in progress) or failed -> retry after
 
 
-def _parse_timed_active(body: dict, state: int, filaments) -> tuple[dict | None, str | None]:
+def _parse_timed_active(body: dict, state: int, filaments,
+                        allow_voltage: bool = False) -> tuple[dict | None, str | None]:
     """(timed, error) from a state request's active_s / then_idle_ma.
+
+    A TIMED VOLTAGE(6) is the voltage-mode stand-in for a timed ACTIVE (heat
+    to a known output voltage, no CC loop -- 2026-10-14): same clock, same
+    return to IDLE, and the caller applies the same IDLE-first ladder guard
+    and dead-man watch. Single-filament requests only (allow_voltage).
 
     timed = {"active_s": s, "idle_ma": {fid: mA}} or None when not requested.
     then_idle_ma omitted: each filament returns to the IDLE current it was last
@@ -1456,8 +1468,12 @@ def _parse_timed_active(body: dict, state: int, filaments) -> tuple[dict | None,
         if raw_ma is not None:
             return None, "then_idle_ma needs active_s (it is what a TIMED ACTIVE returns to)"
         return None, None
-    if int(state) != POWER_STATE_ACTIVE:
-        return None, f"active_s only applies to ACTIVE(5), not {power_state_name(int(state))}"
+    if int(state) == POWER_STATE_VOLTAGE and not allow_voltage:
+        return None, ("a timed VOLTAGE(6) is single-filament only -- use "
+                      "/api/filament-state per filament")
+    if int(state) not in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
+        return None, (f"active_s only applies to ACTIVE(5) or VOLTAGE(6), "
+                      f"not {power_state_name(int(state))}")
     try:
         active_s = float(raw_s)
     except (TypeError, ValueError):
@@ -1499,7 +1515,8 @@ def _active_deadline_loop() -> None:
                 continue
             # No longer ACTIVE (or no board): nothing to walk back.
             gone = [f for f in due
-                    if LAST_POWER_STATE.get(f, (None, 0.0))[0] != POWER_STATE_ACTIVE
+                    if LAST_POWER_STATE.get(f, (None, 0.0))[0] not in (POWER_STATE_ACTIVE,
+                                                                       POWER_STATE_VOLTAGE)
                     or filament_to_board(f)[0] is None]
             if gone:
                 with _SAFETY_LOCK:
@@ -4429,11 +4446,21 @@ class CtHandler(BaseHTTPRequestHandler):
                                        f"for {IDLE_CEILING_MA} or less, or use "
                                        f"ACTIVE if you need more"},
                                       HTTPStatus.OK)
-                timed, err = _parse_timed_active(body, state, [filament])
+                timed, err = _parse_timed_active(body, state, [filament], allow_voltage=True)
                 if err:
                     return self._json({"ok": False, "filament": filament, "error": err},
                                       HTTPStatus.OK)
-                if state == POWER_STATE_ACTIVE:
+                # Timed VOLTAGE = heating without the CC loop. The firmware
+                # clamps an over-cap voltage SILENTLY, so ask for more than the
+                # rig's cap is refused here, like an over-ceiling IDLE.
+                heat_v = state == POWER_STATE_VOLTAGE and timed is not None
+                if heat_v and not (TPS_MIN_OUTPUT_MV <= arg <= VCAP_WANT["mv"]):
+                    return self._json({"ok": False, "filament": filament, "error":
+                                       f"VOLTAGE {arg} mV out of range "
+                                       f"{TPS_MIN_OUTPUT_MV}..{VCAP_WANT['mv']} mV (the "
+                                       f"rig's voltage cap) -- the firmware would clamp "
+                                       f"it silently"}, HTTPStatus.OK)
+                if state == POWER_STATE_ACTIVE or heat_v:
                     # One cheap single-board 0x3A (the CC cache, no I2C) so the
                     # guard tests where the filament IS, not only what it was told.
                     arr, arr_known, cur_ma, tgt_ma = None, False, None, None
@@ -4460,9 +4487,10 @@ class CtHandler(BaseHTTPRequestHandler):
                             why = f"{cause} -- {why}"
                         elif reading:
                             why = f"{why} [measured {reading}]"
-                        log.warning("filament-state: refused ACTIVE for %d — %s", filament, why)
+                        what = "ACTIVE" if state == POWER_STATE_ACTIVE else "timed VOLTAGE"
+                        log.warning("filament-state: refused %s for %d — %s", what, filament, why)
                         out = {"ok": False, "ladder_blocked": True, "filament": filament,
-                               "error": f"filament {filament} may not go to ACTIVE: {why}"}
+                               "error": f"filament {filament} may not go to {what}: {why}"}
                         if board:
                             out["board"] = board
                         return self._json(out, HTTPStatus.OK)

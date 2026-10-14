@@ -1258,7 +1258,11 @@ class _PowerMixin:
                                                     # actually entered
                                                     # voltage-regulation mode
                                                     # afterward -- see below
-                    timeout_s: float = 5.0) -> dict:  # only used if verify=True
+                    timeout_s: float = 5.0,         # only used if verify=True
+                    active_s: float | None = None,  # TIMED: heat at this voltage
+                                                    # this long, then the BACKEND
+                                                    # returns it to IDLE
+                    then_idle_ma: float | None = None) -> dict:
         """Drive a single filament to manual VOLTAGE mode (PowerState 6) at
         `millivolts` mV -- a fixed voltage hold, NOT current-regulated
         (unlike IDLE/ACTIVE, which hold a commanded mA via the closed CC
@@ -1277,12 +1281,25 @@ class _PowerMixin:
         result["heating"]:
             {"ok": bool, "cc_mode": int, "elapsed_s": float, "present": bool}
         cc_mode: 0=voltage (expected here), 1=current, 2/3=fault.
+
+        active_s (2026-10-14): VOLTAGE as a stand-in for a timed ACTIVE --
+        heat to a known voltage with no CC loop. Treated exactly like a timed
+        ACTIVE by the backend: only from a settled IDLE (ladder guard), back
+        to then_idle_ma (default: its last IDLE current) when active_s runs
+        out, and watched by the dead-man like ACTIVE. Above the rig's voltage
+        cap it is refused (the firmware would clamp it silently). Without
+        active_s it is the plain debug setting it always was.
+
+            ct.voltage_one(f, 7600, active_s=10, then_idle_ma=1200)
         """
+        extra = self._timed_active_body(active_s, then_idle_ma)
+        if isinstance(extra, str):
+            return {"ok": False, "filament": int(filament), "error": extra}
         mv = int(millivolts)
         if mv < 800 or mv > 15000:
             return {"ok": False, "filament": int(filament),
                     "error": f"millivolts={mv} out of range 800-15000 (firmware clamps to 0.8-15 V)"}
-        r = self._state_one(filament, VOLTAGE, mv, "voltage_one")
+        r = self._state_one(filament, VOLTAGE, mv, "voltage_one", extra=extra)
         if verify and not r.get("dead"):
             r = {**r, "heating": self._wait_for_voltage_mode(filament, timeout_s)}
         return r
