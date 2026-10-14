@@ -65,9 +65,13 @@ check("failed boots + hardfault on P2 reported, named",
       not r["ok"] and any("P2 boot" in p and "2 failed boot" in p and "0x10012345" in p
                           for p in r["problems"]), r["problems"])
 
-r = make(boot={1: boot_raw(stage=11, up_ms=5000)}).firmware_selftest()
-check("boot not yet stable says how far it got", any("stage 0xB I2C done" in p for p in r["problems"]),
-      r["problems"])
+r = make(boot={1: boot_raw(stage=11, up_ms=60000)}).firmware_selftest()
+check("boot not stable after 60 s: failure, says how far it got",
+      any("stage 0xB I2C done" in p for p in r["problems"]), r["problems"])
+r = make(boot={1: boot_raw(stage=12, up_ms=17500)}).firmware_selftest()
+check("just rebooted (17.5 s): 'still booting', not a failure",
+      r["ok"] and any(x["check"] == "boot" and x["ok"] is None and "still booting" in x["detail"]
+                      for x in r["checks"]), r)
 
 r = make(boot={1: "old", 2: "old"}).firmware_selftest()
 check("old firmware: boot check unsupported (ok None), not a failure",

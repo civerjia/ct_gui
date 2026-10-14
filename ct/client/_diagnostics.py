@@ -1110,6 +1110,9 @@ class _DiagnosticsMixin:
     # ── firmware identity + self-test, over the bridge (no USB) ───────────
     #: Boot-guard stage that means "this boot ran 30 s: stable".
     _BOOT_STAGE_STABLE = 0x64
+    #: A boot younger than this is "still booting", not "unstable" (the guard
+    #: marks stable at 30 s; a little slack for the read itself).
+    _BOOT_STABLE_GRACE_S = 35.0
     _BOOT_STAGES = {1: "preinit", 2: "setup", 3: "serial up", 4: "constructing app",
                     5: "app constructed", 6: "app begun", 10: "I2C init", 11: "I2C done",
                     12: "HV init done", 0x64: "stable (30 s)", 0xBB: "entered BOOTSEL on purpose"}
@@ -1199,11 +1202,18 @@ class _DiagnosticsMixin:
                 if fi["fault_pc"]:
                     bad.append(f"hardfault recorded at pc 0x{fi['fault_pc']:08X} "
                                f"(addr2line on the matching firmware.elf)")
-                if fi["stage"] != self._BOOT_STAGE_STABLE:
+                booting = (fi["stage"] != self._BOOT_STAGE_STABLE
+                           and fi["uptime_s"] < self._BOOT_STABLE_GRACE_S)
+                if fi["stage"] != self._BOOT_STAGE_STABLE and not booting:
                     bad.append(f"this boot is at stage 0x{fi['stage']:X} {fi['stage_name']} "
                                f"after {fi['uptime_s']} s")
-                add(c, "boot", not bad, "; ".join(bad) or
-                    f"stable, up {fi['uptime_s']} s, fw {fi['git']}")
+                if booting and not bad:
+                    # Up less than the guard's 30 s: not judged yet, not failed.
+                    add(c, "boot", None, f"still booting: stage 0x{fi['stage']:X} "
+                                         f"{fi['stage_name']} at {fi['uptime_s']} s (stable at 30 s)")
+                else:
+                    add(c, "boot", not bad, "; ".join(bad) or
+                        f"stable, up {fi['uptime_s']} s, fw {fi['git']}")
             cap = self._voltage_cap_one(c, None)
             add(c, "vcap", cap.get("mv") == int(expect_vcap_mv) if cap.get("ok") else False,
                 f"{cap.get('mv')} mV (want {int(expect_vcap_mv)})" if cap.get("ok") else cap.get("error"))
