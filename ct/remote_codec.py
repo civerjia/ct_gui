@@ -19,10 +19,12 @@ from typing import Any, Callable
 TAG = "__ct__"
 
 
-def encode(o: Any, self_obj: Any = None, register_cm: Callable[[Any], int] | None = None) -> Any:
+def encode(o: Any, self_obj: Any = None, register_cm: Callable[[Any], int] | None = None,
+           register_fn: Callable[[Any], int] | None = None) -> Any:
     """Python value -> JSON-safe value. `self_obj` encodes as a reference to
     the remote client itself; `register_cm` turns a context manager into a
-    handle the other side can enter and exit."""
+    handle the other side can enter and exit; `register_fn` turns a function
+    (on_armed=, progress=) into a handle the other side calls BACK through."""
     def enc(v: Any) -> Any:
         if self_obj is not None and v is self_obj:
             return {TAG: "self"}
@@ -57,15 +59,19 @@ def encode(o: Any, self_obj: Any = None, register_cm: Callable[[Any], int] | Non
             return {TAG: "bytes", "v": base64.b64encode(bytes(v)).decode("ascii")}
         if isinstance(v, PurePath):
             return str(v)
+        if register_fn is not None and callable(v) and not isinstance(v, type):
+            return {TAG: "callback", "id": register_fn(v)}
         if register_cm is not None and hasattr(v, "__enter__") and hasattr(v, "__exit__"):
             return {TAG: "cm", "id": register_cm(v)}
         return {TAG: "repr", "type": cls, "v": repr(v)}
     return enc(o)
 
 
-def decode(o: Any, self_obj: Any = None, make_cm: Callable[[int], Any] | None = None) -> Any:
+def decode(o: Any, self_obj: Any = None, make_cm: Callable[[int], Any] | None = None,
+           make_fn: Callable[[int], Any] | None = None) -> Any:
     """Inverse of encode(). `self_obj` stands in for a {"__ct__": "self"}
-    reference; `make_cm(id)` builds the local handle for a context manager."""
+    reference; `make_cm(id)` builds the local handle for a context manager;
+    `make_fn(id)` the stub that calls a callback back on the other side."""
     from ct.client._base import PulseLog, Result   # imported late: no cycle at import
 
     def dec(v: Any) -> Any:
@@ -99,6 +105,8 @@ def decode(o: Any, self_obj: Any = None, make_cm: Callable[[int], Any] | None = 
                 return v.get("v")
         if tag == "cm" and make_cm is not None:
             return make_cm(int(v["id"]))
+        if tag == "callback" and make_fn is not None:
+            return make_fn(int(v["id"]))
         if tag == "repr":
             return f"<{v.get('type')}: {v.get('v')}>"
         return f"<unknown remote value {tag!r}>"

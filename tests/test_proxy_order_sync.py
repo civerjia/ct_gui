@@ -59,10 +59,20 @@ try:
     ct.set_filament_order(NEW)               # runs in the session
     check("session now on the new order", ct.get_filament_order()[48] == 60)
 
+    # 2026-10-14: the backend calls on_armed back, so the fire runs in the
+    # SESSION, on its order -- the local helper is not used at all.
     armed = []
     r = ct.fire_single_pulse(48, width_us=1000, inter_pulse_ms=300, total_ms=2000,
                              shot_wait_timeout_s=1.0, on_armed=lambda: armed.append(1))
-    check("the local call ran on the new order (48 -> 60)", local._fid_of(48) == 60, local._fid_of(48))
+    check("callback-capable backend: fire ran in the session, local helper untouched",
+          local._fid_of(48) == 61, local._fid_of(48))
+    check("...and was not refused as stale", "filament order changed" not in str(r.get("error")), r.get("error"))
+
+    # An older backend without callbacks: the local path re-reads the order.
+    ct.__dict__["_rp_callbacks"] = False
+    r = ct.fire_single_pulse(48, width_us=1000, inter_pulse_ms=300, total_ms=2000,
+                             shot_wait_timeout_s=1.0, on_armed=lambda: armed.append(1))
+    check("old backend: the local call ran on the new order (48 -> 60)", local._fid_of(48) == 60, local._fid_of(48))
     check("...and was not refused as stale", "filament order changed" not in str(r.get("error")), r.get("error"))
 finally:
     p.send_signal(signal.SIGTERM)

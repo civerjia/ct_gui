@@ -79,13 +79,23 @@ try:
     except AttributeError:
         check("missing method raises AttributeError", True)
 
+    check("this backend calls functions back", ct._rp_callbacks is True)
+    sess = requests.get(BASE + "/api/remote/sessions", timeout=5).json()["sessions"]
+    check("same code -> session not stale", sess and not any(x["stale"] for x in sess), sess)
     calls = []
+    ct.__dict__["_rp_callbacks"] = False          # as against an older backend
     ct.__dict__["_rp_local_client"] = type("L", (), {
         "status": lambda self, cb=None: calls.append(cb) or "local",
         "reload_filament_order": lambda self: calls.append("reload")})()
-    check("a call given a callable runs locally", ct.status(cb=lambda: None) == "local" and calls)
+    check("old backend: a call given a callable runs locally", ct.status(cb=lambda: None) == "local" and calls)
     check("...after re-reading the backend's filament order", calls[0] == "reload", calls)
     ct.__dict__["_rp_local_client"] = None
+    ct.__dict__["_rp_callbacks"] = True
+    try:
+        ct.status(cb=lambda: None)
+        check("new backend: a callable call goes to the backend", False)
+    except TypeError:
+        check("new backend: a callable call goes to the backend (status has no cb -> TypeError)", True)
 
     # Calls from different threads run concurrently, as on a local client.
     import threading as _th

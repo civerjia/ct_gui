@@ -11,8 +11,14 @@ it. Before, every program importing CTClient had to be restarted as well.
 
 What stays local:
   * static/class methods and constants (pure formulas, no hardware);
-  * a call that is given a CALLABLE (progress=..., on_armed=...): a function
-    cannot be sent, so that one call runs on a local client, as before.
+  * the FUNCTIONS a call is given (progress=..., on_armed=...): the call runs
+    in the backend and calls them back here, in the calling thread. Only
+    against a backend too old for callbacks does such a call run on a local
+    client (this process's code, not the backend's).
+
+Version: the proxy tells the backend which ct_gui it loaded; if that is not
+the backend's, both sides warn -- the proxy itself is only updated by
+restarting the program.
 
 Liveness: a background thread pings the backend every PING_S. If this process
 dies, the backend notices within ~15 s and closes the session as a crashed
@@ -25,6 +31,7 @@ from __future__ import annotations
 
 import atexit
 import inspect
+import sys
 import threading
 import weakref
 from typing import Any
@@ -38,6 +45,31 @@ from ct.remote_codec import decode, encode
 from . import _base
 
 PING_S = 3.0
+_MY_VERSION: dict = {}
+
+
+def _my_version() -> dict:
+    """The ct_gui this process LOADED (computed once: files updated on disk
+    after start do not change the code running here)."""
+    if not _MY_VERSION:
+        try:
+            from ct import update
+            _MY_VERSION.update(update.version())
+        except Exception:
+            _MY_VERSION["tree"] = None
+    return dict(_MY_VERSION)
+
+
+def _warn_stale(client_id: str, j: dict) -> None:
+    vc = j.get("version") if isinstance(j.get("version"), dict) else None
+    if not vc or not vc.get("stale"):
+        return
+    msg = (f"[ct] WARNING: {client_id!r} runs OLD ct_gui code ({vc.get('why')}). "
+           "Restart this program to load the backend's version.")
+    print("\n" + "!" * 78 + "\n" + msg + "\n" + "!" * 78, file=sys.stderr, flush=True)
+    import logging
+    logging.getLogger("ct_gui").warning(msg)
+
 _BUILTIN_EXC = {e.__name__: e for e in (ValueError, TypeError, KeyError, IndexError,
                                         RuntimeError, AttributeError, TimeoutError,
                                         LookupError, ZeroDivisionError, OSError)}
@@ -94,14 +126,19 @@ class RemoteCTClient:
         init = {"timeout": a["timeout"], "record": a["record"], "keepalive": a["keepalive"]}
         try:
             r = requests.post(base + "/api/remote/open",
-                              json={"client_id": a["client_id"], "init": init},
+                              json={"client_id": a["client_id"], "init": init,
+                                    "version": _my_version()},
                               headers={"X-CT-Client": a["client_id"]}, timeout=(5, 30))
             if r.status_code != 200 or not r.json().get("ok"):
                 return None
-            sid = r.json()["sid"]
+            j = r.json()
+            sid = j["sid"]
         except Exception:
             return None
-        return cls(base, a["client_id"], init, sid)
+        _warn_stale(a["client_id"], j)
+        p = cls(base, a["client_id"], init, sid)
+        p.__dict__["_rp_callbacks"] = bool(j.get("callbacks"))
+        return p
 
     def __init__(self, base: str, client_id: str, init: dict, sid: str) -> None:
         d = self.__dict__
@@ -112,6 +149,7 @@ class RemoteCTClient:
         d["_rp_tls"] = threading.local()
         d["_rp_kinds"] = {}
         d["_rp_local_client"] = None
+        d["_rp_callbacks"] = False              # backend can call functions back
         d["_rp_stop"] = threading.Event()
         d["_rp_state"] = {"keepalive": False, "order": None}   # see _rp_reopen
         t = threading.Thread(target=RemoteCTClient._rp_pinger,
@@ -174,11 +212,14 @@ class RemoteCTClient:
           * if it was keeping the dead-man watchdog alive, it carries on, so
             filaments that were heating are not dropped to SLEEP."""
         r = requests.post(self.base + "/api/remote/open",
-                          json={"client_id": self.client_id, "init": self._rp_init},
+                          json={"client_id": self.client_id, "init": self._rp_init,
+                                "version": _my_version()},
                           headers={"X-CT-Client": self.client_id}, timeout=(5, 30))
         j = r.json()
         if not j.get("ok"):
             raise _base.CTConnectionError(f"could not reopen the remote session: {j}")
+        self.__dict__["_rp_callbacks"] = bool(j.get("callbacks"))
+        _warn_stale(self.client_id, j)
         self._rp_sid_box()["sid"] = j["sid"]
         self.__dict__["_rp_sid"] = j["sid"]
         st = dict(self._rp_state)
@@ -200,12 +241,12 @@ class RemoteCTClient:
             tls.http.headers.update({"X-CT-Client": self.client_id})
         return tls.http
 
-    def _rp_send(self, body: dict) -> dict:
+    def _rp_send(self, body: dict, path: str = "/api/remote/call") -> dict:
         """One raw request to the current session; returns the JSON reply."""
         ptid = threading.get_ident()
         payload = {**body, "sid": self._rp_sid_box().get("sid"), "ptid": ptid}
         try:
-            r = self._rp_http().post(self.base + "/api/remote/call", json=payload,
+            r = self._rp_http().post(self.base + path, json=payload,
                                      timeout=(5, None))
             return r.json()
         except KeyboardInterrupt:
@@ -222,13 +263,41 @@ class RemoteCTClient:
         except requests.exceptions.RequestException as exc:
             raise _base.CTConnectionError(f"backend unreachable at {self.base}: {exc}") from exc
 
-    def _rp_request(self, body: dict) -> Any:
+    def _rp_callbacks_run(self, j: dict, fns: dict) -> dict:
+        """The call asked for one of its functions: run it here, send back
+        what it returned or raised, until the call answers with its result.
+        Ctrl-C inside the function goes back as KeyboardInterrupt, so the
+        call unwinds (its own cleanup runs) before it is raised here."""
+        interrupted = None
+        while j.get("callback"):
+            cb = j["callback"]
+            reply: dict = {"cid": cb["cid"]}
+            try:
+                fn = fns[int(cb["id"])]
+                args = decode(cb.get("args") or [], self_obj=self,
+                              make_cm=lambda i: _RemoteCM(self, i))
+                kwargs = decode(cb.get("kwargs") or {}, self_obj=self,
+                                make_cm=lambda i: _RemoteCM(self, i))
+                reply["value"] = encode(fn(*args, **kwargs), self_obj=self)
+            except KeyboardInterrupt as e:
+                interrupted = e
+                reply["exc"] = {"type": "KeyboardInterrupt", "message": str(e)}
+            except Exception as e:
+                reply["exc"] = {"type": type(e).__name__, "message": str(e)}
+            j = self._rp_send(reply, path="/api/remote/callback")
+        if interrupted is not None:
+            raise interrupted
+        return j
+
+    def _rp_request(self, body: dict, fns: dict | None = None) -> Any:
         """Send one request to this proxy's session; decode the value or raise
         the error the backend reported. A session that no longer exists (the
         backend restarted -- e.g. to update itself) is reopened and the request
         sent again: it was never executed, so sending it again is safe."""
         for attempt in (1, 2):
             j = self._rp_send(body)
+            if j.get("callback"):
+                j = self._rp_callbacks_run(j, fns or {})
             if isinstance(j.get("state"), dict):
                 self.__dict__["_rp_state"] = j["state"]
             if j.get("expired") and attempt == 1:
@@ -302,7 +371,18 @@ class RemoteCTClient:
             raise AttributeError(f"CTClient has no attribute {name!r}")
 
         def method(*args, **kwargs):
+            if (_has_callable(args) or _has_callable(kwargs)) and self._rp_callbacks:
+                fns: dict = {}
+
+                def reg(fn):
+                    fns[len(fns) + 1] = fn
+                    return len(fns)
+                return self._rp_request(
+                    {"kind": "call", "name": name,
+                     "args": encode(list(args), self_obj=self, register_fn=reg),
+                     "kwargs": encode(kwargs, self_obj=self, register_fn=reg)}, fns)
             if _has_callable(args) or _has_callable(kwargs):
+                # Older backend, no callbacks: this one call runs here.
                 # The local client keeps its own copy of the filament order,
                 # read once. Every other call runs in the backend session, so
                 # an order set through this object (or by anyone) after that

@@ -21,6 +21,7 @@ import ctypes
 import itertools
 import logging
 import os
+import queue
 import threading
 import time
 import traceback
@@ -61,6 +62,9 @@ class _Session:
         # local client; Ctrl-C cancels the one from the thread it hit.
         self.workers: dict[int, int] = {}
         self.cm_lock = threading.Lock()         # with-block bookkeeping only
+        self.jobs: dict[str, "_CallJob"] = {}   # calls waiting on a script callback
+        self.closed = False
+        self.version: dict = {}                 # the proxy's ct_gui version, as it said
 
     def state(self) -> dict:
         """What the proxy needs to rebuild this client if the session is lost
@@ -94,14 +98,49 @@ def _exc(e: BaseException) -> dict:
                                  "trace": traceback.format_exc(limit=6)}}
 
 
+def _backend_version() -> dict:
+    try:
+        from ._safety import _BACKEND_VERSION
+        return dict(_BACKEND_VERSION)
+    except Exception:
+        return {}
+
+
+def version_check(client_v: dict | None) -> dict:
+    """Is the proxy's own code older than this backend's? The client LOGIC
+    runs here, so an old proxy mostly still gets new behaviour -- but the
+    proxy itself (and anything a script imports from ct beside CTClient) is
+    whatever that process loaded at start. 2026-10-13: a proxy too old to
+    send callbacks ran every on_armed fire on its own stale client and 60 of
+    62 read-back failures came from it. Compared by content tree."""
+    mine = _backend_version()
+    cv = client_v if isinstance(client_v, dict) else {}
+    if not cv.get("tree"):
+        return {"stale": True, "client": None, "backend": mine,
+                "why": "the client sent no version: its ct_gui predates the "
+                       "version check (2026-10-14) and runs on-armed fires on its own old code"}
+    if mine.get("tree") and cv["tree"] != mine["tree"]:
+        return {"stale": True, "client": cv, "backend": mine,
+                "why": f"client runs ct_gui {cv.get('commit') or cv['tree']}, "
+                       f"backend {mine.get('commit') or mine['tree']}"}
+    return {"stale": False, "client": cv, "backend": mine}
+
+
 def open_session(body: dict) -> dict:
     client_id = str(body.get("client_id") or "remote")
     s = _Session(client_id, body.get("init") or {})
+    vc = version_check(body.get("version"))
+    s.version = vc.get("client") or {}
     with _LOCK:
         _SESS[s.sid] = s
     _start_reaper()
     log.info("remote session %s opened for %s", s.sid[:8], client_id)
-    return {"ok": True, "sid": s.sid, "idle_s": SESSION_IDLE_S}
+    if vc["stale"]:
+        log.warning("remote client %s runs OLD ct_gui code (%s) -- restart that program "
+                    "to load the backend's version", client_id, vc["why"])
+    return {"ok": True, "sid": s.sid, "idle_s": SESSION_IDLE_S,
+            "callbacks": True,              # this backend calls functions back (see call())
+            "version": vc}
 
 
 def ping(body: dict) -> dict:
@@ -112,10 +151,96 @@ def ping(body: dict) -> dict:
     return {"ok": True}
 
 
+def _has_callback(v: Any) -> bool:
+    if isinstance(v, dict):
+        return v.get("__ct__") == "callback" or any(_has_callback(x) for x in v.values())
+    if isinstance(v, list):
+        return any(_has_callback(x) for x in v)
+    return False
+
+
+_CALLBACK_EXC = {e.__name__: e for e in (KeyboardInterrupt, ValueError, TypeError, KeyError,
+                                         RuntimeError, TimeoutError, OSError)}
+
+
+class _CallJob:
+    """A call given functions (on_armed=, progress=): it runs in its own thread
+    here, and each time it calls one of them the HTTP request carrying the
+    call answers {"callback": ...}. The proxy runs the function in the script
+    and posts its result to /api/remote/callback, whose answer is the next
+    callback or the call's result. So the call is the BACKEND's code even
+    with callbacks -- before, it ran on the script's own client, whose code
+    was whatever that program loaded at start."""
+
+    def __init__(self, s: _Session, body: dict, ptid: int) -> None:
+        self.s, self.body, self.ptid = s, body, ptid
+        self.cid = uuid.uuid4().hex
+        self.events: queue.Queue = queue.Queue()     # job -> HTTP: callback / done
+        self.replies: queue.Queue = queue.Queue()    # HTTP -> job: a callback's result
+        self.waiting = False                         # in the script, not here
+        self.thread = threading.Thread(target=self._main, name=f"remote_call_{self.cid[:6]}",
+                                       daemon=True)
+
+    def stub(self, fid: int):
+        def call_back(*args, **kwargs):
+            s = self.s
+            self.events.put({"ok": True, "callback": {
+                "cid": self.cid, "id": fid, "args": s.enc(list(args)), "kwargs": s.enc(kwargs)}})
+            self.waiting = True
+            try:
+                while True:
+                    try:
+                        r = self.replies.get(timeout=1.0)
+                        break
+                    except queue.Empty:
+                        if s.closed:
+                            raise RuntimeError("remote script gone while its callback ran")
+            finally:
+                self.waiting = False
+                s.last = time.monotonic()
+            if r.get("exc"):
+                e = r["exc"]
+                cls = _CALLBACK_EXC.get(e.get("type"), RuntimeError)
+                msg = e.get("message", "")
+                raise cls(msg if cls is not RuntimeError else f"{e.get('type')}: {msg}")
+            return s.dec(r.get("value"))
+        return call_back
+
+    def _main(self) -> None:
+        s = self.s
+        with s.lock:
+            s.workers[self.ptid] = threading.get_ident()
+        try:
+            name = str(self.body["name"])
+            dec = lambda v: decode(v, self_obj=s.ct, make_cm=lambda i: s.cms[i],   # noqa: E731
+                                   make_fn=self.stub)
+            out = getattr(s.ct, name)(*dec(self.body.get("args") or []),
+                                      **dec(self.body.get("kwargs") or {}))
+            res = {"ok": True, "value": s.enc(out), "state": s.state()}
+        except BaseException as e:
+            res = {**_exc(e), "state": s.state()}
+        finally:
+            with s.lock:
+                if s.workers.get(self.ptid) == threading.get_ident():
+                    del s.workers[self.ptid]
+        self.events.put(res)
+
+    def next_event(self) -> dict:
+        """Wait for the job's next callback or its result."""
+        ev = self.events.get()
+        if "callback" not in ev:
+            with self.s.lock:
+                self.s.jobs.pop(self.cid, None)
+                self.s.busy -= 1
+                self.s.last = time.monotonic()
+        return ev
+
+
 def call(body: dict) -> dict:
     """{sid, ptid, kind, ...}: kind = call {name, args, kwargs} | get {name} |
     set {name, value} | describe {name} | enter {cm} | exit {cm, exc_type, exc}.
-    ptid = the script thread making the call (for Ctrl-C)."""
+    ptid = the script thread making the call (for Ctrl-C). A call whose
+    arguments carry functions runs as a _CallJob (callbacks)."""
     s = _SESS.get(str(body.get("sid")))
     if not s:
         return {"ok": False, "expired": True,
@@ -123,9 +248,19 @@ def call(body: dict) -> dict:
                          "session timed out; the proxy will open a new one"}
     s.last = time.monotonic()
     ptid = int(body.get("ptid") or 0)
+    if body.get("kind", "call") == "call" and (_has_callback(body.get("args"))
+                                                or _has_callback(body.get("kwargs"))):
+        job = _CallJob(s, body, ptid)
+        with s.lock:
+            s.calls += 1
+            s.busy += 1
+            s.jobs[job.cid] = job
+        job.thread.start()
+        return job.next_event()
     with s.lock:
         s.calls += 1
         s.busy += 1
+        prev = s.workers.get(ptid)              # a call made FROM a callback nests
         s.workers[ptid] = threading.get_ident()
     try:
         return _run(s, body)
@@ -134,9 +269,24 @@ def call(body: dict) -> dict:
     finally:
         with s.lock:
             if s.workers.get(ptid) == threading.get_ident():
-                del s.workers[ptid]
+                if prev is not None:
+                    s.workers[ptid] = prev
+                else:
+                    del s.workers[ptid]
             s.busy -= 1
             s.last = time.monotonic()
+
+
+def callback_result(body: dict) -> dict:
+    """{sid, cid, value | exc}: what the script's function returned (or
+    raised); answers with the call's next callback or its result."""
+    s = _SESS.get(str(body.get("sid")))
+    job = s.jobs.get(str(body.get("cid"))) if s else None
+    if not job:
+        return {"ok": False, "error": "no such call waiting for a callback (session closed?)"}
+    s.last = time.monotonic()
+    job.replies.put({"value": body.get("value"), "exc": body.get("exc")})
+    return job.next_event()
 
 
 def _run(s: _Session, body: dict) -> dict:
@@ -210,6 +360,7 @@ def _teardown(s: _Session, reason: str) -> None:
     """Close a session as a dying script would: exit its open `with` blocks
     innermost first (their own cleanup -- lease release, STOPs -- runs), then
     stop its keepalive so the dead-man watchdog takes over."""
+    s.closed = True                             # a call waiting on a callback gives up
     with s.lock:
         err = RuntimeError(f"remote script gone: {reason}")
         for i in reversed(list(s.entered)):
@@ -236,8 +387,11 @@ def _reaper() -> None:
         time.sleep(REAPER_TICK_S)
         now = time.monotonic()
         with _LOCK:
+            # A call waiting on the script's callback is not busy HERE: if
+            # the script stops pinging meanwhile it is gone.
             gone = [s for s in _SESS.values()
-                    if now - s.last > SESSION_IDLE_S and not s.busy]
+                    if now - s.last > SESSION_IDLE_S
+                    and (not s.busy or any(j.waiting for j in list(s.jobs.values())))]
             for s in gone:
                 _SESS.pop(s.sid, None)
         for s in gone:
@@ -259,5 +413,8 @@ def _start_reaper() -> None:
 def sessions() -> list[dict]:
     now = time.monotonic()
     with _LOCK:
-        return [{"sid": s.sid[:8], "client": s.client_id, "idle_s": round(now - s.last, 1),
-                 "calls": s.calls, "open_with_blocks": len(s.entered)} for s in _SESS.values()]
+        live = list(_SESS.values())
+    return [{"sid": s.sid[:8], "client": s.client_id, "idle_s": round(now - s.last, 1),
+             "calls": s.calls, "open_with_blocks": len(s.entered),
+             "version": s.version.get("commit") or s.version.get("tree"),
+             "stale": version_check(s.version or None)["stale"]} for s in live]

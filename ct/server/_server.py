@@ -3883,6 +3883,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 self._json(_remote.open_session(body))
             elif path == "/api/remote/call":
                 self._json(_remote.call(body))
+            elif path == "/api/remote/callback":
+                self._json(_remote.callback_result(body))
             elif path == "/api/remote/ping":
                 self._json(_remote.ping(body))
             elif path == "/api/remote/cancel":
