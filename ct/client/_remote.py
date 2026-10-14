@@ -133,6 +133,16 @@ class RemoteCTClient:
                 return None
             j = r.json()
             sid = j["sid"]
+        except requests.exceptions.RequestException as exc:
+            # Backend not up (not started yet, or restarting to update). A
+            # LOCAL client here would run this program's start-up code for
+            # good -- 2026-10-14 combined_backend could init while the backend
+            # was down. Return a proxy with no session instead: its first call
+            # opens one (the backend-restart path), until then calls raise
+            # CTConnectionError as a local client's would.
+            print(f"[ct remote] backend at {base} not reachable ({type(exc).__name__}); "
+                  "the session opens at the first call", file=sys.stderr, flush=True)
+            return cls(base, a["client_id"], init, None)
         except Exception:
             return None
         _warn_stale(a["client_id"], j)

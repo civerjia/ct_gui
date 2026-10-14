@@ -160,6 +160,22 @@ with contextlib.redirect_stderr(buf):
 check("stale -> loud warning naming the program", "combined_backend" in buf.getvalue()
       and "Restart" in buf.getvalue(), buf.getvalue())
 
+# 8. Backend down when the program builds its client: still a PROXY (no
+#    session yet), never a local client running this process's code.
+from ct.client._client import CTClient  # noqa: E402
+from ct.client import _base  # noqa: E402
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+    c = CTClient("127.0.0.1", port=1, client_id="combined_backend")
+check("backend down at construction -> proxy, not local",
+      type(c).__name__ == "RemoteCTClient" and c._rp_sid_box()["sid"] is None, type(c))
+try:
+    c.read_ads_all()
+    check("call while still down raises CTConnectionError", False)
+except _base.CTConnectionError:
+    check("call while still down raises CTConnectionError", True)
+c._rp_stop.set()
+
 for sid in list(sr._SESS):
     sr.close({"sid": sid})
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
