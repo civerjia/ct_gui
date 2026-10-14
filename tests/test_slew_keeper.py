@@ -48,13 +48,13 @@ class FakeLink:
         self.client = FakeClient(vals)
 
 
-check("default target is 80 % of the ceilings", S.SLEW_WANT ==
-      {"below_mV_per_s": 1600, "above_mV_per_s": 4000, "warm_mV_per_s": 4000}, str(S.SLEW_WANT))
+check("default target is the rig's: cold start <2 V 1000, above/warm 4000", S.SLEW_WANT ==
+      {"below_mV_per_s": 1000, "above_mV_per_s": 4000, "warm_mV_per_s": 4000}, str(S.SLEW_WANT))
 
 link = FakeLink([400, 1000, 2800])                    # RP2350 just reset: firmware defaults
 r = S._slew_check_one(link)
 check("reset controller is written back to the rig's slew",
-      link.client.vals == [1600, 4000, 4000] and r["after"] == S.SLEW_WANT, str(r))
+      link.client.vals == [1000, 4000, 4000] and r["after"] == S.SLEW_WANT, str(r))
 
 r = S._slew_check_one(link)
 check("already right: nothing written", link.client.writes == 1 and r["before"] == r["after"])

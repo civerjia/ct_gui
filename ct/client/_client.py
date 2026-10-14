@@ -1450,8 +1450,11 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
     # cold-inrush. Only `warm` is set near its own. Recorded here because
     # "reset to defaults" is exactly where reaching for the ceiling looks right
     # and is not: doing that once here made cold starts 5x/10x faster.
-    SLEW_DEFAULTS = {"below_mV_per_s": 400, "above_mV_per_s": 1000,
-                     "warm_mV_per_s": 2800}
+    # 2026-10-14: the rig's rates, now also the firmware's defaults (fw
+    # 5051982): the cold start below 2 V at 1000, above 2 V and warm at 80 %
+    # of their 5000 ceiling. (Before: 400 / 1000 / 2800.)
+    SLEW_DEFAULTS = {"below_mV_per_s": 1000, "above_mV_per_s": 4000,
+                     "warm_mV_per_s": 4000}
     SLEW_CEILINGS = {"below_mV_per_s": 2000, "above_mV_per_s": 5000,
                      "warm_mV_per_s": 5000}
 

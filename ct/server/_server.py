@@ -5781,22 +5781,27 @@ def _do_restart(keep: dict, server) -> None:
 
 
 # ── Voltage-ramp slew rates kept at the rig's setting ────────────────────────
-# The RP2350 starts with its own defaults (400/1000/2800 mV/s) after every
-# reset, so a value set once does not stay set. The backend keeps the rig's
-# slew -- by default CT_SLEW_PCT (80) % of the ceilings, or whatever was last
+# The RP2350 starts with its own defaults after every reset (fw 5051982+:
+# the rig's 1000/4000/4000 mV/s; older firmware 400/1000/2800), so a value set
+# once does not stay set. The backend keeps the rig's slew -- SLEW_RIG below
+# (below 2 V = the cold start 1000, above/warm 80 % of the ceiling), or
+# CT_SLEW_PCT % of every ceiling if that is set, or whatever was last
 # SET through /api/cmd CH_SLEW_RATE -- and every SLEW_KEEP_PERIOD_S writes it
 # back to any controller that reads differently. A controller that is armed or
 # running is skipped (no ramp change mid-run). CT_SLEW_KEEP=0 turns it off.
 SLEW_CEILINGS = {"below_mV_per_s": 2000, "above_mV_per_s": 5000, "warm_mV_per_s": 5000}
+SLEW_RIG = {"below_mV_per_s": 1000, "above_mV_per_s": 4000, "warm_mV_per_s": 4000}
 SLEW_KEEP_PERIOD_S = 30.0
 _SLEW_KEYS = ("below_mV_per_s", "above_mV_per_s", "warm_mV_per_s")
 
 
 def _slew_default_want() -> dict:
+    if not os.environ.get("CT_SLEW_PCT"):
+        return dict(SLEW_RIG)
     try:
-        pct = float(os.environ.get("CT_SLEW_PCT", "80"))
+        pct = float(os.environ["CT_SLEW_PCT"])
     except ValueError:
-        pct = 80.0
+        return dict(SLEW_RIG)
     pct = min(100.0, max(10.0, pct))
     return {k: int(SLEW_CEILINGS[k] * pct / 100.0) for k in _SLEW_KEYS}
 
