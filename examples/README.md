@@ -14,6 +14,21 @@ an edge sent earlier is lost. Always ends with HV off and filament F at STOP.
 The callback and its timing rules are documented in `fire_single_pulse`'s
 docstring ("EXTERNAL TRIGGER").
 
+## `fire_voltage_mode.py` — heat for the shot in VOLTAGE mode, build a V → I table
+
+```bash
+python3 fire_voltage_mode.py --host 192.168.8.218 -f 27 --mv 7600
+python3 fire_voltage_mode.py --host 192.168.8.218 -f 27 --mv 7000 7600 8200
+```
+
+Walks filament F up the ladder to IDLE, then for each `--mv` fires one pulse
+with `fire_single_pulse(active_mv=..., idle_ma=..., measure=True)`: a timed
+VOLTAGE after the arm, `--settle-s` at that voltage, fire, back to IDLE. Prints
+each shot's Result (the pulse table includes `heat mV` / `cmd mV` on RP2350 fw
+530b925+) and ends with a table of commanded voltage → measured voltage and
+current at the instant each pulse fired. Does not turn HV on, and refuses to run
+with emission already on unless `--hv-ok`. Always ends with filament F at SLEEP.
+
 ## `fire_steps.py` — fire_single_pulse's steps called one by one
 
 ```bash

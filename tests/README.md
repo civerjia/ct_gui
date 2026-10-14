@@ -49,6 +49,20 @@ python3 tests/test_api.py --scan-presence    # refuse absent boards up front (sl
 wire. Under the liuxing order `--filaments 0` addresses FID 8 (a CH2 board) —
 a different filament from `--filaments 8`, which is FID 0 on CH1.1.
 
+## Offline tests (no hardware)
+
+Run with plain `python3 tests/<file>.py`; each prints PASS/FAIL per check and
+exits non-zero on a failure. They use fakes, an in-process backend or a backend
+started on a spare local port -- never the rig.
+
+| script | what it checks |
+|---|---|
+| `test_remote_callbacks.py` | remote calls given functions (`on_armed`, `progress`) run in the backend and call back into the script; errors / Ctrl-C unwind the call; stale-client version check; backend down at construction gives a lazy proxy |
+| `test_auto_update.py` | the backend applies a GitHub update by itself only when the rig is quiet (`_rig_busy`), once per version, and not with `CT_AUTO_UPDATE=0` |
+| `test_pulse_heat_voltage.py` | pulse-log decode of 16- and 20-byte records: heating voltage (`heat_bus_mV`, `heat_cmd_mV`) and its reasons, and the pulse-table columns |
+| `test_fire_voltage.py` | `fire_single_pulse(active_mv=...)`: VOLTAGE after the arm, settle, one output check, fire, back to IDLE; refused / faulted / open cases |
+| `test_timed_voltage_backend.py` | backend guards on a timed VOLTAGE: cap / floor range, IDLE-first ladder, single-filament only; an untimed VOLTAGE unchanged |
+
 For a guided tour of the API rather than a stress test, see
 [`../examples/walkthrough.py`](../examples/walkthrough.py).
 

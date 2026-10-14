@@ -9,7 +9,8 @@ schedules, and HV pulses without touching the GUI.
 **The API reference is generated from the docstrings:**
 
 ```
-tools/ct_gui/make_api_docs.sh      # -> docs/api/ct_simple_control.html
+cd tools/ct_gui && CT_NO_AUTO_UPDATE=1 PYTHONPATH=$PWD pdoc ./ct/client -o docs/api
+                                   # -> docs/api/ct/client.html (pdoc 16)
 ```
 
 The docstrings are the reference — they carry the measured numbers, the failure
@@ -20,7 +21,7 @@ together, which order to make them in, and the traps that only show up when you
 put them in sequence.
 
 The generated output is not committed (it is derived and it churns); run the
-script.
+command.
 
 ## Requirements
 
@@ -1053,7 +1054,7 @@ if not r["heating"]["ok"]:
     raise RuntimeError(f"filament 5 not at firing current: {r['heating']}")
 ```
 
-**`voltage_one(filament, millivolts, verify=False, timeout_s=5.0)`** — Drive
+**`voltage_one(filament, millivolts, verify=False, timeout_s=5.0, active_s=None, then_idle_ma=None)`** — Drive
 exactly one filament to manual **VOLTAGE** mode (PowerState 6) at
 `millivolts` mV — a fixed voltage hold, NOT current-regulated (unlike
 `idle_one`/`active_one`'s closed CC loop). Mostly for bench/calibration use
@@ -1070,6 +1071,20 @@ ct.voltage_one(5, millivolts=5000)   # hold filament 5's board at 5.0 V
 r = ct.voltage_one(5, millivolts=5000, verify=True, timeout_s=5.0)
 print(r["heating"])
 # {"ok": True, "filament": 5, "cc_mode": 0, "elapsed_s": 0.4, "present": True}
+```
+
+**Timed VOLTAGE** (`active_s`, 2026-10-14) — VOLTAGE as a stand-in for a timed
+ACTIVE: heat to a known voltage with no CC loop. The backend treats it exactly
+like a timed ACTIVE: only from a settled IDLE (the ladder guard), back to
+`then_idle_ma` (default: the filament's last IDLE current) when `active_s` runs
+out, watched by the dead-man watchdog like ACTIVE. It is refused outside
+800 mV..the rig's voltage cap (11 V), because the firmware would clamp an
+over-cap request silently, and it is single-filament only (`/api/filament-prep`
+refuses a timed VOLTAGE). Without `active_s` it is the plain debug setting above.
+`fire_single_pulse(active_mv=...)` uses it.
+
+```python
+ct.voltage_one(5, 7600, active_s=10, then_idle_ma=1200)   # 7.6 V for 10 s, then IDLE 1200 mA
 ```
 
 **`wait_for_current(filament, target_ma, tolerance_ma=150.0, timeout_s=5.0, poll_interval_s=0.2)`**
@@ -1283,11 +1298,17 @@ filament is hot.
 
 | | below | above | warm |
 |---|---|---|---|
-| `SLEW_DEFAULTS` | 400 | 1000 | 2800 |
+| `SLEW_DEFAULTS` | 1000 | 4000 | 4000 |
 | `SLEW_CEILINGS` | 2000 | 5000 | 5000 |
 
-Cold slew sits far below its ceiling deliberately — fast cold ramping is what
-trips OCP on the cold inrush. "Resetting to defaults" by writing the ceilings
+`SLEW_DEFAULTS` are the rig's rates since 2026-10-14 — below 2 V (the cold
+start) 1000, above 2 V and warm 80 % of the ceiling — and the RP2350 firmware's
+own defaults from fw 5051982 (before: 400 / 1000 / 2800). The backend keeps
+them on every controller (`SLEW_RIG`; `CT_SLEW_PCT`, if set, scales every
+ceiling instead), so older firmware is corrected within 30 s of a reset.
+
+The below-2 V rate sits well under its ceiling deliberately — fast cold
+ramping is what trips OCP on the cold inrush. "Resetting to defaults" by writing the ceilings
 once made cold starts 5×/10× faster. To restore: `ct.set_slew_rates(
 **CTClient.SLEW_DEFAULTS)`.
 
@@ -2165,6 +2186,43 @@ still the better first line of defense: it blocks other clients' writes
 outright at the backend level, rather than relying on catching the change
 after the fact. Use both.
 
+**`active_ma`** / **`idle_ma`** / **`heat_timeout_s`** (defaults `None` /
+`None` / `5.0`) — heat the filament for this shot only. The filament must be
+at IDLE; every setup step (detector arm, download, verify, arm) runs at IDLE,
+ACTIVE `active_ma` is raised after the arm and must ARRIVE within
+`heat_timeout_s` (not arrived = not fired, `ok=False`), then `on_armed` is
+called and the trigger follows, and the filament drops back to `idle_ma` the
+moment the run is over. As a backstop the ACTIVE is timed in the backend, so a
+script that dies mid-shot still returns to `idle_ma`. `result["heating"]` is the
+arrival check.
+
+**`active_mv`** / **`voltage_settle_s`** (defaults `None` / `2.0`) — the same,
+but the heat-up is **VOLTAGE mode** at `active_mv` mV instead of ACTIVE at a
+current: no CC loop to converge, so a shot is quicker once each filament's
+voltage is known. Give `active_ma` **or** `active_mv`, not both; `idle_ma` is
+required with either. After the arm the filament goes to a *timed* VOLTAGE
+(`voltage_one(active_s=...)`, below: IDLE-first guard, dead-man, back to
+`idle_ma`, refused above the voltage cap), holds it `voltage_settle_s` (the
+firmware slews the output and the filament warms at that voltage), then reads
+the CC cache **once** to check the output is up — refused, not fired, if it
+reports a fault (open / OCP) or under 100 mA. There is no current target, so
+nothing is "not reached": the current and voltage it actually fired at are in
+every pulse record (`heat_meas_mA`, `heat_bus_mV`, `heat_cmd_mV`, see
+[the heating at the moment each pulse fired](#the-heating-current-at-the-moment-each-pulse-fired)),
+which is the data for choosing each filament's voltage.
+`result["heating"]` = `{"mode": "voltage", "commanded_mv", "settle_s",
+"measured_ma", "cc_mode", ...}`.
+
+```python
+r = ct.fire_single_pulse(5, active_mv=7600, idle_ma=1200, measure=True)
+for rec in r["records"]:
+    print(rec["heat_meas_mA"], "mA at", rec["heat_bus_mV"], "mV (cmd", rec["heat_cmd_mV"], ")")
+```
+
+> One cached read, no polling: in voltage mode the firmware refreshes that
+> cache about every 2 s, and polling one board in a loop starves the shared
+> link. `examples/fire_voltage_mode.py` is a complete run.
+
 **Return value** — a dict, always; never raises:
 
 ```python
@@ -2558,7 +2616,19 @@ firmware writes a `0xEE` sentinel there and its bits mean nothing.
 
 Every pulse record carries `heat_meas_mA` (what the filament was actually
 drawing) and `heat_target_mA` (what it had been commanded to hold), sampled by
-the firmware **at the instant the pulse fired**.
+the firmware **at the instant the pulse fired** — and, from RP2350 fw 530b925
+(20-byte record; the rig runs 5051982), the voltage at the same instant:
+
+| field | what |
+|---|---|
+| `heat_bus_mV` | the load voltage the CC loop last **measured** (INA219 bus). Cached: refreshed ~80 ms while ramping, ~2 s on a settled port |
+| `heat_cmd_mV` | the TPS output setpoint being **commanded** at that instant (exact, no age) |
+
+They are in the printed pulse table (`heat mV` / `cmd mV` columns, shown only
+when the firmware records voltage), in `scan_report()`'s `heating_at_pulse`
+(`bus_mV`, `cmd_mV`), and per shot / per point in emission ramps and
+calibrations (`heat_bus_mV`, `heat_cmd_mV`). The voltage is cached, so it is
+reported, never divided into a resistance against `heat_meas_mA`.
 
 This is what makes an emission reading interpretable. A shot on a filament that
 had not reached current is not comparable with one on a hot filament, and
@@ -2580,6 +2650,9 @@ rather than a number — `0` is a legal current and must never stand for unknown
 | `no_answer` | the board did not answer / is not present |
 | `no_live_sample` | never measured, or the sample was older than the firmware's 6 s freshness limit |
 | `not_current_mode` | `heat_target_mA` only — the board is not current-regulated, so there is no setpoint |
+| `stale` | `heat_bus_mV` only — the last measured voltage is older than the firmware's 10 s limit |
+| `output_off` | `heat_bus_mV` / `heat_cmd_mV` — the output was off (STOP / SLEEP); never reported as 0 V |
+| `firmware_no_voltage` | `heat_bus_mV` / `heat_cmd_mV` — older firmware (16-byte record) does not record voltage |
 
 > ⚠️ **A small number is not a sentinel.** `1 mA` against a `1500 mA` target is a
 > *real* reading from a powered board whose filament is open — it is exactly the
@@ -2588,7 +2661,7 @@ rather than a number — `0` is a legal current and must never stand for unknown
 > looks like this, which is correct.
 
 > ⚠️ **The pulse log PAGES, and the page size is not fixed.** It shrank from 32
-> records to 14 when the record grew from 12 to 16 bytes, because a page has to
+> records to 14 when the record grew from 12 to 16 bytes (and to 11 at 20 bytes), because a page has to
 > fit the link's ~242 deliverable bytes — and an oversized frame is dropped
 > *silently*, so a reader that assumed the old size would have seen a run stop
 > reporting past ~19 pulses, i.e. exactly on the long runs. `shv_pulse_log()`
@@ -3435,7 +3508,9 @@ finished early reads as a hole rather than as a curve with an invented middle.
 **`fire_single_pulse(..., on_armed=callable)`** — runs after arming, one
 instant before the trigger. The only place a caller can start something that
 must be *concurrent* with the firing. An exception from it disarms and fires
-nothing.
+nothing. Through the remote client (the default) the call itself runs in the
+backend and `on_armed` is called back in your script, in the calling thread —
+so the fire uses the backend's code, not the copy your program loaded at start.
 
 ### The grid's own diode current — subtract it, by formula
 

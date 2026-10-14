@@ -127,9 +127,16 @@ restarts mid-script the proxy reconnects by itself, keeping the script's
 filament numbering and its watchdog keepalive. If the script dies, the backend
 notices within ~15 s and closes it like a crash: open `with` blocks are exited
 (lease released, `session()` / `energised()` teardown run). Calls given a
-function (`progress=...`, `on_armed=...`) run locally. Older backend, or
-`CT_CLIENT_LOCAL=1`: the client runs in your process, as before.
-`GET /api/remote/sessions` lists the scripts connected this way.
+function (`progress=...`, `on_armed=...`) run in the backend too: when the call
+reaches the function, the backend calls it back in your script, in the calling
+thread, and carries on with what it returned. An exception or Ctrl-C inside the
+function unwinds the backend call (its cleanup runs). If the backend is not up
+when `CTClient(...)` is built, you still get the proxy; it connects at the
+first call. Older backend, or `CT_CLIENT_LOCAL=1`: the client runs in your
+process, as before. If your copy of ct_gui differs from the backend's, both
+sides warn (a banner on the script's stderr, a WARNING in `backend.log`) --
+restart that program to load the backend's version. `GET /api/remote/sessions`
+lists the scripts connected this way, with each one's `version` and `stale`.
 
 **Things every script needs to know:**
 
@@ -161,10 +168,22 @@ function (`progress=...`, `on_armed=...`) run locally. Older backend, or
   while the filament is really at IDLE. A filament that left ACTIVE less than
   30 s ago may go back up while its CC loop is still settling (it is hot);
   anything colder must have settled at IDLE first.
-- **Voltage-ramp slew rates are kept at 80 % of the ceilings**
-  (1600 / 4000 / 4000 mV/s) on every controller, re-applied within 30 s after an
-  RP2350 reset. A `set_slew_rates(...)` becomes the kept value. `CT_SLEW_PCT`
-  sets the percentage; `CT_SLEW_KEEP=0` turns it off.
+- **Heating in VOLTAGE mode for a shot:** `fire_single_pulse(F, active_mv=7600,
+  idle_ma=1200)` heats at a fixed output voltage instead of an ACTIVE current --
+  no CC loop to converge. It arms at IDLE, holds the voltage `voltage_settle_s`
+  (2 s), checks once that the output is up, fires, and drops back to `idle_ma`.
+  Every pulse record carries the current and voltage it fired at
+  (`heat_meas_mA`, `heat_bus_mV`, `heat_cmd_mV`), which is the data for choosing
+  each filament's voltage. `voltage_one(F, mv, active_s=10, then_idle_ma=1200)`
+  is the same timed hold on its own; it gets ACTIVE's guards (IDLE first,
+  dead-man, back to IDLE, refused above the voltage cap).
+- **Voltage-ramp slew rates are kept at 1000 / 4000 / 4000 mV/s** (below 2 V --
+  the cold start -- / above 2 V / warm) on every controller. These are also the
+  RP2350 firmware's defaults from fw 5051982, so a reset no longer drops to
+  slower ones; older firmware is corrected within 30 s. A `set_slew_rates(...)`
+  becomes the kept value. `CT_SLEW_PCT` (if set) scales every ceiling instead;
+  `CT_SLEW_KEEP=0` turns it off. The output-voltage cap is kept at 11 V
+  (`CT_VCAP_MV`), also the firmware default from fw 260966c.
 - **The lease** (`with ct.lease(...)`) gives this script exclusive WRITE access;
   other clients' writes are refused meanwhile. Reads never need it. It expires
   on its own if the script dies.
@@ -222,6 +241,15 @@ whose `.git` is broken (a synced folder).
   updated, or why it could not check. Updates are logged to `logs/update.log`.
 - `CT_NO_AUTO_UPDATE=1` turns it off. A script warns once if the backend runs
   different code -- restart the backend (`ct.restart_backend()`) to update it.
+- **A running backend updates itself.** Every 7 minutes it asks GitHub; when an
+  update is there it restarts in place to apply it as soon as the rig is quiet:
+  no lease held, no schedule armed or running, no script call in progress or
+  `with` block open, no backend test job, the grid commanded open, and no
+  filament or HV command for 5 minutes. Reads (the GUI, a script polling
+  currents) do not count. It tries once per version (a restart that comes up
+  still behind does not loop). What it is waiting for: `GET /api/version` ->
+  `update.auto_waiting`. `CT_AUTO_UPDATE=0` turns it off (announce only);
+  `CT_AUTO_UPDATE_QUIET_S` sets the quiet window.
 - **Dependencies are checked before an update is applied.** The new version's
   `requirements.txt` (lines marked OPTIONAL excepted) is compared with what this
   Python has; anything missing is installed with `python -m pip install`. If
