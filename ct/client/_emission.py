@@ -643,6 +643,7 @@ class _EmissionMixin:
             # Without a 1:1 pairing no pulse has a heating current: keep the
             # emission, x left empty, and say so -- never a guessed current.
             row["points"] = [{**p, "heat_mA": None, "heat_target_mA": None, "usable": False,
+                              "heat_bus_mV": None, "heat_cmd_mV": None,
                               "heat_unavailable": "unpaired"}
                              for p in self._ramp_points(events, [{}] * len(events), pedestal,
                                                         res.get("ref_mv"))]
@@ -765,8 +766,14 @@ class _EmissionMixin:
                 "heat_mA": heat,
                 "heat_unavailable": rec.get("heat_meas_unavailable"),
                 "heat_target_mA": rec.get("heat_target_mA"),
-                # No live V during a run, so no resistance and no temperature.
-                # None, not a value carried over from a neighbouring shot.
+                # The firmware's heating voltage at this pulse (20-byte record):
+                # cached, so NOT paired closely enough with heat_mA for a
+                # resistance -- reported, not divided.
+                "heat_bus_mV": rec.get("heat_bus_mV"),
+                "heat_cmd_mV": rec.get("heat_cmd_mV"),
+                # No live V/I pair during a run, so no resistance and no
+                # temperature. None, not a value carried over from a
+                # neighbouring shot.
                 "bus_mV": None, "vi_current_mA": None, "r_total_ohm": None,
                 "r_drift_frac": None,
                 "pedestal_ma": round(float(pedestal_ma), 3),
@@ -1077,6 +1084,7 @@ class _EmissionMixin:
         """One heating current: promote, settle, fire, pair, average."""
         pt = {"commanded_ma": int(ma), "settled_ma": None, "heat_mA": None,
               "heat_target_mA": None, "heat_unavailable": None,
+              "heat_bus_mV": None, "heat_cmd_mV": None,
               "bus_mV": None, "vi_current_mA": None, "r_total_ohm": None,
               "r_drift_frac": None,
               "net_ma": None, "net_ma_sd": None, "charge_mams": None,
@@ -1170,6 +1178,7 @@ class _EmissionMixin:
         slope = (self.pulse_ma(1.0, fr.get("ref_mv") or 1200.0)
                  - self.pulse_ma(0.0, fr.get("ref_mv") or 1200.0))
         nets, charges, emis_charges, heats = [], [], [], []
+        bus_mvs, cmd_mvs = [], []
         for i, e in enumerate(events):
             rec = log[i] if paired else {}
             heat = rec.get("heat_meas_mA")
@@ -1182,6 +1191,8 @@ class _EmissionMixin:
             cold = bool(heat is not None and target and heat < 0.8 * target)
             sigma4 = e.get("bg_sigma4")
             shot = {"heat_mA": heat,
+                    "heat_bus_mV": rec.get("heat_bus_mV"),
+                    "heat_cmd_mV": rec.get("heat_cmd_mV"),
                     "net_ma": e.get("plateau_net_ma"),
                     "charge_mams": e.get("integral_mams"),
                     "on_us": e.get("on_us"),
@@ -1219,6 +1230,10 @@ class _EmissionMixin:
                 emis_charges.append(shot["emission_mams"])
             if heat is not None:
                 heats.append(heat)
+            if shot["heat_bus_mV"] is not None:
+                bus_mvs.append(shot["heat_bus_mV"])
+            if shot["heat_cmd_mV"] is not None:
+                cmd_mvs.append(shot["heat_cmd_mV"])
 
         pt["n_used"] = len(nets)
         if nets:
@@ -1237,6 +1252,10 @@ class _EmissionMixin:
             pt["charge_mams"] = round(sum(charges) / len(charges), 4)
         if emis_charges:
             pt["emission_mams"] = round(sum(emis_charges) / len(emis_charges), 4)
+        if bus_mvs:
+            pt["heat_bus_mV"] = round(sum(bus_mvs) / len(bus_mvs), 0)
+        if cmd_mvs:
+            pt["heat_cmd_mV"] = round(sum(cmd_mvs) / len(cmd_mvs), 0)
         if heats:
             pt["heat_mA"] = round(sum(heats) / len(heats), 1)
         elif pt["usable"] and pt["heat_unavailable"] is None and paired:

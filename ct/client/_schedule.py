@@ -573,6 +573,7 @@ class _ScheduleMixin:
             "heating_at_pulse": [
                 {"filament": r.get("filament"), "seq": r.get("seq"),
                  "meas_mA": r.get("heat_meas_mA"), "target_mA": r.get("heat_target_mA"),
+                 "bus_mV": r.get("heat_bus_mV"), "cmd_mV": r.get("heat_cmd_mV"),
                  "unavailable": r.get("heat_meas_unavailable")}
                 for r in logs],
             "fired_cold": cold,
@@ -1048,9 +1049,12 @@ class _ScheduleMixin:
         """Fired pulse records, ALL of them, paging until the log is exhausted.
 
         Each record: {filament, seq, tOnUs, durationUs, flags, read165,
-        on_mismatch, hv_stuck_on, unverified, heat_meas_mA, heat_target_mA} --
-        the last two being the filament's heating current at the instant that
-        pulse fired, or None with a *_unavailable reason.
+        on_mismatch, hv_stuck_on, unverified, heat_meas_mA, heat_target_mA,
+        heat_bus_mV, heat_cmd_mV} -- the filament's heating current and
+        voltage at the instant that pulse fired (bus = the CC loop's last
+        measured load voltage, up to ~2 s old when settled; cmd = the TPS
+        setpoint at that instant), or None with a *_unavailable reason
+        ("firmware_no_voltage" on RP2350 firmware without the 20-byte record).
 
         PAGES, and the page size is not something to assume. The firmware sizes
         a page to fit the link (~242 deliverable bytes), so it shrank from 32 to

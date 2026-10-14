@@ -941,8 +941,14 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
         recs = []
         if raw and raw[0] == 0 and len(raw) >= 6:
             n, off = raw[5], 6
+            # Record size from the reply itself: 16 bytes (current only) or,
+            # from RP2350 fw feat/pulse-heat-voltage, 20 (+ heating voltage).
+            # Both firmwares are on the bench at once during a roll-out.
+            size = (len(raw) - 6) // n if n else 16
+            if size not in (16, 20):
+                size = 16
             for _ in range(n):
-                if off + 16 > len(raw):
+                if off + size > len(raw):
                     break
                 # The record is 12 bytes and only 10 were being decoded; the
                 # last two hold the 165 READ-BACK, which is what makes a flagged
@@ -982,9 +988,23 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                     if v < 0xFFF0:
                         return v, None
                     return None, {0xFFFF: "no_answer", 0xFFFD: "no_live_sample",
+                                  0xFFFE: "stale",
                                   0xFFFC: "not_current_mode"}.get(v, f"sentinel_0x{v:04X}")
                 meas, meas_why = _heat(_le(raw, off + 12, 2))
                 tgt, tgt_why = _heat(_le(raw, off + 14, 2))
+                # Heating VOLTAGE at the same instant (20-byte records only):
+                # bus = load voltage the CC loop last measured (cached, up to
+                # ~2 s old when settled; 0xFFFE = older than 10 s), cmd = the
+                # TPS setpoint at that instant. 0xFFFC = output off.
+                def _volt(v):
+                    val, why = _heat(v)
+                    return val, ("output_off" if v == 0xFFFC else why)
+                if size >= 20:
+                    bus, bus_why = _volt(_le(raw, off + 16, 2))
+                    cmd, cmd_why = _volt(_le(raw, off + 18, 2))
+                else:
+                    bus, bus_why = None, "firmware_no_voltage"
+                    cmd, cmd_why = None, "firmware_no_voltage"
                 recs.append({"filament": raw[off], "flags": fl, "seq": _le(raw, off + 2, 2),
                              "tOnUs": _le(raw, off + 4, 4), "durationUs": _le(raw, off + 8, 2),
                              "read165": None if (fl & 0x04 and (rb & 0xFF) == 0xEE) else rb,
@@ -992,8 +1012,10 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                              "hv_stuck_on": bool(fl & 0x02),
                              "unverified": bool(fl & 0x04),
                              "heat_meas_mA": meas, "heat_meas_unavailable": meas_why,
-                             "heat_target_mA": tgt, "heat_target_unavailable": tgt_why})
-                off += 16
+                             "heat_target_mA": tgt, "heat_target_unavailable": tgt_why,
+                             "heat_bus_mV": bus, "heat_bus_unavailable": bus_why,
+                             "heat_cmd_mV": cmd, "heat_cmd_unavailable": cmd_why})
+                off += size
             return {"ok": True, "total": _le(raw, 1, 2), "records": recs}
         return {"ok": False}
     if op == "capability":

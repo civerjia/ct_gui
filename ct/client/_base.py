@@ -105,8 +105,9 @@ class Result(dict):
                     "background_note")),
         ("verify", ("on_mismatch", "hv_stuck_on", "unverified", "read165",
                     "flags")),
-        ("heating", ("heat_meas_mA", "heat_target_mA", "heat_meas_unavailable",
-                     "heat_target_unavailable")),
+        ("heating", ("heat_meas_mA", "heat_target_mA", "heat_bus_mV", "heat_cmd_mV",
+                     "heat_meas_unavailable", "heat_target_unavailable",
+                     "heat_bus_unavailable", "heat_cmd_unavailable")),
     )
     #: Emission-curve points (emission_vs_heating / emission_ramp) and their
     #: per-shot rows:
@@ -115,8 +116,8 @@ class Result(dict):
               "n_fired", "n_cold", "empty_envelope")),
         ("emission", ("emission_ma", "emission_mams", "pedestal_ma")),
         ("net", ("net_ma", "net_ma_sd", "charge_mams", "on_us")),
-        ("heating", ("heat_mA", "heat_target_mA", "settled_ma",
-                     "heat_unavailable")),
+        ("heating", ("heat_mA", "heat_target_mA", "heat_bus_mV", "heat_cmd_mV",
+                     "settled_ma", "heat_unavailable")),
         ("resistance", ("r_total_ohm", "r_fil_ohm", "r_ratio", "r_drift_frac",
                         "bus_mV", "vi_current_mA")),
         ("temperature", ("T_K", "residual", "inv_T", "ln_i_over_t2")),
@@ -341,7 +342,10 @@ class Result(dict):
 
         def num(v, fmt="{:.0f}"):
             return "-" if v is None else fmt.format(v)
+        volts = any("heat_bus_mV" in r and r.get("heat_bus_unavailable") != "firmware_no_voltage"
+                    for r in recs if isinstance(r, dict))
         rows = [("#", "fil", "t_on ms", "width us", "heat mA", "target", "diff")
+                + (("heat mV", "cmd mV") if volts else ())
                 + (("emission mA", "mA*ms") if paired else ()) + ("flags",)]
         for n, r in enumerate(recs):
             m, t = r.get("heat_meas_mA"), r.get("heat_target_mA")
@@ -354,6 +358,10 @@ class Result(dict):
                    num(r.get("durationUs")), heat,
                    num(t) if t is not None else f"n/a ({r.get('heat_target_unavailable') or '?'})",
                    num(m - t, "{:+.0f}") if m is not None and t is not None else "-")
+            if volts:
+                b, c = r.get("heat_bus_mV"), r.get("heat_cmd_mV")
+                row += (num(b) if b is not None else f"n/a ({r.get('heat_bus_unavailable') or '?'})",
+                        num(c) if c is not None else f"n/a ({r.get('heat_cmd_unavailable') or '?'})")
             if paired:
                 e = meas[n] if isinstance(meas[n], dict) else {}
                 row += (num(e.get("emission_ma"), "{:.3f}"), num(e.get("emission_mams"), "{:.2f}"))
