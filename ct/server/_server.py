@@ -2477,7 +2477,7 @@ _EMISSION_CAL: dict[str, Any] = {"running": False, "shots": [], "done": [],
                                  "params": None, "started": None, "finished": None,
                                  "abort": False}
 _EMISSION_CAL_KEYS = ("filaments", "first", "last", "start_ma", "end_ma", "pulses",
-                      "pulse_gap_ms", "width_us", "emission_v", "limit_ma", "focus_on",
+                      "pulse_gap_ms", "pulse_interval_ms", "width_us", "emission_v", "limit_ma", "focus_on",
                       "focus_v", "idle_ma")
 
 

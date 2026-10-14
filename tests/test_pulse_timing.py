@@ -122,5 +122,29 @@ ct.shv_set_config(1, 2500)
 check("shv_set_config positional old name still works", seen["cfg"]["interPulseMs"] == 2500)
 check("shv_set_config both -> refused", not ct.shv_set_config(1, 2500, trigger_timeout_ms=1)["ok"])
 
+# 8. One name, two defaults across the library (2026-10-14).
+import inspect  # noqa: E402
+check("defaults: SHOT 400, TRAIN 100", CTClient.SHOT_PULSE_INTERVAL_MS == 400
+      and CTClient.TRAIN_PULSE_INTERVAL_MS == 100)
+ct, seen = make()
+s = ct.shot_prepare(16, trigger="sim", **BASE)
+check("fire/shot default spacing is SHOT (400), timeout 900", s["pulse_interval_ms"] == 400
+      and s["trigger_timeout_ms"] == 900, s)
+for fn in ("mosfet_test", "mosfet_sweep", "emission_vs_heating", "measure_emission_pedestal",
+           "emission_ramp", "emission_calibration", "simulate_sync", "fire_single_pulse",
+           "shot_prepare", "measure_pulse_current"):
+    params = inspect.signature(getattr(CTClient, fn)).parameters
+    check(f"{fn} takes pulse_interval_ms", "pulse_interval_ms" in params)
+check("emission_ramp: 30 pulses by default (30 x 100 ms = 3 s)",
+      inspect.signature(CTClient.emission_ramp).parameters["num_pulses"].default == 30)
+ct, seen = make()
+r = ct.mosfet_test([1], inter_pulse_ms=400, pulse_interval_ms=400)
+check("old + new name together refused", not r["ok"] and "not both" in r["error"], r)
+got = {}
+ct, seen = make()
+ct._post = lambda path, body=None, timeout=None: (got.update(body or {}), {"ok": True})[1]
+ct.simulate_sync(count=3, pulse_interval_ms=250)
+check("simulate_sync(pulse_interval_ms) -> interval_ms on the wire", got.get("interval_ms") == 250.0, got)
+
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

@@ -76,7 +76,7 @@ class _EmissionMixin:
                                            # that uses it)
         idle_ma: int = 1500,               # the IDLE rung of the ladder (pre-heat)
         end_state: str = "stop",           # where to leave it: stop/sleep/standby/idle
-        inter_pulse_ms: int = 400,
+        inter_pulse_ms: int | None = None,   # old name of pulse_interval_ms
         settle_s: float = 0.3,             # extra dwell after the CC loop says settled
         idle_timeout_s: float = 40.0,
         active_timeout_s: float = 30.0,
@@ -90,6 +90,9 @@ class _EmissionMixin:
                                             # "measure" = fire and measure it;
                                             # a float = use that; 0.0 = subtract
                                             # nothing
+        pulse_interval_ms: int | None = None,  # spacing between pulses (ms);
+                                               # default SHOT_PULSE_INTERVAL_MS = 400;
+                                               # sim 10..2147483597
     ) -> dict:
         """PRECISE MEASUREMENT of one filament's emission against its heating current.
 
@@ -186,6 +189,10 @@ class _EmissionMixin:
                               charge_mams, emission_mams, on_us,
                               bg_ma, sigma_ma, cold} ]}
         """
+        inter_pulse_ms, _err = self._interval_arg(  # see SHOT/TRAIN_PULSE_INTERVAL_MS
+            pulse_interval_ms, inter_pulse_ms, self.SHOT_PULSE_INTERVAL_MS, "inter_pulse_ms")
+        if _err:
+            return {"ok": False, "error": _err}
         fil = int(filament)
         problems: list[str] = []
 
@@ -327,7 +334,7 @@ class _EmissionMixin:
         start_ma: int = 1800,              # ACTIVE, held until stable, then ...
         end_ma: int = 2500,                # ... ACTIVE end, commanded in one go
         pulses: int = 40,                  # the train fired through the ramp
-        pulse_gap_ms: int = 100,
+        pulse_gap_ms: int | None = None,   # old name of pulse_interval_ms
         width_us: int = 1000,
         emission_v: float = 200.0,
         limit_ma: float = 55.0,
@@ -337,7 +344,10 @@ class _EmissionMixin:
         progress=None,                     # callable(filament, points | None, row | None)
         abort=None,                        # callable() -> True: stop after this filament
         save_as: str | None = "emission_calibration",
-    ) -> dict:
+        pulse_interval_ms: int | None = None,  # spacing between pulses (ms);
+                                               # default TRAIN_PULSE_INTERVAL_MS = 100;
+                                               # sim 10..2147483597
+        ) -> dict:
         """Emission vs heating current for a RANGE of filaments, one ramp each.
 
             r = ct.emission_calibration(first=0, last=11)        # 1800 -> 2500 mA
@@ -384,6 +394,10 @@ class _EmissionMixin:
         "end": "idle" | "stop", "stop_reason", "error", "active_s", "fired",
         "start_settled_ma"}.
         """
+        pulse_gap_ms, _err = self._interval_arg(  # see SHOT/TRAIN_PULSE_INTERVAL_MS
+            pulse_interval_ms, pulse_gap_ms, self.TRAIN_PULSE_INTERVAL_MS, "pulse_gap_ms")
+        if _err:
+            return {"ok": False, "error": _err}
         notes: list[str] = []
         floor, ceil = self._ACTIVE_FLOOR_MA, self._IDLE_CEILING_MA
         if start_ma < floor:
@@ -797,9 +811,9 @@ class _EmissionMixin:
         filament: int,
         from_ma: int = 1500,           # where the ramp starts (already held)
         to_ma: int = 2800,             # where it is commanded to go
-        num_pulses: int = 24,          # shots fired ACROSS the ramp
-        inter_pulse_ms: int = 120,     # spacing -> the whole train is
-                                       # num_pulses * this, in ms
+        num_pulses: int = 30,          # shots fired ACROSS the ramp: 30 x 100 ms
+                                       # = 3 s, about one IDLE->ACTIVE climb
+        inter_pulse_ms: int | None = None,   # old name of pulse_interval_ms
         width_us: int = 1000,
         idle_ma: int = 1400,
         end_state: str = "stop",
@@ -808,7 +822,10 @@ class _EmissionMixin:
         bg_window_us: float | None = None,
         controller: int | None = None,
         save_as: str | None = None,
-    ) -> dict:
+        pulse_interval_ms: int | None = None,  # spacing between pulses (ms);
+                                               # default TRAIN_PULSE_INTERVAL_MS = 100;
+                                               # sim 10..2147483597
+        ) -> dict:
         """QUICK VERIFICATION. The whole curve in one ramp, seconds not a minute.
 
         One of a pair, and they are not interchangeable:
@@ -869,6 +886,10 @@ class _EmissionMixin:
              "span_ma":   lowest to highest heating current actually hit,
              "gap_max_ma": the largest hole between consecutive shots}
         """
+        inter_pulse_ms, _err = self._interval_arg(  # see SHOT/TRAIN_PULSE_INTERVAL_MS
+            pulse_interval_ms, inter_pulse_ms, self.TRAIN_PULSE_INTERVAL_MS, "inter_pulse_ms")
+        if _err:
+            return {"ok": False, "error": _err}
         fil = int(filament)
         problems: list[str] = []
         # `problems` makes the run INVALID; `notes` describes what a ramp
@@ -1371,8 +1392,11 @@ class _EmissionMixin:
                                   heat_ma: int = 1400,      # too cool to emit
                                   widths_us=(1000, 10000),  # the 1/width test
                                   pulses: int = 3,
-                                  inter_pulse_ms: int = 800,
-                                  controller: int | None = None) -> dict:
+                                  inter_pulse_ms: int | None = None,   # old name of pulse_interval_ms
+                                  controller: int | None = None,
+                                  pulse_interval_ms: int | None = None,  # spacing (ms); default
+                                                    # SHOT_PULSE_INTERVAL_MS = 400; sim 10..2147483597
+                                  ) -> dict:
         """Measure the non-emission part of a fired pulse's net current.
 
         Fires at `heat_ma` -- cool enough that thermionic emission is
@@ -1396,6 +1420,10 @@ class _EmissionMixin:
         `pedestal_ma` is None when the measurement did not hold together; it is
         never a plausible-looking number with the checks quietly failed.
         """
+        inter_pulse_ms, _err = self._interval_arg(  # see SHOT/TRAIN_PULSE_INTERVAL_MS
+            pulse_interval_ms, inter_pulse_ms, self.SHOT_PULSE_INTERVAL_MS, "inter_pulse_ms")
+        if _err:
+            return {"ok": False, "error": _err}
         out = {"ok": False, "pedestal_ma": None, "sd_ma": None,
                "emission_v": None, "width_independent": None,
                "temperature_independent": None, "by_width": {},

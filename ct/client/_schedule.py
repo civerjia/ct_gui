@@ -903,7 +903,7 @@ class _ScheduleMixin:
     #                       external 3000.
     # inter_pulse_ms still works and keeps its old meaning per mode; the
     # result then carries a note saying which one it was taken as.
-    _DEFAULT_PULSE_INTERVAL_MS = 3000
+    _DEFAULT_PULSE_INTERVAL_MS = 400       # = CTClient.SHOT_PULSE_INTERVAL_MS
     _DEFAULT_TRIGGER_TIMEOUT_MS = 3000
     # The simulated trigger cannot space edges closer than this (the backend's
     # sim loop). It used to RAISE a smaller value to 10 silently -- a 5 ms
@@ -957,6 +957,15 @@ class _ScheduleMixin:
                              f"pulse_interval_ms={interval} (it is the longest wait for "
                              f"the NEXT trigger; equal values fault after one pulse)"}
         return {"interval_ms": interval, "timeout_ms": timeout, "note": note}
+
+    def _interval_arg(self, new, old, default: int, old_name: str):
+        """(spacing ms, error) for a function that took the spacing under an
+        old name: pulse_interval_ms wins, the old name still works, both is
+        an error."""
+        if new is not None and old is not None:
+            return None, f"give pulse_interval_ms or the old {old_name}, not both"
+        v = new if new is not None else old if old is not None else default
+        return int(v), None
 
     @staticmethod
     def _with_note(r: dict, note) -> dict:
@@ -1191,9 +1200,12 @@ class _ScheduleMixin:
                                                        # to seed the run-report's
                                                        # expected-filament
                                                        # tracking, like a real scan
-                      active_ma: int = 2900) -> dict:  # paired with `expect` --
+                      active_ma: int = 2900,  # paired with `expect` --
                                                         # the ACTIVE current the
                                                         # run-report expects
+                      pulse_interval_ms: float | None = None) -> dict:
+                                                        # = interval_ms, the
+                                                        # library-wide name
         """Start the ESP32 generating `count` SyncIn pulses.
 
         Fires from the head of the chain: the current master unless
@@ -1216,6 +1228,10 @@ class _ScheduleMixin:
 
         Returns {"ok", "count", "interval_ms", "controller"}.
         """
+        if pulse_interval_ms is not None:
+            if interval_ms is not None:
+                return {"ok": False, "error": "give pulse_interval_ms or interval_ms, not both"}
+            interval_ms = pulse_interval_ms
         body: dict = {"count": int(count), "active_mA": int(active_ma)}
         if controller is not None:
             body["controller"] = int(controller)

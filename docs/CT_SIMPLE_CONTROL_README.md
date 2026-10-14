@@ -1998,7 +1998,7 @@ result = ct.fire_single_pulse(
     filament=0,          # 0–95
     num_pulses=1,
     width_us=1000,       # pulse width in µs
-    pulse_interval_ms=3000,   # spacing between pulses (sim: what is fired)
+    pulse_interval_ms=400,    # spacing between pulses (sim: what is fired)
     trigger_timeout_ms=None,  # longest wait for the next trigger (default: sim 2x+100, ext 3000)
     max_on_ms=40,        # firmware safety guard (ms)
     total_ms=15000,      # schedule timeout (ms)
@@ -2045,7 +2045,8 @@ ct.fire_single_pulse(filament=0, width_us=500)    # 0.5 ms pulse
 ct.fire_single_pulse(filament=0, width_us=2000)   # 2 ms pulse
 ```
 
-**`pulse_interval_ms`** (default `3000` with `trigger="sim"`) — the spacing
+**`pulse_interval_ms`** (default `CTClient.SHOT_PULSE_INTERVAL_MS` = `400`
+with `trigger="sim"`; it was 3000 before 2026-10-14) — the spacing
 between pulses, in ms. With `trigger="sim"` it is exactly what is fired:
 the simulated trigger produces one edge every `pulse_interval_ms`. With an
 external trigger the spacing is whatever your trigger source does; pass it
@@ -2071,6 +2072,20 @@ longest gap your source can produce. Must be longer than
 ct.fire_single_pulse(filament=0, num_pulses=10, trigger="ext",
                      trigger_timeout_ms=6000, total_ms=60000)
 ```
+
+**One name, two defaults, everywhere.** Every function that fires pulses
+takes the spacing as `pulse_interval_ms` (old names `inter_pulse_ms`,
+`pulse_gap_ms`, `simulate_sync`'s `interval_ms` still accepted; giving an
+old and the new name together is refused). Defaults are two class
+constants, not per-function numbers:
+
+| Constant | Value | Used by | Why |
+|---|---|---|---|
+| `SHOT_PULSE_INTERVAL_MS` | 400 ms | `fire_single_pulse`, `shot_prepare`, `measure_pulse_current`, `mosfet_test`, `mosfet_sweep`, `emission_vs_heating`, `measure_emission_pedestal` | single shots and per-filament tests; what the MOSFET / emission tests have run at on the rig |
+| `TRAIN_PULSE_INTERVAL_MS` | 100 ms | `emission_ramp` (30 pulses = 3 s), `emission_calibration` | a train fired through a heating climb: the spacing is the sampling of the climb |
+
+Before 2026-10-14 the defaults were 3000 / 400 / 800 / 120 / 100 depending on
+the function, with no stated reason.
 
 **`inter_pulse_ms`** — the OLD name, still accepted with its old meaning,
 which depended on the trigger: with `trigger="sim"` it is
@@ -3491,7 +3506,7 @@ under the result's `saved` key.
 
 ### The fast way — one ramp, no settling
 
-**`emission_ramp(filament, from_ma=1500, to_ma=2800, num_pulses=24, inter_pulse_ms=120, ...)`**
+**`emission_ramp(filament, from_ma=1500, to_ma=2800, num_pulses=30, pulse_interval_ms=100, ...)`**
 — The whole curve in one ramp. The schedule is armed first, the ACTIVE command
 is issued in the gap between arming and triggering (`fire_single_pulse`'s
 `on_armed` hook), and the train fires straight through the CC loop's ramp. Each

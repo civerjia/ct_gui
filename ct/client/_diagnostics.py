@@ -135,12 +135,15 @@ class _DiagnosticsMixin:
                     limit_ma: float = 30.0,
                     width_us: int = 1000,
                     pulses: int = 3,
-                    inter_pulse_ms: int = 400,
+                    inter_pulse_ms: int | None = None,   # old name of pulse_interval_ms
                     r_ohm: float | None = None,
                     vf_v=None,
                     tolerance_frac: float | None = None,
                     controller: int | None = None,
-                    progress=None) -> dict:
+                    progress=None,
+                    pulse_interval_ms: int | None = None,  # spacing (ms); default
+                                      # SHOT_PULSE_INTERVAL_MS = 400; sim 10..2147483597
+                    ) -> dict:
         """Prove each HV grid MOSFET actually CONDUCTS, by firing through it.
 
             r = ct.mosfet_test([0, 1, 2], emission_v=100)
@@ -195,6 +198,10 @@ class _DiagnosticsMixin:
             dead          below _MOSFET_DEAD_FRAC of expected -- not conducting
             inconclusive  in between, or no pulse was measured at all
         """
+        inter_pulse_ms, _err = self._interval_arg(  # see SHOT/TRAIN_PULSE_INTERVAL_MS
+            pulse_interval_ms, inter_pulse_ms, self.SHOT_PULSE_INTERVAL_MS, "inter_pulse_ms")
+        if _err:
+            return {"ok": False, "error": _err}
         tol = self._MOSFET_TOL_FRAC if tolerance_frac is None else float(tolerance_frac)
         wanted, problems = self._mosfet_targets(filaments)
         if not wanted:
@@ -793,11 +800,14 @@ class _DiagnosticsMixin:
                      limit_ma: float = 30.0,
                      width_us: int = 1000,
                      pulses: int = 3,
-                     inter_pulse_ms: int = 400,
+                     inter_pulse_ms: int | None = None,   # old name of pulse_interval_ms
                      r_ohm: float | None = None,
                      tolerance_frac: float | None = None,
                      controller: int | None = None,
-                     progress=None) -> dict:
+                     progress=None,
+                     pulse_interval_ms: int | None = None,  # spacing (ms); default
+                                       # SHOT_PULSE_INTERVAL_MS = 400; sim 10..2147483597
+                     ) -> dict:
         """The MOSFET test at n >= 3 emission voltages, judged on the SLOPE.
 
             r = ct.mosfet_sweep()                      # -50/-60/-70/-80 V, 30 mA limit
@@ -829,6 +839,10 @@ class _DiagnosticsMixin:
             odd          conducts, but R_eq is off or the fit is poor
             unmeasured   fewer than 3 usable points
         """
+        inter_pulse_ms, _err = self._interval_arg(  # see SHOT/TRAIN_PULSE_INTERVAL_MS
+            pulse_interval_ms, inter_pulse_ms, self.SHOT_PULSE_INTERVAL_MS, "inter_pulse_ms")
+        if _err:
+            return {"ok": False, "error": _err}
         n = max(3, int(n))
         volts = [abs(float(v_start)) + i * abs(float(v_step)) for i in range(n)]
         r_nom = float(r_ohm or self._MOSFET_R_OHM) / 1000.0          # kOhm

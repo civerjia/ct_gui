@@ -1517,6 +1517,25 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
     #    error, it just biases the charge.
     MIN_INTER_PULSE_US = 2 * (200 + 50)
 
+    # -- Pulse spacing: ONE name, TWO defaults (2026-10-14). Every function
+    #    that fires pulses takes `pulse_interval_ms` = the spacing between
+    #    pulses (with trigger="sim", what is actually fired; with an external
+    #    trigger, what your source does). It used to be inter_pulse_ms /
+    #    pulse_gap_ms / interval_ms with defaults 3000, 800, 400, 120 and 100
+    #    and no stated reason; the old names are still accepted.
+    #      SHOT_PULSE_INTERVAL_MS   single shots and per-filament tests
+    #          (fire_single_pulse, shot_prepare, measure_pulse_current,
+    #          mosfet_test/sweep, emission_vs_heating, measure_emission_pedestal).
+    #          400 ms: what the MOSFET / emission tests have run at on the rig.
+    #      TRAIN_PULSE_INTERVAL_MS  a train fired THROUGH a heating climb
+    #          (emission_ramp, emission_calibration): the spacing is the
+    #          sampling of the climb, so it is short. 100 ms: calibration's
+    #          rig-proven value; 30 pulses cover a ~3 s climb.
+    #    Range (sim): 10 .. 2147483597 ms, > width_us / 1000, and the train
+    #    must fit total_ms -- see fire_single_pulse's "Limits".
+    SHOT_PULSE_INTERVAL_MS = 400
+    TRAIN_PULSE_INTERVAL_MS = 100
+
     _READY_TTL_FLOOR_MS = 60000     # never below the firmware's own default
     _READY_TTL_GAP_FACTOR = 4       # x inter_pulse_ms; room for a late pulse
                                      # without waiting a whole extra cycle to
