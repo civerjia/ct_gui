@@ -1099,8 +1099,11 @@ class _DiagnosticsMixin:
         if not raw:
             return None, r.get("error") or f"no response to {command}"
         if raw[0] != 0:
+            # 0x0E Unsupported is what the firmware answers an unknown command
+            # with (it was mapped from 0x02, which is BadCrc).
             names = {0x0F: "Busy -- a schedule owns the hardware; try after the run",
-                     0x02: "not supported by this firmware (flash RP2350 00397fe or later)"}
+                     0x0E: "not supported by this firmware -- flash a newer RP2350 build",
+                     0x04: "unknown command type for this firmware -- flash a newer RP2350 build"}
             return None, f"{command}: firmware status 0x{raw[0]:02X} " + names.get(raw[0], "")
         return raw, None
 
@@ -1118,7 +1121,7 @@ class _DiagnosticsMixin:
                 return {"ok": False, "controller": c, "unsupported": True,
                         "error": "the backend predates GET_BOOT_INFO -- it updates itself "
                                  "when the rig is quiet"}
-            if "0x02" in err:
+            if "status 0x0E" in err or "status 0x04" in err:
                 return {"ok": False, "controller": c, "unsupported": True,
                         "error": "this RP2350 firmware predates GET_BOOT_INFO "
                                  "(0x64, fw 98086b2): no boot record over the bridge"}

@@ -37,7 +37,7 @@ def make(boot=None, vcap=11000, slew=(1000, 4000, 4000), records=None, ctrls=(1,
     def diag(c, command, body=None, timeout=10.0):
         b = boot.get(c, boot_raw())
         if b == "old":
-            return None, "GET_BOOT_INFO: firmware status 0x02 not supported by this firmware"
+            return None, "GET_BOOT_INFO: firmware status 0x0E not supported by this firmware"
         return b, None
     ct._diag_cmd = diag
     ct._voltage_cap_one = lambda c, mv: {"ok": True, "controller": c, "mv": vcap, "ceiling_mv": 15000}
