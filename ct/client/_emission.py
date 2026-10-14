@@ -587,7 +587,7 @@ class _EmissionMixin:
                     row["stop_reason"] = why
                 return row
             shot = self.shot_prepare(
-                f, num_pulses=n, width_us=width_us, inter_pulse_ms=gap,
+                f, num_pulses=n, width_us=width_us, pulse_interval_ms=gap,
                 max_on_ms=int(math.ceil(width_us / 1000.0)) + 1,
                 total_ms=int(train_s * 1000) + 30000,
                 trigger="sim", verify=True, reuse=True)
@@ -936,7 +936,7 @@ class _EmissionMixin:
 
                 fired = self.fire_single_pulse(
                     fil, num_pulses=num_pulses, width_us=width_us,
-                    inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
+                    pulse_interval_ms=inter_pulse_ms, max_on_ms=40,
                     total_ms=max(10000, ramp["train_ms"] + 5000),
                     controller=controller, trigger="sim",
                     timeout_s=15.0 + ramp["train_ms"] / 1000.0,
@@ -1134,7 +1134,7 @@ class _EmissionMixin:
         since = self.pulse_cursor()
         fr = self.fire_single_pulse(
             fil, num_pulses=pulses, width_us=width_us,
-            inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
+            pulse_interval_ms=inter_pulse_ms, max_on_ms=40,
             total_ms=max(10000, pulses * (inter_pulse_ms + 1000)),
             controller=controller, trigger="sim",
             timeout_s=15.0 + pulses * inter_pulse_ms / 1000.0,
@@ -1412,7 +1412,7 @@ class _EmissionMixin:
         def shots(width):
             fr = self.fire_single_pulse(
                 filament, num_pulses=pulses, width_us=width,
-                inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
+                pulse_interval_ms=inter_pulse_ms, max_on_ms=40,
                 total_ms=max(12000, pulses * (inter_pulse_ms + 1500)),
                 controller=controller, trigger="sim",
                 timeout_s=20.0 + pulses * inter_pulse_ms / 1000.0,

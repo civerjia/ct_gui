@@ -1998,7 +1998,8 @@ result = ct.fire_single_pulse(
     filament=0,          # 0–95
     num_pulses=1,
     width_us=1000,       # pulse width in µs
-    inter_pulse_ms=3000, # min gap between SyncIn edges
+    pulse_interval_ms=3000,   # spacing between pulses (sim: what is fired)
+    trigger_timeout_ms=None,  # longest wait for the next trigger (default: sim 2x+100, ext 3000)
     max_on_ms=40,        # firmware safety guard (ms)
     total_ms=15000,      # schedule timeout (ms)
     controller=1,        # 1 or 2
@@ -2025,7 +2026,7 @@ ct.fire_single_pulse(filament=42)
 ```
 
 **`num_pulses`** (default `1`) — how many pulses fire in this one burst.
-Each pulse is `width_us` long, spaced `inter_pulse_ms` apart. Use more than
+Each pulse is `width_us` long, spaced `pulse_interval_ms` apart. Use more than
 1 to fire a repeated burst on the same filament in one schedule.
 
 ```python
@@ -2044,16 +2045,53 @@ ct.fire_single_pulse(filament=0, width_us=500)    # 0.5 ms pulse
 ct.fire_single_pulse(filament=0, width_us=2000)   # 2 ms pulse
 ```
 
-**`inter_pulse_ms`** (default `3000`) — the minimum time between successive
-SyncIn edges, in milliseconds. With `trigger="sim"` this also sets the
-spacing of the pulses the ESP32 generates for you; with `trigger="ext"` it's
-just a firmware-side minimum guard against edges arriving too close
-together.
+**`pulse_interval_ms`** (default `3000` with `trigger="sim"`) — the spacing
+between pulses, in ms. With `trigger="sim"` it is exactly what is fired:
+the simulated trigger produces one edge every `pulse_interval_ms`. With an
+external trigger the spacing is whatever your trigger source does; pass it
+only so the `measure=True` spacing check and the detector's timeout know it.
 
 ```python
-ct.fire_single_pulse(filament=0, num_pulses=3, inter_pulse_ms=500)
-# 3 pulses, ≥500 ms apart
+ct.fire_single_pulse(filament=0, num_pulses=3, pulse_interval_ms=500)
+# 3 pulses, 500 ms apart
 ```
+
+**`trigger_timeout_ms`** (default: sim `2 × pulse_interval_ms + 100`,
+external `3000`) — NOT a spacing: the **longest** wait for the next trigger.
+It is the firmware's runtime watchdog (`interPulseMs` on the wire): if no
+trigger arrives within this long after the last one, the RP2350 faults the
+whole run (`stopReason` "inter-pulse timeout"); a late trigger is not
+skipped. With a slow or irregular external trigger, set it above the
+longest gap your source can produce. Must be longer than
+`pulse_interval_ms` — equal values make every edge race its own deadline
+(measured: faulted after one pulse).
+
+```python
+# external trigger that fires about every 2 s, sometimes 4 s apart
+ct.fire_single_pulse(filament=0, num_pulses=10, trigger="ext",
+                     trigger_timeout_ms=6000, total_ms=60000)
+```
+
+**`inter_pulse_ms`** — the OLD name, still accepted with its old meaning,
+which depended on the trigger: with `trigger="sim"` it is
+`pulse_interval_ms`; with an external trigger it is `trigger_timeout_ms`
+(only the timeout — it never set the spacing, despite the old "minimum gap"
+description). The result then carries a `"note"` saying which one it was
+taken as. Passing it together with either new name is refused.
+
+**Limits** — refused with `ok=False` and the reason, never silently
+changed:
+
+| Argument | Range | Why |
+|---|---|---|
+| `num_pulses` | 1 – 255 | one byte on the wire |
+| `width_us` | 1 – 65535 µs | uint16; also ≤ `max_on_ms × 1000` or arm is rejected |
+| `max_on_ms` | 0 – 65535 ms | uint16; checked once at arm |
+| `pulse_interval_ms` | sim: 10 – 2147483597 ms | the simulated trigger cannot space edges closer than 10 ms (it used to raise smaller values to 10 silently); the top keeps `2 × interval + 100` inside uint32 |
+| | > `width_us / 1000` | the next pulse may not start before this one ends |
+| | `measure=True`: ≥ 0.5 ms | each pulse's backgrounds need 2 × (gap 200 + window 50) µs |
+| `trigger_timeout_ms` | 1 – 4294967295 ms, > `pulse_interval_ms` | uint32 |
+| `total_ms` | 1 – 4294967295 ms | uint32; with sim it must exceed `(num_pulses − 1) × pulse_interval_ms + width` |
 
 **`max_on_ms`** (default `40`) — firmware safety guard, checked at **arm
 time** (not a live runtime cutoff mid-pulse): the RP2350 compares
@@ -2073,15 +2111,14 @@ ct.fire_single_pulse(filament=0, width_us=1000, max_on_ms=40)  # 1 ms << 40 ms, 
 
 **`total_ms`** (default `15000`) — the overall schedule timeout on the
 RP2350 itself, in milliseconds. Must be long enough to cover
-`num_pulses * inter_pulse_ms` plus margin, or the firmware will time out
-the schedule before all pulses fire. Wire-format field is uint32
-(0–4294967295 ms) — effectively unbounded for any real schedule, but still
-checked and rejected client-side if you somehow pass something outside
-that (same for `inter_pulse_ms`).
+`num_pulses * pulse_interval_ms` plus margin, or the firmware will time out
+the schedule before all pulses fire — with `trigger="sim"` a train that
+cannot fit is refused before anything is sent. Wire-format field is uint32
+(0–4294967295 ms).
 
 ```python
 # 10 pulses at 3000 ms apart needs >= 30000 ms; give it margin
-ct.fire_single_pulse(filament=0, num_pulses=10, inter_pulse_ms=3000,
+ct.fire_single_pulse(filament=0, num_pulses=10, pulse_interval_ms=3000,
                      total_ms=40000)
 ```
 
@@ -2130,7 +2167,7 @@ COMPLETE/FAULT before Python gives up waiting.
 
 ```python
 # total_ms=40000 (40 s) -> give the client poll a bit more headroom
-ct.fire_single_pulse(filament=0, num_pulses=10, inter_pulse_ms=3000,
+ct.fire_single_pulse(filament=0, num_pulses=10, pulse_interval_ms=3000,
                      total_ms=40000, shot_wait_timeout_s=45.0)
 ```
 
@@ -2404,19 +2441,20 @@ list instead.
 ct.shv_set_entry(1, filament=5, num_pulses=1, width_us=1000)
 ```
 
-**`shv_set_config(controller, inter_pulse_ms=3000, max_on_ms=40, total_ms=30000, trigger_edge=0)`**
+**`shv_set_config(controller, max_on_ms=40, total_ms=30000, trigger_edge=0, trigger_timeout_ms=3000)`**
 — Update just the timing config without touching the emission/heat tables.
 All four are enforced by the RP2350 itself, independent of this Python
 process:
 
-- **`inter_pulse_ms`** — a **runtime watchdog** while Armed/Running: if no
+- **`trigger_timeout_ms`** (old name `inter_pulse_ms`, still accepted —
+  here both mean the same thing; 1 – 4294967295 ms, default 3000) — the
+  LONGEST wait between triggers, not a spacing: a **runtime watchdog** while Armed/Running: if no
   new SyncIn trigger arrives within this many ms of the last one, the
   RP2350 faults the **whole schedule** (`shv_status()["stopReason"]` comes
   back `"inter-pulse timeout"`) — a late trigger isn't skipped or ignored,
   the run just stops. The 3000 ms default here is workable for a real
   trigger source; the 30000 ms (30 s) default of `shv_set_config`'s **`total_ms`** is sized
-  instead for slow *manual* bench triggers. (`fire_single_pulse`'s own
-  `inter_pulse_ms` default is 3000, same as here — not 30000.)
+  instead for slow *manual* bench triggers.
 - **`max_on_ms`** — checked **once, at `shv_arm()` time**, against every
   entry already in the table: if *any* entry's `width_us` exceeds it,
   `arm()` itself is **rejected** (`reject` code `WidthTooLarge`, `2`) and
@@ -2436,13 +2474,13 @@ process:
   fires the schedule. Match this to whatever actually drives SyncIn (the
   ESP32 bridge's own Sync I/O "ext edge" setting, or an external pulse
   source) — get this wrong and every real trigger is invisible to the
-  engine, so you'll just sit Armed until `inter_pulse_ms` above faults the
+  engine, so you'll just sit Armed until `trigger_timeout_ms` above faults the
   run with nothing having fired. `fire_single_pulse` hardcodes this to `0`
   (rising) and doesn't expose it — use `shv_set_config` directly if you
   need falling-edge.
 
 ```python
-ct.shv_set_config(1, inter_pulse_ms=3000, max_on_ms=40, total_ms=15000, trigger_edge=0)
+ct.shv_set_config(1, trigger_timeout_ms=3000, max_on_ms=40, total_ms=15000, trigger_edge=0)
 ```
 
 **`shv_arm(controller=1, repeats=1)`** — Arm the schedule. Returns

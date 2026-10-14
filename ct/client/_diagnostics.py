@@ -120,7 +120,7 @@ class _DiagnosticsMixin:
         shot], "on_mismatch": bool, "error": str | None}."""
         fr = self.fire_single_pulse(
             f, num_pulses=pulses, width_us=width_us,
-            inter_pulse_ms=inter_pulse_ms, max_on_ms=40,
+            pulse_interval_ms=inter_pulse_ms, max_on_ms=40,
             total_ms=max(10000, pulses * (inter_pulse_ms + 1000)),
             controller=controller, trigger="sim",
             timeout_s=15.0 + pulses * inter_pulse_ms / 1000.0,

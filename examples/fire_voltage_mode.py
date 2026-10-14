@@ -75,7 +75,7 @@ with ct.lease(ttl=120, note="fire_voltage_mode example"):
 
         for mv in args.mv:
             r = ct.fire_single_pulse(F, num_pulses=1, width_us=args.width_us,
-                                     inter_pulse_ms=100, max_on_ms=165, total_ms=6000,
+                                     pulse_interval_ms=100, max_on_ms=165, total_ms=6000,
                                      shot_wait_timeout_s=6.0, measure=True,
                                      active_mv=mv, idle_ma=args.idle_ma,
                                      voltage_settle_s=args.settle_s)

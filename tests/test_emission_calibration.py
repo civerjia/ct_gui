@@ -171,7 +171,7 @@ check("start is ACTIVE, waited for; end is ACTIVE, ONCE, no wait",
       of(rig.calls, "active") == [("active", 5, 1800, True), ("active", 5, 2500, False)],
       of(rig.calls, "active"))
 sh = rig.shots[0]["k"]
-check("one train: 40 pulses 100 ms apart", sh["num_pulses"] == 40 and sh["inter_pulse_ms"] == 100, sh)
+check("one train: 40 pulses 100 ms apart", sh["num_pulses"] == 40 and sh["pulse_interval_ms"] == 100, sh)
 row = r["results"][5]
 check("one point per pulse, x = heating at that pulse",
       len(row["points"]) == 40 and [p["heat_mA"] for p in row["points"][:3]] == [1800, 1900, 2000]
@@ -251,7 +251,7 @@ rig = Rig({0: IDLE})
 r = run(rig, width_us=20000, pulse_gap_ms=100)
 check("width 20 ms: passed through, max_on_ms covers it, gap kept",
       rig.shots[0]["k"]["width_us"] == 20000 and rig.shots[0]["k"]["max_on_ms"] >= 20
-      and rig.shots[0]["k"]["inter_pulse_ms"] == 100 and not r["notes"], (rig.shots[0]["k"], r["notes"]))
+      and rig.shots[0]["k"]["pulse_interval_ms"] == 100 and not r["notes"], (rig.shots[0]["k"], r["notes"]))
 rig = Rig({0: IDLE})
 r = run(rig, width_us=100000, pulse_gap_ms=50)
 check("width 100 ms: clamped to 65535 us, gap 50 raised to 71 ms, both said",

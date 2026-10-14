@@ -363,7 +363,7 @@ def s9(ct, args):
         cursor = ct.pulse_cursor()      # take it BEFORE firing, so a stale
                                          # backlog can never be counted as yours
         r = ct.fire_single_pulse(f, num_pulses=3, width_us=1000,
-                                 inter_pulse_ms=800, trigger="sim",
+                                 pulse_interval_ms=800, trigger="sim",
                                  measure=args.measure, timeout_s=25.0)
         print(f"  fired={r.get('fired')} ok={r.get('ok')} "
               f"{(r.get('error') or '')[:60]}")

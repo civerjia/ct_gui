@@ -887,6 +887,83 @@ class _ScheduleMixin:
     #                              yourself.
 
 
+    # ── pulse timing: two numbers that used to share one name ─────────────
+    # inter_pulse_ms meant two different things (2026-10-14): with
+    # trigger="sim" it was the SPACING of the simulated triggers (and the
+    # firmware's timeout was quietly set to 2x+100); with an external trigger
+    # it was only the firmware's TIMEOUT -- the longest wait for the next
+    # trigger before the whole run faults (stopReason InterPulseTimeout) --
+    # and the spacing was whatever the trigger source did. Its docstring even
+    # called it a "minimum gap". Now:
+    #   pulse_interval_ms   spacing between pulses (sim: what is fired; external:
+    #                       optional, what the caller's source will do -- used
+    #                       only for the measure check and the detector TTL)
+    #   trigger_timeout_ms  longest gap allowed between triggers (firmware
+    #                       interPulseMs). Default: sim 2 x interval + 100,
+    #                       external 3000.
+    # inter_pulse_ms still works and keeps its old meaning per mode; the
+    # result then carries a note saying which one it was taken as.
+    _DEFAULT_PULSE_INTERVAL_MS = 3000
+    _DEFAULT_TRIGGER_TIMEOUT_MS = 3000
+    # The simulated trigger cannot space edges closer than this (the backend's
+    # sim loop). It used to RAISE a smaller value to 10 silently -- a 5 ms
+    # request fired at 10 ms; now refused.
+    _SIM_MIN_INTERVAL_MS = 10
+    # Largest spacing whose default timeout (2 x + 100) still fits the u32 field.
+    _MAX_PULSE_INTERVAL_MS = (4294967295 - 100) // 2
+
+    def _pulse_timing(self, trigger: str, inter_pulse_ms=None, pulse_interval_ms=None,
+                      trigger_timeout_ms=None) -> dict:
+        """{"interval_ms": int | None, "timeout_ms": int, "note": str | None}
+        or {"error": str}."""
+        sim = str(trigger) == "sim"
+        note = None
+        if inter_pulse_ms is not None:
+            if pulse_interval_ms is not None or trigger_timeout_ms is not None:
+                return {"error": "give pulse_interval_ms / trigger_timeout_ms, or the old "
+                                 "inter_pulse_ms -- not both"}
+            if sim:
+                pulse_interval_ms = inter_pulse_ms
+                note = (f"inter_pulse_ms={int(inter_pulse_ms)} taken as pulse_interval_ms "
+                        f"(trigger='sim': the spacing of the simulated triggers). Use "
+                        f"pulse_interval_ms / trigger_timeout_ms -- the old name means "
+                        f"something else with an external trigger")
+            else:
+                trigger_timeout_ms = inter_pulse_ms
+                note = (f"inter_pulse_ms={int(inter_pulse_ms)} taken as trigger_timeout_ms "
+                        f"(external trigger: the longest wait for the next trigger before "
+                        f"the run faults -- NOT the spacing, which your trigger source sets). "
+                        f"Use trigger_timeout_ms")
+        if sim and pulse_interval_ms is None:
+            pulse_interval_ms = self._DEFAULT_PULSE_INTERVAL_MS
+        if sim and int(pulse_interval_ms) < self._SIM_MIN_INTERVAL_MS:
+            return {"error": f"pulse_interval_ms={int(pulse_interval_ms)} is below the "
+                             f"{self._SIM_MIN_INTERVAL_MS} ms the simulated trigger can "
+                             f"space edges (range {self._SIM_MIN_INTERVAL_MS}.."
+                             f"{self._MAX_PULSE_INTERVAL_MS} ms)"}
+        if trigger_timeout_ms is None:
+            trigger_timeout_ms = (int(pulse_interval_ms) * 2 + 100 if sim
+                                  else self._DEFAULT_TRIGGER_TIMEOUT_MS)
+        interval = None if pulse_interval_ms is None else int(pulse_interval_ms)
+        timeout = int(trigger_timeout_ms)
+        for name, v, hi in (("pulse_interval_ms", interval, self._MAX_PULSE_INTERVAL_MS),
+                            ("trigger_timeout_ms", timeout, self._U32_MAX)):
+            if v is not None and (v < 1 or v > hi):
+                return {"error": f"{name}={v} out of range 1..{hi} ms"}
+        if interval is not None and timeout <= interval:
+            # Measured 2026-10: a timeout equal to the spacing makes every
+            # trigger race its own deadline (faulted after one pulse).
+            return {"error": f"trigger_timeout_ms={timeout} must be longer than "
+                             f"pulse_interval_ms={interval} (it is the longest wait for "
+                             f"the NEXT trigger; equal values fault after one pulse)"}
+        return {"interval_ms": interval, "timeout_ms": timeout, "note": note}
+
+    @staticmethod
+    def _with_note(r: dict, note) -> dict:
+        if note and isinstance(r, dict):
+            r["note"] = ((r["note"] + "; ") if r.get("note") else "") + note
+        return r
+
     def _range_error(self, name: str, value: int, max_value: int) -> str | None:
         """None if `value` fits [0, max_value]; else a ready-to-return error string."""
         if not (0 <= value <= max_value):
@@ -924,9 +1001,8 @@ class _ScheduleMixin:
         })
 
     def shv_set_config(self, controller: int,
-                       inter_pulse_ms: int = 3000,  # min gap between SyncIn
-                                                     # edges (ms); uint32, huge
-                                                     # legal range
+                       inter_pulse_ms: int | None = None,  # old name of
+                                                     # trigger_timeout_ms
                        max_on_ms: int = 40,          # arm-time safety gate
                                                       # (ms); uint16, 0-65535 --
                                                       # see fire_single_pulse's
@@ -935,22 +1011,23 @@ class _ScheduleMixin:
                                                       # runtime" explanation
                        total_ms: int = 30000,  # FIRMWARE's own schedule
                                                 # deadline (ms); uint32
-                       trigger_edge: int = 0) -> dict:  # 0=rising, 1=falling —
-                                                         # which SyncIn edge
-                                                         # fires the schedule
+                       trigger_edge: int = 0,  # 0=rising, 1=falling —
+                                                # which SyncIn edge
+                                                # fires the schedule
+                       trigger_timeout_ms: int | None = None) -> dict:
         """Set the SHV schedule engine's timing config. All three timeouts
         are FIRMWARE-side (the RP2350 enforces them itself, independent of
         this Python process):
 
-            inter_pulse_ms — a RUNTIME watchdog while Armed/Running: if no
+            trigger_timeout_ms (old name inter_pulse_ms; default 3000) — the
+                LONGEST gap allowed between triggers, NOT a spacing: a
+                RUNTIME watchdog while Armed/Running: if no
                 new SyncIn trigger arrives within this many ms of the last
                 one, the RP2350 faults the WHOLE schedule
                 (stopReason=InterPulseTimeout, shv_status()["stopReason"])
                 — it does not skip/ignore the late trigger, the run stops.
-                Default 30000 ms (30 s) is sized for slow manual bench
-                triggers; tighten it once you're firing on a real cadence
-                so a genuinely stuck run is caught quickly instead of
-                sitting "Armed" for 30 s.
+                Raise it for slow manual bench triggers; keep it tight on a
+                real cadence so a genuinely stuck run is caught quickly.
             max_on_ms — checked ONCE, at arm() time, against every entry's
                 width_us already in the table: if ANY entry exceeds it,
                 arm() itself is REJECTED (WidthTooLarge) and nothing fires
@@ -976,14 +1053,19 @@ class _ScheduleMixin:
         max_on_ms is a firmware uint16 field — legal range 0-65535 ms
         (~65.5 s). Out-of-range values are rejected HERE with a clear
         {"ok": False, "error": ...}, before ever reaching the network."""
+        if inter_pulse_ms is not None and trigger_timeout_ms is not None:
+            return {"ok": False, "error": "give trigger_timeout_ms or inter_pulse_ms, not both"}
+        timeout = int(trigger_timeout_ms if trigger_timeout_ms is not None
+                      else inter_pulse_ms if inter_pulse_ms is not None
+                      else self._DEFAULT_TRIGGER_TIMEOUT_MS)
         err = (self._range_error("max_on_ms", int(max_on_ms), self._U16_MAX)
-               or self._range_error("inter_pulse_ms", int(inter_pulse_ms), self._U32_MAX)
+               or self._range_error("trigger_timeout_ms", timeout, self._U32_MAX)
                or self._range_error("total_ms", int(total_ms), self._U32_MAX))
         if err:
             return {"ok": False, "error": err}
         return self._shv(controller, {
             "op": "set_config",
-            "interPulseMs": int(inter_pulse_ms),
+            "interPulseMs": timeout,
             "maxOnMs": int(max_on_ms),
             "totalMs": int(total_ms),
             "triggerEdge": 1 if int(trigger_edge) else 0,
@@ -1175,7 +1257,10 @@ class _ScheduleMixin:
         filament: int,
         num_pulses: int = 1,
         width_us: int = 1000,
-        inter_pulse_ms: int = 3000,
+        inter_pulse_ms: int | None = None,   # OLD NAME, ambiguous -- use
+                                              # pulse_interval_ms (sim spacing)
+                                              # or trigger_timeout_ms; see
+                                              # _pulse_timing
         max_on_ms: int = 40,
         total_ms: int = 15000,       # RP2350 FIRMWARE's own schedule timeout (ms)
                                       # — see docstring, "total_ms vs shot_wait_timeout_s"
@@ -1222,6 +1307,21 @@ class _ScheduleMixin:
         voltage_settle_s: float = 2.0,   # active_mv only: wait this long at
                                           # the voltage, then fire
         timeout_s: float | None = None,  # old name of shot_wait_timeout_s, still accepted
+        pulse_interval_ms: int | None = None,   # spacing between pulses (ms):
+                                                 # what trigger="sim" fires.
+                                                 # Default 3000. Range: sim
+                                                 # 10..2147483597; must be >
+                                                 # width_us/1000; (num_pulses-1)
+                                                 # x it must fit total_ms;
+                                                 # measure=True needs >= 0.5.
+                                                 # External: optional, only
+                                                 # what your source will do.
+        trigger_timeout_ms: int | None = None,  # LONGEST wait for the next
+                                                 # trigger before the run faults
+                                                 # (ms). Range 1..4294967295,
+                                                 # must be > pulse_interval_ms.
+                                                 # Default: sim 2 x interval +
+                                                 # 100, external 3000.
     ) -> dict:
         """Download a one-entry schedule, arm it, fire, and verify.
 
@@ -1369,10 +1469,32 @@ class _ScheduleMixin:
             filament:       0–95 global filament index.
             num_pulses:     pulses in the burst.
             width_us:       pulse width (µs).
-            inter_pulse_ms: minimum gap between SyncIn edges (ms) — a
-                            RUNTIME watchdog: no trigger within this long
+            pulse_interval_ms: spacing between pulses (ms). trigger="sim"
+                            fires at this spacing (default 3000). External
+                            trigger: your source sets the spacing; pass it
+                            only so the measure check / detector TTL know it.
+            trigger_timeout_ms: the LONGEST wait for the next trigger (ms) —
+                            a RUNTIME watchdog: no trigger within this long
                             faults the WHOLE run (stopReason=
                             InterPulseTimeout), it does not skip a late one.
+                            Default: sim 2 x pulse_interval_ms + 100,
+                            external 3000. Must exceed pulse_interval_ms.
+            inter_pulse_ms: OLD NAME, still accepted with its old meaning per
+                            mode — sim: pulse_interval_ms; external:
+                            trigger_timeout_ms. The result carries a "note"
+                            saying which.
+
+        Limits (refused with ok=False and the reason, never silently changed):
+            num_pulses          1 .. 255                  (one byte on the wire)
+            width_us            1 .. 65535 us             (u16); also <= max_on_ms x 1000
+            max_on_ms           0 .. 65535 ms             (u16); checked at arm
+            pulse_interval_ms   sim: 10 .. 2147483597 ms  (the sim cannot space
+                                closer than 10 ms); > width_us/1000; with
+                                measure=True >= 0.5 ms (backgrounds need
+                                2 x (bg_gap 200 + window 50) us)
+            trigger_timeout_ms  1 .. 4294967295 ms        (u32); > pulse_interval_ms
+            total_ms            1 .. 4294967295 ms        (u32); sim: must exceed
+                                (num_pulses - 1) x pulse_interval_ms + width
             max_on_ms:      firmware safety guard, checked ONCE at arm()
                             against width_us — NOT a runtime cutoff. If
                             width_us exceeds it, arm() itself is rejected
@@ -1514,6 +1636,12 @@ class _ScheduleMixin:
         """
         if timeout_s is not None:        # the old name wins if a script passes it
             shot_wait_timeout_s = timeout_s
+        timing = self._pulse_timing(trigger, inter_pulse_ms, pulse_interval_ms,
+                                    trigger_timeout_ms)
+        if timing.get("error"):
+            return {"ok": False, "fired": 0, "records": [], "status": {},
+                    "error": timing["error"]}
+        interval, tmo, note = timing["interval_ms"], timing["timeout_ms"], timing["note"]
 
         # Both backgrounds need gap + window of quiet on each side of the pulse.
         # Fire tighter than that and one pulse's background is measured over its
@@ -1524,11 +1652,11 @@ class _ScheduleMixin:
         # Only when measure=True: firing faster is legitimate when nobody is
         # integrating, and this client has no business dictating pulse spacing
         # for a run whose charge nobody reads.
-        if measure and int(inter_pulse_ms) * 1000 < self.MIN_INTER_PULSE_US:
+        if measure and interval is not None and interval * 1000 < self.MIN_INTER_PULSE_US:
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "measured": [], "ref_mv": None,
-                    "error": (f"inter_pulse_ms={inter_pulse_ms} is "
-                              f"{int(inter_pulse_ms) * 1000} us, below the "
+                    "error": (f"pulse_interval_ms={interval} is "
+                              f"{interval * 1000} us, below the "
                               f"{self.MIN_INTER_PULSE_US} us each pulse needs for "
                               f"its backgrounds (gap {self._BG_GAP_US:.0f} + window "
                               f"{self._BG_WINDOW_US:.0f} us on each side). Fire "
@@ -1538,31 +1666,33 @@ class _ScheduleMixin:
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "error": "give active_ma OR active_mv, not both"}
         if active_mv is not None:
-            return self._fire_heated(
+            return self._with_note(self._fire_heated(
                 filament, None, idle_ma, float(voltage_settle_s),
                 dict(num_pulses=num_pulses, width_us=width_us,
-                     inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                     pulse_interval_ms=interval, trigger_timeout_ms=tmo,
+                     max_on_ms=max_on_ms,
                      total_ms=total_ms, controller=controller, trigger=trigger,
                      timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
                      measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
                      bg_window_us=bg_window_us, on_armed=on_armed),
-                active_mv=active_mv)
+                active_mv=active_mv), note)
         if active_ma is not None:
-            return self._fire_heated(
+            return self._with_note(self._fire_heated(
                 filament, active_ma, idle_ma, heat_timeout_s,
                 dict(num_pulses=num_pulses, width_us=width_us,
-                     inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                     pulse_interval_ms=interval, trigger_timeout_ms=tmo,
+                     max_on_ms=max_on_ms,
                      total_ms=total_ms, controller=controller, trigger=trigger,
                      timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
                      measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
-                     bg_window_us=bg_window_us, on_armed=on_armed))
-        return self._fire_single(
+                     bg_window_us=bg_window_us, on_armed=on_armed)), note)
+        return self._with_note(self._fire_single(
             filament, num_pulses=num_pulses, width_us=width_us,
-            inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+            pulse_interval_ms=interval, trigger_timeout_ms=tmo, max_on_ms=max_on_ms,
             total_ms=total_ms, controller=controller, trigger=trigger,
             timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse, measure=measure,
             rate_hz=rate_hz, bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
-            on_armed=on_armed)
+            on_armed=on_armed), note)
 
     # active_one(verify=True)'s default tolerance: "within this of the target".
     _HEAT_BAND_MA = 150.0
@@ -1703,14 +1833,15 @@ class _ScheduleMixin:
                 f"backend's timed ACTIVE will still drop it")
         return out
 
-    def _fire_single(self, filament: int, num_pulses, width_us, inter_pulse_ms,
-                     max_on_ms, total_ms, controller, trigger, timeout_s, verify,
-                     reuse, measure, rate_hz, bg_gap_us, bg_window_us,
+    def _fire_single(self, filament: int, num_pulses, width_us, pulse_interval_ms,
+                     trigger_timeout_ms, max_on_ms, total_ms, controller, trigger,
+                     timeout_s, verify, reuse, measure, rate_hz, bg_gap_us, bg_window_us,
                      on_armed=None, after_fire=None) -> dict:
         if not measure:
             return self._fire_core(
                 filament, num_pulses=num_pulses, width_us=width_us,
-                inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                pulse_interval_ms=pulse_interval_ms, trigger_timeout_ms=trigger_timeout_ms,
+                max_on_ms=max_on_ms,
                 total_ms=total_ms, controller=controller, trigger=trigger,
                 timeout_s=timeout_s, verify=verify, reuse=reuse,
                 on_armed=on_armed, after_fire=after_fire)
@@ -1719,7 +1850,8 @@ class _ScheduleMixin:
         # the pulses. If it can't arm we fire nothing: silently firing HV that
         # nobody is measuring is the opposite of what measure=True asked for.
         # See shot_measure_arm() for why it is the RELAY that is armed.
-        m = self.shot_measure_arm({"ok": True, "inter_pulse_ms": int(inter_pulse_ms),
+        m = self.shot_measure_arm({"ok": True, "pulse_interval_ms": pulse_interval_ms,
+                                   "trigger_timeout_ms": int(trigger_timeout_ms),
                                    "num_pulses": int(num_pulses)},
                                   rate_hz, bg_gap_us=bg_gap_us,
                                   bg_window_us=bg_window_us, shot_wait_timeout_s=timeout_s)
@@ -1728,7 +1860,8 @@ class _ScheduleMixin:
         try:
             fired = self._fire_core(
                 filament, num_pulses=num_pulses, width_us=width_us,
-                inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                pulse_interval_ms=pulse_interval_ms, trigger_timeout_ms=trigger_timeout_ms,
+                max_on_ms=max_on_ms,
                 total_ms=total_ms, controller=controller, trigger=trigger,
                 timeout_s=timeout_s, verify=verify, reuse=reuse,
                 on_armed=on_armed, after_fire=after_fire)
@@ -1810,14 +1943,17 @@ class _ScheduleMixin:
         return out
 
     def shot_prepare(self, filament: int, num_pulses: int = 1, width_us: int = 1000,
-                     inter_pulse_ms: int = 3000, max_on_ms: int = 40,
+                     inter_pulse_ms: int | None = None, max_on_ms: int = 40,
                      total_ms: int = 15000, controller: int | None = None,
                      trigger: str = "sim", verify: bool = True,
-                     reuse: bool = False) -> dict:
+                     reuse: bool = False, pulse_interval_ms: int | None = None,
+                     trigger_timeout_ms: int | None = None) -> dict:
         """Step 1 of a shot: check the arguments, pick the controller (and the
         master that frames its envelope), disarm both, and put the one-entry
         schedule on the RP2350s (or confirm by CRC that it is already there,
-        reuse=True). Touches no heating and no HV. Returns the SHOT dict that
+        reuse=True). Touches no heating and no HV. pulse_interval_ms /
+        trigger_timeout_ms (and the old inter_pulse_ms) and their limits are as
+        in fire_single_pulse(). Returns the SHOT dict that
         every later step takes and returns (ok False = stop; see "error").
 
         The steps, in the order fire_single_pulse() runs them:
@@ -1832,6 +1968,13 @@ class _ScheduleMixin:
         disarms everything (put it in a finally). See examples/fire_steps.py."""
         if self._is_dead(filament):
             return self._dead_result(filament, {"fired": 0, "records": [], "status": {}})
+        # pulse_interval_ms / trigger_timeout_ms: see _pulse_timing.
+        timing = self._pulse_timing(trigger, inter_pulse_ms, pulse_interval_ms,
+                                    trigger_timeout_ms)
+        if timing.get("error"):
+            return {"ok": False, "error": timing["error"], "fired": 0, "records": [],
+                    "status": {}}
+        interval, tmo = timing["interval_ms"], timing["timeout_ms"]
 
         if controller is None:
             board = self.filament_to_board(filament)
@@ -1848,8 +1991,18 @@ class _ScheduleMixin:
         err = (self._range_error("num_pulses", int(num_pulses), self._U8_MAX)
                or self._range_error("max_on_ms", int(max_on_ms), self._U16_MAX)
                or self._range_error("width_us", int(width_us), self._U16_MAX)
-               or self._range_error("inter_pulse_ms", int(inter_pulse_ms), self._U32_MAX)
                or self._range_error("total_ms", int(total_ms), self._U32_MAX))
+        if not err and interval is not None and interval * 1000 <= int(width_us):
+            err = (f"pulse_interval_ms={interval} ({interval * 1000} us) is not longer than "
+                   f"width_us={int(width_us)}: the next pulse would start before this one "
+                   f"ends")
+        if not err and trigger == "sim":
+            train_ms = (int(num_pulses) - 1) * interval + -(-int(width_us) // 1000)
+            if train_ms >= int(total_ms):
+                err = (f"{int(num_pulses)} pulses {interval} ms apart take {train_ms} ms, "
+                       f"not inside total_ms={int(total_ms)} (the firmware's limit for the "
+                       f"whole run, counted from ARM) -- raise total_ms or fire fewer / "
+                       f"closer pulses")
         if err:
             return {"ok": False, "error": err, "fired": 0, "records": [], "status": {}}
 
@@ -1881,8 +2034,9 @@ class _ScheduleMixin:
             # is the physically meaningful number, so keep the sim at what the
             # caller asked for and give the WATCHDOG room instead. An external
             # trigger is the caller's to time, so it keeps the value as given.
-            "config": {"interPulseMs": (int(inter_pulse_ms) * 2 + 100
-                                        if trigger == "sim" else int(inter_pulse_ms)),
+            # The firmware's interPulseMs is the TIMEOUT (trigger_timeout_ms):
+            # by default 2 x the spacing + 100 for sim, see _pulse_timing.
+            "config": {"interPulseMs": int(tmo),
                        "maxOnMs": int(max_on_ms),
                        "totalMs": int(total_ms), "triggerEdge": 0},
             # USER_INDEX here -- download()/verify_schedule() cross to FID
@@ -1951,8 +2105,11 @@ class _ScheduleMixin:
 
         return {"ok": True, "filament": int(filament), "controller": int(controller),
                 "companion": companion, "armed_set": armed_set,
-                "num_pulses": int(num_pulses), "inter_pulse_ms": int(inter_pulse_ms),
-                "trigger": trigger, "schedule": reuse_note,
+                "num_pulses": int(num_pulses),
+                "pulse_interval_ms": interval, "trigger_timeout_ms": int(tmo),
+                # Old key, old per-mode meaning, for code that reads it.
+                "inter_pulse_ms": int(interval if trigger == "sim" else tmo),
+                "trigger": trigger, "schedule": reuse_note, "note": timing["note"],
                 "fired": 0, "records": [], "status": {}}
 
     def shot_arm(self, shot: dict) -> dict:
@@ -2043,7 +2200,8 @@ class _ScheduleMixin:
         if not shot.get("ok"):
             return shot
         trigger = shot.get("trigger", "sim")
-        num_pulses, inter_pulse_ms = shot["num_pulses"], shot["inter_pulse_ms"]
+        num_pulses = shot["num_pulses"]
+        interval = shot.get("pulse_interval_ms") or shot["inter_pulse_ms"]
         controller, companion = shot["controller"], shot["companion"]
         armed_set = shot["armed_set"]
         if trigger == "sim":
@@ -2053,7 +2211,7 @@ class _ScheduleMixin:
             # would never see it and never open the window.
             r = self._post("/api/sync/simulate", {
                 "count": int(num_pulses),
-                "interval_ms": float(max(inter_pulse_ms, 10)),
+                "interval_ms": float(max(int(interval), 10)),
                 "controller": int(companion or controller),
             }, timeout=10.0)
             if not r.get("ok"):
@@ -2226,7 +2384,9 @@ class _ScheduleMixin:
         event stream stands. Fails -> nothing has been armed; do not fire."""
         if not shot.get("ok"):
             return shot
-        inter_pulse_ms = shot["inter_pulse_ms"]
+        # The longest gap the run allows between pulses (trigger_timeout_ms);
+        # older shot dicts only have inter_pulse_ms.
+        gap_ms = int(shot.get("trigger_timeout_ms") or shot.get("inter_pulse_ms") or 0)
         rate_hz = int(rate_hz)
         if timeout_s is not None:      # old name of shot_wait_timeout_s
             shot_wait_timeout_s = timeout_s
@@ -2243,10 +2403,11 @@ class _ScheduleMixin:
         # firmware default. The firmware renews the TTL on every relayed edge,
         # so an active run cannot be reclaimed -- but the renewal is driven by
         # PULSES, so a gap wider than the TTL still looks abandoned. The binding
-        # gap is inter_pulse_ms; give it room, and never go below the firmware
-        # default. Also covers the head of the run, before the first pulse.
+        # gap is the longest one the run allows (trigger_timeout_ms); give it
+        # room, and never go below the firmware default. Also covers the head
+        # of the run, before the first pulse.
         arm_ttl_ms = max(self._READY_TTL_FLOOR_MS,
-                         int(inter_pulse_ms) * self._READY_TTL_GAP_FACTOR,
+                         gap_ms * self._READY_TTL_GAP_FACTOR // 2,
                          int(shot_wait_timeout_s * 1000))
         arm = self.ready_arm(rate_hz, ttl_ms=arm_ttl_ms,
                              bg_gap_us=bg_gap_us,
@@ -2387,7 +2548,8 @@ class _ScheduleMixin:
         filament: int,
         num_pulses: int = 1,
         width_us: int = 1000,
-        inter_pulse_ms: int = 3000,
+        pulse_interval_ms: int | None = None,
+        trigger_timeout_ms: int | None = None,
         max_on_ms: int = 40,
         total_ms: int = 15000,       # RP2350 FIRMWARE's own schedule timeout (ms)
                                       # — see docstring, "total_ms vs shot_wait_timeout_s"
@@ -2415,7 +2577,8 @@ class _ScheduleMixin:
         this exists only so the public method can wrap it with the
         detector arm/correlate step without duplicating any of it."""
         shot = self.shot_prepare(filament, num_pulses=num_pulses, width_us=width_us,
-                                 inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+                                 pulse_interval_ms=pulse_interval_ms,
+                                 trigger_timeout_ms=trigger_timeout_ms, max_on_ms=max_on_ms,
                                  total_ms=total_ms, controller=controller,
                                  trigger=trigger, verify=verify, reuse=reuse)
         if not shot.get("ok"):

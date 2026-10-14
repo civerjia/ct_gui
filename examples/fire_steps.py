@@ -65,7 +65,7 @@ def fire_one(f: int) -> dict:
         # --- at IDLE: everything that does not need firing current ----------
         t0 = time.monotonic()
         shot = ct.shot_prepare(f, num_pulses=1, width_us=args.width_us,
-                               inter_pulse_ms=100, max_on_ms=165,
+                               pulse_interval_ms=100, max_on_ms=165,
                                total_ms=6000 + 6000,   # +6 s: heating happens after arm
                                trigger=args.trigger, reuse=True)
         if not args.no_measure:

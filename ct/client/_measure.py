@@ -806,7 +806,7 @@ class _MeasureMixin:
         num_pulses: int = 1,
         width_us: int = 1000,
         rate_hz: int = 1000000,
-        inter_pulse_ms: int = 3000,
+        inter_pulse_ms: int | None = None,   # old name -- see fire_single_pulse
         max_on_ms: int = 40,
         total_ms: int = 15000,
         controller: int | None = None,
@@ -816,6 +816,10 @@ class _MeasureMixin:
         reuse: bool = False,
         bg_gap_us: float | None = None,
         bg_window_us: float | None = None,
+        pulse_interval_ms: int | None = None,   # as fire_single_pulse (ms;
+                                                 # sim 10..2147483597)
+        trigger_timeout_ms: int | None = None,  # as fire_single_pulse (ms;
+                                                 # 1..4294967295, > interval)
     ) -> dict:
         """Fire and measure, returning the two halves separately.
 
@@ -838,7 +842,8 @@ class _MeasureMixin:
         """
         r = self.fire_single_pulse(
             filament, num_pulses=num_pulses, width_us=width_us,
-            inter_pulse_ms=inter_pulse_ms, max_on_ms=max_on_ms,
+            inter_pulse_ms=inter_pulse_ms, pulse_interval_ms=pulse_interval_ms,
+            trigger_timeout_ms=trigger_timeout_ms, max_on_ms=max_on_ms,
             total_ms=total_ms, controller=controller, trigger=trigger,
             timeout_s=timeout_s, verify=verify, reuse=reuse,
             measure=True, rate_hz=rate_hz,
