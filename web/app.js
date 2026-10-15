@@ -90,7 +90,7 @@ const DEFAULT_DUR_US = 1000; // 1 ms, shown in µs
 const filaments = Array.from({ length: N }, () => ({
   state: STATE.STOP, voltage_mV: 0, current_mA: 0, mAs: 0,
   pulses: DEFAULT_PULSES, durationUs: DEFAULT_DUR_US,
-  idleA: 1.5, activeA: 3,    // cathode heating currents (A)
+  idleA: null, activeA: 3,   // cathode heating currents (A); idleA from the backend (loadRigDefaults)
   ocp: 4000, dcHv: false, // debug: per-board OCP (mA, firmware default 4 A), DC HV bit
   dead: false,            // disabled filament — omitted from the schedule (§8.4)
   noHv: false,            // heats normally but fires no HV pulse (excluded from emission schedule)
@@ -1294,11 +1294,34 @@ function refreshFilList() {
   });
 }
 
+// Rig defaults come from the backend (ct/defaults.py via GET /api/defaults);
+// the GUI carries no numbers of its own for them.
+let rigDefaults = null;
+async function loadRigDefaults() {
+  try {
+    const j = await (await fetch('/api/defaults')).json();
+    if (j && j.ok) rigDefaults = j;
+  } catch { /* backend unreachable: idleA stays unset, Idle all refuses */ }
+  if (rigDefaults) {
+    const idleA = rigDefaults.idle_ma / 1000;
+    $('hsIdleA').value = idleA;
+    for (const f of filaments) if (f.idleA == null) f.idleA = idleA;
+  }
+  return rigDefaults;
+}
+
 // host-side persistence of the per-filament plan (pulses / duration / currents)
 const FIL_STORE = 'ct_fil_settings';
+// The IDLE default in force when the settings were saved: a saved value equal
+// to it was the default, not a choice, and follows a later default change.
+const FIL_STORE_DEFAULT = 'ct_fil_settings_default_idle_ma';
 function saveFilSettings() {
   const data = filaments.map((f) => ({ pulses: f.pulses, durationUs: f.durationUs, idleA: f.idleA, activeA: f.activeA, noHv: f.noHv, noHeat: f.noHeat }));
-  try { localStorage.setItem(FIL_STORE, JSON.stringify(data)); $('schStatus').textContent = 'Saved per-filament settings to host.'; }
+  try {
+    localStorage.setItem(FIL_STORE, JSON.stringify(data));
+    if (rigDefaults) localStorage.setItem(FIL_STORE_DEFAULT, String(rigDefaults.idle_ma));
+    $('schStatus').textContent = 'Saved per-filament settings to host.';
+  }
   catch (e) { $('schStatus').textContent = 'Save failed: ' + e; }
 }
 function loadFilSettings(quiet) {
@@ -1306,6 +1329,20 @@ function loadFilSettings(quiet) {
   try { data = JSON.parse(localStorage.getItem(FIL_STORE) || 'null'); } catch { data = null; }
   if (!data) { if (!quiet) $('schStatus').textContent = 'No saved settings on host.'; return false; }
   data.forEach((d, i) => { if (filaments[i]) Object.assign(filaments[i], d); });
+  if (rigDefaults) {
+    // Saved before the default changed: move the values that WERE the default.
+    let saved = null;
+    try { saved = localStorage.getItem(FIL_STORE_DEFAULT); } catch { /* storage off */ }
+    const was = saved != null ? [Number(saved)] : (rigDefaults.retired_idle_ma || []);
+    const now = rigDefaults.idle_ma;
+    let moved = 0;
+    for (const f of filaments) {
+      const ma = f.idleA == null ? null : Math.round(f.idleA * 1000);
+      if (ma == null || (ma !== now && was.includes(ma))) { f.idleA = now / 1000; moved++; }
+    }
+    try { localStorage.setItem(FIL_STORE_DEFAULT, String(now)); } catch { /* storage off */ }
+    if (moved && !quiet) $('schStatus').textContent = `Loaded; ${moved} filament(s) moved to the IDLE default ${now} mA.`;
+  }
   refreshFilList(); rebuildSchedule();
   if (!quiet) $('schStatus').textContent = 'Loaded per-filament settings from host.';
   return true;
@@ -2162,7 +2199,14 @@ function init() {
   $('hwPrepStop').addEventListener('click', () => hwPrep(STATE.STOP, 'Stop all'));
   $('hwPrepSleep').addEventListener('click', () => hwPrep(STATE.SLEEP, 'Sleep all'));
   $('hwPrepStandby').addEventListener('click', () => { const f = heatedFilaments(); hwPrep(STATE.STANDBY, `Standby heated (${f.length})`, { filaments: f }); });
-  $('hwPrepIdle').addEventListener('click', () => { const f = heatedFilaments(); hwPrep(STATE.IDLE, `Idle heated (${f.length})`, { filaments: f, currents: prepCurrents('idleA') }); });
+  $('hwPrepIdle').addEventListener('click', () => {
+    const f = heatedFilaments();
+    if (f.some((i) => filaments[i].idleA == null)) {
+      hwMsg && hwMsg('IDLE current unknown: the backend default (/api/defaults) could not be read -- set "idle A" first.');
+      return;
+    }
+    hwPrep(STATE.IDLE, `Idle heated (${f.length})`, { filaments: f, currents: prepCurrents('idleA') });
+  });
   $('hwPrepActive').addEventListener('click', () => {
     const fils = firstBatchFilaments();
     if (!fils || !fils.length) { hwMsg('No heating plan — build a schedule first.'); return; }
@@ -2345,7 +2389,8 @@ function init() {
   // later via power.js/tests.js's *_HTML templates wire themselves at
   // render time, since they don't exist in the DOM yet when this runs).
   clampNumberInputs(document);
-  if (!loadFilSettings(true)) rebuildSchedule(); // restore host settings, else fresh build
+  // Defaults first: restoring saved settings decides per filament against them.
+  loadRigDefaults().then(() => { if (!loadFilSettings(true)) rebuildSchedule(); });
   setViewMode('live');  // start on real hardware — no simulated data until Plan is chosen
   syncBackendDead(); setInterval(syncBackendDead, 10000);   // file read on the backend, no hardware
   $('updateBadge').addEventListener('click', applyUpdate);

@@ -3667,6 +3667,11 @@ class CtHandler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._json({"ok": False, "error": "tail must be an integer"})
             self._json(read_log_file(q.get("path", "backend.log"), tail, q.get("grep") or None))
+        elif path == "/api/defaults":
+            # Rig operating defaults (ct/defaults.py) -- the GUI's only source
+            # for them, so a change there (or CT_IDLE_MA) reaches it unedited.
+            from ct import defaults as ct_defaults
+            self._json({"ok": True, **ct_defaults.as_dict()})
         elif path == "/api/version":
             # The commit this backend was started from (ct_update.version()),
             # so a client can tell it is talking to older or newer code, plus
