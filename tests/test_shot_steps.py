@@ -62,6 +62,7 @@ def make(arm_ok=True, end_state=SHV_COMPLETE, on_mismatch=False, master=None):
     ct.ready_arm = lambda *a, **k: (calls.append(("ready_arm", None)), {"ok": True})[1]
     ct.ready_disarm = lambda: (calls.append(("ready_disarm", None)), {"ok": True})[1]
     ct.pulse_cursor = lambda: 41
+    ct.read_emission_i_limit = lambda: 45.0
     ct._collect_pulse_events = lambda since, n, *a: (calls.append(("events", since)), ([{"id": 42}], 1228))[1]
     ct._poll_intervals = lambda a, b: iter(lambda: 0.0, None)
     return ct, calls
@@ -127,10 +128,12 @@ check("...records of a failed shot is a no-op", ct.shot_records(shot) is shot)
 # 6. Switch read-back mismatch still judged by shot_records.
 ct, calls = make(on_mismatch=True)
 res = ct.shot_records(ct.shot_wait(ct.shot_trigger(ct.shot_arm(ct.shot_prepare(16, **KW))), 2.0))
-check("MOSFET read-back wrong reported: which pulse, bytes, neighbouring bit, not measured",
-      not res["ok"] and "MOSFET read-back wrong on 1 of 1 pulse(s)" in res["error"]
-      and "pulse 1: wrote 0x04, read back 0x02 (the neighbouring bit)" in res["error"]
-      and "Not measured" in res["error"], res)
+check("MOSFET not confirmed closed: plain error names pulse + site, not measured",
+      not res["ok"] and "Filament 16 (P1 CH1.3): the MOSFET was not confirmed closed on "
+      "pulse(s) 1 of 1" in res["error"] and "Not measured" in res["error"]
+      and "0x" not in res["error"], res)
+check("...the bytes are in detail, not in the error",
+      "pulse 1: wrote 0x04, read back 0x02 (the neighbouring bit)" in res.get("detail", ""), res)
 
 # 6b. ...and the measured current says which: MOSFET closed (read-back wrong) or not.
 # Current flowed -> the shot is GOOD: ok True, the read-back problem as a warning.
@@ -138,14 +141,14 @@ ct, calls = make(on_mismatch=True)
 ct._collect_pulse_events = lambda since, n, *a: ([{"id": 42, "emission_ma": 20.0}], 1228)
 r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **KW)
 check("mismatch + current flowed -> ok True, warning, readback_unreliable, no error",
-      r["ok"] and "READ-BACK is wrong" in r.get("warning", "") and r.get("readback_unreliable")
+      r["ok"] and "only the MOSFET read-back is wrong" in r.get("warning", "") and r.get("readback_unreliable")
       and "error" not in r and r["mosfet_conducted"] is True and r["measured"], r)
 # No current -> the MOSFET did not close: still a failure.
 ct, calls = make(on_mismatch=True)
 ct._collect_pulse_events = lambda since, n, *a: ([{"id": 42, "emission_ma": None}], 1228)
 r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **KW)
-check("mismatch + no current -> ok False, 'did NOT close'",
-      not r["ok"] and "MOSFET did NOT close" in r["error"] and r["mosfet_conducted"] is False, r)
+check("mismatch + no current -> ok False, 'did not fire'",
+      not r["ok"] and "Pulse(s) 1 did not fire" in r["error"] and r["mosfet_conducted"] is False, r)
 # Current flowed, but ALSO read non-zero after the pulse (may still be closed): stays a failure.
 ct, calls = make(on_mismatch=True)
 ct.shv_pulse_log = lambda c: [{"filament": 16, "on_mismatch": True, "hv_stuck_on": True, "read165": 2}]
@@ -178,12 +181,13 @@ ct._collect_pulse_events = lambda since, n, *a: ([{"id": 50 + i, "emission_ma": 
                                                   for i in range(10)], 1228)
 r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **{**KW, "num_pulses": 10})
 e = r.get("error") or ""
-check("10 pulses: names the 2 mismatched ones and their bytes",
-      "wrong on 2 of 10 pulse(s)" in e and "pulse 3: wrote 0x04, read back 0x08 (the neighbouring bit)" in e
-      and "pulse 7: wrote 0x04, read back 0x00 (no bit)" in e, e)
+d = r.get("detail") or ""
+check("10 pulses: names the 2 mismatched ones; bytes in detail",
+      "pulse(s) 3, 7 of 10" in e and "pulse 3: wrote 0x04, read back 0x08 (the neighbouring bit)" in d
+      and "pulse 7: wrote 0x04, read back 0x00 (no bit)" in d, (e, d))
 check("...pulse 3 current flowed: read-back wrong, good data",
-      "Current FLOWED in pulse(s) 3 (5.00 mA)" in e and "good data" in e, e)
-check("...pulse 7 no current: MOSFET did NOT close", "No current in pulse(s) 7" in e, e)
+      "Pulse(s) 3 fired normally (5.00 mA flowed)" in e and "data is good" in e, e)
+check("...pulse 7 no current: did not fire", "Pulse(s) 7 did not fire" in e, e)
 check("...the 'not measured' placeholder is gone", "Not measured" not in e, e)
 check("...mosfet_conducted False (one did not)", r.get("mosfet_conducted") is False, r)
 
@@ -192,7 +196,7 @@ ct, calls = make(on_mismatch=True)
 ct.shv_pulse_log = lambda c: log
 ct._collect_pulse_events = lambda since, n, *a: ([{"id": 50, "emission_ma": 5.0}] * 9, 1228)
 r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **{**KW, "num_pulses": 10})
-check("unpaired: unknown, said so", "cannot be matched" in (r.get("error") or "")
+check("unpaired: unknown, said so", "unknown whether those pulses fired" in (r.get("error") or "")
       and r.get("mosfet_conducted") is None, r)
 
 # 6e. Arm refused: names the filament, its board, and what NotReady means.
@@ -215,6 +219,46 @@ for kw, want in (({"shot_wait_timeout_s": 7.5}, 7.5), ({"timeout_s": 8.5}, 8.5),
     ct._shot_wait = lambda shot, t, real=real, seen=seen: (seen.setdefault("t", t), real(shot, t))[1]
     ct.fire_single_pulse(16, **KW, **kw)
     check(f"{kw or 'default'} -> shot_wait waits {want} s", seen.get("t") == want, seen)
+
+# 9. SUPPLY LIMIT (2026-10-15, filament 78 P1 CH6.3): pulses at the emission
+#    current limit are the supply clamping, not emission -> ok False, plain
+#    message first; it used to come back ok=True.
+def clamp_run(nets, heat=2597.0, limit=45.0, mismatch_at=None):
+    ct, calls = make(on_mismatch=mismatch_at is not None)
+    ct.read_emission_i_limit = lambda: limit
+    ct.shv_pulse_log = lambda c: [{"filament": 16, "on_mismatch": i == mismatch_at,
+                                   "read165": 0 if i == mismatch_at else 4,
+                                   "heat_meas_mA": heat} for i in range(len(nets))]
+    ct._collect_pulse_events = lambda since, n, *a: (
+        [{"id": 50 + i, "plateau_net_ma": v, "emission_ma": None if v is None else v - 1}
+         for i, v in enumerate(nets)], 1228)
+    return ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **{**KW, "num_pulses": len(nets)})
+
+
+r = clamp_run([38.0] * 8 + [5.0, 5.0])
+e = r.get("error") or ""
+check("8 of 10 at 38 mA vs 45 mA limit -> ok False, supply_limited",
+      not r["ok"] and r.get("supply_limited") == list(range(8)) and r.get("supply_limit_ma") == 45.0, r)
+check("...conclusion first, heating current, what to do",
+      e.startswith("Filament 16 (P1 CH1.3): 8 of 10 pulses read about 38 mA = the emission "
+                   "supply's current limit (45 mA set), not emission")
+      and "arcing or breaking down at this heating current (2597 mA)" in e
+      and "Lower the heating current" in e, e)
+r = clamp_run([38.0] * 9 + [None], mismatch_at=9)
+e = r.get("error") or ""
+check("clamp + a pulse that did not fire: both, clamp first",
+      not r["ok"] and e.index("current limit") < e.index("Pulse(s) 10 did not fire"), e)
+r = clamp_run([38.0, 5.0], mismatch_at=0)
+check("clamped pulse with wrong read-back: NOT downgraded to a warning",
+      not r["ok"] and "current limit" in (r.get("error") or "") and not r.get("readback_unreliable")
+      and "warning" not in r, r)
+r = clamp_run([28.0, 28.0], heat=0.0, limit=30.0)
+check("cold clamp -> short/breakdown wording, not 'heating current'",
+      not r["ok"] and "short or breakdown" in (r.get("error") or ""), r.get("error"))
+r = clamp_run([20.0] * 3)
+check("below 80% of the limit -> ok, no supply_limited", r["ok"] and "supply_limited" not in r, r)
+r = clamp_run([44.0] * 3, limit=None)
+check("limit unknown -> check skipped, ok", r["ok"] and "supply_limited" not in r, r)
 
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

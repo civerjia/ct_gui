@@ -2,7 +2,8 @@
 """pulse_interval_ms / trigger_timeout_ms (2026-10-14): inter_pulse_ms meant
 the SPACING with trigger="sim" and only the firmware TIMEOUT with an external
 trigger, and its docstring called it a "minimum gap". Now two names; the old
-one keeps its per-mode meaning and the result says which. Limits are refused,
+one keeps its per-mode meaning; which one is logged once per process (it used
+to ride on every result, burying the real error -- 2026-10-15). Limits are refused,
 never silently changed (the sim used to raise <10 ms to 10). Offline: the
 plan sent to the board is captured.
 
@@ -10,6 +11,7 @@ plan sent to the board is captured.
 """
 import _path  # noqa: F401
 
+import logging
 import os
 
 os.environ.setdefault("CT_NO_AUTO_UPDATE", "1")
@@ -17,6 +19,21 @@ os.environ.setdefault("CT_NO_AUTO_UPDATE", "1")
 from ct.client._client import CTClient  # noqa: E402
 
 FAILS = []
+NOTES = []
+
+
+class _Grab(logging.Handler):
+    def emit(self, rec):
+        NOTES.append(rec.getMessage())
+
+
+logging.getLogger("ct_gui").addHandler(_Grab())
+logging.getLogger("ct_gui").setLevel(logging.INFO)
+
+
+def fresh_notes():
+    CTClient._NOTES_LOGGED.clear()
+    NOTES.clear()
 
 
 def check(name, cond, detail=""):
@@ -46,25 +63,32 @@ BASE = dict(num_pulses=3, width_us=1000, max_on_ms=40, total_ms=20000)
 
 # 1. sim: the old name is the spacing; timeout defaults to 2x+100; note says so.
 ct, seen = make()
+fresh_notes()
 s = ct.shot_prepare(16, inter_pulse_ms=300, trigger="sim", **BASE)
 check("sim old name -> interval 300, firmware timeout 700",
       s["ok"] and s["pulse_interval_ms"] == 300 and s["trigger_timeout_ms"] == 700
       and seen["plan"]["config"]["interPulseMs"] == 700, (s, seen.get("plan", {}).get("config")))
-check("sim old name -> note names pulse_interval_ms", "pulse_interval_ms" in (s.get("note") or ""), s.get("note"))
+check("sim old name -> logged note names pulse_interval_ms, not in the shot",
+      len(NOTES) == 1 and "pulse_interval_ms" in NOTES[0] and "note" not in s, (NOTES, s.get("note")))
+ct.shot_prepare(16, inter_pulse_ms=250, trigger="sim", **BASE)
+check("...logged once per process, not per call", len(NOTES) == 1, NOTES)
 
 # 2. external: the old name is ONLY the timeout; no spacing implied.
 ct, seen = make()
+fresh_notes()
 s = ct.shot_prepare(16, inter_pulse_ms=5000, trigger="ext", **BASE)
 check("external old name -> timeout 5000, no interval",
       s["ok"] and s["trigger_timeout_ms"] == 5000 and s["pulse_interval_ms"] is None
       and seen["plan"]["config"]["interPulseMs"] == 5000, s)
-check("external old name -> note says NOT the spacing", "NOT the spacing" in (s.get("note") or ""), s.get("note"))
+check("external old name -> logged note says NOT the spacing",
+      len(NOTES) == 1 and "NOT the spacing" in NOTES[0], NOTES)
 
 # 3. New names, explicit.
 ct, seen = make()
+fresh_notes()
 s = ct.shot_prepare(16, pulse_interval_ms=200, trigger_timeout_ms=1000, trigger="sim", **BASE)
 check("new names: as given, no note", s["ok"] and s["pulse_interval_ms"] == 200
-      and seen["plan"]["config"]["interPulseMs"] == 1000 and not s.get("note"), s)
+      and seen["plan"]["config"]["interPulseMs"] == 1000 and not NOTES, (s, NOTES))
 ct, seen = make()
 s = ct.shot_prepare(16, trigger="ext", **BASE)
 check("external defaults: timeout 3000", s["ok"] and seen["plan"]["config"]["interPulseMs"] == 3000, s)
@@ -94,10 +118,12 @@ check("measure: external spacing 0.4 ms refused (backgrounds need 0.5 ms)",
       not r["ok"] and "pulse_interval_ms" in r["error"], r.get("error"))
 ct, seen = make()
 ct._fire_single = lambda *a, **k: (seen.update(fs=k), {"ok": True, "fired": 3})[1]
+fresh_notes()
 r = ct.fire_single_pulse(16, inter_pulse_ms=5000, trigger="ext", measure=True, **BASE)
 check("measure + external old name: NOT refused as a 5 s spacing problem, passed as timeout",
       r["ok"] and seen["fs"]["trigger_timeout_ms"] == 5000 and seen["fs"]["pulse_interval_ms"] is None, seen.get("fs"))
-check("...and the result carries the note", "trigger_timeout_ms" in (r.get("note") or ""), r)
+check("...the note is logged, the result does not carry it",
+      "note" not in r and any("trigger_timeout_ms" in n for n in NOTES), (r, NOTES))
 
 # 6. Downstream: sim trigger spacing and detector TTL use the right number.
 ct, seen = make()

@@ -12,6 +12,8 @@ use comes from _base (star-imported, underscore names included -- see
 _base.__all__) or, for CTClient itself, is bound in by _client.py.
 """
 from ._base import *  # noqa: F401,F403
+import logging
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:   # editors only: at run time _client.py binds CTClient into this module
@@ -901,8 +903,8 @@ class _ScheduleMixin:
     #   trigger_timeout_ms  longest gap allowed between triggers (firmware
     #                       interPulseMs). Default: sim 2 x interval + 100,
     #                       external 3000.
-    # inter_pulse_ms still works and keeps its old meaning per mode; the
-    # result then carries a note saying which one it was taken as.
+    # inter_pulse_ms still works and keeps its old meaning per mode; which one
+    # it was taken as is logged once per process.
     _DEFAULT_PULSE_INTERVAL_MS = 400       # = CTClient.SHOT_PULSE_INTERVAL_MS
     _DEFAULT_TRIGGER_TIMEOUT_MS = 3000
     # The simulated trigger cannot space edges closer than this (the backend's
@@ -924,12 +926,14 @@ class _ScheduleMixin:
                                  "inter_pulse_ms -- not both"}
             if sim:
                 pulse_interval_ms = inter_pulse_ms
+                kind = "inter_pulse_ms:sim"
                 note = (f"inter_pulse_ms={int(inter_pulse_ms)} taken as pulse_interval_ms "
                         f"(trigger='sim': the spacing of the simulated triggers). Use "
                         f"pulse_interval_ms / trigger_timeout_ms -- the old name means "
                         f"something else with an external trigger")
             else:
                 trigger_timeout_ms = inter_pulse_ms
+                kind = "inter_pulse_ms:ext"
                 note = (f"inter_pulse_ms={int(inter_pulse_ms)} taken as trigger_timeout_ms "
                         f"(external trigger: the longest wait for the next trigger before "
                         f"the run faults -- NOT the spacing, which your trigger source sets). "
@@ -956,7 +960,9 @@ class _ScheduleMixin:
             return {"error": f"trigger_timeout_ms={timeout} must be longer than "
                              f"pulse_interval_ms={interval} (it is the longest wait for "
                              f"the NEXT trigger; equal values fault after one pulse)"}
-        return {"interval_ms": interval, "timeout_ms": timeout, "note": note}
+        if note:
+            self._log_note_once(kind, note)
+        return {"interval_ms": interval, "timeout_ms": timeout}
 
     def _interval_arg(self, new, old, default: int, old_name: str):
         """(spacing ms, error) for a function that took the spacing under an
@@ -967,11 +973,20 @@ class _ScheduleMixin:
         v = new if new is not None else old if old is not None else default
         return int(v), None
 
-    @staticmethod
-    def _with_note(r: dict, note) -> dict:
-        if note and isinstance(r, dict):
-            r["note"] = ((r["note"] + "; ") if r.get("note") else "") + note
-        return r
+    # The old-name note is logged ONCE per process and kind, not attached to
+    # every result: on every shot it buried the real error (2026-10-15, #78).
+    _NOTES_LOGGED: set = set()
+    _NOTES_LOCK = threading.Lock()
+
+    @classmethod
+    def _log_note_once(cls, kind: str, note) -> None:
+        if not note:
+            return
+        with cls._NOTES_LOCK:
+            if kind in cls._NOTES_LOGGED:
+                return
+            cls._NOTES_LOGGED.add(kind)
+        logging.getLogger("ct_gui").info(note)
 
     def _range_error(self, name: str, value: int, max_value: int) -> str | None:
         """None if `value` fits [0, max_value]; else a ready-to-return error string."""
@@ -1497,8 +1512,8 @@ class _ScheduleMixin:
                             external 3000. Must exceed pulse_interval_ms.
             inter_pulse_ms: OLD NAME, still accepted with its old meaning per
                             mode — sim: pulse_interval_ms; external:
-                            trigger_timeout_ms. The result carries a "note"
-                            saying which.
+                            trigger_timeout_ms. Which one is logged once
+                            per process (ct_gui log), not put in the result.
 
         Limits (refused with ok=False and the reason, never silently changed):
             num_pulses          1 .. 255                  (one byte on the wire)
@@ -1657,7 +1672,7 @@ class _ScheduleMixin:
         if timing.get("error"):
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "error": timing["error"]}
-        interval, tmo, note = timing["interval_ms"], timing["timeout_ms"], timing["note"]
+        interval, tmo = timing["interval_ms"], timing["timeout_ms"]
 
         # Both backgrounds need gap + window of quiet on each side of the pulse.
         # Fire tighter than that and one pulse's background is measured over its
@@ -1682,7 +1697,7 @@ class _ScheduleMixin:
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "error": "give active_ma OR active_mv, not both"}
         if active_mv is not None:
-            return self._with_note(self._fire_heated(
+            return self._fire_heated(
                 filament, None, idle_ma, float(voltage_settle_s),
                 dict(num_pulses=num_pulses, width_us=width_us,
                      pulse_interval_ms=interval, trigger_timeout_ms=tmo,
@@ -1691,9 +1706,9 @@ class _ScheduleMixin:
                      timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
                      measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
                      bg_window_us=bg_window_us, on_armed=on_armed),
-                active_mv=active_mv), note)
+                active_mv=active_mv)
         if active_ma is not None:
-            return self._with_note(self._fire_heated(
+            return self._fire_heated(
                 filament, active_ma, idle_ma, heat_timeout_s,
                 dict(num_pulses=num_pulses, width_us=width_us,
                      pulse_interval_ms=interval, trigger_timeout_ms=tmo,
@@ -1701,14 +1716,14 @@ class _ScheduleMixin:
                      total_ms=total_ms, controller=controller, trigger=trigger,
                      timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
                      measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
-                     bg_window_us=bg_window_us, on_armed=on_armed)), note)
-        return self._with_note(self._fire_single(
+                     bg_window_us=bg_window_us, on_armed=on_armed))
+        return self._fire_single(
             filament, num_pulses=num_pulses, width_us=width_us,
             pulse_interval_ms=interval, trigger_timeout_ms=tmo, max_on_ms=max_on_ms,
             total_ms=total_ms, controller=controller, trigger=trigger,
             timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse, measure=measure,
             rate_hz=rate_hz, bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
-            on_armed=on_armed), note)
+            on_armed=on_armed)
 
     # active_one(verify=True)'s default tolerance: "within this of the target".
     _HEAT_BAND_MA = 150.0
@@ -1866,7 +1881,8 @@ class _ScheduleMixin:
         # the pulses. If it can't arm we fire nothing: silently firing HV that
         # nobody is measuring is the opposite of what measure=True asked for.
         # See shot_measure_arm() for why it is the RELAY that is armed.
-        m = self.shot_measure_arm({"ok": True, "pulse_interval_ms": pulse_interval_ms,
+        m = self.shot_measure_arm({"ok": True, "filament": filament,
+                                   "pulse_interval_ms": pulse_interval_ms,
                                    "trigger_timeout_ms": int(trigger_timeout_ms),
                                    "num_pulses": int(num_pulses)},
                                   rate_hz, bg_gap_us=bg_gap_us,
@@ -2125,7 +2141,7 @@ class _ScheduleMixin:
                 "pulse_interval_ms": interval, "trigger_timeout_ms": int(tmo),
                 # Old key, old per-mode meaning, for code that reads it.
                 "inter_pulse_ms": int(interval if trigger == "sim" else tmo),
-                "trigger": trigger, "schedule": reuse_note, "note": timing["note"],
+                "trigger": trigger, "schedule": reuse_note,
                 "fired": 0, "records": [], "status": {}}
 
     def shot_arm(self, shot: dict) -> dict:
@@ -2338,16 +2354,18 @@ class _ScheduleMixin:
         # invisible: `flags` was a raw byte nobody decoded, so this condition
         # could occur and be reported as a perfectly successful shot. The
         # emission/focus rails themselves are a separate thing (hv_status).
-        stuck = [r for r in fired if r.get("hv_stuck_on")]
+        stuck = [(i, r) for i, r in enumerate(fired) if r.get("hv_stuck_on")]
         if stuck:
-            out["hv_stuck_on"] = sorted({r.get("filament") for r in stuck})
+            out["hv_stuck_on"] = sorted({r.get("filament") for _, r in stuck})
             out["ok"] = False
-            rb = ", ".join(f"filament {r.get('filament')}{self._mosfet_site(r.get('filament'))} "
-                           f"read back {self._hex8(r.get('read165'))} after the pulse"
-                           for r in stuck)
-            out["error"] = (f"MOSFET read-back mismatch (OFF): {rb} -- should be 0x00. "
-                            f"The grid MOSFET may still be closed: check before "
+            # Plain words first (what it means, what to do); the bytes go to
+            # "detail" -- end users could not read the hex (2026-10-15, #78).
+            out["error"] = (f"Filament {filament}{self._mosfet_site(filament)}: the MOSFET "
+                            f"may still be closed after pulse(s) "
+                            f"{self._pulse_list(i for i, _ in stuck)} -- check it before "
                             f"firing again.")
+            self._add_detail(out, "read-back after the pulse (should be 0x00): " + "; ".join(
+                f"pulse {i + 1}: {self._hex8(r.get('read165'))}" for i, r in stuck))
         # MOSFET READ-BACK MISMATCH, ON (flags bit 0x01): during the pulse
         # the 74HC165 read-back of the grid MOSFETs did not match the byte
         # commanded. Either the MOSFET did not close (no HV reached the
@@ -2372,11 +2390,12 @@ class _ScheduleMixin:
                     elif rd in ((cmd << 1) & 0xFF, cmd >> 1):
                         s += " (the neighbouring bit)"
                 return s
-            lst = "; ".join(f"pulse {i + 1}: {what(r)}" for i, r in no_on)
-            out["error"] = ((out["error"] + "; ") if out.get("error") else "") + (
-                f"MOSFET read-back wrong on {len(no_on)} of {len(fired)} pulse(s), "
-                f"filament {filament}{self._mosfet_site(filament)} -- {lst}. "
-                + self._ON_MISMATCH_UNMEASURED)
+            self._add_detail(out, "MOSFET read-back: " + "; ".join(
+                f"pulse {i + 1}: {what(r)}" for i, r in no_on))
+            out["error"] = ((out["error"] + " ") if out.get("error") else "") + (
+                f"Filament {filament}{self._mosfet_site(filament)}: the MOSFET was not "
+                f"confirmed closed on pulse(s) {self._pulse_list(i for i, _ in no_on)} "
+                f"of {len(fired)}. " + self._ON_MISMATCH_UNMEASURED)
         # Unverified (0x04) is NOT a failure: the pulse fired, the
         # firmware just has no read-back evidence about it. Reported so
         # a caller can tell "verified good" from "no evidence", which
@@ -2464,7 +2483,10 @@ class _ScheduleMixin:
         except BaseException:
             self.ready_disarm()
             raise
-        return {**shot, "measuring": True, "since": since, "rate_hz": rate_hz}
+        # The emission current limit, so shot_measured() can tell a pulse the
+        # SUPPLY clamped from real emission. None = unknown, check skipped.
+        return {**shot, "measuring": True, "since": since, "rate_hz": rate_hz,
+                "em_limit_ma": self.read_emission_i_limit()}
 
     def shot_measured(self, shot: dict, result: dict | None = None,
                       grace_s: float = 3.0, prefetched: tuple | None = None) -> dict:
@@ -2508,10 +2530,79 @@ class _ScheduleMixin:
                 out["ok"] = True
                 out["readback_unreliable"] = True
                 out["warning"] = out.pop("error")
+        # SUPPLY LIMIT. A pulse reading at the emission current limit is the
+        # supply clamping, not emission: 2026-10-15, filament 78 (P1 CH6.3)
+        # read ~38 mA against a 45 mA limit on 8 of 10 pulses at 2597 mA
+        # heating (hot breakdown), and the shot came back ok=True. Checked
+        # after the read-back verdict so it is never turned into a warning.
+        lim = shot.get("em_limit_ma")
+        hit = self._supply_limited(measured, lim)
+        if hit:
+            out["ok"] = False
+            out["supply_limited"] = [i for i, _ in hit]          # index into measured
+            out["supply_limit_ma"] = lim
+            msg = self._supply_limit_message(base, shot, measured, hit, lim)
+            if out.get("warning"):          # read-back verdict was the only problem
+                out["error"] = msg + " " + out.pop("warning")
+                out.pop("readback_unreliable", None)
+            else:
+                out["error"] = msg + ((" " + out["error"]) if out.get("error") else "")
         return out
 
-    _ON_MISMATCH_UNMEASURED = ("Not measured, so it is unknown whether the MOSFET did not "
-                               "close or only its read-back (74HC165) is wrong.")
+    #: A pulse whose net current is at least this fraction of the emission
+    #: current limit is taken as clamped by the supply.
+    SUPPLY_LIMIT_FRAC = 0.8
+
+    @classmethod
+    def _supply_limited(cls, measured: list, lim) -> list:
+        """[(event index, net mA)] of the pulses at the supply's current limit."""
+        if not isinstance(lim, (int, float)) or lim <= 0:
+            return []
+        out = []
+        for i, e in enumerate(measured or []):
+            net = e.get("plateau_net_ma")
+            if net is None:
+                net = e.get("emission_ma")
+            if isinstance(net, (int, float)) and net >= cls.SUPPLY_LIMIT_FRAC * lim:
+                out.append((i, float(net)))
+        return out
+
+    def _supply_limit_message(self, base: dict, shot: dict, measured: list,
+                              hit: list, lim: float) -> str:
+        f = shot.get("filament")
+        if f is None:
+            f = next((r.get("filament") for r in base.get("records") or []), None)
+        nets = [n for _, n in hit]
+        recs = base.get("records") or []
+        heat = []
+        if len(recs) == len(measured):      # paired 1:1 by order, else unknown
+            heat = [recs[i].get("heat_meas_mA") for i, _ in hit]
+            heat = [h for h in heat if isinstance(h, (int, float))]
+        mean_heat = sum(heat) / len(heat) if heat else None
+        head = (f"Filament {f}{self._mosfet_site(f)}: {len(hit)} of {len(measured)} pulses "
+                f"read about {sum(nets) / len(nets):.0f} mA = the emission supply's current "
+                f"limit ({lim:.0f} mA set), not emission -- ")
+        if mean_heat is not None and mean_heat >= self._HOT_HEAT_MA:
+            return head + (f"the filament is arcing or breaking down at this heating "
+                           f"current ({mean_heat:.0f} mA). Lower the heating current, "
+                           f"or check this filament.")
+        return head + ("a short or breakdown on this filament's path"
+                       + (f" (heating {mean_heat:.0f} mA)" if mean_heat is not None else "")
+                       + ". Check this filament.")
+
+    #: Heating current above which a clamped pulse is reported as hot breakdown.
+    _HOT_HEAT_MA = 500
+
+    _ON_MISMATCH_UNMEASURED = ("Not measured, so it is unknown whether those pulses fired.")
+
+    @staticmethod
+    def _pulse_list(idx) -> str:
+        """1-based pulse numbers from 0-based indices: "2", "3, 7"."""
+        return ", ".join(str(i + 1) for i in idx)
+
+    @staticmethod
+    def _add_detail(out: dict, text: str) -> None:
+        out["detail"] = ((out["detail"] + "; ") if out.get("detail") else "") + text
 
     @staticmethod
     def _on_mismatch_currents(base: dict, measured: list):
@@ -2533,19 +2624,17 @@ class _ScheduleMixin:
         cur = self._on_mismatch_currents(base, measured)
         if cur is None:
             return (f"The detector measured {len(measured)} of {base.get('fired')} pulses, so "
-                    f"the mismatched pulses cannot be matched to a current: it is unknown "
-                    f"whether the MOSFET closed.")
+                    f"it is unknown whether those pulses fired.")
         flowed = [(i, em) for i, em in cur if em is not None]
         dead = [i for i, em in cur if em is None]
         out = []
         if flowed:
-            out.append(f"Current FLOWED in pulse(s) {', '.join(str(i + 1) for i, _ in flowed)} "
-                       f"({', '.join(f'{em:.2f}' for _, em in flowed)} mA): the MOSFET did close "
-                       f"and the READ-BACK is wrong (the 74HC165 read-back or its cable) -- "
-                       f"those pulses are good data.")
+            out.append(f"Pulse(s) {self._pulse_list(i for i, _ in flowed)} fired normally "
+                       f"({', '.join(f'{em:.2f}' for _, em in flowed)} mA flowed) -- only the "
+                       f"MOSFET read-back is wrong (the 74HC165 or its cable); that data is good.")
         if dead:
-            out.append(f"No current in pulse(s) {', '.join(str(i + 1) for i in dead)}: the "
-                       f"MOSFET did NOT close -- those pulses never reached the filament.")
+            out.append(f"Pulse(s) {self._pulse_list(dead)} did not fire (no current: the "
+                       f"MOSFET did not close).")
         return " ".join(out)
 
     def shot_abort(self, shot: dict) -> None:

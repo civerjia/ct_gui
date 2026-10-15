@@ -370,6 +370,22 @@ class _HvMixin:
         """
         return self._post("/api/hv/set-i", {"ma": abs(ma)})
 
+    #: mA at wiper 127 on the "ei" DS3502 (= the backend's _EM_I_FULL_MA).
+    EM_I_FULL_MA = 85.7
+
+    def read_emission_i_limit(self) -> float | None:
+        """The emission current limit in force (mA), read back from the "ei"
+        DS3502 wiper -- what the supply clamps at, not a measurement. None if
+        it cannot be read."""
+        try:
+            r = self._get("/api/stm32/ds3502?ch=ei")
+        except Exception:
+            return None
+        w = r.get("wiper") if r.get("ok") else None
+        if not isinstance(w, (int, float)) or isinstance(w, bool) or not 0 <= w <= 127:
+            return None
+        return round(w / 127.0 * self.EM_I_FULL_MA, 1)
+
     # ── HV readback (ADS1115) ─────────────────────────────────────────────────
 
     def read_ads_all(self) -> dict:
