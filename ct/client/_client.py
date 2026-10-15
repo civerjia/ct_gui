@@ -1787,6 +1787,14 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         filament inside result loops, and the linear scan it replaces was
         O(len(order)) on every single lookup.
         """
+        # The order is loaded lazily -- by filament_order, which _fid_of goes
+        # through. Reading _order_rev directly skipped that: in a fresh client
+        # whose FIRST translation was inbound (the dead mask, before any
+        # _fid_of), the reverse map was still empty and every FID came back
+        # unchanged. 2026-10-15 mosfet_test then skipped the good filaments
+        # whose USER numbers equal a dead FID (#22, #62) and passed the dead
+        # #6 / #50 on to the backend, which refused them.
+        self.filament_order                  # load it if not yet
         if not self._order_rev:
             return int(fid)
         return self._order_rev.get(int(fid), int(fid))
