@@ -639,18 +639,22 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .api-lock { font-size: 10px; line-height: 1.45; margin: 0 0 5px; padding: 3px 6px;
             border-radius: 6px; background: var(--warn-soft); color: var(--warn); }
 /* card title bar: title · dot+M+P1 heartbeats · dot+M+P2 heartbeats · Scan */
-/* Wraps: the two controller chips + Scan are wider than the card below
-   ~1500 px, and nowrap pushed them past the card edge (page scrolled sideways). */
+/* Title + Scan on the first line; then P1 and P2 status, each on a full-width
+   row of its own. (They used to squeeze in next to the title and spill past
+   the card edge.) */
 .pc-head-bar { align-items: center; gap: 6px; flex-wrap: wrap; }
 .pc-head-bar h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pc-hbs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; margin-left: auto; flex: 1 1 auto; min-width: 0; }
-.pc-hb { display: inline-flex; align-items: center; gap: 3px;
+.pc-hbs { order: 2; flex: 1 0 100%; display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.pc-hb { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0;
          border: 1px solid var(--line); border-radius: 8px; padding: 2px 5px; background: #fbf9f4; }
 .pc-hb-lbl { font-size: 10px; font-weight: 800; color: var(--muted); }
 .pc-hb .dot { flex: 0 0 auto; }
 .pc-hb .master-badge { padding: 1px 5px; font-size: 9px; }
+/* Signal / latency never truncated: on a narrow card it wraps under the
+   heartbeats instead of being cut to "-53 dBm ...". */
+.pc-hb .link-chip { margin-left: auto; white-space: nowrap; }
 .pc-head-bar .hb { font-size: 9px; padding: 1px 4px; }
-.pc-head-bar #scanBtn { flex: 0 0 auto; padding: 5px 9px; font-size: 11px; }
+.pc-head-bar #scanBtn { order: 1; margin-left: auto; flex: 0 0 auto; padding: 5px 9px; font-size: 11px; }
 
 /* IP+Connect rows — dot and M badge removed, full width goes to the input */
 .pc-2up { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; margin-top: 6px; }
