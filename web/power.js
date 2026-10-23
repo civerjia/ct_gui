@@ -1856,30 +1856,46 @@ const SHV_CAP_COLS = [
 
 // ---- Emission & Schedule card: per-pulse + ShV -------------------------------
 const EMI_HTML = `
+  <div class="batch-box shot-panel">
+    <div class="block-title shot-panel-title">Single shot <span class="hint">— fire_single_pulse in the backend: heat → fire (simulated trigger) → measure → back to IDLE</span></div>
+    <div class="hint" style="margin:2px 0 6px">The same call a script makes. The filament must be at IDLE; it is heated only after the arm and dropped back to the IDLE current as soon as the pulses are done. Set the emission rail in High Voltage first — this panel does not touch HV.</div>
+    <div class="bm-set-row">
+      <label class="numlabel" title="Physical filament index (0-95), as on the CT Geometry ring.">filament <input id="shotFil" type="number" min="0" max="95" value="0" /></label>
+      <span id="shotSite" class="hint"></span>
+    </div>
+    <div class="bm-set-row">
+      <label class="numlabel" title="Current: ACTIVE at this current, closed loop -- must ARRIVE within the heat timeout or nothing is fired. Voltage: VOLTAGE mode at this output, no current loop; heated for the settle time, then fired. Heating is host software in both modes (the firmware schedule only fires and records).">heat
+        <select id="shotMode"><option value="ma">current mA</option><option value="mv">voltage mV</option></select></label>
+      <input id="shotHeat" type="number" min="0" max="11000" value="2700" style="width:72px" title="ACTIVE current, mA (current mode) or output voltage, mV (voltage mode, max 11000 = the rig's voltage cap)." />
+      <label class="numlabel" title="IDLE current to drop back to after the shot (default = the rig default from the backend).">idle mA <input id="shotIdle" type="number" min="0" max="4000" value="" /></label>
+    </div>
+    <div class="bm-set-row">
+      <label class="numlabel" title="Pulses to fire, 1-255.">pulses <input id="shotN" type="number" min="1" max="255" value="10" /></label>
+      <label class="numlabel" title="Pulse width, microseconds (1-65535, and within 40 ms).">width µs <input id="shotW" type="number" min="1" max="40000" value="1000" /></label>
+      <label class="numlabel" title="Spacing of the simulated triggers, ms (10 ms minimum).">every ms <input id="shotGap" type="number" min="10" max="60000" value="100" /></label>
+    </div>
+    <div class="bm-set-row">
+      <label class="numlabel" title="Current mode: how long the ACTIVE current may take to arrive (s). Voltage mode: how long to hold the voltage before firing (s).">heat / settle s <input id="shotHeatS" type="number" min="0.5" max="30" step="0.5" value="6" /></label>
+      <button id="shotFire" class="xs danger">Fire</button>
+    </div>
+    <div id="shotStatus" class="summary" style="white-space:pre-line">idle</div>
+    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th title="ms from the first trigger">t ms</th><th title="Heating current measured nearest this pulse's trigger">heat mA</th><th title="Commanded heating current (— in voltage mode: no current target)">target</th><th title="Measured heating voltage (INA219 bus)">heat mV</th><th title="Commanded output voltage">cmd mV</th><th title="When the heating reading was taken, ms relative to the trigger (− before, + after). 'cache' = not the pulse-watch read but the CC loop / guardian cache. Needs RP2350 fw with 24-byte pulse records.">read at</th><th title="Emission current: net of the background AND of the sub-board's diode path">emission mA</th><th title="plateau − background (diode path still in it)">net mA</th><th title="Emission charge, mA·ms">mA·ms</th><th>flags</th></tr></thead><tbody id="shotBody"></tbody></table></div>
+  </div>
+
   <div class="batch-box">
-    <div class="block-title">Per-pulse measurements <span class="hint">— STM32 1 MSPS · Stream arms the ADC; one event per detected pulse</span></div>
+    <div class="block-title">Per-pulse measurements <span class="hint">— STM32 pulse detector (master) · Stream arms it; one event per detected pulse, no raw waveform</span></div>
     <div class="row wrap">
       <button id="pulseStream" class="xs">Stream</button>
       <button id="pulseClear" class="xs">Clear</button>
       <span id="pulseSummary" class="hint">no events</span>
     </div>
     <div class="row compact"><input id="pulseSlider" type="range" min="0" max="0" value="0" title="Scroll through the pulse history (drag right = newest = auto-follow)" style="flex:1" /></div>
-    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th title="ABSOLUTE — the background is NOT removed, and this is a SINGLE sample, so it carries the full noise of one conversion. Not the pulse current.">peak mA</th><th title="ABSOLUTE — the background is NOT removed. Mean over the whole envelope, ramps included. The pulse's own current is the next column (plat − bg), not this one.">plat mA</th><th title="ABSOLUTE — the pre-pulse background level itself, ± its sigma. This is what gets subtracted.">bg±σ mA</th><th title="NET emission current = plat − bg, i.e. what THIS pulse added on top of the standing emission. This is the pulse current; the peak/plat columns are absolute levels that still contain the background.">net mA</th><th title="Samples that actually backed the background mean / the settle gap left before the rise, both in samples. n=0 means NO background was measured — that row's ∫ is not a charge. ? = this firmware does not report it.">bg n/gap</th><th title="Charge: integral converted with THIS pulse's own sample_rate_hz, not an assumed rate. — = the event carried no rate.">∫ mA·µs</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
+    <div class="pulse-wrap"><table class="pulse-table"><thead><tr><th>#</th><th>t µs</th><th>ON µs</th><th title="Emission current = plateau − background − the sub-board's diode-path current (converted by the library, pulse_events_ma). — when the rail could not be read or the path did not conduct.">emission mA</th><th title="plateau − background: what this pulse added. The diode path is still in it.">net mA</th><th title="The background level that was subtracted, ± its sigma (ABSOLUTE).">bg±σ mA</th><th title="Emission charge, mA·ms (background and diode path removed).">mA·ms</th><th title="Samples that backed the background mean / settle gap before the rise. n=0 = NO background: nothing net is shown.">bg n/gap</th><th>flags</th></tr></thead><tbody id="pulseBody"></tbody></table></div>
   </div>
 
-  <div class="batch-box">
-    <div class="block-title">Record measurement <span class="hint">— per-pulse → host .csv</span></div>
-    <div class="row wrap" title="Arms the STM32 detector (same as Stream above) and records every per-pulse measurement to a host .csv for the whole session.">
-      <label class="numlabel">kSPS <input id="recRate" type="number" min="1" max="1000" value="1000" /></label>
-      <button id="recStart" class="xs quick">● Record</button>
-      <button id="recStop" class="xs" disabled>Stop</button>
-    </div>
-    <div id="recStatus" class="summary">idle</div>
-    <div id="recFiles" class="summary"></div>
-  </div>
 
   <details class="batch-box" id="syncDetails">
-    <summary class="block-title">ESP32 Sync I/O <span class="hint">— trigger lines, used by Simple HV schedule below</span></summary>
+    <summary class="block-title">ESP32 Sync I/O <span class="hint">— trigger lines (the debug table below fires on SyncIn)</span></summary>
     <div id="syncLines" class="summary">lines: —</div>
     <div class="bm-set-row">
       <label class="numlabel">SyncOut edge <select id="syncOutEdge"><option value="rising">rising</option><option value="falling">falling</option></select></label>
@@ -1897,9 +1913,9 @@ const EMI_HTML = `
     <div id="syncStatus" class="summary"></div>
   </details>
 
-  <details class="batch-box" open>
-    <summary class="block-title">Simple HV schedule <span class="hint">— ShV 0x70–0x7B</span></summary>
-    <div class="hint" style="margin:2px 0 8px">Bench workflow for firing a schedule on THIS target controller only (independent of the main CT scan): <b>1</b> push the mapping so the board knows which power slot is which filament, <b>2</b> set timeouts, <b>3</b> build the table of what to fire, <b>4</b> Arm then trigger it (external SyncIn, or Simulate below). <b>5</b> is a separate bypass that fires HV immediately, for testing one switch — it does not use the table or need Arm.</div>
+  <details class="batch-box">
+    <summary class="block-title">Debug — manual schedule table <span class="hint">— raw ShV 0x70–0x7B, no heating, no measurement</span></summary>
+    <div class="hint" style="margin:2px 0 8px">Low-level: what Single shot above does for you, step by step and without heating or measuring. Fires on THIS target controller only (independent of the main CT scan): <b>1</b> push the mapping so the board knows which power slot is which filament, <b>2</b> set timeouts, <b>3</b> build the table of what to fire, <b>4</b> Arm then trigger it (external SyncIn, or Simulate below). <b>5</b> is a separate bypass that fires HV immediately, for testing one switch — it does not use the table or need Arm.</div>
 
     <div class="shv-group">
       <div class="shv-grouplabel">1. Active list <span class="hint">— mapping → power slots</span></div>
@@ -1912,7 +1928,7 @@ const EMI_HTML = `
     <div class="shv-group">
       <div class="shv-grouplabel">2. Config — timeouts</div>
       <div class="bm-set-row">
-        <label class="numlabel" title="Max gap between one pulse ending and the next SyncIn trigger before the schedule gives up (InterPulseTimeout).">inter ms <input id="shvInter" type="number" min="1" value="3000" /></label>
+        <label class="numlabel" title="Trigger timeout (firmware interPulseMs): the longest wait for the NEXT SyncIn trigger before the run faults (InterPulseTimeout). Not the pulse spacing -- the trigger source sets that. 1 .. 4294967295 ms.">trigger timeout ms <input id="shvInter" type="number" min="1" value="3000" /></label>
         <label class="numlabel" title="Longest a single pulse is allowed to stay on before the schedule force-stops it.">maxOn ms <input id="shvMaxOn" type="number" min="1" value="40" /></label>
       </div>
       <div class="bm-set-row">
@@ -1977,54 +1993,6 @@ const EMI_HTML = `
 
 let pulseList = [], pulseSince = 0, pulseTimer = null, pulseArmed = false;
 
-// Emission current from a raw ADC count — tests.js's peakToMa() is THE
-// conversion; this is just the name used throughout this file's pulse
-// table rendering below (not an independent formula — see peakToMa's own
-// comment in tests.js for the R_sense/gain constants and where liveRefV
-// comes from). Was an independent duplicate here that drifted out of
-// sync with peakToMa's own R_sense correction — don't reintroduce that;
-// change constants in tests.js only.
-const emissionMa = peakToMa;
-// mA per ADC count (slope only) — use for deviations (σ) and bg-relative sums
-// (integral) where the constant offset cancels.
-const EMI_MA_PER_COUNT = peakToMa(1) - peakToMa(0);
-// ---- measurement recorder: per-pulse → host .csv -----------------------------
-let recTimer = null;
-async function recPoll() {
-  let j; try { j = await (await fetch('/api/record/status')).json(); } catch { return; }
-  if (!j.ok || !j.recording) { if (!j.recording) $p('recStatus').textContent = 'idle'; return; }
-  // no_background = pulses recorded with background_n 0, whose `integral` is
-  // the raw in-envelope sum with nothing subtracted. Surfaced live so a run
-  // that is filling the .csv with uncharges is caught while it is still worth
-  // stopping, not when someone opens the file.
-  $p('recStatus').textContent = `● REC ${j.duration_s || 0}s · pulses ${j.pulse_events}`
-    + (j.no_background ? ` · ⚠ ${j.no_background} with NO background` : '');
-}
-function wireRecord() {
-  $p('recStart').onclick = async () => {
-    const rate = Math.max(1, +$p('recRate').value || 1000) * 1000;
-    $p('recStatus').textContent = 'starting…';
-    const j = await postJ('/api/record/start', { controller: pwTarget, rate });
-    if (!j.ok) { $p('recStatus').textContent = `start failed — ${j.error || ''}`; return; }
-    $p('recStart').disabled = true; $p('recStop').disabled = false; $p('recStart').classList.add('danger');
-    // detector_arm (backend.py) shares the STM32 detector arm with Stream
-    // above -- if Stream is already running, this joins it (Stream's rate
-    // wins; a mismatched recRate here is silently not applied).
-    $p('recFiles').textContent = `recording → ${j.pulse_file}` + (j.shared ? ` (sharing detector with: ${(j.other_users || []).join(', ')})` : '');
-    clearInterval(recTimer); recTimer = setInterval(recPoll, 1000); recPoll();
-  };
-  $p('recStop').onclick = async () => {
-    const j = await postJ('/api/record/stop', { controller: pwTarget });
-    clearInterval(recTimer); recTimer = null;
-    $p('recStart').disabled = false; $p('recStop').disabled = true; $p('recStart').classList.remove('danger');
-    if (j.ok) {
-      $p('recStatus').textContent = `saved · ${j.pulse_events || 0} pulses`
-        + (j.no_background ? ` · ⚠ ${j.no_background} of them had NO background (their ∫ is not a charge)` : '')
-        + (j.still_armed_for && j.still_armed_for.length ? ` (detector still armed for: ${j.still_armed_for.join(', ')})` : '');
-      $p('recFiles').innerHTML = j.pulse_file ? `<a href="/api/record/download?file=${j.pulse_file}" download>${j.pulse_file}</a>` : '';
-    } else { $p('recStatus').textContent = j.error || 'stop failed'; }
-  };
-}
 const PULSE_WIN = 50;        // rows shown at once
 let pulseFollow = true;      // auto-track the newest pulses (slider pinned right)
 // Background measurement, in SAMPLES. ONE symmetric pair applied to BOTH sides
@@ -2055,58 +2023,30 @@ function renderPulses() {
   }
   const off = sl ? Math.min(+sl.value, maxOff) : maxOff;
   const rows = pulseList.slice(off, off + PULSE_WIN);
-  // ADC-count fields → emission mA. peak/plateau/bg are absolute (emissionMa);
-  // σ (bg_sigma4/4) and integral (Σ of sample−bg) are bg-relative → slope only.
+  // Converted by the LIBRARY (GET /api/pulse-events-ma → pulse_events_ma):
+  // emission_ma = plateau − bg − the sub-board's diode path; plateau_net_ma =
+  // plateau − bg; emission_mams = the charge. A field the library could not
+  // produce is ABSENT and shows "—" -- never a number computed here. (This
+  // table used to convert raw ADC counts itself, a second copy of the formula
+  // without the diode path.)
+  //   background_n 0 → NO background: nothing net exists, the row is red.
+  //   background_n short of the default → thinner background, amber.
+  const f = (v, d = 2) => (v == null ? '—' : Number(v).toFixed(d));
   body.innerHTML = rows.map((p) => {
-    // background_n = samples that actually backed the mean; background_gap =
-    // the settle gap actually left before the rise. Three cases, all different:
-    //   0     → there was NO background. bg and bg_sigma4 are 0 because nothing
-    //           was averaged, not because the input was quiet, and `integral`
-    //           degenerates to the raw in-envelope sum with NOTHING subtracted
-    //           — a large, entirely plausible number that is not a charge. Show
-    //           both as absent. Printing "0.00±0.00" here made a missing
-    //           background indistinguishable from a genuine quiet baseline.
-    //   null  → firmware that does not report it. Unknown, not zero: bg/∫ are
-    //           printed as they come (they are the best that firmware offers)
-    //           and the count reads "?" rather than a number.
-    //   short → the mean is real but thinner than the request (short history:
-    //           fresh reset, rate change, ADC restart), or the pre-gap did not
-    //           fully take. Flagged, not hidden — a biased bg still integrates.
     const bn = p.background_n, bgap = p.background_gap;
     const noBg = bn === 0;
     const partial = bn > 0 && (bn < PULSE_BG_WINDOW || (bgap != null && bgap < PULSE_BG_GAP));
     const rowStyle = noBg ? ' style="color:var(--danger)"' : partial ? ' style="color:var(--warn)"' : '';
-    const bgCell = noBg
-      ? '<td title="NO background was measured (background_n 0). bg and σ read 0 because nothing was averaged — not because the input was quiet.">—</td>'
-      : `<td>${emissionMa(p.bg).toFixed(2)}±${((p.bg_sigma4 / 4) * EMI_MA_PER_COUNT).toFixed(2)}</td>`;
-    // NET = plat − bg: the current THIS pulse added, which is the number a
-    // reader actually wants. peak/plat are absolute levels — on a filament
-    // already emitting, most of them can be standing DC (bench: bg 5.8 mA,
-    // plat 15.9 mA, so the pulse was 10.1 mA, not 15.9). Both counts are
-    // needed; with no background there is nothing to subtract and the cell
-    // stays absent rather than showing the absolute level unmarked.
-    const netCell = (noBg || p.plateau == null || p.bg == null)
-      ? '<td title="No background to subtract — the absolute plat column is NOT the pulse current.">—</td>'
-      : `<td>${((p.plateau - p.bg) * EMI_MA_PER_COUNT).toFixed(2)}</td>`;
-    const bgnCell = bn == null
-      ? '<td title="This firmware does not report background_n/background_gap (fw_build &lt; 0x00030000) — unknown, not zero.">?</td>'
-      : `<td title="${noBg ? 'no background: 0 samples averaged' : bn + ' samples averaged after a ' + (bgap == null ? '?' : bgap) + '-sample settle gap'
-        + (partial ? ' — short of the ' + PULSE_BG_WINDOW + '/' + PULSE_BG_GAP + '-sample default, so the subtracted background is thinner (or less settled) than usual' : '')}">${bn}/${bgap == null ? '?' : bgap}</td>`;
-    const intCell = noBg
-      ? '<td title="Charge refused: with no background, ∫ is Σx over the envelope with nothing subtracted. That is not a charge.">—</td>'
-      // integral is count*SAMPLES, so converting it to a TIME needs the rate
-      // this pulse was actually sampled at -- which every event carries. It
-      // used to be printed as mA*us on the assumption of 1 MSPS: true for the
-      // arms this GUI issues today, and silently 2x wrong the moment anything
-      // arms at 500 kHz. Absent rate => no conversion exists, so show the
-      // absence rather than a number that is right only by luck.
-      : (p.rate_hz
-          ? `<td>${(p.integral * EMI_MA_PER_COUNT * 1e6 / p.rate_hz).toFixed(1)}</td>`
-          : `<td title="no sample rate reported — cannot convert samples to time">—</td>`);
+    const flags = [];
+    if (p.empty_envelope) flags.push('<span title="Zero-length envelope: a PA4 glitch, not a pulse">empty</span>');
+    if (p.path_conducted === false) flags.push('<span title="Net current under half the diode path: the switch did not close (or the path is open)">no current</span>');
+    if (noBg) flags.push('<span title="NO background was measured (background_n 0): no net current, no charge">no bg</span>');
+    const bg = p.bg_ma == null ? '—' : `${f(p.bg_ma)}${p.bg_sigma_ma != null ? '±' + f(p.bg_sigma_ma) : ''}`;
     return `<tr${rowStyle}><td>${p.id}</td><td>${p.t_us}</td><td>${p.on_us}</td>`
-      + `<td>${emissionMa(p.peak).toFixed(2)}</td>`
-      + `<td>${p.plateau ? emissionMa(p.plateau).toFixed(2) : '—'}</td>`
-      + bgCell + netCell + bgnCell + intCell + '</tr>';
+      + `<td>${f(p.emission_ma)}</td><td>${f(p.plateau_net_ma)}</td><td>${bg}</td>`
+      + `<td>${f(p.emission_mams)}</td>`
+      + `<td>${bn == null ? '?' : bn}/${bgap == null ? '?' : bgap}</td>`
+      + `<td>${flags.join(' ') || '—'}</td></tr>`;
   }).join('');
   const span = rows.length ? `${off + 1}–${off + rows.length}` : '0';
   // Count over the WHOLE history, not the visible window: a run whose charges
@@ -2121,7 +2061,7 @@ function renderPulses() {
 }
 async function pulseTick() {
   if (!masterConnected()) { $p('pulseSummary').textContent = `master (Power ${masterId()}) not connected`; return; }
-  let j; try { j = await (await fetch(`/api/pulse-events?controller=${masterId()}&since=${pulseSince}`)).json(); } catch { return; }
+  let j; try { j = await (await fetch(`/api/pulse-events-ma?since=${pulseSince}`)).json(); } catch { return; }
   if (j && j.ok === false) { $p('pulseSummary').textContent = `pulse read failed — ${j.error || j.message || ''}`; return; }
   if (j.ok) {
     // Top-level (not per event). Absent → null, i.e. "this firmware doesn't
@@ -2166,13 +2106,22 @@ function shvShow(j, label) {
   } else if (j && j.reject != null) {                          // arm
     t = `${j.ok ? '✓ armed' : '✗ arm rejected'} — ${nm(SHV_REJECT, j.reject)}${j.reject === 0 ? ' (armed, waiting for trigger)' : ''}`;
   } else if (j && j.records) {                                 // pulse log
-    t = `${j.records.length}/${j.total} records\n` + j.records.map((r) => `  fil ${r.filament} seq ${r.seq} t ${r.tOnUs}µs dur ${r.durationUs}µs${r.flags ? ' flags 0x' + r.flags.toString(16) : ''}`).join('\n');
+    // One line per pulse with the heating reading the firmware paired with it
+    // (24-byte records also say when it was read, and whether from the pulse
+    // watch or the cache). n/a(reason) = no reading, never a number.
+    const v = (x, why) => (x == null ? `n/a(${why || '?'})` : x);
+    t = `${j.records.length}/${j.total} records (${j.record_bytes || '?'}-byte)\n` + j.records.map((r) => {
+      const fl = [r.on_mismatch && 'ON-MISMATCH', r.hv_stuck_on && 'STUCK-ON', r.unverified && 'unverified'].filter(Boolean).join(' ');
+      const at = r.heat_meas_dt_ms == null ? '' : ` @${r.heat_meas_dt_ms >= 0 ? '+' : ''}${r.heat_meas_dt_ms}ms${r.trigger_time_approx ? '~' : ''}${r.heat_from_cache ? ' cache' : ''}`;
+      return `  fil ${r.filament} #${r.seq} t ${(r.tOnUs / 1000).toFixed(1)}ms ${r.durationUs}µs · heat ${v(r.heat_meas_mA, r.heat_meas_unavailable)}/${v(r.heat_target_mA, r.heat_target_unavailable)} mA`
+        + ` ${v(r.heat_bus_mV, r.heat_bus_unavailable)}/${v(r.heat_cmd_mV, r.heat_cmd_unavailable)} mV${at}${fl ? ' · ' + fl : ''}`;
+    }).join('\n');
   } else if (j && j.entryCount != null) {                      // table info
     t = `✓ table: ${j.entryCount} entries · crc 0x${(j.crc >>> 0).toString(16).toUpperCase()}`;
   } else if (j && j.heatCount != null) {                       // heat-table info
     t = `✓ heat entries ${j.heatCount}/${j.maxHeatEntries}`;
   } else if (j && j.interPulseMs != null) {                    // get config
-    t = `inter ${j.interPulseMs} ms · maxOn ${j.maxOnMs} ms · total ${j.totalMs} ms · edge ${j.triggerEdge ? 'falling' : 'rising'}`;
+    t = `trigger timeout ${j.interPulseMs} ms · maxOn ${j.maxOnMs} ms · total ${j.totalMs} ms · edge ${j.triggerEdge ? 'falling' : 'rising'}`;
   } else if (j && j.delayUs != null) {                         // trigger delay get/set
     t = `trigger delay ${j.delayUs} µs` + (j.applies ? '' : ' — ⚠ NOT honoured by the current firing mode (e.g. bit-bang fallback)');
   } else if (j && j.mapped != null) {                          // active-list read
@@ -2190,6 +2139,70 @@ function shvShow(j, label) {
 async function shvDo(label, op, extra) { shvMsg(label + '…'); shvShow(await shv(op, extra), label); }
 function parseShvEntries() { return rowTableValues('shvEntries', SHV_ENTRY_COLS); }
 
+// ---- Single shot panel: POST /api/shot runs ct.fire_single_pulse() ------------
+let shotTimer = null;
+function shotSite() {
+  const fid = +$p('shotFil').value, b = filamentToBoard && filamentToBoard(fid);
+  $p('shotSite').textContent = b ? `P${b.controller} CH${b.channel + 1}.${(b.mux ?? b.mux_port ?? 0) + 1}` : '(no board mapped)';
+}
+function renderShot(r) {
+  const body = $p('shotBody'); if (!body) return;
+  const recs = (r && r.records) || [], meas = (r && r.measured) || [];
+  const paired = meas.length === recs.length;
+  const f = (x, d = 0) => (x == null ? '—' : Number(x).toFixed(d));
+  const na = (x, why, d = 0) => (x == null ? `<span title="${why || 'no reading'}">—</span>` : Number(x).toFixed(d));
+  body.innerHTML = recs.map((rec, i) => {
+    const e = paired ? (meas[i] || {}) : {};
+    const fl = [rec.on_mismatch && 'ON-MISMATCH', rec.hv_stuck_on && 'STUCK-ON', rec.unverified && 'unverified',
+      e.path_conducted === false && 'no current'].filter(Boolean).join(' ');
+    const at = rec.heat_meas_dt_ms == null ? '—'
+      : `${rec.heat_meas_dt_ms >= 0 ? '+' : ''}${rec.heat_meas_dt_ms.toFixed(1)}${rec.trigger_time_approx ? '~' : ''}${rec.heat_from_cache ? ' cache' : ''}`;
+    return `<tr${fl ? ' style="color:var(--danger)"' : ''}><td>${i + 1}</td><td>${f(rec.tOnUs / 1000, 1)}</td>`
+      + `<td>${na(rec.heat_meas_mA, rec.heat_meas_unavailable)}</td><td>${na(rec.heat_target_mA, rec.heat_target_unavailable)}</td>`
+      + `<td>${na(rec.heat_bus_mV, rec.heat_bus_unavailable)}</td><td>${na(rec.heat_cmd_mV, rec.heat_cmd_unavailable)}</td>`
+      + `<td>${at}</td><td>${paired ? f(e.emission_ma, 2) : '—'}</td><td>${paired ? f(e.plateau_net_ma, 2) : '—'}</td>`
+      + `<td>${paired ? f(e.emission_mams, 2) : '—'}</td><td>${fl || '—'}</td></tr>`;
+  }).join('');
+}
+function shotSummary(j) {
+  if (j.running) return `running — filament ${j.params && j.params.filament}…`;
+  if (j.error) return `✗ ${j.error}`;
+  const r = j.result; if (!r) return 'idle';
+  const p = j.params || {};
+  const heat = (r.heating || {}).active || {};
+  const h = heat.heating || {};
+  const how = p.active_mv != null
+    ? `voltage ${p.active_mv} mV → ${h.measured_ma != null ? h.measured_ma + ' mA' : 'current unread'}`
+    : `ACTIVE ${p.active_ma} mA → ${h.measured_ma != null ? h.measured_ma + ' mA' : '?'}${h.elapsed_s != null ? ' in ' + Number(h.elapsed_s).toFixed(1) + ' s' : ''}`;
+  const head = `${r.ok ? '✓' : '✗'} filament ${p.filament} (user #${r.user_filament}) · fired ${r.fired ?? 0}/${p.num_pulses} · measured ${(r.measured || []).length} · ${how}`;
+  const msg = r.error || r.warning;
+  return head + (msg ? `\n${r.ok ? '⚠ ' : ''}${msg}` : '') + (r.detail ? `\ndetail: ${r.detail}` : '');
+}
+function wireShot() {
+  $p('shotFil').addEventListener('input', shotSite); shotSite();
+  fetch('/api/defaults').then((r) => r.json()).then((d) => { if (d && d.idle_ma != null && !$p('shotIdle').value) $p('shotIdle').value = d.idle_ma; }).catch(() => {});
+  $p('shotFire').onclick = async () => {
+    const fid = +$p('shotFil').value, mode = $p('shotMode').value, heat = +$p('shotHeat').value;
+    const idle = $p('shotIdle').value === '' ? null : +$p('shotIdle').value;
+    const body = { filament: fid, num_pulses: +$p('shotN').value, width_us: +$p('shotW').value,
+      pulse_interval_ms: +$p('shotGap').value, idle_ma: idle };
+    const hs = +$p('shotHeatS').value;
+    if (mode === 'mv') { body.active_mv = heat; body.voltage_settle_s = hs; } else { body.active_ma = heat; body.heat_timeout_s = hs; }
+    if (idle == null) { $p('shotStatus').textContent = '✗ set the IDLE current to drop back to'; return; }
+    if (!confirm(`Heat filament ${fid} (${$p('shotSite').textContent}) to ${mode === 'mv' ? 'VOLTAGE ' + heat + ' mV' : 'ACTIVE ' + heat + ' mA'}, `
+      + `fire ${body.num_pulses} × ${body.width_us} µs every ${body.pulse_interval_ms} ms, then back to IDLE ${idle} mA. Continue?`)) return;
+    const j = await postJ('/api/shot', body);
+    if (!j.ok) { $p('shotStatus').textContent = `✗ ${j.error || 'not started'}`; return; }
+    $p('shotFire').disabled = true; $p('shotBody').innerHTML = '';
+    clearInterval(shotTimer);
+    shotTimer = setInterval(async () => {
+      let st; try { st = await (await fetch('/api/shot')).json(); } catch { return; }
+      $p('shotStatus').textContent = shotSummary(st);
+      if (!st.running) { clearInterval(shotTimer); shotTimer = null; $p('shotFire').disabled = false; renderShot(st.result); }
+    }, 700);
+  };
+}
+
 function wireEmission() {
   $p('emissionCard').innerHTML = EMI_HTML;
   clampNumberInputs($p('emissionCard'));
@@ -2197,8 +2210,8 @@ function wireEmission() {
     if (pulseTimer) {
       clearInterval(pulseTimer); pulseTimer = null; $p('pulseStream').classList.remove('danger');
       if (pulseArmed) {
-        // detector_arm/disarm (backend.py) is reference-counted between this
-        // and Record measurement -- if Record is still using it, this just
+        // detector_arm/disarm (backend) is reference-counted between its users
+        // -- if another (e.g. a running shot) still holds it, this just
         // releases Stream's claim without actually disarming the STM32.
         const j = await postJ('/api/adc/pulse-disarm', { controller: pwTarget });
         pulseArmed = false;
@@ -2234,7 +2247,7 @@ function wireEmission() {
     pulseFollow = (+sl.value >= +sl.max);   // dragged to the far right ⇒ resume live-follow
     renderPulses();
   });
-  wireRecord();
+  wireShot();
   $p('shvPushList').onclick = () => shvDo('mapping pushed', 'push_active_list');
   $p('shvGetList').onclick = () => shvDo('read active list', 'get_active_list');
   $p('shvSetCfg').onclick = () => shvDo('config set', 'set_config', {

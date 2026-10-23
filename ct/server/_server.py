@@ -2582,6 +2582,93 @@ def emission_cal_status() -> dict:
         return {"ok": True, **copy.deepcopy({k: v for k, v in _EMISSION_CAL.items()})}
 
 
+# ---- GUI single shot: ct.fire_single_pulse() run by the backend ----------------
+# The Emission & Schedule card's shot panel. The GUI names the filament by its
+# PHYSICAL index (FID, as everywhere in the GUI); the library takes the user
+# order in force, so it is translated here. Heated (active_ma or active_mv),
+# measured, simulated trigger -- the same call a script makes, so the GUI shows
+# exactly what fire_single_pulse returns. Under the lease, like the other
+# backend-run jobs: refused while another client holds it.
+GUI_SHOT_CLIENT = "gui-single-shot"
+_SHOT_LOCK = threading.Lock()
+_SHOT: dict = {"running": False, "params": None, "result": None, "error": None,
+               "started": None, "finished": None}
+_SHOT_KEYS = ("num_pulses", "width_us", "pulse_interval_ms", "active_ma", "active_mv",
+              "idle_ma", "heat_timeout_s", "voltage_settle_s")
+
+
+def shot_start(body: dict) -> dict:
+    try:
+        fid = int(body["filament"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "filament (physical index 0-95) is required"}
+    kw = {k: body[k] for k in _SHOT_KEYS if body.get(k) is not None}
+    if (kw.get("active_ma") is None) == (kw.get("active_mv") is None):
+        return {"ok": False, "error": "give a heating current (active_ma) OR a voltage (active_mv)"}
+    running, _why = _safety_schedule_running()
+    if running:
+        return {"ok": False, "error": "a schedule is armed or running -- disarm it first"}
+    with _SHOT_LOCK:
+        if _SHOT["running"]:
+            return {"ok": False, "error": "a shot is already running"}
+        _SHOT.update(running=True, params={"filament": fid, **kw}, result=None, error=None,
+                     started=time.strftime("%Y-%m-%d %H:%M:%S"), finished=None)
+
+    def _run():
+        from ct.client._client import CTClient
+        result, err = None, None
+        try:
+            port = int(os.environ.get("CT_GUI_PORT", "8770"))
+            ct = CTClient("127.0.0.1", port=port, client_id=GUI_SHOT_CLIENT, _local=True)
+            user = ct._user_index_of(fid)
+            with ct.lease(ttl=60, note=f"GUI single shot, filament {fid}"):
+                r = ct.fire_single_pulse(user, trigger="sim", measure=True, **kw)
+            # JSON-clean copy (Result is a dict subclass; numbers / None only).
+            result = json.loads(json.dumps(dict(r), default=str))
+            result["user_filament"] = user
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            log.warning("GUI single shot on filament %s failed: %s", fid, err)
+        with _SHOT_LOCK:
+            _SHOT.update(running=False, result=result, error=err,
+                         finished=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    threading.Thread(target=_run, daemon=True, name="gui-shot").start()
+    return {"ok": True, "started": True}
+
+
+def shot_status() -> dict:
+    with _SHOT_LOCK:
+        return {"ok": True, **copy.deepcopy(_SHOT)}
+
+
+# Per-pulse events WITH the library's conversion (pulse_events_ma): emission
+# mA with the diode path removed, net current, charge, path_conducted, empty
+# envelopes. The GUI used to convert raw ADC counts itself, in a second copy of
+# the formula, without the diode path. Only converted when there ARE events:
+# the conversion reads the ADS1115 reference and the emission rail.
+_PULSE_MA_CT = None
+_PULSE_MA_LOCK = threading.Lock()
+
+
+def pulse_events_ma_get(since: int) -> dict:
+    global _PULSE_MA_CT
+    from ct.client._client import CTClient
+    with _PULSE_MA_LOCK:
+        if _PULSE_MA_CT is None:
+            port = int(os.environ.get("CT_GUI_PORT", "8770"))
+            _PULSE_MA_CT = CTClient("127.0.0.1", port=port, client_id="gui-pulse-ma",
+                                    _local=True, keepalive=False)
+        ct = _PULSE_MA_CT
+    try:
+        raw = ct.pulse_events(since)
+        if not raw.get("ok") or not raw.get("events"):
+            return json.loads(json.dumps(dict(raw), default=str))
+        return json.loads(json.dumps(dict(ct.pulse_events_ma(since)), default=str))
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def hv_preflight_switches(reason: str) -> dict:
     """Before a rail goes ON: every grid switch on every connected controller
     must READ open (real 165 read + the firmware's desired byte). Any that is
@@ -3419,6 +3506,13 @@ class CtHandler(BaseHTTPRequestHandler):
                                 "last_us": int(hdr.get("x-ring-last-us", 0) or 0),
                                 "total": int(hdr.get("x-ring-total", 0) or 0),
                                 "gaps": int(hdr.get("x-ring-gaps", 0) or 0)})
+        elif path == "/api/pulse-events-ma":
+            # /api/pulse-events converted by the library (pulse_events_ma):
+            # emission_ma (diode path removed), plateau_net_ma, bg_ma,
+            # emission_mams, path_conducted, empty_envelope. ?since= cursor.
+            self._json(pulse_events_ma_get(int(self._query().get("since", "0"))))
+        elif path == "/api/shot":
+            self._json(shot_status())
         elif path == "/api/pulse-events":
             # Poll new STM32-detected pulse events (from whichever capture last
             # armed the pulse_detector — a ring, pulse-arm, or spi-shot) with
@@ -4265,6 +4359,12 @@ class CtHandler(BaseHTTPRequestHandler):
                         _HEAT_SHORT["abort"] = True
                     return self._json({"ok": True, "running": running})
                 self._json(heat_short_start(body))
+            elif path == "/api/shot":
+                # GUI single shot: body {filament (physical), active_ma | active_mv,
+                # idle_ma?, num_pulses?, width_us?, pulse_interval_ms?,
+                # heat_timeout_s?, voltage_settle_s?}. Runs fire_single_pulse in
+                # the backend; GET /api/shot for the result.
+                self._json(shot_start(body))
             elif path == "/api/tests/emission-cal":
                 # Emission calibration: body {action: "start", filaments? |
                 # first?/last?, start_ma?, end_ma?, pulses?, pulse_gap_ms?,
