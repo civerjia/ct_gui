@@ -293,6 +293,8 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .geo-power .pw-item.act b { color: #ff7a7a; }
 .geo-power .pw-item.idle { border-color: rgba(63,182,160,0.4); }
 .geo-power .pw-item.idle b { color: #3fb6a0; }
+.geo-power .pw-item.standby { border-color: rgba(199,154,58,0.45); }
+.geo-power .pw-item.standby b { color: #c79a3a; }
 .pw-config { gap: 12px; margin: 6px 2px 0; align-items: center; }
 .pw-config .numlabel input { width: 52px; }
 

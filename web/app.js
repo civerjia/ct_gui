@@ -200,6 +200,10 @@ function ingestTelemetry(rows) {
     if (r.state != null) f.state = r.state;
     if (r.bus_mV != null) f.voltage_mV = r.bus_mV;
     if (r.current_mA != null) f.current_mA = r.current_mA;
+    // Live power counts only boards with BOTH numbers in THIS poll: the last
+    // known values are kept for the drawing, but a board that stopped reporting
+    // must not add an old (or Plan-estimated) V*I to the total.
+    f.vi_live = r.bus_mV != null && r.current_mA != null;
     if (r.lost !== undefined) f.lost = !!r.lost;
   }
   sync();
@@ -621,28 +625,37 @@ function sync() {
   else { pb.textContent = `ring ${pct}%`; pb.className = 'badge heartbeat-idle'; }
 }
 
-// total heating power, split by ACTIVE vs IDLE.
+// total heating power, split by state.
 //  · Plan  — ESTIMATE: per-filament configured power (powerEst.idleW/activeW)
-//            × the number of filaments in each state.
-//  · Live  — MEASURED: real P = V·I (voltage_mV × current_mA / 1e6), present only.
+//            × the number of filaments in each state (no STANDBY estimate).
+//  · Live  — MEASURED: real P = V·I (voltage_mV × current_mA / 1e6) for every
+//            board whose output is on -- STANDBY (0.8 V, ~0.6 A each) and
+//            VOLTAGE (counted with ACTIVE: it is shot heating) included. Only
+//            ACTIVE/IDLE were summed before, so a rig at STANDBY read 0 W
+//            (90 boards ≈ 49 W measured, 2026-10-23).
 function renderPower() {
-  let active = 0, idle = 0, p1 = 0, p2 = 0;
+  let active = 0, idle = 0, standby = 0, p1 = 0, p2 = 0;
   const live = viewMode === 'live';
   const getCtrl = ctState.filamentController;   // filament idx -> 0 (P1) / 1 (P2) / other
   for (let i = 0; i < filaments.length; i++) {
     const f = filaments[i];
     if (!f || f.dead) continue;
+    const vi = live ? (f.vi_live ? (f.voltage_mV * f.current_mA) / 1e6 : 0) : null;
     let w = 0;
-    if (f.state === STATE.ACTIVE) { w = live ? (f.voltage_mV * f.current_mA) / 1e6 : powerEst.activeW; active += w; }
-    else if (f.state === STATE.IDLE) { w = live ? (f.voltage_mV * f.current_mA) / 1e6 : powerEst.idleW; idle += w; }
+    if (f.state === STATE.ACTIVE || f.state === STATE.VOLTAGE) {
+      w = live ? vi : (f.state === STATE.ACTIVE ? powerEst.activeW : 0); active += w;
+    }
+    else if (f.state === STATE.IDLE) { w = live ? vi : powerEst.idleW; idle += w; }
+    else if (f.state === STATE.STANDBY) { w = live ? vi : 0; standby += w; }
     else continue;
     const c = getCtrl ? getCtrl(i) : -1;   // split heating power by the controller that drives it
     if (c === 0) p1 += w; else if (c === 1) p2 += w;
   }
   const fmt = (w) => (w >= 1000 ? (w / 1000).toFixed(2) + ' kW' : w.toFixed(1) + ' W');
-  $('pwTotal').textContent = fmt(active + idle);
+  $('pwTotal').textContent = fmt(active + idle + standby);
   $('pwActive').textContent = fmt(active);
   $('pwIdle').textContent = fmt(idle);
+  if ($('pwStandby')) $('pwStandby').textContent = fmt(standby);
   if ($('pwP1')) $('pwP1').textContent = fmt(p1);
   if ($('pwP2')) $('pwP2').textContent = fmt(p2);
 }
