@@ -14,6 +14,7 @@ _base.__all__) or, for CTClient itself, is bound in by _client.py.
 from ._base import *  # noqa: F401,F403
 import logging
 import threading
+import warnings
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:   # editors only: at run time _client.py binds CTClient into this module
@@ -1337,9 +1338,9 @@ class _ScheduleMixin:
         active_mv: float | None = None,  # INSTEAD of active_ma: heat at this
                                           # VOLTAGE (no CC loop) -- see
                                           # "active_mv" in the docstring
-        voltage_settle_s: float | None = None,  # OLD active_mv wait; now the
-                                          # arrival timeout if given (use
-                                          # heat_timeout_s)
+        voltage_settle_s: float | None = None,  # REMOVED: ignored with a
+                                          # warning -- active_mv waits for
+                                          # arrival, up to heat_timeout_s
         timeout_s: float | None = None,  # old name of shot_wait_timeout_s, still accepted
         pulse_interval_ms: int | None = None,   # spacing between pulses (ms):
                                                  # what trigger="sim" fires.
@@ -1702,9 +1703,17 @@ class _ScheduleMixin:
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "error": "give active_ma OR active_mv, not both"}
         if active_mv is not None:
+            if voltage_settle_s is not None:
+                # The fixed settle sleep is gone: active_mv now waits for the
+                # firmware's voltage arrival. Accepted, ignored, said.
+                logging.getLogger("ct_gui").warning(
+                    "fire_single_pulse: voltage_settle_s=%s is ignored -- active_mv now "
+                    "waits for the voltage to ARRIVE (+-150 mV), up to heat_timeout_s=%s",
+                    voltage_settle_s, heat_timeout_s)
+                warnings.warn("voltage_settle_s is ignored: active_mv waits for the "
+                              "voltage to arrive, up to heat_timeout_s", stacklevel=2)
             return self._fire_heated(
-                filament, None, idle_ma,
-                float(voltage_settle_s if voltage_settle_s is not None else heat_timeout_s),
+                filament, None, idle_ma, float(heat_timeout_s),
                 dict(num_pulses=num_pulses, width_us=width_us,
                      pulse_interval_ms=interval, trigger_timeout_ms=tmo,
                      max_on_ms=max_on_ms,

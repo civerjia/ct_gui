@@ -319,7 +319,13 @@ def _cached_entry(fil: int, raw_mode: int, current_mA, target_mA) -> dict:
     # for it. The docstring even said "bus_mV is unavailable here" while returning
     # a value for it. Want a voltage -> 0x24 (read_telemetry / ?live=1); that is
     # the only command that carries one.
-    return {"index": fil, "present": (cc_mode != 0) and not unavailable,
+    # PRESENT: regulating (mode != 0) OR carrying a live measurement. Mode 0 is
+    # also VOLTAGE mode, whose firmware voltage loop keeps a live current
+    # (feat/pulse-instant-heat); `cc_mode != 0` alone called every voltage-mode
+    # board absent, and the client then blanked its current (2026-10-23: 5 V on
+    # filament 0 read 1751 mA here and None in the client). STOP/SLEEP boards
+    # carry the stale bit, so they stay not-present as before.
+    return {"index": fil, "present": ((cc_mode != 0) or current_valid) and not unavailable,
             "arrival": arrival, "cc_mode_raw": int(raw_mode),
             "bus_mV": None,
             "current_mA": current_mA if current_valid else None,

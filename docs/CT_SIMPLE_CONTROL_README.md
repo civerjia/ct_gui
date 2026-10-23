@@ -2250,8 +2250,8 @@ arrival check.
 
 **`active_mv`** (default `None`) — the same, but the heat-up is **VOLTAGE
 mode** at `active_mv` mV of LOAD voltage instead of ACTIVE at a current.
-`voltage_settle_s` is the old name of the wait; if given it is now the arrival
-timeout (use `heat_timeout_s`).
+`voltage_settle_s` (the old fixed wait) is accepted and IGNORED, with a
+warning: the wait is now the arrival, up to `heat_timeout_s`.
 
 > **Heating is entirely host software — in both modes.** The schedule this
 > downloads holds ONE emission entry (`heating: []`); the RP2350's own heating
