@@ -2250,7 +2250,18 @@ arrival check.
 
 **`active_mv`** / **`voltage_settle_s`** (defaults `None` / `2.0`) — the same,
 but the heat-up is **VOLTAGE mode** at `active_mv` mV instead of ACTIVE at a
-current: no CC loop to converge, so a shot is quicker once each filament's
+current.
+
+> **Heating is entirely host software — in both modes.** The schedule this
+> downloads holds ONE emission entry (`heating: []`); the RP2350's own heating
+> table (pre-heat by trigger count) is not used, and it refuses VOLTAGE entries
+> anyway. The firmware's part of a shot is the firing: the PIO pulse, the 165
+> read-backs, the envelope, and the pulse record with the heating reading
+> nearest the trigger. The ACTIVE / VOLTAGE command, the wait, the check and the
+> drop back to `idle_ma` are all sent by this client (through the backend,
+> which times them).
+
+No CC loop to converge, so a shot is quicker once each filament's
 voltage is known. Give `active_ma` **or** `active_mv`, not both; `idle_ma` is
 required with either. After the arm the filament goes to a *timed* VOLTAGE
 (`voltage_one(active_s=...)`, below: IDLE-first guard, dead-man, back to
@@ -2668,20 +2679,38 @@ firmware writes a `0xEE` sentinel there and its bits mean nothing.
 #### The heating current at the moment each pulse fired
 
 Every pulse record carries `heat_meas_mA` (what the filament was actually
-drawing) and `heat_target_mA` (what it had been commanded to hold), sampled by
-the firmware **at the instant the pulse fired** — and, from RP2350 fw 530b925
-(20-byte record; the rig runs 5051982), the voltage at the same instant:
+drawing) and `heat_target_mA` (what it had been commanded to hold) — and, from
+RP2350 fw 530b925 (20-byte record), the voltage:
 
 | field | what |
 |---|---|
-| `heat_bus_mV` | the load voltage the CC loop last **measured** (INA219 bus). Cached: refreshed ~80 ms while ramping, ~2 s on a settled port |
+| `heat_bus_mV` | the **measured** load voltage (INA219 bus) |
 | `heat_cmd_mV` | the TPS output setpoint being **commanded** at that instant (exact, no age) |
+| `heat_meas_dt_ms` | WHEN `heat_meas_mA` was read: ms relative to the pulse's trigger, `-` before / `+` after (24-byte record, feat/pulse-instant-heat) |
+| `heat_bus_dt_ms` | the same for `heat_bus_mV` |
+| `trigger_time_approx` | the trigger's time stamp was lost; the dt are against the firmware's accounting time instead |
 
-They are in the printed pulse table (`heat mV` / `cmd mV` columns, shown only
-when the firmware records voltage), in `scan_report()`'s `heating_at_pulse`
-(`bus_mV`, `cmd_mV`), and per shot / per point in emission ramps and
-calibrations (`heat_bus_mV`, `heat_cmd_mV`). The voltage is cached, so it is
-reported, never divided into a resistance against `heat_meas_mA`.
+A pulse fires in hardware; nothing reads I2C at that instant. The firmware takes
+the reading **nearest the trigger**:
+
+- **24-byte firmware (pulse watch):** while a schedule is armed or running, the
+  board firing now / next is read every 5 ms (current and voltage from one
+  INA219 read), at the lowest priority on its channel — only when the CC loop
+  and the voltage ramp have nothing due, and it feeds nothing back into control.
+  The record takes the sample nearest the trigger, so `heat_meas_dt_ms` is
+  typically within ±5 ms, and current and voltage come from the same read (same
+  dt): they can be divided into a resistance. The INA219 value describes the
+  ~1 ms before its read (one 12-bit conversion of shunt + bus).
+- **Without a watch sample, or older firmware:** the cached value — the CC loop's
+  last reading (every 20 ms while ramping, every 500 ms on a converged ACTIVE
+  port), or in VOLTAGE / STANDBY the guardian's (~2 s). On 20-byte firmware a
+  VOLTAGE-mode record has no measured voltage (`heat_bus_mV` `stale`) — the
+  guardian read it but did not keep it; fixed with the 24-byte firmware.
+
+They are in the printed pulse table (`heat mV` / `cmd mV` columns when the
+firmware records voltage, `read at ms` when it records the time), in
+`scan_report()`'s `heating_at_pulse` (`bus_mV`, `cmd_mV`), and per shot / per
+point in emission ramps and calibrations (`heat_bus_mV`, `heat_cmd_mV`).
 
 This is what makes an emission reading interpretable. A shot on a filament that
 had not reached current is not comparable with one on a hot filament, and
@@ -2692,8 +2721,8 @@ way.
 > ACTIVE window is a few triggers wide and one host poll round is ~250 ms, so
 > host sampling cannot be aligned to pulses — and sampling hard enough to try
 > perturbs the ramp being measured (measured: a live-INA poll stretches
-> IDLE→ACTIVE by 20%). The firmware reads only the CC loop's cached value and
-> never touches I2C on the firing path.
+> IDLE→ACTIVE by 20%). The firmware never touches I2C on the firing path: it
+> picks from the pulse-watch samples or the cache.
 
 Both fields are `None` when there is no reading, with a `*_unavailable` reason
 rather than a number — `0` is a legal current and must never stand for unknown:
@@ -2706,6 +2735,7 @@ rather than a number — `0` is a legal current and must never stand for unknown
 | `stale` | `heat_bus_mV` only — the last measured voltage is older than the firmware's 10 s limit |
 | `output_off` | `heat_bus_mV` / `heat_cmd_mV` — the output was off (STOP / SLEEP); never reported as 0 V |
 | `firmware_no_voltage` | `heat_bus_mV` / `heat_cmd_mV` — older firmware (16-byte record) does not record voltage |
+| `firmware_no_timing` | `heat_dt_unavailable` — firmware before the 24-byte record does not date the reading; `heat_*_dt_ms` are `None` |
 
 > ⚠️ **A small number is not a sentinel.** `1 mA` against a `1500 mA` target is a
 > *real* reading from a powered board whose filament is open — it is exactly the

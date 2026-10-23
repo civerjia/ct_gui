@@ -1225,14 +1225,18 @@ class _DiagnosticsMixin:
             recs = pl.get("records") or []
             size = pl.get("record_bytes")
             if size is None and recs:      # backend older than record_bytes
-                size = 16 if recs[0].get("heat_bus_unavailable") == "firmware_no_voltage" else 20
+                r0 = recs[0]
+                size = (16 if r0.get("heat_bus_unavailable") == "firmware_no_voltage"
+                        else 20 if r0.get("heat_dt_unavailable") == "firmware_no_timing"
+                        or "heat_meas_dt_ms" not in r0 else 24)
             if not pl.get("ok"):
                 add(c, "pulse_log", False, pl.get("error") or "pulse log unreadable")
             elif not recs:
                 add(c, "pulse_log", None, "log empty since the last reset -- record size not judged")
             else:
-                add(c, "pulse_log", size == 20, f"{size}-byte records"
-                    + ("" if size == 20 else " -- this firmware does not record the heating voltage"))
+                add(c, "pulse_log", size >= 24, f"{size}-byte records"
+                    + ("" if size >= 24 else " -- this firmware does not record the heating "
+                       + ("voltage" if size < 20 else "reading's time (dt) relative to the trigger")))
         gits = {c: fi.get("git") for c, fi in infos.items() if fi.get("ok")}
         if len(gits) > 1:
             add(None, "firmware", len(set(gits.values())) == 1, f"builds {gits}")

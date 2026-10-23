@@ -106,8 +106,10 @@ class Result(dict):
         ("verify", ("on_mismatch", "hv_stuck_on", "unverified", "read165",
                     "flags")),
         ("heating", ("heat_meas_mA", "heat_target_mA", "heat_bus_mV", "heat_cmd_mV",
+                     "heat_meas_dt_ms", "heat_bus_dt_ms", "trigger_time_approx",
                      "heat_meas_unavailable", "heat_target_unavailable",
-                     "heat_bus_unavailable", "heat_cmd_unavailable")),
+                     "heat_bus_unavailable", "heat_cmd_unavailable",
+                     "heat_dt_unavailable")),
     )
     #: Emission-curve points (emission_vs_heating / emission_ramp) and their
     #: per-shot rows:
@@ -344,8 +346,12 @@ class Result(dict):
             return "-" if v is None else fmt.format(v)
         volts = any("heat_bus_mV" in r and r.get("heat_bus_unavailable") != "firmware_no_voltage"
                     for r in recs if isinstance(r, dict))
+        # 24-byte records date the reading: ms relative to the trigger.
+        timed = any("heat_meas_dt_ms" in r and r.get("heat_dt_unavailable") is None
+                    for r in recs if isinstance(r, dict))
         rows = [("#", "fil", "t_on ms", "width us", "heat mA", "target", "diff")
                 + (("heat mV", "cmd mV") if volts else ())
+                + (("read at ms",) if timed else ())
                 + (("emission mA", "mA*ms") if paired else ()) + ("flags",)]
         for n, r in enumerate(recs):
             m, t = r.get("heat_meas_mA"), r.get("heat_target_mA")
@@ -362,6 +368,9 @@ class Result(dict):
                 b, c = r.get("heat_bus_mV"), r.get("heat_cmd_mV")
                 row += (num(b) if b is not None else f"n/a ({r.get('heat_bus_unavailable') or '?'})",
                         num(c) if c is not None else f"n/a ({r.get('heat_cmd_unavailable') or '?'})")
+            if timed:
+                d = r.get("heat_meas_dt_ms")
+                row += (num(d, "{:+.1f}") + ("~" if r.get("trigger_time_approx") else ""),)
             if paired:
                 e = meas[n] if isinstance(meas[n], dict) else {}
                 row += (num(e.get("emission_ma"), "{:.3f}"), num(e.get("emission_mams"), "{:.2f}"))
@@ -369,7 +378,9 @@ class Result(dict):
                     flags.append("NO-CURRENT")      # the path did not conduct: no emission
             rows.append(row + (" ".join(flags) or "-",))
         widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-        out = [f"  pulses: [{len(recs)}]  (heat = RP2350 snapshot at the instant each pulse fired)"]
+        out = [f"  pulses: [{len(recs)}]  (heat = RP2350 reading nearest each trigger"
+               + ("; read at = ms from the trigger, - before / + after, ~ = trigger time lost"
+                  if timed else "") + ")"]
         for r in rows:
             out.append("    " + "  ".join(c.rjust(w) if i < len(r) - 1 else c
                                           for i, (c, w) in enumerate(zip(r, widths))).rstrip())

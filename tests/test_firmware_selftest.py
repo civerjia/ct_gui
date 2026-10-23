@@ -29,7 +29,7 @@ def boot_raw(fails=0, prev=0x64, stage=0x64, pc=0, up_ms=120000, git=b"98086b2d"
     return list(bytes([0, fails, prev, stage]) + struct.pack("<II", pc, up_ms) + git.ljust(12, b"\0"))
 
 
-def make(boot=None, vcap=11000, slew=(1000, 4000, 4000), records=None, ctrls=(1, 2)):
+def make(boot=None, vcap=11000, slew=(1000, 4000, 4000), records=None, ctrls=(1, 2), rb=24):
     ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
     ct._connected_controllers = lambda: list(ctrls)
     boot = boot or {}
@@ -44,7 +44,7 @@ def make(boot=None, vcap=11000, slew=(1000, 4000, 4000), records=None, ctrls=(1,
     ct._get_slew_rates_one = lambda c=1: {"ok": True, "below_mV_per_s": slew[0],
                                           "above_mV_per_s": slew[1], "warm_mV_per_s": slew[2]}
     ct._shv = lambda c, body: {"ok": True, "records": (records or {}).get(c, []),
-                               "record_bytes": 20 if (records or {}).get(c) else None}
+                               "record_bytes": rb if (records or {}).get(c) else None}
     return ct
 
 
@@ -97,6 +97,10 @@ ct._shv = lambda c, body: {"ok": True, "records": [{"heat_bus_unavailable": "fir
 r = ct.firmware_selftest(controller=1)
 check("16-byte records (old backend, inferred) reported",
       any("16-byte" in p for p in r["problems"]), r["problems"])
+
+r = make(records={1: [{"filament": 3}]}, rb=20).firmware_selftest(controller=1)
+check("20-byte records (no reading time) reported",
+      any("20-byte" in p and "time" in p for p in r["problems"]), r["problems"])
 
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

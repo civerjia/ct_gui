@@ -941,12 +941,16 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
         recs = []
         if raw and raw[0] == 0 and len(raw) >= 6:
             n, off = raw[5], 6
-            # Record size from the reply itself: 16 bytes (current only) or,
-            # from RP2350 fw feat/pulse-heat-voltage, 20 (+ heating voltage).
-            # Both firmwares are on the bench at once during a roll-out.
+            # Record size from the reply itself: 16 bytes (current only), 20
+            # (+ heating voltage), 24 (+ when the reading was taken). Fields
+            # are only ever APPENDED, so a larger size decodes as the largest
+            # layout known here. Old and new firmware share the bench during a
+            # roll-out. A size that fits no layout is an error, not a guess --
+            # forcing it to 16 misread every field after the first record.
             size = (len(raw) - 6) // n if n else 16
-            if size not in (16, 20):
-                size = 16
+            if n and (size < 16 or (len(raw) - 6) % n):
+                return {"ok": False, "error": f"pulse log: {len(raw) - 6} bytes for {n} "
+                                              f"records fits no record layout"}
             for _ in range(n):
                 if off + size > len(raw):
                     break
@@ -1005,6 +1009,22 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                 else:
                     bus, bus_why = None, "firmware_no_voltage"
                     cmd, cmd_why = None, "firmware_no_voltage"
+                # WHEN heat_meas / heat_bus were read, relative to this pulse's
+                # trigger (24-byte records): int16 in 0.1 ms, negative = before
+                # the trigger; -32768 = not dated. A "pulse watch" read of the
+                # firing board lands within ~5 ms; a cached one can be 0.5-2 s
+                # old. flags bit3: the trigger stamp was lost, so the dt is
+                # against the firmware's accounting time instead.
+                def _dt(v):
+                    v = v - 0x10000 if v >= 0x8000 else v
+                    return None if v == -0x8000 else v / 10.0
+                if size >= 24:
+                    meas_dt = _dt(_le(raw, off + 20, 2)) if meas is not None else None
+                    bus_dt = _dt(_le(raw, off + 22, 2)) if bus is not None else None
+                    dt_why = None
+                else:
+                    meas_dt = bus_dt = None
+                    dt_why = "firmware_no_timing"
                 recs.append({"filament": raw[off], "flags": fl, "seq": _le(raw, off + 2, 2),
                              "tOnUs": _le(raw, off + 4, 4), "durationUs": _le(raw, off + 8, 2),
                              "read165": None if (fl & 0x04 and (rb & 0xFF) == 0xEE) else rb,
@@ -1014,7 +1034,10 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                              "heat_meas_mA": meas, "heat_meas_unavailable": meas_why,
                              "heat_target_mA": tgt, "heat_target_unavailable": tgt_why,
                              "heat_bus_mV": bus, "heat_bus_unavailable": bus_why,
-                             "heat_cmd_mV": cmd, "heat_cmd_unavailable": cmd_why})
+                             "heat_cmd_mV": cmd, "heat_cmd_unavailable": cmd_why,
+                             "heat_meas_dt_ms": meas_dt, "heat_bus_dt_ms": bus_dt,
+                             "heat_dt_unavailable": dt_why,
+                             "trigger_time_approx": bool(fl & 0x08)})
                 off += size
             return {"ok": True, "total": _le(raw, 1, 2), "records": recs,
                     "record_bytes": size if n else None}
