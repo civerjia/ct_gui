@@ -68,11 +68,12 @@
             </div>
           </div>
 
-          <div class="geo-power" title="Filament heating power. Plan view estimates from the configured per-filament power × state counts; Live view uses measured P = V·I of every board whose output is on (STANDBY, IDLE, ACTIVE; VOLTAGE counts as active); a board with no reading this poll adds nothing. P1 / P2 split the total by which controller drives each filament (the active-list mapping).">
+          <div class="geo-power" title="Filament heating power. Plan view estimates from the configured per-filament power × state counts; Live view uses measured P = V·I of every board whose output is on (STANDBY, IDLE, ACTIVE, VOLTAGE, each shown separately); a board with no reading this poll adds nothing. P1 / P2 split the total by which controller drives each filament (the active-list mapping).">
             <div class="pw-item total"><span class="pw-cap">total</span><b id="pwTotal">0 W</b></div>
             <div class="pw-item act"><span class="pw-cap">active</span><b id="pwActive">0 W</b></div>
             <div class="pw-item idle"><span class="pw-cap">idle</span><b id="pwIdle">0 W</b></div>
             <div class="pw-item standby" title="STANDBY boards (0.8 V detection point). Measured in Live view; Plan has no STANDBY estimate."><span class="pw-cap">standby</span><b id="pwStandby">0 W</b></div>
+            <div class="pw-item volt" title="VOLTAGE-mode boards (fixed mV, no current loop -- e.g. fire_single_pulse(active_mv=...)). Measured in Live view; Plan has no VOLTAGE estimate."><span class="pw-cap">voltage</span><b id="pwVolt">0 W</b></div>
             <div class="pw-item p1"><span class="pw-cap">Power 1</span><b id="pwP1">0 W</b></div>
             <div class="pw-item p2"><span class="pw-cap">Power 2</span><b id="pwP2">0 W</b></div>
           </div>
