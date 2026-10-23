@@ -169,9 +169,10 @@ lists the scripts connected this way, with each one's `version` and `stale`.
   30 s ago may go back up while its CC loop is still settling (it is hot);
   anything colder must have settled at IDLE first.
 - **Heating in VOLTAGE mode for a shot:** `fire_single_pulse(F, active_mv=7600,
-  idle_ma=1200)` heats at a fixed output voltage instead of an ACTIVE current --
-  no CC loop to converge. It arms at IDLE, holds the voltage `voltage_settle_s`
-  (2 s), checks once that the output is up, fires, and drops back to `idle_ma`.
+  idle_ma=1200)` heats at a fixed LOAD voltage instead of an ACTIVE current: the
+  RP2350 voltage loop trims the output until the measured load voltage is within
+  ±150 mV and reports arrival; it arms at IDLE, waits for that arrival (up to
+  `heat_timeout_s`, else not fired), fires, and drops back to `idle_ma`.
   Every pulse record carries the current and voltage it fired at
   (`heat_meas_mA`, `heat_bus_mV`, `heat_cmd_mV`), which is the data for choosing
   each filament's voltage. `voltage_one(F, mv, active_s=10, then_idle_ma=1200)`

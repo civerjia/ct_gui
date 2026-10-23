@@ -58,28 +58,39 @@ def make(volt_ok=True, cached=None):
     ct.idle_one = idle_one
     ct.active_one = lambda *a, **k: calls.append("ACTIVE!") or {"ok": True}
     ct._fire_core = fire_core
-    ct.read_filament_current_cached = lambda f: {f: cached if cached is not None
-                                                  else {"current_mA": 2510, "cc_mode": 0}}
+    # The firmware's voltage loop: arrival goes ramping -> settled (load voltage
+    # within +-150 mV). `cached` is a list of successive replies (last repeats).
+    seq = list(cached) if cached is not None else [
+        {"current_mA": 2300, "cc_mode": 0, "arrival": "ramping"},
+        {"current_mA": 2480, "cc_mode": 0, "arrival": "ramping"},
+        {"current_mA": 2510, "cc_mode": 0, "arrival": "settled"}]
+
+    def cached_read(f):
+        calls.append("poll")
+        return {f: seq.pop(0) if len(seq) > 1 else seq[0]}
+    ct.read_filament_current_cached = cached_read
     return ct, calls, seen
 
 
 KW = dict(width_us=7000, inter_pulse_ms=100, max_on_ms=165, total_ms=6000, timeout_s=6.0)
 
-# 1. The order: setup at IDLE, VOLTAGE after the arm, settle, trigger, IDLE.
+# 1. The order: setup at IDLE, VOLTAGE after the arm, wait for ARRIVAL, trigger, IDLE.
+#    2026-10-23: it used to sleep voltage_settle_s and read once -- not arrival.
 ct, calls, seen = make()
 SLEPT.clear()
 user = []
 r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, on_armed=lambda: user.append(1), **KW)
 check("ok, fired", r["ok"] and r["fired"] == 1, r)
-check("order: setup -> voltage -> trigger -> idle, never ACTIVE",
-      calls == ["setup", "voltage", "trigger", "idle"], calls)
+check("order: setup -> voltage -> polls until settled -> trigger -> idle, never ACTIVE",
+      calls == ["setup", "voltage", "poll", "poll", "poll", "trigger", "idle"], calls)
 mv, kw = seen["v"]
 check("timed VOLTAGE at 7600 mV, back to 1200 mA", mv == 7600 and kw["then_idle_ma"] == 1200
       and kw["active_s"] > 6, seen["v"])
-check("settled the default 2 s before firing; caller's on_armed ran", 2.0 in SLEPT and user == [1], SLEPT)
-check("heating summary: voltage mode, cached current", r["heating"]["mode"] == "voltage"
-      and r["heating"]["measured_ma"] == 2510 and r["heating"]["commanded_mv"] == 7600, r["heating"])
-check("total_ms grew by the settle", seen["total_ms"] == 6000 + 2000 + 1000, seen["total_ms"])
+check("caller's on_armed ran only after arrival (no fixed settle sleep)", user == [1] and 2.0 not in SLEPT, SLEPT)
+check("heating summary: voltage mode, settled, its current", r["heating"]["mode"] == "voltage"
+      and r["heating"]["arrival"] == "settled" and r["heating"]["measured_ma"] == 2510
+      and r["heating"]["commanded_mv"] == 7600, r["heating"])
+check("total_ms grew by the arrival timeout", seen["total_ms"] == 6000 + 5000 + 1000, seen["total_ms"])
 
 # 2. Refused (not at a settled IDLE): nothing fired, no IDLE write.
 ct, calls, seen = make(volt_ok=False)
@@ -87,11 +98,14 @@ r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, **KW)
 check("refused -> not fired, no idle", not r["ok"] and "idle" not in calls and "trigger" not in calls,
       (calls, r))
 
-# 3. Output faulted / open after the settle: not fired, dropped to IDLE.
-for cached, word in (({"current_mA": None, "cc_mode": 3}, "OCP"),
-                     ({"current_mA": 6, "cc_mode": 0}, "open filament")):
+# 3. Not arrived: faulted, capped, or never settled (old firmware) -> not
+#    fired, dropped to IDLE, said why.
+for cached, word, kw2 in (([{"current_mA": None, "cc_mode": 3, "arrival": None}], "OCP", {}),
+                          ([{"current_mA": 2900, "cc_mode": 0, "arrival": "capped"}], "at its limit", {}),
+                          ([{"current_mA": 2400, "cc_mode": 0, "arrival": "ramping"}], "not reached within",
+                           {"heat_timeout_s": 0.3})):
     ct, calls, seen = make(cached=cached)
-    r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, **KW)
+    r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, **KW, **kw2)
     check(f"{word}: not fired, back to IDLE, said",
           not r["ok"] and "trigger" not in calls and calls[-1] == "idle"
           and word in str(r.get("error")), (calls, r.get("error")))

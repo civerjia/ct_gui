@@ -1330,13 +1330,16 @@ class _ScheduleMixin:
                                           # "active_ma" in the docstring
         idle_ma: float | None = None,    # active_ma only: IDLE current to
                                           # return to right after the pulse
-        heat_timeout_s: float = 5.0,     # active_ma only: longest wait for
-                                          # the ACTIVE current to arrive
+        heat_timeout_s: float = 5.0,     # longest wait for the heating to
+                                          # ARRIVE (ACTIVE current, or the
+                                          # VOLTAGE within +-150 mV); not
+                                          # arrived = not fired
         active_mv: float | None = None,  # INSTEAD of active_ma: heat at this
                                           # VOLTAGE (no CC loop) -- see
                                           # "active_mv" in the docstring
-        voltage_settle_s: float = 2.0,   # active_mv only: wait this long at
-                                          # the voltage, then fire
+        voltage_settle_s: float | None = None,  # OLD active_mv wait; now the
+                                          # arrival timeout if given (use
+                                          # heat_timeout_s)
         timeout_s: float | None = None,  # old name of shot_wait_timeout_s, still accepted
         pulse_interval_ms: int | None = None,   # spacing between pulses (ms):
                                                  # what trigger="sim" fires.
@@ -1373,16 +1376,18 @@ class _ScheduleMixin:
         mid-shot still drops back to idle_ma.
 
         active_mv: the same, but the heat-up is VOLTAGE mode at active_mv mV
-        instead of ACTIVE at a current -- no CC loop to converge, so it is
-        quicker once you know each filament's voltage. After the arm the
-        filament goes to a TIMED voltage (backend: IDLE-first guard, dead-man,
-        back to idle_ma), waits voltage_settle_s (the firmware slews the
-        output, and the filament warms at that voltage), checks once that the
-        output is up and not faulted, then fires and drops to idle_ma. There is
-        no current target to reach, so nothing is "not reached": the current
-        it ran at is in every pulse record (heat_meas_mA with heat_bus_mV /
-        heat_cmd_mV on firmware that records voltage) -- which is the data for
-        choosing each filament's voltage. Give active_ma OR active_mv.
+        instead of ACTIVE at a current. Closed loop on the LOAD voltage (RP2350
+        fw feat/pulse-instant-heat): the firmware ramps at the slew, then reads
+        the INA219 bus voltage and trims the output until the measured load
+        voltage is within +-150 mV of active_mv -- ARRIVED, reported like the CC
+        loop's convergence. After the arm the filament goes to a TIMED voltage
+        (backend: IDLE-first guard, dead-man, back to idle_ma); on_armed and the
+        trigger wait for that arrival exactly as they wait for an ACTIVE
+        current, up to heat_timeout_s -- not arrived = not fired. The current
+        it settles at is in every pulse record (heat_meas_mA with heat_bus_mV),
+        which is the data for choosing each filament's voltage. Heating is host
+        software in both modes; the firmware schedule fires and records.
+        Give active_ma OR active_mv.
 
             ct.fire_single_pulse(f, active_mv=7600, idle_ma=1200, measure=True)
 
@@ -1698,7 +1703,8 @@ class _ScheduleMixin:
                     "error": "give active_ma OR active_mv, not both"}
         if active_mv is not None:
             return self._fire_heated(
-                filament, None, idle_ma, float(voltage_settle_s),
+                filament, None, idle_ma,
+                float(voltage_settle_s if voltage_settle_s is not None else heat_timeout_s),
                 dict(num_pulses=num_pulses, width_us=width_us,
                      pulse_interval_ms=interval, trigger_timeout_ms=tmo,
                      max_on_ms=max_on_ms,
@@ -1814,23 +1820,38 @@ class _ScheduleMixin:
                 heat["raised"] = False       # refused: nothing applied to drop
                 raise RuntimeError(f"VOLTAGE {active_mv} mV not accepted: "
                                    f"{r.get('error') or r}")
-            time.sleep(float(heat_timeout_s))
-            # ONE cached read (no polling: in voltage mode the cache refreshes
-            # every ~2 s and single-board polling starves the shared link).
-            # It confirms the output is up and not faulted; it is not a target.
-            d = (self.read_filament_current_cached(filament) or {}).get(int(filament)) or {}
-            ma, mode = d.get("current_mA"), d.get("cc_mode")
-            h = {"ok": True, "mode": "voltage", "commanded_mv": int(active_mv),
-                 "settle_s": float(heat_timeout_s), "measured_ma": ma,
-                 "measured_valid": ma is not None, "cc_mode": mode,
+            # ARRIVAL, as for ACTIVE: the firmware's voltage loop reports
+            # "settled" (load voltage within +-150 mV of active_mv) or "capped"
+            # (output at its limit, load still short) in the cached-current
+            # read -- no I2C on the RP2350 side, so it can be polled.
+            deadline = time.monotonic() + float(heat_timeout_s)
+            naps = self._poll_intervals(0.1, 0.3)
+            t0 = time.monotonic()
+            d, arrival = {}, None
+            while True:
+                d = (self.read_filament_current_cached(filament) or {}).get(int(filament)) or {}
+                arrival, mode = d.get("arrival"), d.get("cc_mode")
+                if mode in (2, 3) or arrival in ("settled", "capped") or time.monotonic() >= deadline:
+                    break
+                time.sleep(next(naps))
+            ma = d.get("current_mA")
+            h = {"ok": arrival == "settled", "mode": "voltage", "commanded_mv": int(active_mv),
+                 "arrival": arrival, "elapsed_s": round(time.monotonic() - t0, 3),
+                 "measured_ma": ma, "measured_valid": ma is not None, "cc_mode": mode,
                  "measured_from": "cached"}
             if mode in (2, 3):
                 h.update(ok=False, faulted=True,
                          error=f"output faulted at {active_mv} mV (cc_mode {mode}: "
                                f"{'open filament' if mode == 2 else 'OCP/short'})")
-            elif ma is not None and ma < 100:
-                h.update(ok=False, error=f"output at {active_mv} mV draws only {ma} mA "
-                                         f"-- open filament or output off")
+            elif arrival == "capped":
+                h.update(error=f"{active_mv} mV not reached on the load: the output is at its "
+                               f"limit (voltage cap or +1.5 V drop compensation) and the load "
+                               f"is still more than 150 mV short ({ma} mA)")
+            elif arrival != "settled":
+                h.update(error=f"{active_mv} mV not reached within {heat_timeout_s} s "
+                               f"(arrival {arrival!r}, {ma} mA). Firmware without the "
+                               f"voltage loop (before feat/pulse-instant-heat) never "
+                               f"reports arrival in VOLTAGE mode")
             heat["active"] = {**r, "heating": h}
             if not h["ok"]:
                 raise RuntimeError(f"VOLTAGE {active_mv} mV: {h['error']} -- not fired")

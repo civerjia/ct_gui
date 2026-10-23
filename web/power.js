@@ -1860,7 +1860,7 @@ const EMI_HTML = `
       <span id="shotSite" class="hint"></span>
     </div>
     <div class="bm-set-row">
-      <label class="numlabel" title="Current: ACTIVE at this current, closed loop -- must ARRIVE within the heat timeout or nothing is fired. Voltage: VOLTAGE mode at this output, no current loop; heated for the settle time, then fired. Heating is host software in both modes (the firmware schedule only fires and records).">heat
+      <label class="numlabel" title="Current: ACTIVE at this current (firmware current loop). Voltage: VOLTAGE at this LOAD voltage (firmware voltage loop, ±150 mV). Either must ARRIVE within the heat timeout or nothing is fired. The heating commands are sent by the host; the firmware loops regulate them and the schedule fires and records.">heat
         <select id="shotMode"><option value="ma">current mA</option><option value="mv">voltage mV</option></select></label>
       <input id="shotHeat" type="number" min="0" max="11000" value="2700" style="width:72px" title="ACTIVE current, mA (current mode) or output voltage, mV (voltage mode, max 11000 = the rig's voltage cap)." />
       <label class="numlabel" title="IDLE current to drop back to after the shot (default = the rig default from the backend).">idle mA <input id="shotIdle" type="number" min="0" max="4000" value="" /></label>
@@ -1871,7 +1871,7 @@ const EMI_HTML = `
       <label class="numlabel" title="Spacing of the simulated triggers, ms (10 ms minimum).">every ms <input id="shotGap" type="number" min="10" max="60000" value="100" /></label>
     </div>
     <div class="bm-set-row">
-      <label class="numlabel" title="Current mode: how long the ACTIVE current may take to arrive (s). Voltage mode: how long to hold the voltage before firing (s).">heat / settle s <input id="shotHeatS" type="number" min="0.5" max="30" step="0.5" value="6" /></label>
+      <label class="numlabel" title="Longest wait for the heating to ARRIVE before firing (s): the ACTIVE current (current mode) or the measured load voltage within ±150 mV (voltage mode, needs the RP2350 voltage loop). Not arrived = not fired.">heat timeout s <input id="shotHeatS" type="number" min="0.5" max="30" step="0.5" value="6" /></label>
       <button id="shotFire" class="xs danger">Fire</button>
     </div>
     <div id="shotStatus" class="summary" style="white-space:pre-line">idle</div>
@@ -2183,7 +2183,8 @@ function wireShot() {
     const body = { filament: fid, num_pulses: +$p('shotN').value, width_us: +$p('shotW').value,
       pulse_interval_ms: +$p('shotGap').value, idle_ma: idle };
     const hs = +$p('shotHeatS').value;
-    if (mode === 'mv') { body.active_mv = heat; body.voltage_settle_s = hs; } else { body.active_ma = heat; body.heat_timeout_s = hs; }
+    body.heat_timeout_s = hs;
+    if (mode === 'mv') body.active_mv = heat; else body.active_ma = heat;
     if (idle == null) { $p('shotStatus').textContent = '✗ set the IDLE current to drop back to'; return; }
     if (!confirm(`Heat filament ${fid} (${$p('shotSite').textContent}) to ${mode === 'mv' ? 'VOLTAGE ' + heat + ' mV' : 'ACTIVE ' + heat + ' mA'}, `
       + `fire ${body.num_pulses} × ${body.width_us} µs every ${body.pulse_interval_ms} ms, then back to IDLE ${idle} mA. Continue?`)) return;

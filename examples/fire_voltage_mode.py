@@ -10,7 +10,7 @@ heat-up done at a fixed output voltage instead of an ACTIVE current: no CC loop
 to converge. Per shot:
 
     IDLE     prepare, detector arm, arm      (nothing here needs heat)
-    VOLTAGE  timed voltage_one(active_mv) -> settle voltage_settle_s ->
+    VOLTAGE  timed voltage_one(active_mv) -> wait for ARRIVAL (+-150 mV) ->
              one cached check that the output is up -> trigger -> wait
     IDLE     back to idle_ma, then records + detector events
 
@@ -43,7 +43,7 @@ ap.add_argument("-f", "--filament", type=int, required=True)
 ap.add_argument("--mv", type=int, nargs="+", required=True,
                 help="heating voltage(s) in mV, one shot each (800 .. the 11000 mV cap)")
 ap.add_argument("--idle-ma", type=float, default=1200)
-ap.add_argument("--settle-s", type=float, default=2.0, help="hold at each voltage before firing")
+ap.add_argument("--settle-s", type=float, default=6.0, help="longest wait for the voltage to ARRIVE (+-150 mV) before firing")
 ap.add_argument("--idle-settle-s", type=float, default=15.0, help="IDLE settle before the first shot")
 ap.add_argument("--width-us", type=int, default=7000)
 ap.add_argument("--hv-ok", action="store_true", help="run even though emission HV is on")
@@ -78,7 +78,7 @@ with ct.lease(ttl=120, note="fire_voltage_mode example"):
                                      pulse_interval_ms=100, max_on_ms=165, total_ms=6000,
                                      shot_wait_timeout_s=6.0, measure=True,
                                      active_mv=mv, idle_ma=args.idle_ma,
-                                     voltage_settle_s=args.settle_s)
+                                     heat_timeout_s=args.settle_s)
             print(f"\n--- {mv} mV ---")
             print(r)                              # the pulse table is in the Result's printout
             ev = r.get("measured") or []

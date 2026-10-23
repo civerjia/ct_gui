@@ -2248,32 +2248,44 @@ moment the run is over. As a backstop the ACTIVE is timed in the backend, so a
 script that dies mid-shot still returns to `idle_ma`. `result["heating"]` is the
 arrival check.
 
-**`active_mv`** / **`voltage_settle_s`** (defaults `None` / `2.0`) — the same,
-but the heat-up is **VOLTAGE mode** at `active_mv` mV instead of ACTIVE at a
-current.
+**`active_mv`** (default `None`) — the same, but the heat-up is **VOLTAGE
+mode** at `active_mv` mV of LOAD voltage instead of ACTIVE at a current.
+`voltage_settle_s` is the old name of the wait; if given it is now the arrival
+timeout (use `heat_timeout_s`).
 
 > **Heating is entirely host software — in both modes.** The schedule this
 > downloads holds ONE emission entry (`heating: []`); the RP2350's own heating
 > table (pre-heat by trigger count) is not used, and it refuses VOLTAGE entries
-> anyway. The firmware's part of a shot is the firing: the PIO pulse, the 165
-> read-backs, the envelope, and the pulse record with the heating reading
-> nearest the trigger. The ACTIVE / VOLTAGE command, the wait, the check and the
-> drop back to `idle_ma` are all sent by this client (through the backend,
-> which times them).
+> anyway. The ACTIVE / VOLTAGE command, the wait for arrival and the drop back
+> to `idle_ma` are sent by this client (through the backend, which times them);
+> the firmware's loops REGULATE them (current loop / voltage loop) and report
+> arrival; the schedule fires (PIO pulse, 165 read-backs, envelope) and writes
+> the pulse record with the heating reading nearest the trigger.
 
-No CC loop to converge, so a shot is quicker once each filament's
-voltage is known. Give `active_ma` **or** `active_mv`, not both; `idle_ma` is
-required with either. After the arm the filament goes to a *timed* VOLTAGE
+**The voltage loop** (RP2350 fw `feat/pulse-instant-heat`): the output ramps
+at the slew without being read; once it is at its setpoint the firmware reads
+the INA219 load voltage (and current) every 50 ms, trims the setpoint by the
+error (cable / shunt drop, up to +1.5 V above the target, never past the
+voltage cap) and reports **arrived** when the measured load voltage is within
+**±150 mV** of `active_mv` on two reads in a row; after that it keeps reading
+every 500 ms — a drift is trimmed, one past ±150 mV drops "arrived" again. An
+output that collapses (TPS trip) is the guardian's to re-enable; the loop then
+brings it back. Two registers per read: far lighter on I²C than the 20 ms
+current loop.
+
+Give `active_ma` **or** `active_mv`, not both; `idle_ma` is required with
+either. After the arm the filament goes to a *timed* VOLTAGE
 (`voltage_one(active_s=...)`, below: IDLE-first guard, dead-man, back to
-`idle_ma`, refused above the voltage cap), holds it `voltage_settle_s` (the
-firmware slews the output and the filament warms at that voltage), then reads
-the CC cache **once** to check the output is up — refused, not fired, if it
-reports a fault (open / OCP) or under 100 mA. There is no current target, so
-nothing is "not reached": the current and voltage it actually fired at are in
+`idle_ma`, refused above the voltage cap); `on_armed` and the trigger wait for
+the firmware's **arrival** within `heat_timeout_s`, exactly as for ACTIVE —
+not arrived (still climbing, `capped` at the output limit, or a fault) = not
+fired, back to `idle_ma`. Firmware without the voltage loop never reports
+arrival in VOLTAGE mode, so on it every voltage shot is refused, with that
+reason. The current and voltage it actually fired at are in
 every pulse record (`heat_meas_mA`, `heat_bus_mV`, `heat_cmd_mV`, see
 [the heating at the moment each pulse fired](#the-heating-current-at-the-moment-each-pulse-fired)),
 which is the data for choosing each filament's voltage.
-`result["heating"]` = `{"mode": "voltage", "commanded_mv", "settle_s",
+`result["heating"]` = `{"mode": "voltage", "commanded_mv", "arrival", "elapsed_s",
 "measured_ma", "cc_mode", ...}`.
 
 ```python
@@ -2282,9 +2294,9 @@ for rec in r["records"]:
     print(rec["heat_meas_mA"], "mA at", rec["heat_bus_mV"], "mV (cmd", rec["heat_cmd_mV"], ")")
 ```
 
-> One cached read, no polling: in voltage mode the firmware refreshes that
-> cache about every 2 s, and polling one board in a loop starves the shared
-> link. `examples/fire_voltage_mode.py` is a complete run.
+> The wait polls the cached-current read (no I2C on the RP2350; the voltage loop
+> keeps it fresh), backing off from 0.1 to 0.3 s. `examples/fire_voltage_mode.py`
+> is a complete run.
 
 **Return value** — a dict, always; never raises:
 
