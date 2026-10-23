@@ -169,7 +169,7 @@ const BOARDS_HTML = `
     <span class="legend-item"><span class="dot on">I</span> ISO</span>
     <span class="legend-item"><span class="dot on">T</span> TPS</span>
     <span class="legend-item"><span class="dot fault">F</span> fault</span>
-    <span class="legend-item"><span class="hv-badge on">HV</span> HV current</span>
+
     <span class="legend-item"><span class="dot absent">·</span> absent</span>
     <span class="legend-item"><span class="ps-chip ps-stop">STOP</span><span class="ps-chip ps-sleep">SLEEP</span><span class="ps-chip ps-standby">STBY</span><span class="ps-chip ps-idle">IDLE</span><span class="ps-chip ps-active">ACTIVE</span><span class="ps-chip ps-voltage">VOLT</span> power state</span>
     <span class="legend-item"><span class="ps-chip ps-dead">DEAD</span> marked dead (refused power)</span>
@@ -326,7 +326,6 @@ const boardTiles = new Map();
 // -- see the innerHTML comment above renderBoardGrid() for why this has to
 // go all the way down, not just at the outer tile level.
 function buildTileParts(tile) {
-  const hv = document.createElement('span'); hv.className = 'hv-badge'; hv.textContent = 'HV';
   const title = document.createElement('span'); title.className = 'tile-title';
   const dots = document.createElement('span'); dots.className = 'tile-dots';
   const dotP = document.createElement('span'); dotP.className = 'dot';
@@ -340,8 +339,8 @@ function buildTileParts(tile) {
   const iSpan = document.createElement('span');
   measure.append(dash, vSpan, iSpan);
   const ps = document.createElement('span'); ps.className = 'ps-chip';
-  tile.append(hv, title, ps, dots, measure);
-  tile._parts = { hv, title, ps, dotP, dotI, dotT, dotF, dash, vSpan, iSpan };
+  tile.append(title, ps, dots, measure);
+  tile._parts = { title, ps, dotP, dotI, dotT, dotF, dash, vSpan, iSpan };
 }
 
 // Short power-state labels for the tile chip (full name in the tooltip).
@@ -398,9 +397,6 @@ function renderBoardGrid() {
       + (chEnabled(b.channel) ? '' : ' masked')
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');
     const p = tile._parts;
-    const hvValid = b.hv_overcurrent_valid;
-    p.hv.className = 'hv-badge ' + (!hvValid ? 'unknown' : b.hv_overcurrent ? 'on' : 'off');
-    p.hv.title = `HV current ${!hvValid ? 'unavailable (chip not present)' : b.hv_overcurrent ? 'sensed (>1 mA)' : 'none'}`;
     p.title.textContent = b.label;   // the filament number is in the tooltip
     p.ps.textContent = b.channel_dark ? 'DARK' : b.lost ? 'LOST' : b.dead ? 'DEAD'
       : !b.present ? '' : (PS_SHORT[psName] || '?');
