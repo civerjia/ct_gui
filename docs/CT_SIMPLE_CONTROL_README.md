@@ -2689,6 +2689,7 @@ RP2350 fw 530b925 (20-byte record), the voltage:
 | `heat_meas_dt_ms` | WHEN `heat_meas_mA` was read: ms relative to the pulse's trigger, `-` before / `+` after (24-byte record, feat/pulse-instant-heat) |
 | `heat_bus_dt_ms` | the same for `heat_bus_mV` |
 | `trigger_time_approx` | the trigger's time stamp was lost; the dt are against the firmware's accounting time instead |
+| `heat_from_cache` | `True`: the reading is NOT from the pulse watch but the CC-loop / guardian cache (the dt says how old), or there was none. `None` on firmware before the 24-byte record |
 
 A pulse fires in hardware; nothing reads I2C at that instant. The firmware takes
 the reading **nearest the trigger**:

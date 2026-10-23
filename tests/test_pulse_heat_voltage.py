@@ -86,7 +86,7 @@ check("printout: old firmware -> no voltage columns", "heat mV" not in txt and "
 #    trigger, in 0.1 ms; -32768 = not dated; flags bit3 = trigger stamp lost.
 r = srv.shv_op(Link(reply([rec(16, 0, 2532, 2555, 7860, 7878, dt=(-23, -23)),
                            rec(16, 1, 2530, 2555, 7861, 7878, dt=(41, 41), flags=0x08),
-                           rec(16, 2, 2529, 0xFFFC, 0xFFFE, 7878, dt=(-4980, -32768))])),
+                           rec(16, 2, 2529, 0xFFFC, 0xFFFE, 7878, dt=(-4980, -32768), flags=0x10)])),
                {"op": "pulse_log", "start": 0})
 a, b, c = r["records"]
 check("24-byte: dt decoded in ms, signed", r["record_bytes"] == 24 and a["heat_meas_dt_ms"] == -2.3
@@ -102,9 +102,13 @@ check("24-byte: a sentinel value carries no dt (never a time for a non-reading)"
 check("20-byte: dt None, reason firmware_no_timing", r is not None and
       srv.shv_op(Link(reply([rec(59, 0, 2780, 2800, 7650, 7712)])), {"op": "pulse_log", "start": 0})
       ["records"][0]["heat_dt_unavailable"] == "firmware_no_timing")
+check("24-byte: flags bit4 -> heat_from_cache; 20-byte -> None (bit does not exist)",
+      c["heat_from_cache"] is True and a["heat_from_cache"] is False
+      and srv.shv_op(Link(reply([rec(59, 0, 2780, 2800, 7650, 7712, flags=0x10)])),
+                     {"op": "pulse_log", "start": 0})["records"][0]["heat_from_cache"] is None, c)
 txt = repr(Result({"ok": True, "records": r["records"]}))
-check("printout: 'read at ms' column with signed values and ~ for approx",
-      "read at ms" in txt and "-2.3" in txt and "+4.1~" in txt, txt)
+check("printout: 'read at ms' column with signed values, ~ for approx, cache marked",
+      "read at ms" in txt and "-2.3" in txt and "+4.1~" in txt and "-498.0 cache" in txt, txt)
 
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

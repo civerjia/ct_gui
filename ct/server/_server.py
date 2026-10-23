@@ -1018,13 +1018,18 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                 def _dt(v):
                     v = v - 0x10000 if v >= 0x8000 else v
                     return None if v == -0x8000 else v / 10.0
+                # flags bit4 (24-byte records): the reading is NOT from the pulse
+                # watch -- it is the CC loop / guardian cache (or none). None on
+                # older firmware, where the bit does not exist.
                 if size >= 24:
                     meas_dt = _dt(_le(raw, off + 20, 2)) if meas is not None else None
                     bus_dt = _dt(_le(raw, off + 22, 2)) if bus is not None else None
                     dt_why = None
+                    from_cache = bool(fl & 0x10)
                 else:
                     meas_dt = bus_dt = None
                     dt_why = "firmware_no_timing"
+                    from_cache = None
                 recs.append({"filament": raw[off], "flags": fl, "seq": _le(raw, off + 2, 2),
                              "tOnUs": _le(raw, off + 4, 4), "durationUs": _le(raw, off + 8, 2),
                              "read165": None if (fl & 0x04 and (rb & 0xFF) == 0xEE) else rb,
@@ -1037,7 +1042,8 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                              "heat_cmd_mV": cmd, "heat_cmd_unavailable": cmd_why,
                              "heat_meas_dt_ms": meas_dt, "heat_bus_dt_ms": bus_dt,
                              "heat_dt_unavailable": dt_why,
-                             "trigger_time_approx": bool(fl & 0x08)})
+                             "trigger_time_approx": bool(fl & 0x08),
+                             "heat_from_cache": from_cache})
                 off += size
             return {"ok": True, "total": _le(raw, 1, 2), "records": recs,
                     "record_bytes": size if n else None}

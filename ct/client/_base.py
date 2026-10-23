@@ -107,6 +107,7 @@ class Result(dict):
                     "flags")),
         ("heating", ("heat_meas_mA", "heat_target_mA", "heat_bus_mV", "heat_cmd_mV",
                      "heat_meas_dt_ms", "heat_bus_dt_ms", "trigger_time_approx",
+                     "heat_from_cache",
                      "heat_meas_unavailable", "heat_target_unavailable",
                      "heat_bus_unavailable", "heat_cmd_unavailable",
                      "heat_dt_unavailable")),
@@ -370,7 +371,8 @@ class Result(dict):
                         num(c) if c is not None else f"n/a ({r.get('heat_cmd_unavailable') or '?'})")
             if timed:
                 d = r.get("heat_meas_dt_ms")
-                row += (num(d, "{:+.1f}") + ("~" if r.get("trigger_time_approx") else ""),)
+                row += (num(d, "{:+.1f}") + ("~" if r.get("trigger_time_approx") else "")
+                        + (" cache" if r.get("heat_from_cache") else ""),)
             if paired:
                 e = meas[n] if isinstance(meas[n], dict) else {}
                 row += (num(e.get("emission_ma"), "{:.3f}"), num(e.get("emission_mams"), "{:.2f}"))
@@ -379,8 +381,8 @@ class Result(dict):
             rows.append(row + (" ".join(flags) or "-",))
         widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
         out = [f"  pulses: [{len(recs)}]  (heat = RP2350 reading nearest each trigger"
-               + ("; read at = ms from the trigger, - before / + after, ~ = trigger time lost"
-                  if timed else "") + ")"]
+               + ("; read at = ms from the trigger, - before / + after, ~ = trigger time lost,"
+                  " cache = not the pulse-watch read" if timed else "") + ")"]
         for r in rows:
             out.append("    " + "  ".join(c.rjust(w) if i < len(r) - 1 else c
                                           for i, (c, w) in enumerate(zip(r, widths))).rstrip())
