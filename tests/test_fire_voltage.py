@@ -120,6 +120,32 @@ check("voltage_settle_s ignored (fired normally) and warned",
       r["ok"] and any("voltage_settle_s is ignored" in str(w.message) for w in caught)
       and seen["total_ms"] == 6000 + 5000 + 1000, (r.get("error"), [str(w.message) for w in caught]))
 
+# 3c. sim_delay_ms (2026-10-23): the first pulse D ms after the heating arrived.
+#     The ESP32 fires its first edge one interval after it starts, so the
+#     request goes out D - interval after arrival; arrival polled at 50 ms.
+ct, calls, seen = make()
+ct.simulate_sync_status = lambda: {"ok": True, "start_ms": 83.0}
+SLEPT.clear()
+r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, sim_delay_ms=500, **KW)
+st = r.get("sim_timing") or {}
+check("sim_delay 500 @ 100 ms: waited 400 ms after arrival, then triggered",
+      r["ok"] and any(abs(x - 0.4) < 0.01 for x in SLEPT) and calls.index("trigger") > calls.index("poll")
+      and st.get("request_after_ms") == 400.0 and st.get("esp32_start_ms") == 83.0, (SLEPT, st))
+check("...arrival polled at a steady 50 ms", SLEPT.count(0.05) >= 2, SLEPT)
+check("...total_ms grew by the delay too", seen["total_ms"] == 6000 + 5000 + 1000 + 500, seen["total_ms"])
+ct, calls, seen = make()
+check("sim_delay shorter than one interval -> refused, nothing done",
+      "shorter than pulse_interval_ms" in (ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200,
+                                                                  sim_delay_ms=50, **KW).get("error") or "")
+      and "voltage" not in calls, calls)
+ct, calls, seen = make()
+check("sim_delay with an external trigger -> refused",
+      "needs trigger='sim'" in (ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, sim_delay_ms=500,
+                                                     trigger="ext", **KW).get("error") or ""))
+ct, calls, seen = make()
+r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, **KW)
+check("no sim_delay -> no sim_timing, back-off polling as before", "sim_timing" not in r)
+
 # 4. Both / neither idle_ma.
 ct, calls, seen = make()
 check("active_ma AND active_mv refused",

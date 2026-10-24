@@ -1950,7 +1950,14 @@ def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) ->
     if rate_hz < 1:
         rate_hz = 1
     try:
+        # How long the ESP32 took to START the train: the part of a simulated
+        # trigger's timing nobody controls (HTTP, shares the ESP32's loop).
+        # Reported by /api/sync/simulate-status -> fire_single_pulse sim_timing.
+        t0 = time.monotonic()
         r = sync_post_burst(host, count, rate_hz, timeout=3.0)
+        with _SIM_LOCK:
+            _SIM_STATE["start_ms"] = round((time.monotonic() - t0) * 1000.0, 1)
+            _SIM_STATE["start_ok"] = bool(r.get("ok"))
         if not r.get("ok"):
             return
         time.sleep(0.3)   # let the train start before the first status poll
@@ -2594,7 +2601,7 @@ _SHOT_LOCK = threading.Lock()
 _SHOT: dict = {"running": False, "params": None, "result": None, "error": None,
                "started": None, "finished": None}
 _SHOT_KEYS = ("num_pulses", "width_us", "pulse_interval_ms", "active_ma", "active_mv",
-              "idle_ma", "heat_timeout_s", "voltage_settle_s")
+              "idle_ma", "heat_timeout_s", "sim_delay_ms")
 
 
 def shot_start(body: dict) -> dict:
@@ -5643,7 +5650,8 @@ class CtHandler(BaseHTTPRequestHandler):
                         return self._json({"ok": False, "error": "simulation already running"}, HTTPStatus.OK)
                     # Claim it ATOMICALLY here (not inside the thread) so two near-
                     # simultaneous starts can't both pass the guard and double-fire.
-                    _SIM_STATE.update(running=True, fired=0, count=count, stop=False, controller=cid)
+                    _SIM_STATE.update(running=True, fired=0, count=count, stop=False, controller=cid,
+                                      start_ms=None, start_ok=None)
                 # Arm the run recorder with the scheduled filament set so the report
                 # can flag any that were scheduled but never reached ACTIVE.
                 RUN_RECORDER.start(expect=body.get("expect"),

@@ -2262,6 +2262,16 @@ warning: the wait is now the arrival, up to `heat_timeout_s`.
 > arrival; the schedule fires (PIO pulse, 165 read-backs, envelope) and writes
 > the pulse record with the heating reading nearest the trigger.
 
+**`sim_delay_ms`** (default `None`, `trigger="sim"` only, `pulse_interval_ms`
+.. 60000) — **when** the simulated train starts: the first pulse `sim_delay_ms`
+after the heating arrived (after the arm if unheated), then every
+`pulse_interval_ms`. The backend waits `sim_delay_ms − pulse_interval_ms` (the
+ESP32 puts its first edge one interval after it starts) and sends the trigger;
+with `active_mv` the arrival is polled every 50 ms. The HTTP request that starts
+the ESP32 train is not controlled (tens to a few hundred ms):
+`result["sim_timing"]` = `{sim_delay_ms, request_after_ms, waited_ms,
+esp32_start_ms}` reports it. The GUI shot panel's "delay after arrival ms".
+
 **The voltage loop** (RP2350 fw `feat/pulse-instant-heat`): the output ramps
 at the slew without being read; once it is at its setpoint the firmware reads
 the INA219 load voltage (and current) every 50 ms, trims the setpoint by the

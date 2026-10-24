@@ -1325,6 +1325,11 @@ class _ScheduleMixin:
         on_armed=None,               # callable() run after arming,
                                       # immediately before the trigger
                                       # -- see emission_ramp()
+        sim_delay_ms: float | None = None,  # trigger="sim" only: the FIRST
+                                      # pulse this long after the heating
+                                      # ARRIVED (or after the arm, unheated).
+                                      # 0..60000 ms and >= pulse_interval_ms
+                                      # -- see "sim_delay_ms" in the docstring
         active_ma: float | None = None,  # heat to ACTIVE at this current
                                           # only AFTER the arm, fire, and
                                           # drop to idle_ma at once -- see
@@ -1391,6 +1396,21 @@ class _ScheduleMixin:
         Give active_ma OR active_mv.
 
             ct.fire_single_pulse(f, active_mv=7600, idle_ma=1200, measure=True)
+
+        sim_delay_ms: trigger="sim" only -- WHEN the simulated train starts: the
+        first pulse sim_delay_ms after the heating ARRIVED (ACTIVE current or
+        VOLTAGE within +-150 mV; unheated: after the arm), then every
+        pulse_interval_ms. The backend waits sim_delay_ms - pulse_interval_ms
+        (the ESP32 puts its first edge one interval after it starts) and sends
+        the trigger; with active_mv the arrival is polled every 50 ms. Must be
+        >= pulse_interval_ms, <= 60000. Not controlled: the HTTP request that
+        starts the ESP32 train (tens to a few hundred ms) -- result
+        ["sim_timing"] = {sim_delay_ms, request_after_ms, waited_ms,
+        esp32_start_ms} says what it was.
+
+            ct.fire_single_pulse(f, active_mv=8000, idle_ma=1200, measure=True,
+                                 num_pulses=10, pulse_interval_ms=100,
+                                 sim_delay_ms=2000)   # first pulse 2 s after arrival
 
         IT DOES NOT HEAT THE FILAMENT. The schedule it builds carries an EMPTY
         heating table and this method calls nothing in the power-state ladder,
@@ -1702,6 +1722,42 @@ class _ScheduleMixin:
         if active_ma is not None and active_mv is not None:
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "error": "give active_ma OR active_mv, not both"}
+        # SIM DELAY. The ESP32 burst puts its FIRST edge one full interval after
+        # it starts (sync_io.cpp startBurst), so the trigger request goes out
+        # sim_delay_ms - pulse_interval_ms after the heating is seen to arrive
+        # (on_armed time is the arrival: _fire_heated calls it only then). What
+        # is NOT controlled: the HTTP hop to the ESP32 (tens to a few hundred
+        # ms, loop-shared) -- measured and returned in sim_timing.
+        sim_timing = None
+        if sim_delay_ms is not None:
+            if str(trigger) != "sim":
+                return {"ok": False, "fired": 0, "records": [], "status": {},
+                        "error": f"sim_delay_ms needs trigger='sim' (got {trigger!r}): with an "
+                                 f"external trigger the edge source sets the timing"}
+            d = float(sim_delay_ms)
+            if not 0 <= d <= 60000:
+                return {"ok": False, "fired": 0, "records": [], "status": {},
+                        "error": f"sim_delay_ms={d} out of range 0..60000 ms"}
+            if d < interval:
+                return {"ok": False, "fired": 0, "records": [], "status": {},
+                        "error": f"sim_delay_ms={d:g} is shorter than pulse_interval_ms={interval}: "
+                                 f"the ESP32 fires its first simulated edge one interval after "
+                                 f"it starts, so the first pulse cannot come sooner than "
+                                 f"{interval} ms"}
+            sim_timing = {"sim_delay_ms": d, "pulse_interval_ms": interval,
+                          "request_after_ms": round(d - interval, 1)}
+            user_cb = on_armed
+
+            def on_armed(_cb=user_cb, _t=sim_timing, _wait_s=(d - interval) / 1000.0):
+                t0 = time.monotonic()
+                if callable(_cb):
+                    _cb()
+                left = _wait_s - (time.monotonic() - t0)
+                if left > 0:
+                    time.sleep(left)
+                # The request is sent right after this returns (_fire_core).
+                _t["waited_ms"] = round((time.monotonic() - t0) * 1000.0, 1)
+            total_ms = int(total_ms) + int(d)
         if active_mv is not None:
             if voltage_settle_s is not None:
                 # The fixed settle sleep is gone: active_mv now waits for the
@@ -1712,7 +1768,7 @@ class _ScheduleMixin:
                     voltage_settle_s, heat_timeout_s)
                 warnings.warn("voltage_settle_s is ignored: active_mv waits for the "
                               "voltage to arrive, up to heat_timeout_s", stacklevel=2)
-            return self._fire_heated(
+            res = self._fire_heated(
                 filament, None, idle_ma, float(heat_timeout_s),
                 dict(num_pulses=num_pulses, width_us=width_us,
                      pulse_interval_ms=interval, trigger_timeout_ms=tmo,
@@ -1721,9 +1777,9 @@ class _ScheduleMixin:
                      timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
                      measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
                      bg_window_us=bg_window_us, on_armed=on_armed),
-                active_mv=active_mv)
-        if active_ma is not None:
-            return self._fire_heated(
+                active_mv=active_mv, fast_poll=sim_delay_ms is not None)
+        elif active_ma is not None:
+            res = self._fire_heated(
                 filament, active_ma, idle_ma, heat_timeout_s,
                 dict(num_pulses=num_pulses, width_us=width_us,
                      pulse_interval_ms=interval, trigger_timeout_ms=tmo,
@@ -1732,13 +1788,25 @@ class _ScheduleMixin:
                      timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
                      measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
                      bg_window_us=bg_window_us, on_armed=on_armed))
-        return self._fire_single(
-            filament, num_pulses=num_pulses, width_us=width_us,
-            pulse_interval_ms=interval, trigger_timeout_ms=tmo, max_on_ms=max_on_ms,
-            total_ms=total_ms, controller=controller, trigger=trigger,
-            timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse, measure=measure,
-            rate_hz=rate_hz, bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
-            on_armed=on_armed)
+        else:
+            res = self._fire_single(
+                filament, num_pulses=num_pulses, width_us=width_us,
+                pulse_interval_ms=interval, trigger_timeout_ms=tmo, max_on_ms=max_on_ms,
+                total_ms=total_ms, controller=controller, trigger=trigger,
+                timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse, measure=measure,
+                rate_hz=rate_hz, bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
+                on_armed=on_armed)
+        if sim_timing is not None and isinstance(res, dict):
+            if "waited_ms" in sim_timing:
+                # ...and how long the ESP32 then took to start the train (HTTP):
+                # the uncontrolled part. None if the backend does not report it.
+                try:
+                    st = self.simulate_sync_status() or {}
+                    sim_timing["esp32_start_ms"] = st.get("start_ms")
+                except Exception:
+                    sim_timing["esp32_start_ms"] = None
+            res["sim_timing"] = sim_timing
+        return res
 
     # active_one(verify=True)'s default tolerance: "within this of the target".
     _HEAT_BAND_MA = 150.0
@@ -1754,7 +1822,8 @@ class _ScheduleMixin:
         return m is not None and abs(float(m) - float(target_ma)) <= cls._HEAT_BAND_MA
 
     def _fire_heated(self, filament: int, active_ma: float | None, idle_ma,
-                     heat_timeout_s: float, kw: dict, active_mv: float | None = None) -> dict:
+                     heat_timeout_s: float, kw: dict, active_mv: float | None = None,
+                     fast_poll: bool = False) -> dict:
         """fire_single_pulse(active_ma=... | active_mv=...): prepare at IDLE,
         heat only between the arm and the end of the run. See its docstring.
         With active_mv, heat_timeout_s is the voltage settle time."""
@@ -1834,7 +1903,9 @@ class _ScheduleMixin:
             # (output at its limit, load still short) in the cached-current
             # read -- no I2C on the RP2350 side, so it can be polled.
             deadline = time.monotonic() + float(heat_timeout_s)
-            naps = self._poll_intervals(0.1, 0.3)
+            # sim_delay_ms counts from this arrival: poll at a steady 50 ms then,
+            # so the arrival is seen within one poll, not after a 0.3 s back-off.
+            naps = iter(lambda: 0.05, None) if fast_poll else self._poll_intervals(0.1, 0.3)
             t0 = time.monotonic()
             d, arrival = {}, None
             while True:
