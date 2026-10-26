@@ -1871,7 +1871,7 @@ const EMI_HTML = `
       <label class="numlabel" title="Spacing of the simulated triggers, ms (10 ms minimum).">every ms <input id="shotGap" type="number" min="10" max="60000" value="100" /></label>
     </div>
     <div class="bm-set-row">
-      <label class="numlabel" title="First pulse this long after the heating ARRIVED (ms), then every 'every ms'. Empty = straight away. Must be at least 'every ms' (the simulated trigger's first edge comes one interval after it starts). The HTTP hop to the ESP32 is not controlled; the result says how long it took.">delay after arrival ms <input id="shotDelay" type="number" min="0" max="60000" value="" placeholder="—" /></label>
+      <label class="numlabel" title="How long the heating must STAY arrived (ACTIVE current converged, or voltage within ±150 mV) before the trigger, timed by the RP2350 (needs fw with the arrival settle time). Empty = fire at arrival.">settle ms <input id="shotSettle" type="number" min="0" max="60000" value="" placeholder="—" /></label>
       <label class="numlabel" title="Longest wait for the heating to ARRIVE before firing (s): the ACTIVE current (current mode) or the measured load voltage within ±150 mV (voltage mode, needs the RP2350 voltage loop). Not arrived = not fired.">heat timeout s <input id="shotHeatS" type="number" min="0.5" max="30" step="0.5" value="6" /></label>
       <button id="shotFire" class="xs danger">Fire</button>
     </div>
@@ -2173,8 +2173,7 @@ function shotSummary(j) {
     : `ACTIVE ${p.active_ma} mA → ${h.measured_ma != null ? h.measured_ma + ' mA' : '?'}${h.elapsed_s != null ? ' in ' + Number(h.elapsed_s).toFixed(1) + ' s' : ''}`;
   const head = `${r.ok ? '✓' : '✗'} filament ${p.filament} (user #${r.user_filament}) · fired ${r.fired ?? 0}/${p.num_pulses} · measured ${(r.measured || []).length} · ${how}`;
   const msg = r.error || r.warning;
-  const st = r.sim_timing;
-  const timing = st ? `\ntiming: first pulse ${st.sim_delay_ms} ms after arrival requested · trigger sent ${st.waited_ms ?? '?'} ms after arrival · ESP32 start ${st.esp32_start_ms ?? '?'} ms (not controlled)` : '';
+  const timing = r.settle_ms != null ? `\nsettle: fired after the heating held arrival ${r.settle_ms} ms (firmware-timed)` : '';
   return head + (msg ? `\n${r.ok ? '⚠ ' : ''}${msg}` : '') + (r.detail ? `\ndetail: ${r.detail}` : '') + timing;
 }
 function wireShot() {
@@ -2187,7 +2186,7 @@ function wireShot() {
       pulse_interval_ms: +$p('shotGap').value, idle_ma: idle };
     const hs = +$p('shotHeatS').value;
     body.heat_timeout_s = hs;
-    if ($p('shotDelay').value !== '') body.sim_delay_ms = +$p('shotDelay').value;
+    if ($p('shotSettle').value !== '') body.settle_ms = +$p('shotSettle').value;
     if (mode === 'mv') body.active_mv = heat; else body.active_ma = heat;
     if (idle == null) { $p('shotStatus').textContent = '✗ set the IDLE current to drop back to'; return; }
     if (!confirm(`Heat filament ${fid} (${$p('shotSite').textContent}) to ${mode === 'mv' ? 'VOLTAGE ' + heat + ' mV' : 'ACTIVE ' + heat + ' mA'}, `

@@ -2262,15 +2262,10 @@ warning: the wait is now the arrival, up to `heat_timeout_s`.
 > arrival; the schedule fires (PIO pulse, 165 read-backs, envelope) and writes
 > the pulse record with the heating reading nearest the trigger.
 
-**`sim_delay_ms`** (default `None`, `trigger="sim"` only, `pulse_interval_ms`
-.. 60000) — **when** the simulated train starts: the first pulse `sim_delay_ms`
-after the heating arrived (after the arm if unheated), then every
-`pulse_interval_ms`. The backend waits `sim_delay_ms − pulse_interval_ms` (the
-ESP32 puts its first edge one interval after it starts) and sends the trigger;
-with `active_mv` the arrival is polled every 50 ms. The HTTP request that starts
-the ESP32 train is not controlled (tens to a few hundred ms):
-`result["sim_timing"]` = `{sim_delay_ms, request_after_ms, waited_ms,
-esp32_start_ms}` reports it. The GUI shot panel's "delay after arrival ms".
+**`sim_delay_ms`** — **removed** (2026-10-26). It was a host-side sleep between
+arrival and the simulated trigger; `settle_ms` below does the same wait in the
+RP2350, for every trigger source. Passing it returns an error and nothing is
+done.
 
 **`settle_ms`** (default `None`, with `active_ma` or `active_mv`, 0..60000) —
 how long the heating must **stay** arrived before `on_armed` is called and the
@@ -2281,7 +2276,8 @@ without a break, then `"settled"`; dropping out restarts the clock. IDLE is not
 affected. Written to every connected controller for the shot and set back to 0
 afterwards (an RP2350 reset also clears it). `heat_timeout_s` is the wait for
 arrival; `settle_ms` is added on top. So an external trigger source can fire
-the moment `on_armed` says so. Older firmware: error, not fired.
+the moment `on_armed` says so. Older firmware: error, not fired. The GUI shot
+panel's "settle ms".
 `ct.get_arrival_settle()` / `ct.set_arrival_settle(ms)` read/write it directly.
 
 **The voltage loop** (RP2350 fw `feat/pulse-instant-heat`): the output ramps

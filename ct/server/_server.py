@@ -1952,7 +1952,7 @@ def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) ->
     try:
         # How long the ESP32 took to START the train: the part of a simulated
         # trigger's timing nobody controls (HTTP, shares the ESP32's loop).
-        # Reported by /api/sync/simulate-status -> fire_single_pulse sim_timing.
+        # Reported by /api/sync/simulate-status (how long the ESP32 took to start).
         t0 = time.monotonic()
         r = sync_post_burst(host, count, rate_hz, timeout=3.0)
         with _SIM_LOCK:
@@ -2601,7 +2601,7 @@ _SHOT_LOCK = threading.Lock()
 _SHOT: dict = {"running": False, "params": None, "result": None, "error": None,
                "started": None, "finished": None}
 _SHOT_KEYS = ("num_pulses", "width_us", "pulse_interval_ms", "active_ma", "active_mv",
-              "idle_ma", "heat_timeout_s", "sim_delay_ms")
+              "idle_ma", "heat_timeout_s", "settle_ms")
 
 
 def shot_start(body: dict) -> dict:
