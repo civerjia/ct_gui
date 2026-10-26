@@ -810,6 +810,17 @@ async function pollTelemetry() {
   // the firmware-reported firing filament(s) are authoritative ACTIVE
   const firing = data.firing || [];
   for (const fi of firing) { const r = rows.find((x) => x.index === fi); if (r) r.state = STATE.ACTIVE; }
+  // The beam (red line) follows what is FIRING when the backend says so
+  // (scan_view): its schedule is not the GUI's, so the run-status playhead,
+  // which indexes the GUI's own table, cannot place it. Inside the current
+  // collimator window only the window position moves; outside, the collimator
+  // is centred on it.
+  if (firing.length) {
+    const fi = firing[0];
+    const off = ctMod(fi - (state.collimatorCenter - HALF), N);
+    if (off <= 2 * HALF) state.windowPos = off;
+    else { state.collimatorCenter = ctMod(fi, N); state.windowPos = HALF; }
+  }
   // NOTE: do not assign state.activeFilament — it's a derived getter (no setter),
   // and writing it throws in strict mode (ES module), aborting the poll. The
   // firing rows are already marked ACTIVE above; the live active pointer is

@@ -761,6 +761,25 @@ _PUSH_FIRING: list = []
 # for ~3 s after every scan_view and froze on the last pushed frame.
 _LAST_PUSH_ROWS: dict = {}
 LAST_PUSH_SERVE_S = 15.0
+# After scan_view releases the push it keeps streaming this long, so the live
+# view SEES the last filaments go back to IDLE instead of freezing on them hot.
+PUSH_TAIL_S = 3.0
+_PUSH_TAIL_UNTIL = 0.0
+
+
+def _push_release_later(delay_s: float) -> None:
+    global _PUSH_TAIL_UNTIL
+    _PUSH_TAIL_UNTIL = time.monotonic() + delay_s
+
+    def _off():
+        if _PUSH_HOLD or time.monotonic() < _PUSH_TAIL_UNTIL - 0.05:
+            return                                   # re-held, or a newer tail
+        for c2, l2 in CONTROLLERS.items():
+            if c2 in _LIVE_PUSH and l2.client.connected:
+                set_scan_telemetry(l2, c2 - 1, False)
+    t = threading.Timer(delay_s, _off)
+    t.daemon = True
+    t.start()
 
 
 def set_scan_telemetry(link: "ControllerLink", controller: int, enable: bool) -> None:
@@ -1996,7 +2015,8 @@ def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) ->
         # Stop the telemetry push and finalize the power-state report -- unless
         # a scan_view holds it for the rest of its view.
         for c2, l2 in CONTROLLERS.items():
-            if c2 in _LIVE_PUSH and l2.client.connected and not _PUSH_HOLD:
+            if c2 in _LIVE_PUSH and l2.client.connected and not _PUSH_HOLD \
+                    and time.monotonic() >= _PUSH_TAIL_UNTIL:
                 set_scan_telemetry(l2, c2 - 1, False)
         RUN_RECORDER.stop()
 
@@ -3970,7 +3990,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     any_running = any((v.get("status") or {}).get("state") == 2 for v in out.values())
                     if any_running:
                         _PUSH_SAW_RUN = True
-                    elif _PUSH_SAW_RUN and not _PUSH_HOLD:
+                    elif _PUSH_SAW_RUN and not _PUSH_HOLD and time.monotonic() >= _PUSH_TAIL_UNTIL:
                         for c2 in list(_LIVE_PUSH):
                             l2 = CONTROLLERS.get(c2)
                             if l2 and l2.client.connected:
@@ -5820,11 +5840,13 @@ class CtHandler(BaseHTTPRequestHandler):
                 if "on" in body:
                     on = bool(body["on"])
                     _PUSH_HOLD = on
-                    if not on:
+                    if on:
+                        for c2, l2 in CONTROLLERS.items():
+                            if l2.client.connected:
+                                set_scan_telemetry(l2, c2 - 1, True)
+                    else:
                         _PUSH_FIRING = []
-                    for c2, l2 in CONTROLLERS.items():
-                        if l2.client.connected:
-                            set_scan_telemetry(l2, c2 - 1, on)
+                        _push_release_later(PUSH_TAIL_S)
                 self._json({"ok": True, "hold": _PUSH_HOLD, "firing": _PUSH_FIRING})
             elif path == "/api/filament-perf":
                 # Bookkeeping, not hardware: any client may record (see _access).
