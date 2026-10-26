@@ -50,7 +50,7 @@ def make(never_arrives=(), settle_ok=True):
             st["perf"].extend(body["records"])
             return {"ok": True}
         if path == "/api/live-push":
-            log.append(("push", body.get("on"), tuple(body.get("firing") or ())))
+            log.append(("push", body.get("on"), tuple(body.get("firing") or ()), body.get("view")))
             return {"ok": True}
         if path == "/api/arm":
             log.append(("arm", tuple(body["controllers"])))
@@ -119,6 +119,8 @@ check("rows carry the heating at the pulse", r["rows"][0]["heat_mV"] == 8000 and
 pushes = [e for e in log if e[0] == "push"]
 check("live push held for the whole view and released",
       pushes[0][1] is True and pushes[-1][1] is False, pushes)
+views = [e for e in log if e[0] == "push" and e[1] is True]
+check("detector centre defaults to the middle filament", r.get("detector_center") == V[len(V) // 2], r.get("detector_center"))
 check("each filament announced as firing, then cleared",
       [p[2] for p in pushes if p[1] is None][:2] == [(int(ct._fid_of(3)),), ()], pushes)
 check("disarmed at the end", log[-1][0] in ("disarm", "settle") and any(e[0] == "disarm" for e in log[-3:]))

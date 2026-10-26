@@ -1391,6 +1391,7 @@ class _ScheduleMixin:
                   k="auto",                    # "auto", or a fixed number of filaments ahead
                   k_max: int = 6,              # never more than this many hot at once
                   start_in_s: float = 0.0,     # first pulse no sooner than this (motor moving)
+                  detector_center=None,        # filament the detector faces; None = the middle one
                   num_pulses: int = 1,         # pulses per filament
                   width_us: int = 1000,
                   pulse_interval_ms: int = 100,   # spacing inside one filament's burst
@@ -1424,6 +1425,12 @@ class _ScheduleMixin:
             STOPS the view: disarm, every filament back to idle_ma, settle 0,
             and the reason in "error". Retry or skip is the caller's call.
             (If the caller itself dies, the backend drops the timed VOLTAGE.)
+
+        detector_center: the filament the detector faces in this view (the
+        collimator centre). None = the middle of `filaments` (35 -> the 18th).
+        Only drawn: the GUI places the detector/collimator there and the beam
+        follows the firing filament inside that window. Returned as
+        "detector_center".
 
         Simulated trigger only. Every filament must be at a settled IDLE first.
         Needs RP2350 fw with the voltage loop (903cd23+ for settle_ms > 0).
@@ -1462,6 +1469,7 @@ class _ScheduleMixin:
                          if isinstance(active_mv, dict) else active_mv) for f in fils}
         except (KeyError, TypeError, ValueError) as exc:
             return fail(f"active_mv must be a number or give every filament one ({exc!r})")
+        center = fils[len(fils) // 2] if detector_center is None else int(detector_center)
         auto = k == "auto"
         try:
             kk = None if auto else max(1, int(k))
@@ -1593,7 +1601,9 @@ class _ScheduleMixin:
             if bad:
                 raise self._ScanStop(f"arm failed: { {c: self._arm_failure(r)[1] for c, r in bad.items()} }")
             # 20 fps live view for the WHOLE view (the GUI), not only per burst.
-            push_on = bool((self._post("/api/live-push", {"on": True}) or {}).get("ok"))
+            push_on = bool((self._post("/api/live-push", {
+                "on": True, "view": {"center": int(self._fid_of(center)),
+                                     "filaments": [int(self._fid_of(f)) for f in fils]}}) or {}).get("ok"))
             # The move: nothing fires before start_at; the first filaments are
             # raised so that they arrive about then.
             while time.monotonic() < start_at:
@@ -1718,7 +1728,7 @@ class _ScheduleMixin:
                    heated_mean_s=mean("heated_s"), waited_mean_s=mean("waited_s"),
                    per_filament_s=(round((since() - out["start_s"]) / len(fired), 2)
                                    if fired and out.get("start_s") is not None else None),
-                   settle_ms=settle, k=k, estimate={"arrive_s": round(est.arrive_s(), 3),
+                   settle_ms=settle, k=k, detector_center=center, estimate={"arrive_s": round(est.arrive_s(), 3),
                                                      "cycle_s": round(est.cycle_s(), 3)},
                    gantt=self._scan_gantt([rows[f] for f in fils], out.get("start_s")))
         return out

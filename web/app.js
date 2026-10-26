@@ -815,6 +815,9 @@ async function pollTelemetry() {
   // which indexes the GUI's own table, cannot place it. Inside the current
   // collimator window only the window position moves; outside, the collimator
   // is centred on it.
+  // scan_view says which filament the detector faces in this view: the
+  // collimator goes there (detector opposite), the beam moves inside it.
+  if (data.view && data.view.center != null) state.collimatorCenter = ctMod(data.view.center, N);
   if (firing.length) {
     const fi = firing[0];
     const off = ctMod(fi - (state.collimatorCenter - HALF), N);

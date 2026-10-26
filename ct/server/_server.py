@@ -755,6 +755,8 @@ _PUSH_SAW_RUN = False                 # push tore-down only after a run actually
 # tears the push down. _PUSH_FIRING is what scan_view says it is firing (FIDs).
 _PUSH_HOLD = False
 _PUSH_FIRING: list = []
+# The view scan_view is firing: {"center": fid the detector faces, "filaments": [...]}
+_PUSH_VIEW: dict = {}
 # The last pushed snapshot per controller, {cid: (monotonic, {fid: row})}: served
 # by /api/telemetry right after the push stops, while the board monitor (paused
 # during the run) has nothing fresh yet. Without it the GUI got EMPTY telemetry
@@ -3395,6 +3397,7 @@ class CtHandler(BaseHTTPRequestHandler):
                         _LAST_PUSH_ROWS[cid] = (time.monotonic(), dict(got))
             RUN_RECORDER.observe(rows.values())
             self._json({"telemetry": list(rows.values()), "firing": list(_PUSH_FIRING),
+                        "view": dict(_PUSH_VIEW),
                         "run": {str(c): {"state": 2} for c in _LIVE_PUSH}})
         elif path == "/api/telemetry":
             # Real per-filament telemetry for the ring: batch INA219 (V/I) per
@@ -5834,7 +5837,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 # scan_view: {"on": bool} holds/releases the 20 fps telemetry
                 # push for a whole view; {"firing": [fid, ...]} says what it is
                 # firing right now (served in /api/telemetry's push snapshot).
-                global _PUSH_HOLD, _PUSH_FIRING
+                global _PUSH_HOLD, _PUSH_FIRING, _PUSH_VIEW
+                if isinstance(body.get("view"), dict):
+                    _PUSH_VIEW = {"center": body["view"].get("center"),
+                                  "filaments": list(body["view"].get("filaments") or [])}
                 if "firing" in body:
                     _PUSH_FIRING = [int(x) for x in (body.get("firing") or [])]
                 if "on" in body:
