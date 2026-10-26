@@ -2280,21 +2280,43 @@ the moment `on_armed` says so. Older firmware: error, not fired. The GUI shot
 panel's "settle ms".
 `ct.get_arrival_settle()` / `ct.set_arrival_settle(ms)` read/write it directly.
 
-**`scan_view(filaments, active_mv, idle_ma, settle_ms=0, k=4, num_pulses=1, …)`**
-— SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire one CT view,
-several filaments in order, in VOLTAGE mode with the host heating ahead. One
-schedule for the whole view (one download / verify / arm, no heating rows);
-the first `k` filaments go to a timed VOLTAGE; each is fired (simulated
-trigger, `num_pulses`) only once the RP2350 reports it `"settled"` (±150 mV,
-held `settle_ms`), then dropped to `idle_ma` while the filament `k` places on
-is raised. The backend lets the running schedule's own filaments change
-IDLE ↔ VOLTAGE mid-run for this (`in_run`), nothing else. A filament that does
-not arrive within `heat_timeout_s` (+ settle) stops the view — nothing is fired
-on it. Always: disarm, everything back to `idle_ma`, settle back to 0.
-`active_mv` is one number or `{filament: mV}`. Every filament must start at a
-settled IDLE. Rows: arrival time, the heating V/I at each pulse.
+**`scan_view(filaments, active_mv, idle_ma, settle_ms=0, k="auto", start_in_s=0, num_pulses=1, …)`**
+— SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire ONE CT view, its
+filaments in order, in VOLTAGE mode. Call it once per view when the motor
+STARTS moving, `start_in_s` = how long the move takes: it downloads, verifies
+and arms the view during the move, heats each filament **just in time** and
+fires it (simulated trigger, `num_pulses`) only once the RP2350 reports it
+`"settled"` (±150 mV held `settle_ms`), then drops it to `idle_ma`.
 
-    r = ct.scan_view([3, 4, 5, 6, 7, 8], active_mv=8000, idle_ma=1200, settle_ms=500)
+* `k="auto"`: filament *s* is raised when its turn is expected within its own
+  arrival time + `lead_margin_s` (0.3 s). Its arrival time comes from the
+  backend's per-filament table at about this voltage (±300 mV); with too
+  little history, from this session's measurements (90th percentile of the
+  last 20). The time per filament is the median of the last 20, measured
+  WITHOUT waiting for heating. `k=N` instead raises N turns ahead. Never more
+  than `k_max` (6) hot at once.
+* A wrong prediction only costs time — nothing fires before `"settled"`.
+  Reads and IDLE/VOLTAGE commands are retried for 10 s (a bridge reconnect);
+  the trigger is never sent twice.
+* Anything that does not recover (a filament not arriving within
+  `heat_timeout_s` + settle, an SHV fault, a lost count) STOPS the view:
+  disarm, everything to `idle_ma`, settle 0, the reason in `error`. Retry or
+  skip is the caller's decision. The backend lets the running schedule's own
+  filaments go IDLE ↔ VOLTAGE mid-run for this (`in_run`), nothing else.
+* Rows: `raise_s`, `settled_s`, `fired_s`, `heated_s` (time hot), `waited_s`
+  (hot and only waiting), heating V/I at the pulses; `r["gantt"]` draws what
+  happened (`.` heating, `=` settled and waiting, `#` pulses, `|` view start).
+
+      for v, fils in enumerate(views):
+          motor.start_move(v)
+          r = ct.scan_view(fils, active_mv=8000, idle_ma=1200, settle_ms=500,
+                           start_in_s=3.0, num_pulses=5, width_us=20000,
+                           pulse_interval_ms=100)
+
+**`filament_perf(filaments=None)`** — the backend's per-filament table that
+`scan_view` keeps (persistent, `state/filament_perf.json`): per filament the
+last 30 views' voltage, arrival time (settle excluded), heating V/I at the
+pulse, ohms, and failures with the last reason.
 
 **The voltage loop** (RP2350 fw `feat/pulse-instant-heat`): the output ramps
 at the slew without being read; once it is at its setpoint the firmware reads

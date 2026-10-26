@@ -148,6 +148,7 @@ AUDIT_SKIP_PATHS = frozenset({
     "/api/adc/ready-status", "/api/adc/ready-renew", "/api/diagnosis",
     "/api/present", "/api/tca9554-read", "/api/verify-schedule",
     "/api/poll-pause",
+    "/api/filament-perf",       # bookkeeping only (scan_view's per-filament table)
 })
 
 

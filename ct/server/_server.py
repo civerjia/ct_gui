@@ -2596,6 +2596,94 @@ def emission_cal_status() -> dict:
 # measured, simulated trigger -- the same call a script makes, so the GUI shows
 # exactly what fire_single_pulse returns. Under the lease, like the other
 # backend-run jobs: refused while another client holds it.
+# ── Per-filament performance table (scan_view, 2026-10-26) ──────────────────
+# What each filament actually did in VOLTAGE heating: how long it took to
+# ARRIVE (raw, settle excluded, so a different settle_ms can reuse it), the
+# heating V/I at its pulses, failures. scan_view's k="auto" raises each
+# filament by ITS OWN arrival time from here instead of one rig-wide guess.
+# Persistent (STATE_DIR), keyed by physical filament (FID).
+FILAMENT_PERF_PATH = STATE_DIR / "filament_perf.json"
+FILAMENT_PERF_KEEP = 30
+_PERF_LOCK = threading.Lock()
+
+
+def _perf_load() -> dict:
+    try:
+        with open(FILAMENT_PERF_PATH, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("filament_perf.json unreadable (%s) -- starting empty", exc)
+        return {}
+
+
+FILAMENT_PERF: dict = _perf_load()
+
+
+def _perf_summary(fid: int, ent: dict) -> dict:
+    smp = ent.get("samples") or []
+    arr = sorted(x["arrive_raw_s"] for x in smp if x.get("arrive_raw_s") is not None)
+    ohm = sorted(x["heat_mV"] / x["heat_mA"] for x in smp
+                 if x.get("heat_mV") and x.get("heat_mA"))
+    med = lambda v: v[len(v) // 2] if v else None  # noqa: E731
+    last = smp[-1] if smp else {}
+    return {"filament": fid, "n": len(smp), "fired": ent.get("fired", 0),
+            "failed": ent.get("failed", 0), "last_error": ent.get("last_error"),
+            "last_mv": last.get("mv"), "last_t": last.get("t"),
+            "arrive_raw_med_s": None if not arr else round(med(arr), 3),
+            "arrive_raw_max_s": None if not arr else round(arr[-1], 3),
+            "ohm_med": None if not ohm else round(med(ohm), 3),
+            "samples": smp}
+
+
+def filament_perf_get(fids=None) -> dict:
+    with _PERF_LOCK:
+        keys = [str(int(f)) for f in fids] if fids else list(FILAMENT_PERF)
+        return {"ok": True, "filaments": {k: _perf_summary(int(k), FILAMENT_PERF[k])
+                                          for k in keys if k in FILAMENT_PERF}}
+
+
+def filament_perf_record(records) -> dict:
+    """records: [{filament (FID), mv, settle_ms, arrive_s?, heat_mV?, heat_mA?,
+    waited_s?, error?}] -- one per filament per view. A record with "error"
+    counts a failure and stores no sample."""
+    added = 0
+    with _PERF_LOCK:
+        for r in records or []:
+            try:
+                fid = int(r["filament"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            ent = FILAMENT_PERF.setdefault(str(fid), {"samples": [], "fired": 0, "failed": 0})
+            if r.get("error"):
+                ent["failed"] = int(ent.get("failed", 0)) + 1
+                ent["last_error"] = {"t": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                     "mv": r.get("mv"), "error": str(r["error"])[:300]}
+                continue
+            arr = r.get("arrive_s")
+            settle = float(r.get("settle_ms") or 0) / 1000.0
+            ent["samples"].append({
+                "t": time.strftime("%Y-%m-%d %H:%M:%S"), "mv": r.get("mv"),
+                "settle_ms": r.get("settle_ms"),
+                "arrive_raw_s": None if arr is None else round(max(0.0, float(arr) - settle), 3),
+                "heat_mV": r.get("heat_mV"), "heat_mA": r.get("heat_mA"),
+                "waited_s": r.get("waited_s")})
+            ent["samples"] = ent["samples"][-FILAMENT_PERF_KEEP:]
+            ent["fired"] = int(ent.get("fired", 0)) + 1
+            added += 1
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = FILAMENT_PERF_PATH.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(FILAMENT_PERF, fh)
+            os.replace(tmp, FILAMENT_PERF_PATH)
+        except Exception as exc:
+            return {"ok": False, "added": added, "error": f"not saved: {exc}"}
+    return {"ok": True, "added": added}
+
+
 GUI_SHOT_CLIENT = "gui-single-shot"
 _SHOT_LOCK = threading.Lock()
 _SHOT: dict = {"running": False, "params": None, "result": None, "error": None,
@@ -3797,6 +3885,9 @@ class CtHandler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._json({"ok": False, "error": "tail must be an integer"})
             self._json(read_log_file(q.get("path", "backend.log"), tail, q.get("grep") or None))
+        elif path == "/api/filament-perf":
+            fids = [int(x) for x in (q.get("filaments") or "").split(",") if x.strip().isdigit()]
+            self._json(filament_perf_get(fids or None))
         elif path == "/api/defaults":
             # Rig operating defaults (ct/defaults.py) -- the GUI's only source
             # for them, so a change there (or CT_IDLE_MA) reaches it unedited.
@@ -5676,6 +5767,9 @@ class CtHandler(BaseHTTPRequestHandler):
                 threading.Thread(target=_run_scan_sim, args=(link.host, count, interval_ms, cid),
                                  daemon=True).start()
                 self._json({"ok": True, "count": count, "interval_ms": interval_ms, "controller": cid})
+            elif path == "/api/filament-perf":
+                # Bookkeeping, not hardware: any client may record (see _access).
+                self._json(filament_perf_record(body.get("records")))
             elif path == "/api/sync/simulate-stop":
                 # Signal the background scan-simulation thread (started by
                 # POST /api/sync/simulate) to stop after its current
