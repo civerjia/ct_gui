@@ -2280,6 +2280,22 @@ the moment `on_armed` says so. Older firmware: error, not fired. The GUI shot
 panel's "settle ms".
 `ct.get_arrival_settle()` / `ct.set_arrival_settle(ms)` read/write it directly.
 
+**`scan_view(filaments, active_mv, idle_ma, settle_ms=0, k=4, num_pulses=1, …)`**
+— SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire one CT view,
+several filaments in order, in VOLTAGE mode with the host heating ahead. One
+schedule for the whole view (one download / verify / arm, no heating rows);
+the first `k` filaments go to a timed VOLTAGE; each is fired (simulated
+trigger, `num_pulses`) only once the RP2350 reports it `"settled"` (±150 mV,
+held `settle_ms`), then dropped to `idle_ma` while the filament `k` places on
+is raised. The backend lets the running schedule's own filaments change
+IDLE ↔ VOLTAGE mid-run for this (`in_run`), nothing else. A filament that does
+not arrive within `heat_timeout_s` (+ settle) stops the view — nothing is fired
+on it. Always: disarm, everything back to `idle_ma`, settle back to 0.
+`active_mv` is one number or `{filament: mV}`. Every filament must start at a
+settled IDLE. Rows: arrival time, the heating V/I at each pulse.
+
+    r = ct.scan_view([3, 4, 5, 6, 7, 8], active_mv=8000, idle_ma=1200, settle_ms=500)
+
 **The voltage loop** (RP2350 fw `feat/pulse-instant-heat`): the output ramps
 at the slew without being read; once it is at its setpoint the firmware reads
 the INA219 load voltage (and current) every 50 ms, trims the setpoint by the

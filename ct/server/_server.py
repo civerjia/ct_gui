@@ -4657,7 +4657,19 @@ class CtHandler(BaseHTTPRequestHandler):
                                                f"refusing rather than assuming idle"},
                         HTTPStatus.OK)
                 if st and st.get("state") == 2:
-                    return self._json({"ok": False, "error": "running — disarm first"}, HTTPStatus.OK)
+                    # SOFTWARE SCAN PATCH (scan_view, 2026-10-26): a running
+                    # schedule's OWN filaments may be raised to VOLTAGE / dropped
+                    # to IDLE mid-run, when the caller says so (in_run) -- that
+                    # is how the host pre-heats the next filaments with arrival
+                    # feedback. Everything else still waits for the disarm, and
+                    # every guard above (dead, ladder, cap, timed) already ran.
+                    own = any(filament in fids for fids in LOADED_EMIT_FIDS.values())
+                    if not (body.get("in_run") and own
+                            and state in (POWER_STATE_IDLE, POWER_STATE_VOLTAGE)):
+                        return self._json({"ok": False, "error": "running — disarm first"
+                                           + (" (in_run covers only IDLE/VOLTAGE on the "
+                                              "running schedule's own filaments)"
+                                              if body.get("in_run") else "")}, HTTPStatus.OK)
                 ft, flags, payload = build_payload("CH_SET_POWER_STATE", {
                     "channel": ch, "mux_port": pos, "state": state, "arg": arg,
                 })
