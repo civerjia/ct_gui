@@ -3886,6 +3886,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "tail must be an integer"})
             self._json(read_log_file(q.get("path", "backend.log"), tail, q.get("grep") or None))
         elif path == "/api/filament-perf":
+            q = self._query()
             fids = [int(x) for x in (q.get("filaments") or "").split(",") if x.strip().isdigit()]
             self._json(filament_perf_get(fids or None))
         elif path == "/api/defaults":
