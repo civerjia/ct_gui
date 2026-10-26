@@ -236,7 +236,8 @@ window.ingestTelemetry = ingestTelemetry;
 const MAX_ROWS = 8192;            // firmware schedule cap
 let schedule = [];
 let totalTriggers = 0;           // total SyncIn pulses in one rotation
-let filamentOrder = null;        // null = natural (0..95); array = custom ring-pos→filament map
+// (The GUI's own ring-position order is gone: the backend's filament order is
+// the one mapping, for scripts and GUI alike -- see ringToFid above.)
 let liveSeq = 0;
 // the pulse-trigger position of the current scan row
 function currentTrigger() { return schedule[liveSeq] ? schedule[liveSeq].trigger : 0; }
@@ -288,7 +289,7 @@ function buildSchedule() {
   while (sim.ringStep < N) {
     if (rows.length >= MAX_ROWS) { scheduleTruncated = true; break; }
     const logPos = ctMod(sim.collimatorCenter - HALF + sim.windowPos, N);
-    const fil = filamentOrder ? (filamentOrder[logPos] ?? logPos) : logPos;
+    const fil = logPos;   // ring position; buildPlan() maps it to the physical filament
     if (!filaments[fil].dead && !filaments[fil].noHv) { // dead/noHv fire nothing
       const burstLen = Math.max(1, filaments[fil].pulses);
       rows.push({
@@ -1495,16 +1496,18 @@ ctState.invalidateRun = () => { runState.hwChecked = false; invalidateRun(); };
 // Translate the GUI's bound schedule into the host plan (logical filament 0-95;
 // the backend maps to global 0-127 + per-controller split).
 function buildPlan() {
+  // The schedule is in RING positions; the hardware takes physical filaments
+  // (FID) -- through the backend's order, the one mapping there is.
   const emission = schedule.map((r) => ({
-    filament: r.filament, numPulses: r.burstLen, widthUs: Math.round(r.duration),
+    filament: fidOfRing(r.filament), numPulses: r.burstLen, widthUs: Math.round(r.duration),
   }));
   const heating = (heatingPlan ? heatingPlan.deltas : []).map((d) => ({
-    filament: d.filament, triggerIndex: d.seq, state: d.state, milliamps: d.arg,
+    filament: fidOfRing(d.filament), triggerIndex: d.seq, state: d.state, milliamps: d.arg,
   }));
   const currents = {};
   filaments.forEach((f, i) => {
     if (f.dead || f.noHeat) return;
-    currents[i] = { idle_mA: Math.round(f.idleA * 1000), active_mA: Math.round(f.activeA * 1000) };
+    currents[fidOfRing(i)] = { idle_mA: Math.round(f.idleA * 1000), active_mA: Math.round(f.activeA * 1000) };
   });
   // Derive the firmware config from the actual schedule instead of hardcoding:
   //  - maxOnMs MUST exceed the widest pulse or arm() rejects WidthTooLarge.
@@ -1839,7 +1842,7 @@ async function pollRunStatus() {
     if (s.state === 3) anyComplete = true;
     if (s.state === 4) fault = { ctrl: k, fil: s.faultFilament, reason: s.stopReason };
     // firmware-reported live firing filament (255 = none/idle)
-    if (s.filamentIndex != null && s.filamentIndex !== 255) firingFil = s.filamentIndex;
+    if (s.filamentIndex != null && s.filamentIndex !== 255) firingFil = ringOfFid(s.filamentIndex);
     const fil = (s.filamentIndex == null || s.filamentIndex === 255) ? '—' : s.filamentIndex;
     // Poll succeeded => responsive. A stale heartbeat here is just a soft note.
     const hb = stale ? ' · ⚠hb-stale' : '';
@@ -2292,28 +2295,32 @@ function init() {
 
   $('filListDetails').addEventListener('toggle', (e) => { if (e.target.open) buildFilList(); });
 
+  // Filament order = the BACKEND's order (order[ring position] = physical
+  // filament), shared with every script. Shown when opened; Apply/Reset write it.
+  const showOrder = () => { $('filOrderInput').value = ringToFid ? ringToFid.join(', ') : ''; };
+  $('filOrderDetails').addEventListener('toggle', (e) => { if (e.target.open) syncBackendOrder().then(showOrder); });
+  const putOrder = async (order) => {
+    const status = $('filOrderStatus');
+    let j;
+    try { j = await postJSON('/api/filament-order', { order }); } catch (err) { j = { ok: false, error: String(err) }; }
+    if (!j || !j.ok) { status.textContent = `✗ ${(j && j.error) || 'not accepted'}`; return; }
+    await syncBackendOrder();
+    showOrder();
+    status.textContent = order ? '✓ Backend order set (scripts use it too).' : '✓ Backend order back to natural.';
+    rebuildSchedule();
+  };
   $('filOrderApply').addEventListener('click', () => {
     const raw = $('filOrderInput').value.trim();
     const status = $('filOrderStatus');
-    if (!raw) { filamentOrder = null; status.textContent = 'Natural order restored.'; rebuildSchedule(); return; }
+    if (!raw) { putOrder(null); return; }
     const nums = raw.split(/[\s,]+/).filter(Boolean).map(Number);
-    if (nums.some(n => !Number.isInteger(n) || n < 0 || n > 95)) {
-      status.textContent = `✗ Invalid values — all must be integers 0–95.`; return;
+    if (nums.length !== N || nums.some(n => !Number.isInteger(n) || n < 0 || n >= N)) {
+      status.textContent = `✗ Give all ${N} positions: integers 0–${N - 1}.`; return;
     }
-    const uniq = new Set(nums);
-    if (uniq.size !== nums.length) {
-      status.textContent = `✗ Duplicates found (${nums.length - uniq.size} repeated).`; return;
-    }
-    filamentOrder = nums;
-    status.textContent = `✓ Custom order applied (${nums.length} entr${nums.length === 1 ? 'y' : 'ies'}).`;
-    rebuildSchedule();
+    if (new Set(nums).size !== N) { status.textContent = '✗ Each filament exactly once.'; return; }
+    putOrder(nums);
   });
-  $('filOrderReset').addEventListener('click', () => {
-    filamentOrder = null;
-    $('filOrderInput').value = '';
-    $('filOrderStatus').textContent = 'Natural order restored.';
-    rebuildSchedule();
-  });
+  $('filOrderReset').addEventListener('click', () => putOrder(null));
 
   // filament context menu (plan mode right-click)
   $('filMenuEnable').addEventListener('click', () => { if (filMenuTarget >= 0) setFilState(filMenuTarget, false, false, false); });

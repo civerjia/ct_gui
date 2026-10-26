@@ -248,9 +248,9 @@
             <div id="filList" class="fil-list"></div>
           </details>
           <details class="sch-section" id="filOrderDetails">
-            <summary>Filament order <span class="hint">— custom ring-position → filament mapping</span></summary>
+            <summary>Filament order <span class="hint">— the backend's ring-position → physical filament map (shared with scripts)</span></summary>
             <div class="fil-order-wrap">
-              <textarea id="filOrderInput" class="fil-order-input" rows="3" spellcheck="false" placeholder="Paste comma-separated filament indices 0–95 (up to 96 values). Position i in this list fires at ring step i. Leave blank for natural order (0, 1, 2 … 95)."></textarea>
+              <textarea id="filOrderInput" class="fil-order-input" rows="3" spellcheck="false" placeholder="96 comma-separated physical filaments: entry i is the board at ring position i. This is the backend's order -- Apply sets it for every client and script; empty or Reset = natural (0, 1, 2 … 95)."></textarea>
               <div class="fil-order-btns">
                 <button id="filOrderApply" class="xs quick">Apply</button>
                 <button id="filOrderReset" class="xs">Reset</button>
