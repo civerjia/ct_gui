@@ -1541,7 +1541,11 @@ class _ScheduleMixin:
                 extra={"active_s": wait_s + float(start_in_s) + len(fils) * 2.0 + 30.0,
                        "then_idle_ma": int(idle_ma), "in_run": True}))
             if not r.get("ok"):
-                raise self._ScanStop(f"filament {f}: VOLTAGE {mv[f]} mV refused: {r.get('error')}")
+                # This filament's own problem (board absent, not warm, dead...):
+                # named, so scan_views leaves it out and fires the rest.
+                out["failed_filament"] = f
+                out["failed_why"] = f"VOLTAGE {mv[f]} mV refused: {r.get('error')}"
+                raise self._ScanStop(f"filament {f}: {out['failed_why']}")
             raised.add(f)
             rows[f]["raise_s"] = since()
 
@@ -1796,7 +1800,8 @@ class _ScheduleMixin:
              and return; the view's first pulse comes move_s later, and the
              first filaments are heated during the move so they are ready then;
           2. scan_view() fires the view (see it for the heating rules);
-          3. a filament that does not reach its voltage is left out of the rest
+          3. a filament that does not reach its voltage (or is refused it: board
+             absent, not warm) is left out of the rest
              of the run, and the view's filaments NOT YET FIRED are fired once
              more without it; any other failure STOPS the run (nothing is
              heated for nothing).
@@ -1810,16 +1815,29 @@ class _ScheduleMixin:
                               move_s=3.0, move_to=motor.start_move)
             print(r)           # one line per view
 
-        Returns {"ok", "error"?, "views_done", "views_total", "left_out",
-        "pulses", "elapsed_s", "per_view": [{view, center, ok, fired, n,
+        Before the first view, filaments whose board gives no current reading
+        are left out (with the reason). Returns {"ok", "error"?, "views_done",
+        "views_total", "left_out", "left_out_why", "pulses", "elapsed_s", "per_view": [{view, center, ok, fired, n,
         pulses, s, hot_s, waited_s, error?}]}. Each pulse's heating V/I is in
         filament_perf() (and in scan_view()'s own result, view by view).
         """
         t0 = time.monotonic()
         left_out: set = set()
+        why_out: dict = {}
         per: list = []
         pulses = 0
         out: dict = {"ok": True}
+        # Up front: a filament whose board gives no current reading cannot be
+        # heated -- left out now, not discovered mid-view.
+        every = sorted({int(f) for v in views for f in v["filaments"]})
+        try:
+            now = self.read_filament_current_cached(every) or {}
+        except Exception:
+            now = {}
+        for f in every:
+            if now and (now.get(f) or {}).get("current_mA") is None:
+                left_out.add(f)
+                why_out[f] = "no current reading before the run (board absent?)"
         for v in views:
             done_here: set = set()
             for attempt in (1, 2):
@@ -1852,10 +1870,12 @@ class _ScheduleMixin:
                     out.update(ok=False, error=f"view {v.get('view')}: {r.get('error')} -- run stopped")
                     break
                 left_out.add(int(ff))
+                why_out[int(ff)] = f"view {v.get('view')}: {r.get('failed_why') or r.get('error')}"
             if not out["ok"]:
                 break
         out.update(views_done=sum(1 for p in per if p["ok"]), views_total=len(views),
-                   left_out=sorted(left_out), pulses=pulses,
+                   left_out=sorted(left_out),
+                   left_out_why={f: why_out.get(f, "") for f in sorted(left_out)}, pulses=pulses,
                    elapsed_s=round(time.monotonic() - t0, 1), per_view=per)
         return out
 

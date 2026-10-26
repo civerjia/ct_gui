@@ -250,12 +250,14 @@ def fake_view(fils, **kw):
     return {"ok": True, "fired": len(fils), "elapsed_s": 1.0,
             "rows": [{"records": [{}] * 5} for _ in fils]}
 ct.scan_view = fake_view
+ct.read_filament_current_cached = lambda fs: {f: {"current_mA": 1200} for f in fs}
 r = ct.scan_views(plan["views"], active_mv=5000, idle_ma=1200, num_pulses=5, move_s=3.0,
                   move_to=lambda v: moved.append(v["view"]))
 check("motor started once per view", moved == [0, 1], moved)
 check("a filament that does not arrive: left out, only the view's UNFIRED rest retried, no new move",
       calls[0] == ([95, 0, 1], 3.0, 0) and calls[1] == ([0], 0.0, 0)
       and calls[2] == ([0, 2], 3.0, 1), calls)
+check("left_out_why says why", "not settled" in r["left_out_why"][1], r.get("left_out_why"))
 check("run completes; left_out and pulses reported",
       r["ok"] and r["views_done"] == 2 and r["left_out"] == [1] and r["pulses"] == 5 + 5 + 10, r)
 
@@ -264,6 +266,22 @@ ct.scan_view = lambda fils, **kw: calls.append(1) or {"ok": False, "error": "SHV
 r = ct.scan_views(plan["views"], active_mv=5000, idle_ma=1200)
 check("any other failure stops the run (no retry, no next view)",
       not r["ok"] and len(calls) == 1 and "run stopped" in r["error"] and r["views_done"] == 0, r)
+
+# A filament refused its VOLTAGE (board absent) is NAMED, so scan_views leaves it out.
+ct, log, st = make()
+real_state = ct._state_one
+ct._state_one = lambda f, state, arg, op, extra=None: ({"ok": False, "error": "its board is not present"}
+                                                      if (f == 6 and state == 6) else real_state(f, state, arg, op, extra))
+r = ct.scan_view(V, active_mv=8000, idle_ma=1200, k=4)
+check("VOLTAGE refused -> failed_filament set", not r["ok"] and r.get("failed_filament") == 6
+      and "not present" in r["error"], (r.get("failed_filament"), r.get("error")))
+
+calls.clear()
+ct.scan_view = fake_view
+ct.read_filament_current_cached = lambda fs: {f: {"current_mA": (None if f == 2 else 1200)} for f in fs}
+r = ct.scan_views(plan["views"][1:], active_mv=5000, idle_ma=1200)
+check("no current reading before the run -> left out up front, with the reason",
+      2 in r["left_out"] and "no current reading" in r["left_out_why"][2] and all(2 not in c[0] for c in calls), (r, calls))
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 raise SystemExit(1 if FAILS else 0)
