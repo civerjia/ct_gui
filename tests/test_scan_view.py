@@ -245,18 +245,19 @@ def fake_view(fils, **kw):
     calls.append((list(fils), kw["start_in_s"], kw["detector_center"]))
     if 1 in fils:                                   # filament 1 never arrives
         return {"ok": False, "error": "filament 1 not settled", "failed_filament": 1,
-                "rows": [{"records": [{}] * 5}], "fired": 1}
+                "rows": [{"filament": fils[0], "fired_s": 1.0, "records": [{}] * 5},
+                         {"filament": 1, "fired_s": None}], "fired": 1}
     return {"ok": True, "fired": len(fils), "elapsed_s": 1.0,
             "rows": [{"records": [{}] * 5} for _ in fils]}
 ct.scan_view = fake_view
 r = ct.scan_views(plan["views"], active_mv=5000, idle_ma=1200, num_pulses=5, move_s=3.0,
                   move_to=lambda v: moved.append(v["view"]))
 check("motor started once per view", moved == [0, 1], moved)
-check("a filament that does not arrive: left out, view fired again without it, no new move",
-      calls[0] == ([95, 0, 1], 3.0, 0) and calls[1] == ([95, 0], 0.0, 0)
+check("a filament that does not arrive: left out, only the view's UNFIRED rest retried, no new move",
+      calls[0] == ([95, 0, 1], 3.0, 0) and calls[1] == ([0], 0.0, 0)
       and calls[2] == ([0, 2], 3.0, 1), calls)
 check("run completes; left_out and pulses reported",
-      r["ok"] and r["views_done"] == 2 and r["left_out"] == [1] and r["pulses"] == 5 + 10 + 10, r)
+      r["ok"] and r["views_done"] == 2 and r["left_out"] == [1] and r["pulses"] == 5 + 5 + 10, r)
 
 calls.clear()
 ct.scan_view = lambda fils, **kw: calls.append(1) or {"ok": False, "error": "SHV fault", "rows": []}

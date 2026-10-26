@@ -1797,8 +1797,9 @@ class _ScheduleMixin:
              first filaments are heated during the move so they are ready then;
           2. scan_view() fires the view (see it for the heating rules);
           3. a filament that does not reach its voltage is left out of the rest
-             of the run and the view is fired once more without it; any other
-             failure STOPS the run (nothing is heated for nothing).
+             of the run, and the view's filaments NOT YET FIRED are fired once
+             more without it; any other failure STOPS the run (nothing is
+             heated for nothing).
 
         Ctrl-C, or the script dying, stops it safely: the current view is
         disarmed and its filaments go back to idle_ma. Ends at idle_ma.
@@ -1820,8 +1821,11 @@ class _ScheduleMixin:
         pulses = 0
         out: dict = {"ok": True}
         for v in views:
+            done_here: set = set()
             for attempt in (1, 2):
-                fils = [f for f in v["filaments"] if f not in left_out]
+                # A retry fires only what this view has NOT fired yet: the rest
+                # already has its pulses, heating it again would be for nothing.
+                fils = [f for f in v["filaments"] if f not in left_out and f not in done_here]
                 if callable(move_to) and attempt == 1:
                     move_to(v)
                 r = self.scan_view(fils, active_mv=active_mv, idle_ma=idle_ma,
@@ -1831,6 +1835,8 @@ class _ScheduleMixin:
                                    width_us=width_us, pulse_interval_ms=pulse_interval_ms,
                                    heat_timeout_s=heat_timeout_s)
                 n_p = sum(len(x.get("records") or []) for x in (r.get("rows") or []))
+                done_here |= {x["filament"] for x in (r.get("rows") or [])
+                              if x.get("fired_s") is not None and "filament" in x}
                 pulses += n_p
                 row = {"view": v.get("view"), "center": v.get("center"), "try": attempt,
                        "ok": bool(r.get("ok")), "fired": r.get("fired"), "n": len(fils),
