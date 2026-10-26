@@ -1340,6 +1340,11 @@ class _ScheduleMixin:
                                           # ARRIVE (ACTIVE current, or the
                                           # VOLTAGE within +-150 mV); not
                                           # arrived = not fired
+        settle_ms: int | None = None,    # active_ma/active_mv only: the
+                                          # FIRMWARE holds "settled" (and so
+                                          # on_armed + the trigger) until the
+                                          # heating has stayed arrived this
+                                          # long -- see "settle_ms" below
         active_mv: float | None = None,  # INSTEAD of active_ma: heat at this
                                           # VOLTAGE (no CC loop) -- see
                                           # "active_mv" in the docstring
@@ -1396,6 +1401,20 @@ class _ScheduleMixin:
         Give active_ma OR active_mv.
 
             ct.fire_single_pulse(f, active_mv=7600, idle_ma=1200, measure=True)
+
+        settle_ms: with active_ma or active_mv -- how long the heating must STAY
+        arrived before on_armed is called and the trigger goes out, timed by the
+        RP2350 (CH_ARRIVAL_SETTLE, fw 903cd23+): the board reads arrival
+        "settling" until it has held the ACTIVE current (CC converged) or the
+        voltage (+-150 mV) for settle_ms continuously, then "settled"; dropping
+        out restarts the clock. So an external trigger source can fire blindly
+        on on_armed. 0..60000 ms; written to every connected controller for
+        this shot and set back to 0 after it. heat_timeout_s is the wait for
+        ARRIVAL; settle_ms is added on top of it. Older firmware: error, not
+        fired.
+
+            ct.fire_single_pulse(f, active_mv=8000, idle_ma=1200, settle_ms=1500,
+                                 trigger="ext", on_armed=tell_the_source)
 
         sim_delay_ms: trigger="sim" only -- WHEN the simulated train starts: the
         first pulse sim_delay_ms after the heating ARRIVED (ACTIVE current or
@@ -1722,6 +1741,22 @@ class _ScheduleMixin:
         if active_ma is not None and active_mv is not None:
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "error": "give active_ma OR active_mv, not both"}
+        settle = None
+        if settle_ms is not None:
+            if active_ma is None and active_mv is None:
+                return {"ok": False, "fired": 0, "records": [], "status": {},
+                        "error": "settle_ms needs active_ma or active_mv: it is a wait AFTER "
+                                 "the heating arrives, and without them this call does not heat"}
+            settle = int(settle_ms)
+            if not 0 <= settle <= 60000:
+                return {"ok": False, "fired": 0, "records": [], "status": {},
+                        "error": f"settle_ms={settle_ms} out of range 0..60000 ms"}
+            r = self.set_arrival_settle(settle)
+            if not r.get("ok"):
+                return {"ok": False, "fired": 0, "records": [], "status": {},
+                        "error": f"settle_ms={settle}: could not set the firmware's arrival "
+                                 f"settle time: {r.get('error')} -- not fired"}
+            heat_timeout_s = float(heat_timeout_s) + settle / 1000.0
         # SIM DELAY. The ESP32 burst puts its FIRST edge one full interval after
         # it starts (sync_io.cpp startBurst), so the trigger request goes out
         # sim_delay_ms - pulse_interval_ms after the heating is seen to arrive
@@ -1758,6 +1793,41 @@ class _ScheduleMixin:
                 # The request is sent right after this returns (_fire_core).
                 _t["waited_ms"] = round((time.monotonic() - t0) * 1000.0, 1)
             total_ms = int(total_ms) + int(d)
+        try:
+            res = self._fire_single_pulse_run(
+                filament, num_pulses, width_us, interval, tmo, max_on_ms, total_ms,
+                controller, trigger, shot_wait_timeout_s, verify, reuse, measure,
+                rate_hz, bg_gap_us, bg_window_us, on_armed, active_ma, idle_ma,
+                heat_timeout_s, active_mv, voltage_settle_s, sim_delay_ms)
+        finally:
+            if settle:
+                try:
+                    self.set_arrival_settle(0)
+                except Exception as exc:
+                    logging.getLogger("ct_gui").warning(
+                        "fire_single_pulse: arrival settle not set back to 0: %s", exc)
+        if settle is not None and isinstance(res, dict):
+            res["settle_ms"] = settle
+        if sim_timing is not None and isinstance(res, dict):
+            if "waited_ms" in sim_timing:
+                # ...and how long the ESP32 then took to start the train (HTTP):
+                # the uncontrolled part. None if the backend does not report it.
+                try:
+                    st = self.simulate_sync_status() or {}
+                    sim_timing["esp32_start_ms"] = st.get("start_ms")
+                except Exception:
+                    sim_timing["esp32_start_ms"] = None
+            res["sim_timing"] = sim_timing
+        return res
+
+    def _fire_single_pulse_run(self, filament, num_pulses, width_us, interval, tmo,
+                               max_on_ms, total_ms, controller, trigger,
+                               shot_wait_timeout_s, verify, reuse, measure, rate_hz,
+                               bg_gap_us, bg_window_us, on_armed, active_ma, idle_ma,
+                               heat_timeout_s, active_mv, voltage_settle_s,
+                               sim_delay_ms) -> dict:
+        """fire_single_pulse's dispatch: heated by voltage, heated by current,
+        or unheated. Arguments already validated by fire_single_pulse."""
         if active_mv is not None:
             if voltage_settle_s is not None:
                 # The fixed settle sleep is gone: active_mv now waits for the
@@ -1767,7 +1837,7 @@ class _ScheduleMixin:
                     "waits for the voltage to ARRIVE (+-150 mV), up to heat_timeout_s=%s",
                     voltage_settle_s, heat_timeout_s)
                 warnings.warn("voltage_settle_s is ignored: active_mv waits for the "
-                              "voltage to arrive, up to heat_timeout_s", stacklevel=2)
+                              "voltage to arrive, up to heat_timeout_s", stacklevel=3)
             res = self._fire_heated(
                 filament, None, idle_ma, float(heat_timeout_s),
                 dict(num_pulses=num_pulses, width_us=width_us,
@@ -1796,16 +1866,6 @@ class _ScheduleMixin:
                 timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse, measure=measure,
                 rate_hz=rate_hz, bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
                 on_armed=on_armed)
-        if sim_timing is not None and isinstance(res, dict):
-            if "waited_ms" in sim_timing:
-                # ...and how long the ESP32 then took to start the train (HTTP):
-                # the uncontrolled part. None if the backend does not report it.
-                try:
-                    st = self.simulate_sync_status() or {}
-                    sim_timing["esp32_start_ms"] = st.get("start_ms")
-                except Exception:
-                    sim_timing["esp32_start_ms"] = None
-            res["sim_timing"] = sim_timing
         return res
 
     # active_one(verify=True)'s default tolerance: "within this of the target".
@@ -1868,7 +1928,7 @@ class _ScheduleMixin:
             # heat_timeout_s with r["ok"] still True. Do not fire a filament
             # that never reached firing current (the finally drops it).
             h = r.get("heating") or {}
-            if not h.get("ok") and self._heat_in_band(h, active_ma):
+            if not h.get("ok") and h.get("arrival") != "settling" and self._heat_in_band(h, active_ma):
                 # Near miss, rescued: the loop still says "ramping" at the
                 # deadline but the measured current is inside the band
                 # (2026-10-11: 4 of 1265 shots refused at 2532-2575 mA of 2600).
@@ -1927,6 +1987,9 @@ class _ScheduleMixin:
                 h.update(error=f"{active_mv} mV not reached on the load: the output is at its "
                                f"limit (voltage cap or +1.5 V drop compensation) and the load "
                                f"is still more than 150 mV short ({ma} mA)")
+            elif arrival == "settling":
+                h.update(error=f"{active_mv} mV arrived but did not stay within +-150 mV for the "
+                               f"settle time before the {heat_timeout_s} s deadline")
             elif arrival != "settled":
                 h.update(error=f"{active_mv} mV not reached within {heat_timeout_s} s "
                                f"(arrival {arrival!r}, {ma} mA). Firmware without the "

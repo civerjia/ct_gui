@@ -122,6 +122,13 @@ def build_payload(command: str, b: dict):
         if b.get("millivolts") is None:
             return 0x3B, 0, b""
         return 0x3B, 0, _u16(int(b["millivolts"]))
+    if command == "CH_ARRIVAL_SETTLE":       # 0x83: empty=GET, ms16=SET -> [status, ms16, max16]
+        # Settle time after ARRIVAL, one per RP2350 (fw 903cd23+): an ACTIVE or
+        # VOLTAGE board reports "settling" until it has held arrival this long,
+        # then "settled". 0 = off. Clamped to max, not rejected; not persisted.
+        if b.get("settle_ms") is None:
+            return 0x83, 0, b""
+        return 0x83, 0, _u16(int(b["settle_ms"]))
     if command == "CH_SLEW_RATE":            # 0x3C: empty=GET, 6 bytes=SET
         # Three voltage-ramp slew rates, runtime-settable. Out-of-range CLAMPS
         # rather than rejecting, and the response is always the values IN FORCE

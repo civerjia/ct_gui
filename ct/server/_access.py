@@ -203,6 +203,8 @@ def is_read_post(path: str, body: dict) -> bool:
             return True
         if cmd == "CH_VOLTAGE_CAP" and body.get("millivolts") is None:
             return True
+        if cmd == "CH_ARRIVAL_SETTLE" and body.get("settle_ms") is None:
+            return True
     return False
 
 

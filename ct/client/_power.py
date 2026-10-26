@@ -1027,6 +1027,10 @@ class _PowerMixin:
                         error=f"CC loop reports this channel FAULTED (cc_mode "
                               f"{cc_mode}) on {streaks[f]} consecutive reads.")
                     pending.discard(f); continue
+                if arrival == "settling":
+                    # Arrived and holding, inside the firmware's settle time:
+                    # not ready yet, and not a stall (it is AT target).
+                    continue
                 # Fallback for firmware with no arrival bits, same as the
                 # single-filament version: compare the sample only when the
                 # loop has given no verdict of its own.
@@ -1544,6 +1548,42 @@ class _PowerMixin:
         out = {"ok": True, "controller": int(controller), "mv": raw[1] | (raw[2] << 8),
                "ceiling_mv": raw[3] | (raw[4] << 8)}
         if millivolts is not None and out["mv"] != int(millivolts):
+            out["clamped"] = True
+        return out
+
+    def get_arrival_settle(self, controller: int | None = None) -> dict:
+        """The arrival settle time (ms) on every connected controller (or one):
+        {"ok", "settle_ms", "max_ms"}. See set_arrival_settle."""
+        return self._rig_wide(lambda c: self._arrival_settle_one(c, None), controller,
+                              same=("settle_ms",), carry=("max_ms",))
+
+    def set_arrival_settle(self, settle_ms: int, controller: int | None = None) -> dict:
+        """Settle time after the heating ARRIVES, in ms, one value per RP2350
+        (fw 903cd23+). An ACTIVE or VOLTAGE board then reads arrival
+        "settling" until it has HELD arrival (CC converged / voltage within
+        +-150 mV) this long, and only then "settled" -- so anything that fires
+        on "settled" (fire_single_pulse's on_armed) fires settle_ms after
+        arrival, timed by the firmware. Dropping out of arrival restarts it.
+        IDLE is not affected. 0 = off. Not kept across an RP2350 reset (it
+        comes back 0); fire_single_pulse writes it on every shot."""
+        return self._rig_wide(lambda c: self._arrival_settle_one(c, int(settle_ms)), controller,
+                              same=("settle_ms",), carry=("max_ms",))
+
+    def _arrival_settle_one(self, controller: int, settle_ms) -> dict:
+        body = {"controller": int(controller), "command": "CH_ARRIVAL_SETTLE"}
+        if settle_ms is not None:
+            body["settle_ms"] = int(settle_ms)
+        r = self._post("/api/cmd", body, timeout=10.0)
+        raw = ((r.get("response") or {}).get("raw")) if r.get("ok") else None
+        if not raw or len(raw) < 5 or raw[0] != 0:
+            old = bool(raw) and raw[0] in (0x04, 0x0E)
+            return {"ok": False, "controller": int(controller), "unsupported": old,
+                    "error": ("this RP2350 firmware has no arrival settle time "
+                              "(CH_ARRIVAL_SETTLE, fw 903cd23+) -- flash a newer build")
+                             if old else (r.get("error") or f"bad CH_ARRIVAL_SETTLE response {raw}")}
+        out = {"ok": True, "controller": int(controller), "settle_ms": raw[1] | (raw[2] << 8),
+               "max_ms": raw[3] | (raw[4] << 8)}
+        if settle_ms is not None and out["settle_ms"] != int(settle_ms):
             out["clamped"] = True
         return out
 

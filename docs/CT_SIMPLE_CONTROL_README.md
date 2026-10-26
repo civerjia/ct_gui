@@ -2272,6 +2272,18 @@ the ESP32 train is not controlled (tens to a few hundred ms):
 `result["sim_timing"]` = `{sim_delay_ms, request_after_ms, waited_ms,
 esp32_start_ms}` reports it. The GUI shot panel's "delay after arrival ms".
 
+**`settle_ms`** (default `None`, with `active_ma` or `active_mv`, 0..60000) —
+how long the heating must **stay** arrived before `on_armed` is called and the
+trigger goes out, **timed by the RP2350** (`CH_ARRIVAL_SETTLE` 0x83, fw
+`903cd23`+): an ACTIVE or VOLTAGE board reports arrival `"settling"` until it
+has held the current (CC converged) or the voltage (±150 mV) for `settle_ms`
+without a break, then `"settled"`; dropping out restarts the clock. IDLE is not
+affected. Written to every connected controller for the shot and set back to 0
+afterwards (an RP2350 reset also clears it). `heat_timeout_s` is the wait for
+arrival; `settle_ms` is added on top. So an external trigger source can fire
+the moment `on_armed` says so. Older firmware: error, not fired.
+`ct.get_arrival_settle()` / `ct.set_arrival_settle(ms)` read/write it directly.
+
 **The voltage loop** (RP2350 fw `feat/pulse-instant-heat`): the output ramps
 at the slew without being read; once it is at its setpoint the firmware reads
 the INA219 load voltage (and current) every 50 ms, trims the setpoint by the

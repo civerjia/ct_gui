@@ -292,7 +292,7 @@ def _cached_entry(fil: int, raw_mode: int, current_mA, target_mA) -> dict:
     # The mode byte is FOUR fields, not one value plus two flags:
     #   bits 0-3  base mode (0 voltage, 1 current Idle/Active, 2 FaultOpen,
     #             3 FaultOcp)
-    #   bits 4-5  ARRIVAL: 0x00 ramping, 0x10 settled, 0x20 capped
+    #   bits 4-5  ARRIVAL: 0x00 ramping, 0x10 settled, 0x20 capped, 0x30 settling
     #   bit  6    unavailable, bit 7 stale
     #
     # Masking only bits 6-7 (as this did) folded the arrival bits into the base
@@ -310,6 +310,9 @@ def _cached_entry(fil: int, raw_mode: int, current_mA, target_mA) -> dict:
     current_valid = not (raw_mode & CC_STALE) and not unavailable
     arrival = None if unavailable else {
         0x00: "ramping", 0x10: "settled", 0x20: "capped",
+        # fw 903cd23+: ACTIVE/VOLTAGE arrived but still inside the arrival
+        # settle time (CH_ARRIVAL_SETTLE). Not ready to fire yet.
+        0x30: "settling",
     }.get(arrival_bits, f"unknown:0x{arrival_bits:02X}")
     # bus_mV is None, NOT 0. The 0x3A response has no voltage field at all --
     # status, channel, muxPort, mode, measMa, targetMa, and nothing else (measured
