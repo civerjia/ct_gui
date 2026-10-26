@@ -1460,6 +1460,14 @@ class _ScheduleMixin:
                     raise self._ScanStop(f"filament {f} ({rows[f]['site']}) at {mv[f]} mV: "
                                          f"{why} -- view stopped, nothing fired on it")
                 rows[f]["arrive_s"] = since()
+                # The backend's previous burst thread outlives the RP2350's count
+                # of its edges (it still waits on the ESP32 HTTP reply), and a
+                # start while it runs is refused: 2026-10-26, the 3rd filament
+                # of the first rig scan got "simulation already running".
+                free_by = time.monotonic() + 3.0
+                while (self.simulate_sync_status() or {}).get("running") \
+                        and time.monotonic() < free_by:
+                    time.sleep(0.02)
                 r = self._post("/api/sync/simulate", {"count": n,
                                                       "interval_ms": float(interval),
                                                       "controller": head}, timeout=10.0)

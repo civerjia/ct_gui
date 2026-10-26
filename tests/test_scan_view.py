@@ -52,6 +52,7 @@ def make(never_arrives=(), settle_ok=True):
             return {"ok": True}
         raise AssertionError(path)
     ct._post = post
+    ct.simulate_sync_status = lambda: {"ok": True, "running": False}
     ct.shv_status = lambda c: {"state": 2, "totalPulsesDone": st["done"]}
 
     def state_one(f, state, arg, op, extra=None):
