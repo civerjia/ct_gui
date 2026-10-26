@@ -1624,6 +1624,12 @@ class _ScheduleMixin:
                 done += n
                 fire_deadline = time.monotonic() + burst_s + 10.0
                 while True:
+                    # The others keep heating while this one fires: catch the
+                    # moment each settles HERE too. Missed until the next turn,
+                    # an arrival read 1-1.5 s long (first per-view rig run,
+                    # 2026-10-26), the estimate grew, and filaments were raised
+                    # ever earlier to wait ever longer.
+                    watch_settled()
                     st = self._scan_retry(lambda: self.shv_status(head), until_s=2.0,
                                           ok=lambda r: r.get("state") is not None)
                     if st.get("state") == SHV_FAULT:
