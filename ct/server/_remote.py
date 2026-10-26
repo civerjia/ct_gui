@@ -33,6 +33,7 @@ from ct.remote_codec import decode, encode
 log = logging.getLogger("ct_gui")
 
 SESSION_IDLE_S = 15.0          # no call and no ping for this long -> the script is gone
+SESSION_DEAD_CALL_S = 30.0     # a call running, no ping this long -> interrupt it (script died)
 REAPER_TICK_S = 2.0
 # Constructor arguments a proxy may pass through. host/port are not among
 # them: the session always talks to THIS backend over loopback.
@@ -394,6 +395,23 @@ def _reaper() -> None:
                     and (not s.busy or any(j.waiting for j in list(s.jobs.values())))]
             for s in gone:
                 _SESS.pop(s.sid, None)
+            # A script that DIED during a long call (scan_view, a whole
+            # rotation) left that call running in a backend thread, heating,
+            # with nobody to stop it: busy sessions were never reaped. No ping
+            # for SESSION_DEAD_CALL_S -> interrupt its calls exactly as Ctrl-C
+            # would (their finally blocks run: disarm, IDLE); once they unwind
+            # the session is idle and the next tick reaps it.
+            stuck = [s for s in _SESS.values()
+                     if s.busy and s.workers and now - s.last > SESSION_DEAD_CALL_S
+                     and not getattr(s, "interrupted", False)]
+        for s in stuck:
+            s.interrupted = True
+            for tid in list(s.workers.values()):
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid),
+                                                           ctypes.py_object(KeyboardInterrupt))
+            log.warning("remote session %s (%s): no ping for %.0f s during a call -- "
+                        "the script is gone; its call was interrupted", s.sid[:8],
+                        s.client_id, now - s.last)
         for s in gone:
             try:
                 _teardown(s, f"no ping for {SESSION_IDLE_S:g} s -- the script stopped")

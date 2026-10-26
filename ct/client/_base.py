@@ -126,7 +126,13 @@ class Result(dict):
         ("temperature", ("T_K", "residual", "inv_T", "ln_i_over_t2")),
         ("noise", ("bg_ma", "sigma_ma")),
     )
-    _ROW_LAYOUTS = (_PULSE_GROUPS, _CURVE_GROUPS)
+    #: scan_view rows: one filament of a view.
+    _SCAN_GROUPS = (
+        ("", ("filament", "site", "mv", "arrival")),
+        ("times (s)", ("raise_s", "settled_s", "trigger_s", "fired_s")),
+        ("heating", ("heated_s", "waited_s", "heat_mV", "heat_mA")),
+    )
+    _ROW_LAYOUTS = (_PULSE_GROUPS, _CURVE_GROUPS, _SCAN_GROUPS)
     _GROUP_LABEL_W = 12
     _GROUP_MIN_FRAC = 0.6
     _GROUP_MIN_FIELDS = 6       # below this one line reads fine ungrouped
@@ -313,6 +319,12 @@ class Result(dict):
                             cls._render(k2, v2, indent + 6, out)
                 else:
                     cls._render(f"[{n}]", item, indent + 2, out)
+            return
+        if isinstance(v, str) and "\n" in v:
+            # A drawing (scan_view's gantt): its lines ARE the layout, so they
+            # are kept, never re-flowed into a paragraph.
+            out.append(f"{pad}{key}:")
+            out.extend(f"{pad}  {line}" for line in v.splitlines())
             return
         if isinstance(v, str) and len(v) + len(key) + indent > cls._WIDTH:
             # break_long_words=False so a path or a URL overflows its line

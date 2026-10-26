@@ -1,5 +1,19 @@
 # Examples
 
+## `scan_views.py` — scan CT views, heating each filament just in time
+
+```bash
+python3 scan_views.py --host 192.168.8.218                 # first 10 views, 5 V
+python3 scan_views.py --host 192.168.8.218 --views 96      # a whole rotation
+```
+
+`ct.scan_plan()` gives every view of a rotation (dead filaments left out);
+`ct.scan_views()` fires them in order. Per view the motor moves (`move_to` --
+put your motor there; the example only prints) and the view's first filaments
+heat during the move; each filament fires once its voltage has settled and
+drops straight back to IDLE. Filaments must be at IDLE before; HV is not
+touched; Ctrl-C stops safely; everything ends at IDLE.
+
 ## `external_trigger.py` — fire on an external trigger, and know when to send it
 
 ```bash

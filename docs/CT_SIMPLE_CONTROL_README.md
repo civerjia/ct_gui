@@ -2280,6 +2280,30 @@ the moment `on_armed` says so. Older firmware: error, not fired. The GUI shot
 panel's "settle ms".
 `ct.get_arrival_settle()` / `ct.set_arrival_settle(ms)` read/write it directly.
 
+### Scanning views (VOLTAGE heating, just in time)
+
+```python
+plan = ct.scan_plan()                      # every view of a rotation, dead left out
+r = ct.scan_views(plan["views"][:10],      # the first 10 views
+                  active_mv=5000,          # heating voltage, or {filament: mV}
+                  idle_ma=1200,            # back to IDLE after each filament
+                  settle_ms=500,           # voltage held this long before firing
+                  num_pulses=5, width_us=20000, pulse_interval_ms=100,
+                  move_s=3.0,              # motor time per view
+                  move_to=motor.start)     # your motor: START the move, return
+print(r)                                   # one line per view
+```
+
+What happens per view: `move_to(view)` starts the motor; during the `move_s`
+the view's first filaments heat, so each is at its voltage when its turn
+comes; a filament fires only once its voltage has settled (±150 mV held
+`settle_ms`, timed by the RP2350) and goes straight back to IDLE; when it is
+heated is learnt per filament (`filament_perf()`). A filament that does not
+reach its voltage is left out of the rest of the run; any other failure stops
+it. Ctrl-C, or the script dying, stops safely. Filaments are YOUR numbers =
+ring positions (the backend's filament order maps them to boards; the GUI draws
+the same). Example: `examples/scan_views.py`.
+
 **`scan_view(filaments, active_mv, idle_ma, settle_ms=0, k="auto", start_in_s=0, num_pulses=1, …)`**
 — SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire ONE CT view, its
 filaments in order, in VOLTAGE mode. Call it once per view when the motor

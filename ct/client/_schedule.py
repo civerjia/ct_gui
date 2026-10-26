@@ -1508,7 +1508,7 @@ class _ScheduleMixin:
         # Each filament's own arrival history at about this voltage (backend
         # table); the session-wide estimate only for one with too little.
         try:
-            hist = (self.filament_perf(fils) or {}).get("filaments") or {}
+            hist = (self.filament_perf() or {}).get("filaments") or {}
         except Exception:
             hist = {}
         est = getattr(self, "_scan_est", None)
@@ -1545,6 +1545,16 @@ class _ScheduleMixin:
             raised.add(f)
             rows[f]["raise_s"] = since()
 
+        _pools: dict = {}
+
+        def pool_near(m):
+            if m in _pools:
+                return _pools[m]
+            _pools[m] = sorted(x["arrive_raw_s"] for e in hist.values() for x in (e.get("samples") or [])
+                          if x.get("arrive_raw_s") is not None and x.get("mv") is not None
+                          and abs(int(x["mv"]) - int(m)) <= 300)
+            return _pools[m]
+
         def arrive_for(f):
             near = sorted(x["arrive_raw_s"] for x in ((hist.get(f) or {}).get("samples") or [])
                           if x.get("arrive_raw_s") is not None and x.get("mv") is not None
@@ -1553,6 +1563,12 @@ class _ScheduleMixin:
                 # 75th percentile: with a handful of samples a 90th IS the
                 # maximum, and one long read (2026-10-26) pulled every raise early.
                 return near[min(len(near) - 1, int(0.75 * len(near)))] + settle / 1000.0
+            # No history of its own: the MEDIAN of every filament's arrivals at
+            # about this voltage (user, 2026-10-26). The session's p90 was pulled
+            # up by a few slow filaments and raised all the unknown ones early.
+            if len(pool_near(mv[f])) >= 3:
+                pool = pool_near(mv[f])
+                return pool[len(pool) // 2] + settle / 1000.0
             return est.arrive_s()
 
         def due(j, turn_at):
@@ -1731,6 +1747,110 @@ class _ScheduleMixin:
                    settle_ms=settle, k=k, detector_center=center, estimate={"arrive_s": round(est.arrive_s(), 3),
                                                      "cycle_s": round(est.cycle_s(), 3)},
                    gantt=self._scan_gantt([rows[f] for f in fils], out.get("start_s")))
+        return out
+
+    def scan_plan(self, mode: str = "stationary", **geometry) -> dict:
+        """The views of one CT rotation, ready for scan_views().
+
+        Each view: {"view": n, "center": the filament the detector faces,
+        "filaments": the ones it fires, in order}. Filaments are YOUR numbers,
+        which are the ring positions (the backend's filament order maps them to
+        boards). Dead filaments are already left out. `mode` and the geometry
+        keywords are build_scan_schedule()'s (mode="precision" adds gantry
+        angles: many more views).
+
+            plan = ct.scan_plan()
+            plan["views"][0]   # {'view': 0, 'center': 0, 'filaments': [79, 80, ... 17]}
+        """
+        sched = self.build_scan_schedule(mode=mode, **geometry)
+        views: list = []
+        key = None
+        for r in sched["emission"]:
+            k = (r["ringStep"], r.get("gantry"))
+            if k != key:
+                views.append({"view": len(views), "center": int(r["coll"]),
+                              "filaments": []})
+                if mode == "precision":
+                    views[-1]["gantry"] = r.get("gantry")
+                key = k
+            views[-1]["filaments"].append(int(r["filament"]))
+        return {"ok": True, "n_views": len(views), "dead_left_out": sched.get("excluded"),
+                "truncated": sched.get("truncated"), "views": views}
+
+    def scan_views(self,
+                   views,                    # scan_plan()["views"] (or a slice of it)
+                   active_mv,                # heating voltage (mV): one number or {filament: mV}
+                   idle_ma: float,           # back to this after each filament's pulses
+                   settle_ms: int = 500,     # hold the voltage this long before firing
+                   num_pulses: int = 1,      # pulses per filament
+                   width_us: int = 1000,
+                   pulse_interval_ms: int = 100,
+                   move_s: float = 3.0,      # how long the motor takes to reach a view
+                   move_to=None,             # move_to(view): STARTS the motor move; None = no motor
+                   heat_timeout_s: float = 8.0,
+                   k="auto") -> dict:
+        """SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire many
+        views in a row, VOLTAGE heating just in time. For each view:
+
+          1. move_to(view) is called (if given) -- it should START the motor
+             and return; the view's first pulse comes move_s later, and the
+             first filaments are heated during the move so they are ready then;
+          2. scan_view() fires the view (see it for the heating rules);
+          3. a filament that does not reach its voltage is left out of the rest
+             of the run and the view is fired once more without it; any other
+             failure STOPS the run (nothing is heated for nothing).
+
+        Ctrl-C, or the script dying, stops it safely: the current view is
+        disarmed and its filaments go back to idle_ma. Ends at idle_ma.
+
+            plan = ct.scan_plan()
+            r = ct.scan_views(plan["views"][:10], active_mv=5000, idle_ma=1200,
+                              num_pulses=5, width_us=20000, pulse_interval_ms=100,
+                              move_s=3.0, move_to=motor.start_move)
+            print(r)           # one line per view
+
+        Returns {"ok", "error"?, "views_done", "views_total", "left_out",
+        "pulses", "elapsed_s", "per_view": [{view, center, ok, fired, n,
+        pulses, s, hot_s, waited_s, error?}]}. Each pulse's heating V/I is in
+        filament_perf() (and in scan_view()'s own result, view by view).
+        """
+        t0 = time.monotonic()
+        left_out: set = set()
+        per: list = []
+        pulses = 0
+        out: dict = {"ok": True}
+        for v in views:
+            for attempt in (1, 2):
+                fils = [f for f in v["filaments"] if f not in left_out]
+                if callable(move_to) and attempt == 1:
+                    move_to(v)
+                r = self.scan_view(fils, active_mv=active_mv, idle_ma=idle_ma,
+                                   settle_ms=settle_ms, k=k,
+                                   start_in_s=float(move_s) if attempt == 1 else 0.0,
+                                   detector_center=v.get("center"), num_pulses=num_pulses,
+                                   width_us=width_us, pulse_interval_ms=pulse_interval_ms,
+                                   heat_timeout_s=heat_timeout_s)
+                n_p = sum(len(x.get("records") or []) for x in (r.get("rows") or []))
+                pulses += n_p
+                row = {"view": v.get("view"), "center": v.get("center"), "try": attempt,
+                       "ok": bool(r.get("ok")), "fired": r.get("fired"), "n": len(fils),
+                       "pulses": n_p, "s": r.get("elapsed_s"),
+                       "hot_s": r.get("heated_mean_s"), "waited_s": r.get("waited_mean_s")}
+                if not r.get("ok"):
+                    row["error"] = r.get("error")
+                per.append(row)
+                if r.get("ok"):
+                    break
+                ff = r.get("failed_filament")
+                if ff is None or attempt == 2:
+                    out.update(ok=False, error=f"view {v.get('view')}: {r.get('error')} -- run stopped")
+                    break
+                left_out.add(int(ff))
+            if not out["ok"]:
+                break
+        out.update(views_done=sum(1 for p in per if p["ok"]), views_total=len(views),
+                   left_out=sorted(left_out), pulses=pulses,
+                   elapsed_s=round(time.monotonic() - t0, 1), per_view=per)
         return out
 
     @staticmethod

@@ -231,5 +231,38 @@ first_trig = next(i for i, e in enumerate(log) if e[0] == "trigger")
 check("history at another voltage (5 V vs 8 V) is not used",
       6 not in [e[1] for e in log[:first_trig] if e[0] == "VOLT"])
 
+# --- scan_plan / scan_views ----------------------------------------------------
+ct, log, st = make()
+ct.build_scan_schedule = lambda mode="stationary", **g: {"excluded": [9], "truncated": False, "emission": [
+    {"filament": f, "coll": c, "ringStep": c, "gantry": 0.0} for c in (0, 1) for f in ((95, 0, 1) if c == 0 else (0, 1, 2))]}
+plan = ct.scan_plan()
+check("scan_plan groups by view, centre and order kept",
+      plan["n_views"] == 2 and plan["views"][0] == {"view": 0, "center": 0, "filaments": [95, 0, 1]}
+      and plan["views"][1]["filaments"] == [0, 1, 2] and plan["dead_left_out"] == [9], plan)
+
+calls, moved = [], []
+def fake_view(fils, **kw):
+    calls.append((list(fils), kw["start_in_s"], kw["detector_center"]))
+    if 1 in fils:                                   # filament 1 never arrives
+        return {"ok": False, "error": "filament 1 not settled", "failed_filament": 1,
+                "rows": [{"records": [{}] * 5}], "fired": 1}
+    return {"ok": True, "fired": len(fils), "elapsed_s": 1.0,
+            "rows": [{"records": [{}] * 5} for _ in fils]}
+ct.scan_view = fake_view
+r = ct.scan_views(plan["views"], active_mv=5000, idle_ma=1200, num_pulses=5, move_s=3.0,
+                  move_to=lambda v: moved.append(v["view"]))
+check("motor started once per view", moved == [0, 1], moved)
+check("a filament that does not arrive: left out, view fired again without it, no new move",
+      calls[0] == ([95, 0, 1], 3.0, 0) and calls[1] == ([95, 0], 0.0, 0)
+      and calls[2] == ([0, 2], 3.0, 1), calls)
+check("run completes; left_out and pulses reported",
+      r["ok"] and r["views_done"] == 2 and r["left_out"] == [1] and r["pulses"] == 5 + 10 + 10, r)
+
+calls.clear()
+ct.scan_view = lambda fils, **kw: calls.append(1) or {"ok": False, "error": "SHV fault", "rows": []}
+r = ct.scan_views(plan["views"], active_mv=5000, idle_ma=1200)
+check("any other failure stops the run (no retry, no next view)",
+      not r["ok"] and len(calls) == 1 and "run stopped" in r["error"] and r["views_done"] == 0, r)
+
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 raise SystemExit(1 if FAILS else 0)
