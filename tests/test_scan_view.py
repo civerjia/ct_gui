@@ -61,7 +61,13 @@ def make(never_arrives=(), settle_ok=True):
     ct._state_one = state_one
     ct.idle_one = lambda f, ma, **k: log.append(("idle_one", f)) or st["volt"].discard(f) or {"ok": True}
 
-    def cached(f):
+    def cached(fs):
+        if isinstance(fs, list):
+            out = {}
+            for g in fs:
+                out.update(cached(g))
+            return out
+        f = fs
         st["polls"][f] = st["polls"].get(f, 0) + 1
         arr = ("ramping" if f in never_arrives or st["polls"][f] < 3 else "settled")
         if f not in st["volt"]:

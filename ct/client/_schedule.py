@@ -1327,9 +1327,17 @@ class _ScheduleMixin:
             print(r)      # one row per filament: arrival time, V/I at the pulse
 
         Returns {"ok", "error"?, "rows": [{filament, site, mv, raise_s,
-        arrive_s, fired_s, arrival, heat_mV, heat_mA, records}], "elapsed_s",
-        "per_filament_s"} -- times in s from the start of the view; arrive_s is
-        when "settled" was seen (settle included).
+        settled_s, arrive_s, fired_s, heated_s, waited_s, arrival, heat_mV,
+        heat_mA, records}], "elapsed_s", "per_filament_s", "heated_mean_s",
+        "waited_mean_s"} -- times in s from the start of the view. settled_s =
+        when it was first seen "settled" (settle included), arrive_s = when its
+        turn found it settled; heated_s = raise -> pulse (the time it spent hot),
+        waited_s = settled -> pulse (hot and only waiting: k too large if big).
+
+        HEATING TIME. With k ahead, each filament is hot for about
+        max(time to arrive, k x per-filament firing time): k below
+        arrive/fire keeps waited_s near 0 (heated only as long as it takes);
+        k above it only adds waiting at temperature.
         """
         t0 = time.monotonic()
         fils = [int(f) for f in filaments]
@@ -1428,7 +1436,16 @@ class _ScheduleMixin:
                 deadline = t0 + rows[f]["raise_s"] + wait_s
                 d = {}
                 while True:
-                    d = (self.read_filament_current_cached(f) or {}).get(f) or {}
+                    # Read EVERY raised filament, not only this one: when each
+                    # really settled is what tells heating that served from
+                    # heating that only waited for its turn (k too large).
+                    watch = sorted(raised | {f})
+                    got = self.read_filament_current_cached(watch) or {}
+                    for g in watch:
+                        if (got.get(g) or {}).get("arrival") == "settled" \
+                                and rows[g].get("settled_s") is None:
+                            rows[g]["settled_s"] = since()
+                    d = got.get(f) or {}
                     arrival = d.get("arrival")
                     if arrival in ("settled", "capped") or d.get("cc_mode") in (2, 3) \
                             or time.monotonic() >= deadline:
@@ -1463,6 +1480,9 @@ class _ScheduleMixin:
                                              f"{st.get('totalPulsesDone')} of {done} triggers")
                     time.sleep(0.05)
                 rows[f]["fired_s"] = since()
+                rows[f]["heated_s"] = round(rows[f]["fired_s"] - rows[f]["raise_s"], 3)
+                rows[f]["waited_s"] = round(rows[f]["fired_s"] - (rows[f].get("settled_s")
+                                                                  or rows[f]["arrive_s"]), 3)
                 r = self._state_one(f, IDLE, int(idle_ma), "scan_view", extra={"in_run": True})
                 if r.get("ok"):
                     raised.discard(f)
@@ -1494,7 +1514,10 @@ class _ScheduleMixin:
         for r in fired:
             rec = (r.get("records") or [{}])[0]
             r["heat_mV"], r["heat_mA"] = rec.get("heat_bus_mV"), rec.get("heat_meas_mA")
+        mean = lambda key: (round(sum(r[key] for r in fired) / len(fired), 3)  # noqa: E731
+                            if fired else None)
         out.update(rows=[rows[f] for f in fils], fired=len(fired), elapsed_s=since(),
+                   heated_mean_s=mean("heated_s"), waited_mean_s=mean("waited_s"),
                    per_filament_s=round(since() / len(fired), 2) if fired else None,
                    settle_ms=settle, k=k)
         return out
