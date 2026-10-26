@@ -1377,6 +1377,12 @@ class _ScheduleMixin:
         return {"ok": True, "filaments": {int(self._user_index_of(int(k))): v
                                           for k, v in (r.get("filaments") or {}).items()}}
 
+    def filament_perf_clear(self, filaments="all") -> dict:
+        """Drop the per-filament table's history: "all", or YOUR filament
+        numbers. For samples a since-fixed bug measured wrong."""
+        which = "all" if filaments == "all" else [int(self._fid_of(f)) for f in filaments]
+        return self._post("/api/filament-perf", {"clear": which})
+
     def scan_view(self,
                   filaments,                   # ONE view, in firing order (your numbering)
                   active_mv,                   # mV for all, or {filament: mV}
@@ -1430,12 +1436,12 @@ class _ScheduleMixin:
                 print(r)          # rows + r["gantt"]: what actually happened
 
         Returns {"ok", "error"?, "rows": [{filament, site, mv, raise_s,
-        settled_s, fired_s, heated_s, waited_s, arrival, heat_mV, heat_mA,
+        settled_s, trigger_s, fired_s, heated_s, waited_s, arrival, heat_mV, heat_mA,
         records}], "elapsed_s", "start_s", "per_filament_s", "heated_mean_s",
         "waited_mean_s", "estimate": {arrive_s, cycle_s}, "gantt"} -- times in
         s from the call. settled_s = first seen "settled"; heated_s = raise ->
-        pulse (time hot); waited_s = settled -> pulse (hot and only waiting:
-        the lead was too long).
+        pulse (time hot); waited_s = settled -> its trigger (hot and only
+        waiting: the lead was too long); fired_s = its pulses counted.
         """
         t0 = time.monotonic()
         fils = [int(f) for f in filaments]
@@ -1516,6 +1522,7 @@ class _ScheduleMixin:
                 for f in fils}
         raised: set = set()
         settle_set = False
+        push_on = False
         out: dict = {"ok": False}
         since = lambda: round(time.monotonic() - t0, 3)  # noqa: E731
         start_at = t0 + float(start_in_s)
@@ -1535,7 +1542,9 @@ class _ScheduleMixin:
                           if x.get("arrive_raw_s") is not None and x.get("mv") is not None
                           and abs(int(x["mv"]) - mv[f]) <= 300)
             if len(near) >= 2:
-                return near[min(len(near) - 1, int(0.9 * len(near)))] + settle / 1000.0
+                # 75th percentile: with a handful of samples a 90th IS the
+                # maximum, and one long read (2026-10-26) pulled every raise early.
+                return near[min(len(near) - 1, int(0.75 * len(near)))] + settle / 1000.0
             return est.arrive_s()
 
         def due(j, turn_at):
@@ -1583,6 +1592,8 @@ class _ScheduleMixin:
             bad = {c: per.get(str(c), arm) for c in armed if not per.get(str(c), arm).get("ok")}
             if bad:
                 raise self._ScanStop(f"arm failed: { {c: self._arm_failure(r)[1] for c, r in bad.items()} }")
+            # 20 fps live view for the WHOLE view (the GUI), not only per burst.
+            push_on = bool((self._post("/api/live-push", {"on": True}) or {}).get("ok"))
             # The move: nothing fires before start_at; the first filaments are
             # raised so that they arrive about then.
             while time.monotonic() < start_at:
@@ -1618,6 +1629,9 @@ class _ScheduleMixin:
                 if rows[f]["settled_s"] is None:
                     rows[f]["settled_s"] = since()
                 t_trig = time.monotonic()
+                rows[f]["trigger_s"] = since()
+                if push_on:
+                    self._post("/api/live-push", {"firing": [int(self._fid_of(f))]})
                 why = self._scan_trigger(head, n, interval)
                 if why:
                     raise self._ScanStop(f"filament {f}: {why}")
@@ -1643,8 +1657,12 @@ class _ScheduleMixin:
                                              f"{st.get('totalPulsesDone')} of {done} triggers")
                     time.sleep(0.05)
                 rows[f]["fired_s"] = since()
+                if push_on:
+                    self._post("/api/live-push", {"firing": []})
                 rows[f]["heated_s"] = round(rows[f]["fired_s"] - rows[f]["raise_s"], 3)
-                rows[f]["waited_s"] = round(rows[f]["fired_s"] - rows[f]["settled_s"], 3)
+                # Settled -> its trigger: the time it was hot only waiting. Not
+                # to fired_s, which also holds its own burst and the count check.
+                rows[f]["waited_s"] = round(rows[f]["trigger_s"] - rows[f]["settled_s"], 3)
                 r = self._scan_retry(lambda: self._state_one(f, IDLE, int(idle_ma), "scan_view",
                                                              extra={"in_run": True}))
                 if r.get("ok"):
@@ -1656,6 +1674,11 @@ class _ScheduleMixin:
             out["error"] = str(exc)
         finally:
             self._disarm_all(armed)
+            if push_on:
+                try:
+                    self._post("/api/live-push", {"on": False})
+                except Exception:
+                    pass
             for f in sorted(raised):
                 r = self._scan_retry(lambda f=f: self.idle_one(f, idle_ma))
                 if not r.get("ok"):

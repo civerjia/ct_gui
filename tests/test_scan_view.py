@@ -49,6 +49,9 @@ def make(never_arrives=(), settle_ok=True):
         if path == "/api/filament-perf":
             st["perf"].extend(body["records"])
             return {"ok": True}
+        if path == "/api/live-push":
+            log.append(("push", body.get("on"), tuple(body.get("firing") or ())))
+            return {"ok": True}
         if path == "/api/arm":
             log.append(("arm", tuple(body["controllers"])))
             return {"ok": True, "results": {str(c): {"ok": True} for c in body["controllers"]}}
@@ -113,6 +116,11 @@ check("watchdog spans the wait (> heat timeout + settle)",
       [e for e in log if e[0] == "download"][0][2] > 8500)
 check("per-filament mV honoured (60 at 7800)", r["rows"][-1]["mv"] == 7800)
 check("rows carry the heating at the pulse", r["rows"][0]["heat_mV"] == 8000 and r["rows"][-1]["heat_mA"] == 2500)
+pushes = [e for e in log if e[0] == "push"]
+check("live push held for the whole view and released",
+      pushes[0][1] is True and pushes[-1][1] is False, pushes)
+check("each filament announced as firing, then cleared",
+      [p[2] for p in pushes if p[1] is None][:2] == [(int(ct._fid_of(3)),), ()], pushes)
 check("disarmed at the end", log[-1][0] in ("disarm", "settle") and any(e[0] == "disarm" for e in log[-3:]))
 
 # Not arriving stops the view and fires nothing on it; everything raised dropped.

@@ -149,6 +149,7 @@ AUDIT_SKIP_PATHS = frozenset({
     "/api/present", "/api/tca9554-read", "/api/verify-schedule",
     "/api/poll-pause",
     "/api/filament-perf",       # bookkeeping only (scan_view's per-filament table)
+    "/api/live-push",           # live-view telemetry push on/off: no power, no HV
 })
 
 

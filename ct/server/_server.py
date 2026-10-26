@@ -750,6 +750,11 @@ def read_cached_telemetry_one(link: "ControllerLink", controller: int, fil: int)
 
 
 _PUSH_SAW_RUN = False                 # push tore-down only after a run actually started
+# scan_view holds the push for a whole view (move, heating waits and every
+# burst): with it set, neither a finished sim burst nor the run-status poll
+# tears the push down. _PUSH_FIRING is what scan_view says it is firing (FIDs).
+_PUSH_HOLD = False
+_PUSH_FIRING: list = []
 
 
 def set_scan_telemetry(link: "ControllerLink", controller: int, enable: bool) -> None:
@@ -1982,9 +1987,10 @@ def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) ->
     finally:
         with _SIM_LOCK:
             _SIM_STATE["running"] = False
-        # Stop the telemetry push and finalize the power-state report.
+        # Stop the telemetry push and finalize the power-state report -- unless
+        # a scan_view holds it for the rest of its view.
         for c2, l2 in CONTROLLERS.items():
-            if c2 in _LIVE_PUSH and l2.client.connected:
+            if c2 in _LIVE_PUSH and l2.client.connected and not _PUSH_HOLD:
                 set_scan_telemetry(l2, c2 - 1, False)
         RUN_RECORDER.stop()
 
@@ -2645,6 +2651,31 @@ def filament_perf_get(fids=None) -> dict:
                                           for k in keys if k in FILAMENT_PERF}}
 
 
+def _perf_save() -> str | None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = FILAMENT_PERF_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(FILAMENT_PERF, fh)
+        os.replace(tmp, FILAMENT_PERF_PATH)
+        return None
+    except Exception as exc:
+        return f"not saved: {exc}"
+
+
+def filament_perf_clear(which) -> dict:
+    with _PERF_LOCK:
+        if which == "all":
+            n = len(FILAMENT_PERF)
+            FILAMENT_PERF.clear()
+        else:
+            keys = [str(int(f)) for f in which]
+            n = sum(1 for k in keys if FILAMENT_PERF.pop(k, None) is not None)
+        err = _perf_save()
+    log.info("filament_perf: cleared %s (%d filaments)", which, n)
+    return {"ok": err is None, "cleared": n, **({"error": err} if err else {})}
+
+
 def filament_perf_record(records) -> dict:
     """records: [{filament (FID), mv, settle_ms, arrive_s?, heat_mV?, heat_mA?,
     waited_s?, error?}] -- one per filament per view. A record with "error"
@@ -2673,14 +2704,9 @@ def filament_perf_record(records) -> dict:
             ent["samples"] = ent["samples"][-FILAMENT_PERF_KEEP:]
             ent["fired"] = int(ent.get("fired", 0)) + 1
             added += 1
-        try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = FILAMENT_PERF_PATH.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(FILAMENT_PERF, fh)
-            os.replace(tmp, FILAMENT_PERF_PATH)
-        except Exception as exc:
-            return {"ok": False, "added": added, "error": f"not saved: {exc}"}
+        err = _perf_save()
+    if err:
+        return {"ok": False, "added": added, "error": err}
     return {"ok": True, "added": added}
 
 
@@ -3339,7 +3365,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 if link and link.client.connected:
                     rows.update(read_pushed_telemetry(link, cid - 1))
             RUN_RECORDER.observe(rows.values())
-            self._json({"telemetry": list(rows.values()), "firing": [],
+            self._json({"telemetry": list(rows.values()), "firing": list(_PUSH_FIRING),
                         "run": {str(c): {"state": 2} for c in _LIVE_PUSH}})
         elif path == "/api/telemetry":
             # Real per-filament telemetry for the ring: batch INA219 (V/I) per
@@ -3928,7 +3954,7 @@ class CtHandler(BaseHTTPRequestHandler):
                     any_running = any((v.get("status") or {}).get("state") == 2 for v in out.values())
                     if any_running:
                         _PUSH_SAW_RUN = True
-                    elif _PUSH_SAW_RUN:
+                    elif _PUSH_SAW_RUN and not _PUSH_HOLD:
                         for c2 in list(_LIVE_PUSH):
                             l2 = CONTROLLERS.get(c2)
                             if l2 and l2.client.connected:
@@ -5768,9 +5794,30 @@ class CtHandler(BaseHTTPRequestHandler):
                 threading.Thread(target=_run_scan_sim, args=(link.host, count, interval_ms, cid),
                                  daemon=True).start()
                 self._json({"ok": True, "count": count, "interval_ms": interval_ms, "controller": cid})
+            elif path == "/api/live-push":
+                # scan_view: {"on": bool} holds/releases the 20 fps telemetry
+                # push for a whole view; {"firing": [fid, ...]} says what it is
+                # firing right now (served in /api/telemetry's push snapshot).
+                global _PUSH_HOLD, _PUSH_FIRING
+                if "firing" in body:
+                    _PUSH_FIRING = [int(x) for x in (body.get("firing") or [])]
+                if "on" in body:
+                    on = bool(body["on"])
+                    _PUSH_HOLD = on
+                    if not on:
+                        _PUSH_FIRING = []
+                    for c2, l2 in CONTROLLERS.items():
+                        if l2.client.connected:
+                            set_scan_telemetry(l2, c2 - 1, on)
+                self._json({"ok": True, "hold": _PUSH_HOLD, "firing": _PUSH_FIRING})
             elif path == "/api/filament-perf":
                 # Bookkeeping, not hardware: any client may record (see _access).
-                self._json(filament_perf_record(body.get("records")))
+                # {"clear": "all" | [fid, ...]} drops history (e.g. samples taken
+                # by a since-fixed measurement bug).
+                if body.get("clear") is not None:
+                    self._json(filament_perf_clear(body["clear"]))
+                else:
+                    self._json(filament_perf_record(body.get("records")))
             elif path == "/api/sync/simulate-stop":
                 # Signal the background scan-simulation thread (started by
                 # POST /api/sync/simulate) to stop after its current
