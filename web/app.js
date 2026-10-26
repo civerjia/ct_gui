@@ -59,7 +59,27 @@ const SHOT_S = 0.0005; // demo dwell per fired filament (s) for mAs integration
 // 2 power controllers (ESP32 bridges). 6 of 8 channels used per controller,
 // 8 boards/channel = 48 filaments each. Filaments 0-47 -> power1, 48-95 -> power2.
 const CH_USED = 6;
-function filamentToHw(i) {
+// RING POSITION <-> PHYSICAL FILAMENT (FID). The backend's filament order
+// (/api/filament-order, set by the scripts: order[userIndex] = FID) says where
+// each physical board sits on the ring: the user index IS the ring position
+// (user, 2026-10-26). The live view draws by ring position; everything the
+// backend sends or takes is a FID, so it is translated at these edges.
+// Identity until the order is read (and when none is set).
+let ringToFid = null, fidToRing = null;
+const fidOfRing = (r) => (ringToFid ? ringToFid[r] : r);
+const ringOfFid = (f) => (fidToRing && fidToRing[f] != null ? fidToRing[f] : f);
+async function syncBackendOrder() {
+  let j;
+  try { j = await (await fetch('/api/filament-order')).json(); } catch { return; }
+  if (!j || !j.ok) return;
+  const o = Array.isArray(j.order) && j.order.length === N ? j.order.map(Number) : null;
+  if (JSON.stringify(o) === JSON.stringify(ringToFid)) return;
+  ringToFid = o;
+  fidToRing = o ? Object.fromEntries(o.map((fid, ring) => [fid, ring])) : null;
+  if (typeof syncBackendDead === 'function') syncBackendDead();
+}
+function filamentToHw(ring) {
+  const i = fidOfRing(ring);              // the board at this ring position
   const controller = i < 48 ? 1 : 2;
   const local = i % 48;
   const channel = Math.floor(local / 8); // 0..5
@@ -590,7 +610,7 @@ function sync() {
     filaments, vMax: V_MAX, iMax: I_MAX, mAsMax: maxMAs(),
     stateColor: STATE_COLOR,
     hover: hoverFil,
-    hwMap: filamentToBoard,   // filament idx -> active-list {controller, channel, mux} for the HUD board-id readout
+    hwMap: (r) => filamentToBoard(fidOfRing(r)),   // ring position -> its board (active-list {controller, channel, mux}) for the HUD
   });
 
   $('collimatorSlider').value = state.collimatorCenter;
@@ -792,7 +812,8 @@ async function pollTelemetry() {
   if (!tele.length && !running) { setStatus('Live — no telemetry (controllers disconnected or bridge slot busy).'); return; }
   const present = tele.filter((t) => t.present).length;
   const rows = tele.map((t) => {
-    const f = filaments[t.index]; if (!f) return null;
+    const ring = ringOfFid(t.index);
+    const f = filaments[ring]; if (!f) return null;
     // current_mA === null means the backend had no trustworthy reading for this
     // board (stale cache, unreadable, or absent — see backend _cached_entry /
     // read_pushed_telemetry). ingestTelemetry already refuses to draw a null
@@ -804,11 +825,11 @@ async function pollTelemetry() {
     // guess from the current: a guess painted every cold IDLE as STOP. null =
     // not reported -> ingestTelemetry keeps the last known state.
     const state = t.power_state || null;
-    return { index: t.index, state, bus_mV: t.bus_mV, current_mA: t.current_mA,
+    return { index: ring, state, bus_mV: t.bus_mV, current_mA: t.current_mA,
              lost: !!(t.lost || t.channel_dark) };
   }).filter(Boolean);
   // the firmware-reported firing filament(s) are authoritative ACTIVE
-  const firing = data.firing || [];
+  const firing = (data.firing || []).map(ringOfFid);
   for (const fi of firing) { const r = rows.find((x) => x.index === fi); if (r) r.state = STATE.ACTIVE; }
   // The beam (red line) follows what is FIRING when the backend says so
   // (scan_view): its schedule is not the GUI's, so the run-status playhead,
@@ -817,7 +838,7 @@ async function pollTelemetry() {
   // is centred on it.
   // scan_view says which filament the detector faces in this view: the
   // collimator goes there (detector opposite), the beam moves inside it.
-  if (data.view && data.view.center != null) state.collimatorCenter = ctMod(data.view.center, N);
+  if (data.view && data.view.center != null) state.collimatorCenter = ctMod(ringOfFid(data.view.center), N);
   if (firing.length) {
     const fi = firing[0];
     const off = ctMod(fi - (state.collimatorCenter - HALF), N);
@@ -911,7 +932,7 @@ async function popupRefresh(i) {
       fetch(`/api/hv-snapshot?controller=${hw.controller}`).then((r) => r.json()).catch(() => null),
     ]);
     if (heatTarget !== i) return;  // popup moved on while this was in flight
-    const row = t && (t.telemetry || []).find((x) => x.index === i);
+    const row = t && (t.telemetry || []).find((x) => x.index === fidOfRing(i));
     if (!row) {
       $('heatImeas').textContent = '— A'; $('heatVmeas').textContent = '— V';
     } else if (!row.present) {
@@ -1151,7 +1172,7 @@ async function syncBackendDead() {
   backendDeadOk = true;
   let changed = false;
   for (let i = 0; i < N; i++) {
-    const f = filaments[i], e = j.dead[String(i)];
+    const f = filaments[i], e = j.dead[String(fidOfRing(i))];
     f.hwDead = !!e;
     f.hwDeadReason = e ? (e.reason || '') : '';
     if (f.hwDead && !f.dead) { f.dead = true; f.deadFromBackend = true; f.state = STATE.STOP; f.mAs = 0; changed = true; }
@@ -2423,6 +2444,7 @@ function init() {
   // Defaults first: restoring saved settings decides per filament against them.
   loadRigDefaults().then(() => { if (!loadFilSettings(true)) rebuildSchedule(); });
   setViewMode('live');  // start on real hardware — no simulated data until Plan is chosen
+  syncBackendOrder(); setInterval(syncBackendOrder, 10000);   // ring <-> FID (file read, no hardware)
   syncBackendDead(); setInterval(syncBackendDead, 10000);   // file read on the backend, no hardware
   $('updateBadge').addEventListener('click', applyUpdate);
   pollUpdateStatus(); setInterval(pollUpdateStatus, 60000);   // the backend does the GitHub check
