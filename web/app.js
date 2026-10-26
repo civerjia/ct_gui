@@ -767,9 +767,13 @@ function startLiveTelemetry() {
   liveTelemetryStop = false;
   const tick = async () => {
     if (liveTelemetryStop || viewMode !== 'live') { liveTelemetryTimer = null; return; }
+    const t0 = performance.now();
     await pollTelemetry();
     if (liveTelemetryStop || viewMode !== 'live') { liveTelemetryTimer = null; return; }
-    liveTelemetryTimer = setTimeout(tick, lastRunActive ? TELE_FAST_MS : TELE_IDLE_MS);
+    // The period counts from the START of the poll: waiting a full 50 ms AFTER
+    // a ~60 ms request made it ~110 ms (9 fps, measured 2026-10-26).
+    const period = lastRunActive ? TELE_FAST_MS : TELE_IDLE_MS;
+    liveTelemetryTimer = setTimeout(tick, Math.max(0, period - (performance.now() - t0)));
   };
   liveTelemetryTimer = setTimeout(tick, 0);
 }

@@ -755,6 +755,12 @@ _PUSH_SAW_RUN = False                 # push tore-down only after a run actually
 # tears the push down. _PUSH_FIRING is what scan_view says it is firing (FIDs).
 _PUSH_HOLD = False
 _PUSH_FIRING: list = []
+# The last pushed snapshot per controller, {cid: (monotonic, {fid: row})}: served
+# by /api/telemetry right after the push stops, while the board monitor (paused
+# during the run) has nothing fresh yet. Without it the GUI got EMPTY telemetry
+# for ~3 s after every scan_view and froze on the last pushed frame.
+_LAST_PUSH_ROWS: dict = {}
+LAST_PUSH_SERVE_S = 15.0
 
 
 def set_scan_telemetry(link: "ControllerLink", controller: int, enable: bool) -> None:
@@ -3363,7 +3369,10 @@ class CtHandler(BaseHTTPRequestHandler):
             for cid in list(_LIVE_PUSH):
                 link = CONTROLLERS.get(cid)
                 if link and link.client.connected:
-                    rows.update(read_pushed_telemetry(link, cid - 1))
+                    got = read_pushed_telemetry(link, cid - 1)
+                    rows.update(got)
+                    if got:
+                        _LAST_PUSH_ROWS[cid] = (time.monotonic(), dict(got))
             RUN_RECORDER.observe(rows.values())
             self._json({"telemetry": list(rows.values()), "firing": list(_PUSH_FIRING),
                         "run": {str(c): {"state": 2} for c in _LIVE_PUSH}})
@@ -3409,6 +3418,13 @@ class CtHandler(BaseHTTPRequestHandler):
                     continue
                 board_rows, meta = monitor_board_rows(cid)
                 if not meta["fresh"]:
+                    # Just after a push: its last snapshot, marked as such,
+                    # until the monitor catches up (no reading = no row still).
+                    last = _LAST_PUSH_ROWS.get(cid)
+                    if last and time.monotonic() - last[0] <= LAST_PUSH_SERVE_S:
+                        for fil, r in last[1].items():
+                            rows[fil] = {**r, "cached": True, "from_last_push": True,
+                                         "age_ms": int((time.monotonic() - last[0]) * 1000)}
                     continue      # no reading is no row -- never a row of zeros
                 _annotate_board_rows(cid, board_rows)
                 for b in board_rows:
