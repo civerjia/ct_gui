@@ -9,8 +9,11 @@ import _path  # noqa: F401
 
 import os
 
+import tempfile
+
 os.environ.setdefault("CT_NO_AUTO_UPDATE", "1")
 os.environ["CT_NO_AUTO_CONNECT"] = "1"
+os.environ["CT_STATE_DIR"] = tempfile.mkdtemp(prefix="ct_vac_")   # the saved limit goes here
 
 import ct.server._server as S  # noqa: E402
 
@@ -130,6 +133,22 @@ w = tail_case(14.9)
 check("+2.45 mA 1-5 s after the train -> warning naming the filament",
       w and w["action"] == "warning" and w["filaments"] == [20] and 2.3 < w["tail_ma"] < 2.6, w)
 check("normal fall -> nothing", tail_case(12.47) is None)
+
+# 6. The limit can be changed, is saved, and the interlock follows it.
+reset()
+msg({"type": "pressure_point", "data": {"pressure_torr": 3.0e-5}}, S.time.monotonic())
+check("3e-5 Torr over the default 2.5e-5 -> refused", S.vacuum_refusal("emission ON") is not None)
+r = S.vacuum_set_limit(5e-5, "test")
+check("limit set to 5e-5, saved", r["ok"] and r["limit_torr"] == 5e-5 and r["was"] == 2.5e-5 and r["saved"], r)
+check("...3e-5 now allowed", S.vacuum_refusal("emission ON") is None)
+check("...and it is what a restart would load", S._vacuum_limit_load() == 5e-5)
+check("...shown in /api/vacuum and /api/series", S.vacuum_snapshot()["limit_torr"] == 5e-5
+      and S.series_get(["vac"])["vacuum_limit_torr"] == 5e-5)
+r = S.vacuum_set_limit(5, "test")
+check("5 Torr (a typo) -> refused, unchanged", not r["ok"] and S.vacuum_limit() == 5e-5, r)
+r = S.vacuum_set_limit("abc", "test")
+check("not a number -> refused", not r["ok"] and "number" in r["error"], r)
+S.vacuum_set_limit(2.5e-5, "test")
 
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

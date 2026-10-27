@@ -447,6 +447,11 @@
                 <button class="seg-btn" data-s="600">10 min</button>
                 <button class="seg-btn" data-s="3600">1 h</button>
               </div>
+              <span class="hint" title="The vacuum interlock: over this (or no reading) HV ON and ACTIVE/VOLTAGE are refused; while running, HV off and heating back to IDLE. Saved on the backend.">vacuum limit</span>
+              <input id="vacLimit" class="vac-limit" type="text" inputmode="decimal" placeholder="2.5e-5" data-nostick />
+              <span class="hint">Torr</span>
+              <button id="vacLimitSet" class="xs">Set</button>
+              <span id="vacLimitMsg" class="hint"></span>
             </div>
             <canvas id="trendCanvas" class="trend-canvas"></canvas>
           </details>

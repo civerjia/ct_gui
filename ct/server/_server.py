@@ -3540,7 +3540,8 @@ def series_get(names, since: float = 0.0, max_points: int = 4000) -> dict:
                 k = -(-len(pts) // max_points)
                 pts = pts[::k] + ([pts[-1]] if (len(pts) - 1) % k else [])
             out[n] = [[round(t, 3), v] for t, v in pts]
-    return {"ok": True, "now": round(time.time(), 3), "keep_s": SERIES_KEEP_S, "series": out}
+    return {"ok": True, "now": round(time.time(), 3), "keep_s": SERIES_KEEP_S, "series": out,
+            "vacuum_limit_torr": vacuum_limit()}
 
 
 # ── Spellman HV supply + vacuum, READ-ONLY (control2's spellman_backend) ──────
@@ -3552,7 +3553,49 @@ def series_get(names, since: float = 0.0, max_points: int = 4000) -> dict:
 SPELLMAN_WS_URL = os.environ.get("CT_SPELLMAN_WS", "ws://control2:8770")
 SPELLMAN_RECONNECT_S = 5.0
 SPELLMAN_STALE_S = 10.0         # older than this = no reading
-VACUUM_LIMIT_TORR = float(os.environ.get("CT_VACUUM_LIMIT_TORR", "2.5e-5"))
+VACUUM_LIMIT_DEFAULT_TORR = float(os.environ.get("CT_VACUUM_LIMIT_TORR", "2.5e-5"))
+VACUUM_LIMIT_RANGE = (1e-9, 1e-2)          # anything outside is a typo, refused
+VACUUM_STATE_PATH = STATE_DIR / "vacuum.json"
+
+
+def _vacuum_limit_load() -> float:
+    """The limit set from the GUI / API survives a restart; else the default."""
+    try:
+        v = float(json.loads(VACUUM_STATE_PATH.read_text()).get("limit_torr"))
+        if VACUUM_LIMIT_RANGE[0] <= v <= VACUUM_LIMIT_RANGE[1]:
+            return v
+    except Exception:
+        pass
+    return VACUUM_LIMIT_DEFAULT_TORR
+
+
+_VAC_CFG = {"limit": _vacuum_limit_load()}
+
+
+def vacuum_limit() -> float:
+    return _VAC_CFG["limit"]
+
+
+def vacuum_set_limit(value, who: str = "?") -> dict:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"limit_torr must be a number in Torr, got {value!r}"}
+    lo, hi = VACUUM_LIMIT_RANGE
+    if not (lo <= v <= hi):
+        return {"ok": False, "error": f"limit_torr {v:.2e} out of range {lo:.0e}..{hi:.0e} Torr -- nothing changed"}
+    old = _VAC_CFG["limit"]
+    _VAC_CFG["limit"] = v
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        VACUUM_STATE_PATH.write_text(json.dumps({"limit_torr": v, "set_by": who,
+                                                 "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}))
+        saved = True
+    except OSError as exc:
+        saved = False
+        log.warning("vacuum limit not saved (%s) -- it holds until the backend restarts", exc)
+    log.warning("vacuum limit %.2e -> %.2e Torr (by %s)", old, v, who)
+    return {"ok": True, "limit_torr": v, "was": old, "saved": saved}
 VACUUM_INTERLOCK = os.environ.get("CT_VACUUM_INTERLOCK", "1") != "0"
 VACUUM_TRIP_READINGS = 2        # consecutive fresh readings over the limit -> trip
 
@@ -3677,8 +3720,8 @@ def vacuum_snapshot() -> dict:
     fresh = at is not None and now - at <= SPELLMAN_STALE_S
     return {"ok": True, "source": SPELLMAN_WS_URL, "connected": conn, "error": err,
             "pressure_torr": p if fresh else None, "age_s": _age(at, now), "raw": raw if fresh else None,
-            "limit_torr": VACUUM_LIMIT_TORR, "interlock": VACUUM_INTERLOCK,
-            "within_limit": (p <= VACUUM_LIMIT_TORR) if fresh else None, "lesker": les}
+            "limit_torr": vacuum_limit(), "interlock": VACUUM_INTERLOCK,
+            "within_limit": (p <= vacuum_limit()) if fresh else None, "lesker": les}
 
 
 def vacuum_refusal(action: str) -> str | None:
@@ -3695,8 +3738,8 @@ def vacuum_refusal(action: str) -> str | None:
                 f"-- refusing {action}. "
                 f"Start control2's spellman_backend (it relays the Lesker gauge), or set "
                 f"CT_VACUUM_INTERLOCK=0 to run without the interlock")
-    if v["pressure_torr"] > VACUUM_LIMIT_TORR:
-        return (f"vacuum interlock: {v['pressure_torr']:.2e} Torr is over the {VACUUM_LIMIT_TORR:.1e} "
+    if v["pressure_torr"] > vacuum_limit():
+        return (f"vacuum interlock: {v['pressure_torr']:.2e} Torr is over the {vacuum_limit():.1e} "
                 f"Torr limit -- refusing {action}")
     return None
 
@@ -3760,9 +3803,9 @@ def _vacuum_trip(p: float, now: float) -> dict:
         except Exception:
             off[ch] = False
     to_idle, no_idle = drop_hot_to_idle(now)
-    rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": VACUUM_LIMIT_TORR, "hv_off": off,
+    rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": vacuum_limit(), "hv_off": off,
            "to_idle": to_idle, "to_sleep_no_idle_known": no_idle,
-           "message": (f"HV OFF: vacuum {p:.2e} Torr over the {VACUUM_LIMIT_TORR:.1e} Torr limit -- "
+           "message": (f"HV OFF: vacuum {p:.2e} Torr over the {vacuum_limit():.1e} Torr limit -- "
                        f"emission and focus switched off, heating back to IDLE for {to_idle or 'none'}"
                        f"{f', SLEEP for {no_idle} (no IDLE current known)' if no_idle else ''}; HV ON is "
                        f"refused until the vacuum recovers and the latch is cleared "
@@ -3779,7 +3822,7 @@ def _vacuum_tick(now: float) -> dict | None:
         return None
     v = vacuum_snapshot()
     p = v["pressure_torr"]
-    if p is None or p <= VACUUM_LIMIT_TORR:
+    if p is None or p <= vacuum_limit():
         _VAC_OVER["n"] = 0
         return None
     with _SPELL_LOCK:
@@ -5641,6 +5684,13 @@ class CtHandler(BaseHTTPRequestHandler):
                         f"Power {c}: {r.get('error') or 'refused'}"
                         for c, r in sorted(results.items()) if not r.get("ok"))
                 self._json(out)
+            elif path == "/api/vacuum":
+                # {"limit_torr": x}: the interlock's limit, saved (survives a
+                # restart). Other fields: none -- the reading is control2's.
+                if "limit_torr" not in body:
+                    return self._json({"ok": False, "error": "give limit_torr (Torr)"}, HTTPStatus.OK)
+                r = vacuum_set_limit(body["limit_torr"], self._client(body))
+                self._json({**r, "vacuum": vacuum_snapshot()} if r.get("ok") else r)
             elif path == "/api/hv-guard":
                 # {"clear": true}: a person has dealt with the switch that would
                 # not turn off -- HV may come on again. {"enabled": bool}: switch

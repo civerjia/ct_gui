@@ -6,6 +6,7 @@
  * fetched incrementally once a second. Drawn only while the card is open.
  */
 import { $ } from './dom.js';
+import { postJ } from './net.js';
 
 const KEEP_S = 3600;
 const STRIPS = [
@@ -13,7 +14,7 @@ const STRIPS = [
   { key: 'sp_ma', label: 'Spellman I', unit: 'mA', color: '#7a4fb3', fmt: (v) => v.toFixed(3) },
   { key: 'em_v', label: 'Emission V', unit: 'V', color: '#1f8a70', fmt: (v) => v.toFixed(1) },
   { key: 'em_i', label: 'Emission I', unit: 'mA', color: '#c46a1b', fmt: (v) => v.toFixed(2) },
-  { key: 'vac', label: 'Vacuum', unit: 'Torr', color: '#56636b', fmt: (v) => v.toExponential(2), log: true, limit: 2.5e-5 },
+  { key: 'vac', label: 'Vacuum', unit: 'Torr', color: '#56636b', fmt: (v) => v.toExponential(2), log: true, limit: null },   // limit: the backend's
 ];
 const STRIP_H = 58, GAP = 6, AXIS_H = 18, LEFT = 84, RIGHT = 8;
 
@@ -38,6 +39,11 @@ export function initTrends() {
     try {
       const r = await (await fetch(`/api/series?since=${last}&max_points=4000`)).json();
       if (!r.ok) return;
+      if (typeof r.vacuum_limit_torr === 'number') {
+        STRIPS[4].limit = r.vacuum_limit_torr;
+        const inp = $('vacLimit');
+        if (inp && document.activeElement !== inp) inp.value = r.vacuum_limit_torr.toExponential(1);
+      }
       for (const s of STRIPS) {
         const pts = (r.series || {})[s.key] || [];
         if (pts.length) data[s.key].push(...pts);
@@ -141,6 +147,15 @@ export function initTrends() {
     }
   }
 
+  const setBtn = $('vacLimitSet'), msg = $('vacLimitMsg');
+  if (setBtn) setBtn.onclick = async () => {
+    const v = parseFloat(($('vacLimit') || {}).value);
+    if (!(v > 0)) { if (msg) msg.textContent = 'enter a pressure in Torr, e.g. 2.5e-5'; return; }
+    const r = await postJ('/api/vacuum', { limit_torr: v });
+    if (msg) msg.textContent = r.ok ? `limit ${r.limit_torr.toExponential(1)} Torr (was ${r.was.toExponential(1)})`
+                                    : (r.error || 'not changed');
+    if (r.ok) { STRIPS[4].limit = r.limit_torr; draw(); }
+  };
   card.addEventListener('toggle', draw);
   window.addEventListener('resize', draw);
   const loop = async () => { await fetchNew(); draw(); setTimeout(loop, 1000); };
