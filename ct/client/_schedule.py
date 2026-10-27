@@ -1387,76 +1387,76 @@ class _ScheduleMixin:
         return self._post("/api/filament-perf", {"clear": which})
 
     def scan_view(self,
-                  filaments,                   # ONE view, in firing order (your numbering)
-                  active_mv,                   # mV for all, or {filament: mV}
-                  idle_ma: float,              # back to this after its pulse(s)
-                  settle_ms: int = 0,          # hold arrival this long first (firmware-timed)
-                  k="auto",                    # "auto", or a fixed number of filaments ahead
-                  k_max: int = 6,              # never more than this many hot at once
-                  start_in_s: float = 0.0,     # first pulse no sooner than this (motor moving); None = 0
-                  detector_center=None,        # filament the detector faces; None = the middle one
+                  filaments,                   # the filament numbers to fire, IN THIS ORDER
+                  active_mv,                   # heating mV: one number, or {filament: mV} for each
+                  idle_ma: float,              # each filament back to this current after its pulses
                   num_pulses: int = 1,         # pulses per filament
-                  width_us: int = 1000,
-                  pulse_interval_ms: int = 100,   # spacing inside one filament's burst
-                  heat_timeout_s: float = 8.0,    # longest wait for ARRIVAL, per filament
-                  lead_margin_s: float = 0.3,     # k="auto": raise this much earlier still
+                  width_us: int = 1000,        # pulse width
+                  pulse_interval_ms: int = 100,   # spacing of one filament's pulses
+                  settle_ms: int = 0,          # voltage held +-150 mV this long before it fires
+                  trigger: str = "sim",        # "sim": the library fires; "ext": your hardware
+                  on_ready=None,               # "ext": on_ready(filament) = send its edges NOW
+                  trigger_wait_s: float = 10.0,   # "ext": its edges must arrive within this
+                  heat_timeout_s: float = 8.0,    # longest wait for one filament's voltage
+                  start_in_s: float = 0.0,     # first pulse no sooner than this; None = 0
+                  detector_center=None,        # GUI drawing only; None = the middle filament
+                  k="auto",                    # heating lead: "auto" or N filaments ahead
+                  k_max: int = 6,              # never more than this many hot at once
+                  lead_margin_s: float = 0.3,  # k="auto": heat this much earlier still
                   max_on_ms: int = 40) -> dict:
-        """SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire ONE CT
-        view -- its filaments in order -- in VOLTAGE mode, the host heating
-        each just ahead of its turn and firing it only once the RP2350 reports
-        its heating ARRIVED. Call it once per view, when the motor STARTS
-        moving to that view, with start_in_s = how long the move takes.
+        """Fire a list of filaments one after another, then stop. Every
+        filament ends at IDLE.
 
-          * ONE schedule for the view (every filament an emission entry, no
-            heating rows): download, verify and arm at once, during the move;
-          * HEATING JUST IN TIME: filament s is raised to a timed VOLTAGE when
-            its turn is expected within (its arrival time + lead_margin_s).
-            The turn is predicted from the view start (start_in_s), the slots
-            before it and the measured time per slot; arrival from what this
-            session has measured. k="auto" does that; k=N instead raises a
-            filament N turns ahead (old behaviour). Never more than k_max hot.
-          * for each filament in order: wait until it is "settled" (load
-            voltage +-150 mV, held settle_ms -- CH_ARRIVAL_SETTLE), send its
-            num_pulses simulated triggers exactly once, wait until they are
-            counted, drop it to idle_ma. The backend allows these mid-run
-            changes (in_run) for the running schedule's own filaments only;
-          * a prediction that is wrong only costs time: nothing is fired before
-            "settled", ever. Link hiccups (reads, VOLTAGE/IDLE commands) are
-            retried for 10 s; the trigger is never sent twice;
-          * anything that does not recover -- a filament that does not arrive
-            within heat_timeout_s (+ settle), an SHV fault, a lost count --
-            STOPS the view: disarm, every filament back to idle_ma, settle 0,
-            and the reason in "error". Retry or skip is the caller's call.
-            (If the caller itself dies, the backend drops the timed VOLTAGE.)
+            r = ct.scan_view([23, 24, 25, 26], active_mv=5000, idle_ma=1200,
+                             num_pulses=5, width_us=20000, settle_ms=500)
 
-        detector_center: the filament the detector faces in this view (the
-        collimator centre). None = the middle of `filaments` (35 -> the 18th).
-        Only drawn: the GUI places the detector/collimator there and the beam
-        follows the firing filament inside that window. Returned as
-        "detector_center".
+        For each filament, in the order given: heat it to active_mv, wait until
+        its voltage holds (+-150 mV for settle_ms), fire num_pulses pulses,
+        put it back to idle_ma. The next filaments are already heating while
+        one fires, so there is little waiting.
 
-        Simulated trigger only. Every filament must be at a settled IDLE first.
-        Needs RP2350 fw with the voltage loop (903cd23+ for settle_ms > 0).
+        active_mv   5000 = all at 5000 mV; {23: 5000, 24: 5200, ...} = each its
+                    own (every filament in the list must be given one).
+        trigger     "sim": the library sends the trigger edges itself.
+                    "ext": your hardware sends them. on_ready(filament) is
+                    called when that filament is hot and armed; send its
+                    num_pulses edges then (one pulse per edge). Not all counted
+                    within trigger_wait_s -> stopped.
 
-            for v, fils in enumerate(views):
-                motor.start_move(v)
-                r = ct.scan_view(fils, active_mv=8000, idle_ma=1200, settle_ms=500,
-                                 start_in_s=3.0, num_pulses=5, width_us=20000,
-                                 pulse_interval_ms=100)
-                print(r)          # rows + r["gantt"]: what actually happened
+                        def send_edges(filament):
+                            detector.trigger()          # your hardware
+                        ct.scan_view([23, 24, 25], active_mv=5000, idle_ma=1200,
+                                     trigger="ext", on_ready=send_edges)
 
-        Returns {"ok", "error"?, "rows": [{filament, site, mv, raise_s,
-        settled_s, trigger_s, fired_s, heated_s, waited_s, arrival, heat_mV, heat_mA,
-        records}], "elapsed_s", "start_s", "per_filament_s", "heated_mean_s",
-        "waited_mean_s", "estimate": {arrive_s, cycle_s}, "gantt"} -- times in
-        s from the call. settled_s = first seen "settled"; heated_s = raise ->
-        pulse (time hot); waited_s = settled -> its trigger (hot and only
-        waiting: the lead was too long); fired_s = its pulses counted.
+        Before: every filament in the list at IDLE. HV is not touched.
+
+        Any failure (a filament not reaching its voltage within
+        heat_timeout_s, an SHV fault, edges not counted, on_ready raising)
+        STOPS it: disarmed, every filament back to idle_ma, the reason in
+        "error", the filament in "failed_filament". Ctrl-C does the same.
+
+        Returns {"ok", "error"?, "failed_filament"?, "rows": one per filament
+        {filament, mv, fired_s, heated_s (time hot), waited_s (hot, only
+        waiting), heat_mV, heat_mA, records (its pulses)}, "elapsed_s",
+        "gantt" (text timeline: '.' heating, '=' ready and waiting,
+        '#' pulses)}. Times are seconds from the call.
+
+        start_in_s: only if you start this while something else still has to
+        happen first (e.g. a motor still moving): the first pulse comes no
+        sooner, and the heating overlaps the wait.
         """
         t0 = time.monotonic()
         fils = [int(f) for f in filaments]
         if start_in_s is None:            # None = no motor move to wait for
             start_in_s = 0.0
+        trigger = str(trigger or "sim").lower()
+        if trigger not in ("sim", "ext"):
+            return {"ok": False, "error": f"trigger must be 'sim' or 'ext', got {trigger!r}",
+                    "rows": [], "elapsed_s": 0.0}
+        if trigger == "ext" and not callable(on_ready):
+            return {"ok": False, "error": "trigger='ext' needs on_ready=your_function(filament): "
+                                          "it is called when that filament is ready for its edges",
+                    "rows": [], "elapsed_s": 0.0}
 
         def fail(msg, **kw):
             return {"ok": False, "error": msg, "rows": [], **kw}
@@ -1667,11 +1667,20 @@ class _ScheduleMixin:
                 rows[f]["trigger_s"] = since()
                 if push_on:
                     self._post("/api/live-push", {"firing": [int(self._fid_of(f))]})
-                why = self._scan_trigger(head, n, interval)
-                if why:
-                    raise self._ScanStop(f"filament {f}: {why}")
+                if trigger == "ext":
+                    try:
+                        on_ready(f)
+                    except Exception as exc:
+                        raise self._ScanStop(f"filament {f}: on_ready raised "
+                                             f"{type(exc).__name__}: {exc} -- view stopped")
+                    wait_edges_s = float(trigger_wait_s)
+                else:
+                    why = self._scan_trigger(head, n, interval)
+                    if why:
+                        raise self._ScanStop(f"filament {f}: {why}")
+                    wait_edges_s = 10.0
                 done += n
-                fire_deadline = time.monotonic() + burst_s + 10.0
+                fire_deadline = time.monotonic() + burst_s + wait_edges_s
                 while True:
                     # The others keep heating while this one fires: catch the
                     # moment each settles HERE too. Missed until the next turn,
@@ -1689,7 +1698,9 @@ class _ScheduleMixin:
                         break
                     if time.monotonic() >= fire_deadline:
                         raise self._ScanStop(f"filament {f}: controller {head} counted "
-                                             f"{st.get('totalPulsesDone')} of {done} triggers")
+                                             f"{st.get('totalPulsesDone')} of {done} triggers"
+                                             + (f" -- the external edges did not all arrive within "
+                                                f"{trigger_wait_s:g} s of on_ready" if trigger == "ext" else ""))
                     time.sleep(0.05)
                 rows[f]["fired_s"] = since()
                 if push_on:
@@ -1759,18 +1770,38 @@ class _ScheduleMixin:
         return out
 
     def scan_plan(self, mode: str = "stationary", **geometry) -> dict:
-        """The views of one CT rotation, ready for scan_views().
+        """The list of VIEWS (angles) of one CT rotation. Fires nothing: it only
+        computes, from the ring geometry and the backend's dead list, which
+        filaments each angle fires and in what order. Pick a view from it and
+        pass its "filaments" to scan_view().
 
-        Each view: {"view": n, "center": the filament the detector faces,
-        "filaments": the ones it fires, in order}. Filaments are YOUR numbers,
-        which are the ring positions (the backend's filament order maps them to
-        boards). Dead filaments are already left out. `mode` and the geometry
-        keywords are build_scan_schedule()'s (mode="precision" adds gantry
-        angles: many more views).
+        A view = one detector position: {"view": index in the list,
+        "center": the filament the detector faces, "filaments": the filaments
+        under the collimator -- center-17 .. center+17 round the ring, dead
+        ones removed -- in firing order}; mode="precision" adds "gantry"
+        (degrees). Filaments are ring positions 0-95 (your numbers).
 
-            plan = ct.scan_plan()
+            plan = ct.scan_plan()        # 96 views; view n faces filament n
             plan["views"][0]   # {'view': 0, 'center': 0, 'filaments': [79, 80, ... 17]}
+
+        Returns {"ok", "n_views", "views", "dead_left_out" (filaments removed:
+        dead + skip), "truncated" (True only if you passed a max_rows that cut
+        the plan short)}.
+
+        mode="stationary" (default): one view per ring position, 96.
+        mode="precision": at every ring position the gantry also sweeps
+        2*gantry_steps+1 angles over +-gantry_max_deg (default 11 angles,
+        +-10 deg), so 96*11 = 1056 views; the sweep reverses direction at each
+        ring step. Geometry keywords (build_scan_schedule's): collimator_center
+        (first view's center, default 0), collimator_dir (+1 = center goes up
+        by one per ring step, -1 = down), filament_dir, gantry_max_deg,
+        gantry_steps, ring_order, skip (more filaments to leave out),
+        skip_dead (default True), max_rows.
         """
+        # Not the firmware's 8192-row cap: scan_view() downloads one schedule
+        # PER VIEW (<= 35 rows), so the plan itself has no row limit. With the
+        # cap, a precision plan silently stopped at 241 of 1056 views.
+        geometry.setdefault("max_rows", 1 << 30)
         sched = self.build_scan_schedule(mode=mode, **geometry)
         views: list = []
         key = None
@@ -1797,7 +1828,10 @@ class _ScheduleMixin:
                    move_s: float = 3.0,      # how long the motor takes to reach a view; None = 0
                    move_to=None,             # move_to(view): STARTS the motor move; None = no motor
                    heat_timeout_s: float = 8.0,
-                   k="auto") -> dict:
+                   k="auto",
+                   trigger: str = "sim",     # "ext": on_ready(filament) per filament, see scan_view
+                   on_ready=None,
+                   trigger_wait_s: float = 10.0) -> dict:
         """SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire many
         views in a row, VOLTAGE heating just in time. For each view:
 
@@ -1856,7 +1890,8 @@ class _ScheduleMixin:
                                    start_in_s=float(move_s or 0.0) if attempt == 1 else 0.0,
                                    detector_center=v.get("center"), num_pulses=num_pulses,
                                    width_us=width_us, pulse_interval_ms=pulse_interval_ms,
-                                   heat_timeout_s=heat_timeout_s)
+                                   heat_timeout_s=heat_timeout_s, trigger=trigger,
+                                   on_ready=on_ready, trigger_wait_s=trigger_wait_s)
                 n_p = sum(len(x.get("records") or []) for x in (r.get("rows") or []))
                 done_here |= {x["filament"] for x in (r.get("rows") or [])
                               if x.get("fired_s") is not None and "filament" in x}

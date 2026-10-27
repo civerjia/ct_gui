@@ -240,6 +240,19 @@ check("scan_plan groups by view, centre and order kept",
       plan["n_views"] == 2 and plan["views"][0] == {"view": 0, "center": 0, "filaments": [95, 0, 1]}
       and plan["views"][1]["filaments"] == [0, 1, 2] and plan["dead_left_out"] == [9], plan)
 
+# The real geometry: 96 views, view n faces filament n, 35 filaments n-17..n+17;
+# precision is NOT cut at the firmware's 8192-row cap (one schedule per view).
+real, _l, _s = make()
+real._dead_users = lambda: frozenset([50])
+p = real.scan_plan()
+check("stationary plan: 96 views, view n centred on n, 35 under the collimator, dead removed",
+      p["n_views"] == 96 and p["views"][40]["center"] == 40
+      and p["views"][0]["filaments"] == list(range(79, 96)) + list(range(0, 18))
+      and 50 not in p["views"][40]["filaments"] and len(p["views"][40]["filaments"]) == 34, p["n_views"])
+q = real.scan_plan(mode="precision")
+check("precision plan: all 96 x 11 = 1056 views, not truncated",
+      q["n_views"] == 1056 and not q["truncated"] and "gantry" in q["views"][0], (q["n_views"], q["truncated"]))
+
 calls, moved = [], []
 def fake_view(fils, **kw):
     calls.append((list(fils), kw["start_in_s"], kw["detector_center"]))
@@ -292,7 +305,7 @@ check("scan_views(move_s=None, move_to=None): runs, first pulse not delayed",
       r["ok"] and calls and calls[0][1] == 0.0, (r, calls))
 ct, log, st = make()
 r = ct.scan_view(V, active_mv=8000, idle_ma=1200, start_in_s=None)
-check("scan_view(start_in_s=None) = 0", r.get("ok") and r.get("start_s", 0) == 0, (r.get("ok"), r.get("error"), r.get("start_s")))
+check("scan_view(start_in_s=None) = 0: no wait before the first filament", r.get("ok") and r.get("start_s", 1) < 0.5, (r.get("ok"), r.get("error"), r.get("start_s")))
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 raise SystemExit(1 if FAILS else 0)
