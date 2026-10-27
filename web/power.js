@@ -885,7 +885,13 @@ const HV_HTML = `
       <div class="metric"><span class="metric-label">Emission V</span><span id="adsEmV" class="metric-value">—</span></div>
       <div class="metric"><span class="metric-label">Emission HV</span><span id="hvEmStatus" class="metric-value">—</span></div>
       <div class="metric"><span class="metric-label">Focus HV</span><span id="hvFocStatus" class="metric-value">—</span></div>
+      <div class="metric" title="Spellman output voltage (read-only, control2)"><span class="metric-label">60 kV V</span><span id="spKv" class="metric-value">—</span></div>
+      <div class="metric" title="Spellman output current (read-only, control2)"><span class="metric-label">60 kV I</span><span id="spMa" class="metric-value">—</span></div>
+      <div class="metric" title="Lesker gauge via raspberrypi5 / control2. Over the limit, or no reading: HV ON and ACTIVE/VOLTAGE are refused."><span class="metric-label">Vacuum</span><span id="vacP" class="metric-value">—</span></div>
+      <div class="metric" title="HV guard: STM32 (ms) + backend. Tripped = HV off and latched."><span class="metric-label">HV guard</span><span id="hvGuardState" class="metric-value">—</span></div>
     </div>
+    <div id="hvGuardMsg" class="hw-status bad" hidden></div>
+    <button id="hvGuardClear" class="xs" hidden title="The switch / vacuum was dealt with: clear the latch (HV stays off; turn it on again yourself)">Clear HV guard latch</button>
     <div id="adsStatus" class="summary"></div>
   </div>
 
@@ -1390,6 +1396,7 @@ function wireHv() {
   $p('adsAuto').onchange = (e) => adsAutoApply(e.target.checked);
   adsAutoApply($p('adsAuto').checked);
   wireSingleBoardTests();
+  wireSupplyMonitor();
 }
 
 // ---- single-board calibration & test (selected board on the target controller)
@@ -2361,6 +2368,72 @@ async function syncRefresh() {
 }
 
 // ---- target selector + gantt fold + lifecycle -------------------------------
+// Spellman 60 kV supply + vacuum + HV guard, 1 Hz from /api/safety: all three
+// are the backend's cached state (the Spellman/vacuum reader listens to
+// control2; the guard is the backend's latch) -- this adds no request to the
+// ESP32/STM32. A reading the backend calls stale comes back null and is shown
+// as "no data", never as the last value.
+function wireSupplyMonitor() {
+  // Every element exists twice (this card's id, and id + '2' in the HV
+  // Control & Monitor card above the run) -- forMirrored() writes both.
+  const set = (ids, text, cls, title) => {
+    for (const id of ids) forMirrored(id, (e) => {
+      e.textContent = text;
+      e.classList.remove('bad', 'stale');
+      if (cls) e.classList.add(cls);
+      if (title !== undefined) e.title = title;
+    });
+  };
+  const tick = async () => {
+    const r = await getSafety();
+    if (!r || !r.ok) { set(['spKv', 'spMa', 'vacP', 'hvGuardState'], '—', 'stale', 'backend unreachable'); return; }
+    const g = r.hv_guard || {}, v = g.vacuum || {}, h = g.hv_supply || {};
+    const why = (x) => (x.connected ? '' : 'not connected to ' + (x.source || 'control2') + (x.error ? ': ' + x.error : ''));
+    // Spellman
+    if (h.kv == null) set(['spKv'], 'no data', 'stale', why(h) || 'no kV reading from control2 (its reply was empty)');
+    else set(['spKv'], (+h.kv).toFixed(2) + ' kV', null, `${h.kv_age_s ?? '?'} s old`);
+    if (h.ma == null) set(['spMa'], 'no data', 'stale', why(h) || 'no mA reading from control2 (its reply was empty)');
+    else set(['spMa'], (+h.ma).toFixed(3) + ' mA', null, `${h.ma_age_s ?? '?'} s old`);
+    // Vacuum
+    if (v.pressure_torr == null) {
+      set(['vacP'], 'no data', 'bad', (why(v) || `no reading for ${v.age_s ?? 'ever'} s`) +
+          (v.interlock ? ' -- the interlock refuses HV ON / ACTIVE until it reads' : ''));
+    } else {
+      const over = v.within_limit === false;
+      set(['vacP'], (+v.pressure_torr).toExponential(2) + ' Torr', over ? 'bad' : null,
+          `limit ${(+v.limit_torr).toExponential(1)} Torr · ${v.age_s} s old` + (v.interlock ? '' : ' · interlock OFF'));
+    }
+    // HV guard
+    const t = g.tripped;
+    if (t) {
+      set(['hvGuardState'], 'TRIPPED · ' + (t.source || 'host'), 'bad');
+      forMirrored('hvGuardMsg', (e) => { e.hidden = false; e.textContent = (t.at ? t.at + ' — ' : '') + (t.message || 'HV guard tripped'); });
+      forMirrored('hvGuardClear', (e) => { e.hidden = false; });
+    } else {
+      set(['hvGuardState'], g.enabled === false ? 'off' : 'armed', g.enabled === false ? 'stale' : null);
+      forMirrored('hvGuardMsg', (e) => { e.hidden = true; });
+      forMirrored('hvGuardClear', (e) => { e.hidden = true; });
+    }
+  };
+  forMirrored('hvGuardClear', (b) => {
+    b.onclick = async () => {
+      if (!confirm('Clear the HV guard latch?\n\nOnly after the cause was dealt with. HV stays OFF; turn it on again yourself.')) return;
+      const r = await postJ('/api/hv-guard', { clear: true });
+      if (!r.ok) {
+        forMirrored('hvGuardMsg', (e) => { e.hidden = false; e.textContent = 'Clear failed: ' + (r.error || 'unknown error'); });
+        return;
+      }
+      tick();
+    };
+  });
+  const loop = async () => { try { await tick(); } catch { /* keep polling */ } setTimeout(loop, 1000); };
+  loop();
+}
+
+const getSafety = async () => {
+  try { return await (await fetch('/api/safety')).json(); } catch { return null; }
+};
+
 export function initPower() {
   wireBoards();
   wireHv();

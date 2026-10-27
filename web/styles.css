@@ -205,6 +205,8 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .ct-hv-row span { color: #8b97a0; text-align: left; }
 .ct-hv-row b { color: #3fb6a0; font-weight: 700; }
 .ct-hv-row b.dim { color: #566069; font-weight: 400; }
+.metric-value.bad { color: #e0605a; }
+.metric-value.stale { color: #6b7780; font-weight: 400; }
 
 /* hardware run panel (schedule card) */
 .hw-actions { gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
