@@ -54,6 +54,7 @@ import json
 import os
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -251,10 +252,42 @@ def _interactive() -> bool:
 
 # ---- GitHub -----------------------------------------------------------------
 
+_SSL_CTX: list = []
+
+
+def _ssl_context() -> ssl.SSLContext | None:
+    """On Windows: trust only the ROOT store, not the "CA" (intermediate)
+    store Python also loads by default.
+
+    2026-10-27, the rig PC: Windows had cached, in the current user's CA store, a
+    USERTrust ECC certificate cross-signed by "AAA Certificate Services" --
+    a root that machine does not have. OpenSSL 1.1.1 built GitHub's chain
+    through that cached copy and failed ("unable to get issuer certificate");
+    Windows drops and re-caches it, so the update check passed or failed by
+    the hour. GitHub sends its whole chain up to the self-signed USERTrust
+    ECC root, which IS in ROOT, so the ROOT store alone verifies it every
+    time. Verification and hostname checks stay on. Anything that goes wrong
+    building this falls back to Python's default context (None)."""
+    if _SSL_CTX:
+        return _SSL_CTX[0]
+    ctx = None
+    if sys.platform == "win32":
+        try:
+            ders = [c for c, enc, trust in ssl.enum_certificates("ROOT")
+                    if enc == "x509_asn" and (trust is True or "1.3.6.1.5.5.7.3.1" in trust)]
+            if ders:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)   # CERT_REQUIRED + check_hostname
+                ctx.load_verify_locations(cadata=b"".join(ders))
+        except Exception:
+            ctx = None
+    _SSL_CTX.append(ctx)
+    return ctx
+
+
 def _http(url: str, timeout: float) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "ct_gui-update",
                                                "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as r:
         return r.read()
 
 
