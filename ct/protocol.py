@@ -1948,6 +1948,19 @@ def stm32_hv_status(host: str) -> dict[str, Any]:
     return _stm32_get_json(host, "/stm32/hv_status")
 
 
+def stm32_hv_guard(host: str, op: str | None = None, **cfg) -> dict[str, Any]:
+    """The STM32's own HV guard (OP 0x1D, through the ESP32's /stm32/hv_guard).
+    op None: status. op='clear': clear its latch (the rails stay off).
+    op='config': enabled, thr, n, window, learn. Status fields: enabled,
+    latched, learned, thr_counts, n_windows, window_samples, learn_windows,
+    base_x16 / last_x16 / trip_mean_x16 / trip_base_x16 (ADC counts x 16),
+    trips, windows. Older ESP32 firmware: HTTP 404; older STM32: 501."""
+    if op is None:
+        return _stm32_get_json(host, "/stm32/hv_guard")
+    return _stm32_post(host, "/stm32/hv_guard",
+                       {"op": str(op), **{k: str(int(v)) for k, v in cfg.items()}})
+
+
 def stm32_hv_enable_set(host: str, ch: str, on: bool) -> dict[str, Any]:
     """Enable/disable an HV output. ch = 'emission' | 'focus'."""
     return _stm32_post(host, "/stm32/hv_enable", {"ch": str(ch), "on": "1" if on else "0"})

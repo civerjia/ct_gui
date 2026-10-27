@@ -71,12 +71,16 @@ def setup(rig):
     S.stm32_hv_enable_set = rig.rail
     S._note_forced_open = lambda *a, **k: None
     S._safety_record = lambda *a, **k: None
-    S.HV_GUARD_RECHECK_S = 0.0
+    S._hv_guard_read_fresh = rig.read
     S.CONTROLLERS.clear()
     S.CONTROLLERS.update({1: _Link(), 2: _Link()})
     S.LAST_POWER_STATE.clear()
     rig.stopped = []
     S._safety_fallback_filaments = lambda fids, state: rig.stopped.append((sorted(fids), int(state)))
+    S._hv_guard_stm32_flags = lambda: rig.stm32
+    rig.stm32 = {"ok": True, "flags": 0, "reason": 5}
+    S.stm32_hv_guard = lambda host, op=None, **k: {"ok": True, "latched": True, "trip_base_x16": 1049 * 16,
+                                                    "trip_mean_x16": 1096 * 16}
 
 
 def run(rig, seconds, t0, step=1.0):
@@ -233,6 +237,30 @@ S._GRID_CLOSED.clear()
 S.board_monitor_snapshot = lambda cid: {"run_owns": False}
 S._SIM_STATE.update(started_at=-1e9)
 check("nothing armed, no sim -> quiet", QUIET(now))
+
+# 11. The STM32's own guard tripped (it already took the HV down): the backend
+#     opens every switch, stops the heat, latches, names the suspects.
+rig = Rig()
+setup(rig)
+S._LAST_HOT.clear()
+S._LAST_HOT.update({20: 99.0})
+rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
+r = S.hv_guard_tick(100.0)
+check("STM32 trip seen: tripped here too, source stm32", r and r["action"] == "tripped"
+      and S._HV_GUARD["tripped"]["source"] == "stm32", r)
+check("...every switch forced open (both controllers)", rig.forced == 2, rig.forced)
+check("...the hot filament to STOP", rig.stopped == [([20], int(S.POWER_STATE_STOP))], rig.stopped)
+check("...rise from the STM32's own numbers (~2 mA)", r and 1.8 < r["rise_ma_approx"] < 2.2, r.get("rise_ma_approx"))
+check("...the HV was not switched again by the host (the STM32 did it)", rig.rails == [], rig.rails)
+n = rig.forced
+S.hv_guard_tick(101.0)
+check("...handled once: latched, nothing repeated", rig.forced == n)
+rig = Rig()
+setup(rig)
+rig.stm32 = {"ok": True, "flags": 0, "reason": 8}
+r = S.hv_guard_tick(100.0)
+check("reason 8 without the flag (latch cleared; reason is first-wins until reset) -> not a trip",
+      r is None and rig.forced == 0, r)
 
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

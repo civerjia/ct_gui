@@ -71,6 +71,7 @@ from ct.protocol import (
     stm32_ds3502_get,
     stm32_ds3502_set,
     stm32_hv_enable_set,
+    stm32_hv_guard,
     stm32_hv_status,
     stm32_ads1115,
     stm32_adc_window,
@@ -2979,7 +2980,13 @@ HV_GUARD_TICK_S = 1.0
 HV_GUARD_RISE_MA = 1.5          # one sub-board's diode path alone is ~1.95 mA
 HV_GUARD_HOLD_S = 2.0           # sustained this long between pulses -> act (3 readings at 1 Hz)
 HV_GUARD_CLEARED_MA = 1.0       # back within this of the baseline -> it was a 595
-HV_GUARD_RECHECK_S = 1.5        # after forcing every switch open, read again
+# After every switch is confirmed open: fresh reads back to back (each is one
+# STM32 single-shot scan of the ADS1115 through the ESP32, 0.1-0.35 s measured
+# 2026-10-27). Back under -> cleared at once; HIGH_N fresh reads still over ->
+# the HV goes off, never later than RECHECK_MAX_S. It used to sleep 1.5 s and
+# read once -- too slow for a switch that is conducting.
+HV_GUARD_RECHECK_MAX_S = 0.8
+HV_GUARD_RECHECK_HIGH_N = 2
 HV_GUARD_BASE_WINDOW_S = 120.0  # baseline = lowest quiet reading this far back
 HV_GUARD_MIN_BASE_S = 10.0      # quiet history needed before it may act at all
 HV_GUARD_AFTER_TRAIN_S = 1.5    # a sim train's last pulse is not "between pulses"
@@ -3035,6 +3042,110 @@ def _hv_guard_read() -> dict | None:
     return r
 
 
+def _hv_guard_read_fresh() -> dict | None:
+    """One NEW ADS read (not the shared cache): the decision after the
+    force-open must be made on a conversion taken after it."""
+    link = CONTROLLERS.get(MASTER)
+    if not link or not link.client.connected or not link.host:
+        return None
+    try:
+        r = stm32_ads1115(link.host)
+    except Exception:
+        return None
+    if not isinstance(r, dict) or not r.get("ok") or r.get("emiss_i_ma") is None:
+        return None
+    return r
+
+
+# The STM32's own guard (fw 1f6ab81+): it drives both HV enable pins low in
+# milliseconds and reports it in hv_status. The host does the rest -- open
+# every grid switch, put the hot filaments to STOP, latch, say who.
+STM32_FLAG_HV_GUARD = 1 << 5
+STM32_TRIP_EMISSION_STUCK = 8
+STM32_MA_PER_COUNT = 0.042      # rig front end, for the message only (2026-10-27 pulse data)
+
+
+def _hv_guard_stm32_flags() -> dict | None:
+    link = CONTROLLERS.get(MASTER)
+    if not link or not link.client.connected or not link.host:
+        return None
+    host = link.host
+    try:
+        r = shared_read(("stm32-hv-status", host), SHARED_TTL_STM32_S, lambda: stm32_hv_status(host))
+    except Exception:
+        return None
+    return r if isinstance(r, dict) and r.get("ok") else None
+
+
+def _hv_guard_force_open_all() -> dict:
+    """Every controller at once: one at a time cost a whole force-off per
+    controller."""
+    opened = {}
+
+    def _open(cid, link):
+        fr = force_grid_off(link, cid, None, reason="HV guard")
+        if fr.get("ok"):
+            _note_forced_open(cid, None)
+        opened[str(cid)] = bool(fr.get("ok"))
+    threads = [threading.Thread(target=_open, args=(cid, link), daemon=True)
+               for cid, link in sorted(CONTROLLERS.items()) if link and link.client.connected]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=FORCE_OFF_DEADLINE_S + 2.0)
+    return opened
+
+
+def _hv_guard_stop_hot(now: float) -> list[int]:
+    """No heat, no thermionic electrons: filaments hot now or within
+    HV_GUARD_STOP_RECENT_S go to STOP (the user, 2026-10-27)."""
+    with _SAFETY_LOCK:
+        hot_now = {int(f) for f, (st, _w) in LAST_POWER_STATE.items()
+                   if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE)}
+        recent = {f for f, t in _LAST_HOT.items() if now - t <= HV_GUARD_STOP_RECENT_S}
+    stop = sorted(hot_now | recent)
+    if stop:
+        _safety_fallback_filaments(stop, POWER_STATE_STOP)
+    return stop
+
+
+def _hv_guard_after_stm32_trip(now: float) -> dict:
+    """The STM32 already took the HV down. Open every switch, stop the heat,
+    latch here too (HV ON refused by the backend as well), and say who."""
+    suspects = _hv_guard_suspects(now)
+    link = CONTROLLERS.get(MASTER)
+    g = {}
+    try:
+        g = stm32_hv_guard(link.host) if link and link.host else {}
+    except Exception as exc:
+        g = {"ok": False, "error": str(exc)}
+    opened = _hv_guard_force_open_all()
+    try:
+        stop = _hv_guard_stop_hot(now)
+    except Exception as exc:
+        stop, g["stop_error"] = [], str(exc)
+    base = (g.get("trip_base_x16") or 0) / 16.0
+    mean = (g.get("trip_mean_x16") or 0) / 16.0
+    rise_ma = (mean - base) * STM32_MA_PER_COUNT if g.get("ok") else None
+    rec = {"source": "stm32", "stm32_guard": g, "rise_ma_approx": None if rise_ma is None else round(rise_ma, 2),
+           "suspects": suspects, "forced_open": opened, "heating_stopped": stop,
+           "hv_off": {"emission": True, "focus": True}}
+    rec["message"] = (f"HV OFF by the STM32 HV guard: the emission current between pulses stayed "
+                      f"{'' if rise_ma is None else f'~{rise_ma:.1f} mA '}over its baseline "
+                      f"({mean:.0f} vs {base:.0f} counts) -- a grid switch is conducting that was "
+                      f"not fired (recently hot filaments, most recent first: {suspects}). Every grid "
+                      f"switch forced open, heating set to STOP for {stop or 'none (no filament was hot)'}; "
+                      f"HV ON is refused until the latch is cleared (POST /api/hv-guard {{\"clear\": true}}, "
+                      f"which clears the STM32's too).")
+    with _HV_GUARD_LOCK:
+        _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                                **rec}
+    _HVG_HIST.clear()
+    log.error("HV guard TRIPPED (STM32): %s", rec["message"])
+    _safety_record("hv_guard_tripped", rec)
+    return {"action": "tripped", **rec}
+
+
 def _hv_guard_suspects(now: float) -> list[int]:
     """Filaments hot right now first, then the recently hot, most recent first."""
     with _SAFETY_LOCK:
@@ -3049,7 +3160,14 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
     """One look at the emission current. Returns what it did (cleared / tripped)
     or None. See the block comment above."""
     now = time.monotonic() if now is None else now
-    if not _HV_GUARD["enabled"] or _HV_GUARD["tripped"]:
+    if _HV_GUARD["tripped"]:
+        return None
+    st = _hv_guard_stm32_flags()
+    # The flag, not the reason: the reason is first-wins until the STM32 resets,
+    # so after a cleared latch it still says 8 and would re-trip at once.
+    if st is not None and st.get("flags", 0) & STM32_FLAG_HV_GUARD:
+        return _hv_guard_after_stm32_trip(now)
+    if not _HV_GUARD["enabled"]:
         return None
     r = _hv_guard_read()
     if r is None or (r.get("emiss_v") or 0.0) > HV_GUARD_RAIL_ON_V:
@@ -3089,18 +3207,25 @@ def _hv_guard_act(base: float | None, ma: float, focus: float, now: float) -> di
     log.warning("HV guard: emission %.2f mA between pulses (baseline %s, ceiling %.1f mA) -- "
                 "forcing every grid switch open (recently hot: %s)", ma,
                 "unknown" if base is None else f"{base:.2f} mA", HV_GUARD_ABS_MA, suspects)
-    opened = {}
-    for cid, link in sorted(CONTROLLERS.items()):
-        if link and link.client.connected:
-            fr = force_grid_off(link, cid, None, reason="HV guard: emission current over baseline")
-            if fr.get("ok"):
-                _note_forced_open(cid, None)
-            opened[str(cid)] = bool(fr.get("ok"))
-    time.sleep(HV_GUARD_RECHECK_S)
-    r2 = _hv_guard_read()
-    ma2 = float(r2["emiss_i_ma"]) if r2 else None
+    opened = _hv_guard_force_open_all()
+    t0 = time.monotonic()
+    reads, highs, ma2 = [], 0, None
+    while True:
+        r2 = _hv_guard_read_fresh()
+        if r2 is not None:
+            ma2 = float(r2["emiss_i_ma"])
+            reads.append(round(ma2, 2))
+            if ma2 < ok_below:
+                break
+            highs += 1
+            if highs >= HV_GUARD_RECHECK_HIGH_N:
+                break
+        if time.monotonic() - t0 >= HV_GUARD_RECHECK_MAX_S:
+            break
     rec = {"baseline_ma": None if base is None else round(base, 2), "emission_ma": round(ma, 2),
            "after_force_open_ma": None if ma2 is None else round(ma2, 2),
+           "after_force_open_reads": reads,
+           "recheck_ms": round((time.monotonic() - t0) * 1000.0),
            "focus_v": focus, "suspects": suspects, "forced_open": opened}
     if ma2 is not None and ma2 < ok_below:
         _safety_record("hv_guard_cleared_by_force_open", rec)
@@ -3121,19 +3246,10 @@ def _hv_guard_act(base: float | None, ma: float, focus: float, now: float) -> di
                 break
         off[ch] = bool(res and res.get("ok"))
     rec["hv_off"] = off
-    # And no heat: a MOSFET that will not open still passes nothing from a cold
-    # filament -- no thermionic electrons. The ones hot now or within the last
-    # HV_GUARD_STOP_RECENT_S go to STOP (the user, 2026-10-27).
-    with _SAFETY_LOCK:
-        hot_now = {int(f) for f, (st, _w) in LAST_POWER_STATE.items()
-                   if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE)}
-        recent = {f for f, t in _LAST_HOT.items() if now - t <= HV_GUARD_STOP_RECENT_S}
-    stop = sorted(hot_now | recent)
-    if stop:
-        try:
-            _safety_fallback_filaments(stop, POWER_STATE_STOP)
-        except Exception as exc:
-            rec["stop_error"] = str(exc)
+    try:
+        stop = _hv_guard_stop_hot(now)
+    except Exception as exc:
+        stop, rec["stop_error"] = [], str(exc)
     rec["heating_stopped"] = stop
     was = ("unreadable" if ma2 is None else f"{ma2:.2f} mA")
     ref = (f"its {base:.2f} mA baseline" if base is not None else
@@ -3667,7 +3783,13 @@ class CtHandler(BaseHTTPRequestHandler):
         elif path == "/api/safety":
             self._json(safety_snapshot())
         elif path == "/api/hv-guard":
-            self._json(hv_guard_snapshot())
+            snap = hv_guard_snapshot()
+            link = CONTROLLERS.get(MASTER)
+            try:
+                snap["stm32"] = stm32_hv_guard(link.host) if link and link.host else None
+            except Exception as exc:
+                snap["stm32"] = {"ok": False, "error": str(exc)}
+            self._json(snap)
         elif path == "/api/remote/sessions":
             self._json({"ok": True, "sessions": _remote.sessions()})
         elif path == "/api/status":
@@ -4928,6 +5050,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 # {"clear": true}: a person has dealt with the switch that would
                 # not turn off -- HV may come on again. {"enabled": bool}: switch
                 # the guard (it starts enabled; CT_HV_GUARD=0 at start-up).
+                stm32_clear = None
+                if body.get("clear"):
+                    link = CONTROLLERS.get(MASTER)
+                    if link and link.host:
+                        try:
+                            stm32_clear = stm32_hv_guard(link.host, "clear")
+                        except Exception as exc:
+                            stm32_clear = {"ok": False, "error": str(exc)}
                 with _HV_GUARD_LOCK:
                     if body.get("clear"):
                         was = _HV_GUARD["tripped"]
@@ -4941,7 +5071,10 @@ class CtHandler(BaseHTTPRequestHandler):
                                     else "DISABLED", self._client(body))
                 _HVG_HIST.clear()
                 _HVG_HIGH_SINCE[0] = None
-                self._json(hv_guard_snapshot())
+                snap = hv_guard_snapshot()
+                if stm32_clear is not None:
+                    snap["stm32_clear"] = stm32_clear
+                self._json(snap)
             elif path == "/api/safety":
                 # Dead-man watchdog: read the state, or change the rules.
                 # POST with any of enabled / active_timeout_s /
