@@ -1869,7 +1869,7 @@ const EMI_HTML = `
     <div class="bm-set-row">
       <label class="numlabel" title="Current: ACTIVE at this current (firmware current loop). Voltage: VOLTAGE at this LOAD voltage (firmware voltage loop, ±150 mV). Either must ARRIVE within the heat timeout or nothing is fired. The heating commands are sent by the host; the firmware loops regulate them and the schedule fires and records.">heat
         <select id="shotMode"><option value="ma">current mA</option><option value="mv">voltage mV</option></select></label>
-      <input id="shotHeat" type="number" min="0" max="11000" value="2700" style="width:72px" title="ACTIVE current, mA (current mode) or output voltage, mV (voltage mode, max 11000 = the rig's voltage cap)." />
+      <input id="shotHeat" type="number" min="0" max="9500" value="2700" style="width:72px" title="ACTIVE current, mA (current mode) or output voltage, mV (voltage mode, max 9500 = the rig's voltage cap)." />
       <label class="numlabel" title="IDLE current to drop back to after the shot (default = the rig default from the backend).">idle mA <input id="shotIdle" type="number" min="0" max="4000" value="" /></label>
     </div>
     <div class="bm-set-row">

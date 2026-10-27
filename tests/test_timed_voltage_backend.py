@@ -44,9 +44,9 @@ try:
         return requests.post(BASE + "/api/filament-state", json=body,
                              headers={"X-CT-Client": "tv-test"}, timeout=10).json()
 
-    r = fs(filament=5, state=6, arg=12000, active_s=5, then_idle_ma=1200)
-    check("timed VOLTAGE above the 11 V cap refused (firmware would clamp silently)",
-          not r["ok"] and "out of range" in r["error"] and "11000" in r["error"], r)
+    r = fs(filament=5, state=6, arg=10000, active_s=5, then_idle_ma=1200)
+    check("timed VOLTAGE above the 9.5 V cap (10 V) refused (firmware would clamp silently)",
+          not r["ok"] and "out of range" in r["error"] and "9500" in r["error"], r)
     r = fs(filament=5, state=6, arg=500, active_s=5, then_idle_ma=1200)
     check("timed VOLTAGE below the 0.8 V floor refused", not r["ok"] and "out of range" in r["error"], r)
     r = fs(filament=5, state=6, arg=7600, active_s=5, then_idle_ma=1200)

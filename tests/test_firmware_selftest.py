@@ -29,7 +29,7 @@ def boot_raw(fails=0, prev=0x64, stage=0x64, pc=0, up_ms=120000, git=b"98086b2d"
     return list(bytes([0, fails, prev, stage]) + struct.pack("<II", pc, up_ms) + git.ljust(12, b"\0"))
 
 
-def make(boot=None, vcap=11000, slew=(1000, 4000, 4000), records=None, ctrls=(1, 2), rb=24):
+def make(boot=None, vcap=9500, slew=(1000, 4000, 4000), records=None, ctrls=(1, 2), rb=24):
     ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
     ct._connected_controllers = lambda: list(ctrls)
     boot = boot or {}

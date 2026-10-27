@@ -4054,7 +4054,7 @@ Two refusals are deliberate:
 
 ### Board self-test and I²C diagnostics
 
-**`firmware_selftest(controller=None, expect_vcap_mv=11000, expect_slew=None)`**
+**`firmware_selftest(controller=None, expect_vcap_mv=9500, expect_slew=None)`**
 — check every connected RP2350 **over the bridge, no USB**, read-only and safe
 at any time (nothing energised, nothing fired). Needs RP2350 firmware 98086b2+
 for the boot part (`GET_BOOT_INFO`, 0x64); on older firmware or an older

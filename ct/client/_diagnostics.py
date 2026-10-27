@@ -1158,7 +1158,7 @@ class _DiagnosticsMixin:
         return self._per_controller(controller, self._firmware_info_one)
 
     def firmware_selftest(self, controller: int | None = None,
-                          expect_vcap_mv: int = 11000,
+                          expect_vcap_mv: int = 9500,
                           expect_slew: dict | None = None) -> dict:
         """Check every connected RP2350 over the bridge -- no USB, read-only,
         safe at any time (nothing is energised, nothing is fired):
@@ -1166,7 +1166,7 @@ class _DiagnosticsMixin:
           boot       GET_BOOT_INFO: no failed boots before this one, no
                      hardfault recorded, this boot stable (or how far it got)
           firmware   the same git build on every controller, not a dirty one
-          vcap       the output-voltage cap in force (expect_vcap_mv, 11000)
+          vcap       the output-voltage cap in force (expect_vcap_mv, 9500)
           slew       the slew rates in force (expect_slew, SLEW_DEFAULTS)
           pulse_log  pulse records are 20 bytes (heating voltage recorded) --
                      only judged when the log has records

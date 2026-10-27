@@ -7329,11 +7329,12 @@ def _slew_check_one(link) -> dict:
 # ── Output-voltage cap kept at the rig's setting ────────────────────────────
 # The RP2350 boots with kDefaultVoltageCapMv (11 V from fw 260966c, 13 V
 # before); the rig runs its own cap
-# (CT_VCAP_MV, default 11000 -- 2026-10-13, the user's choice), or whatever was
+# (CT_VCAP_MV, default 9500 -- 2026-10-27, the user's choice; 11000 from
+# 2026-10-13), or whatever was
 # last SET through /api/cmd CH_VOLTAGE_CAP. Re-written by the slew keeper's tick
 # to any controller that reads differently (an RP2350 reset restores the
 # firmware default).
-VCAP_WANT: dict = {"mv": int(os.environ.get("CT_VCAP_MV", "11000"))}
+VCAP_WANT: dict = {"mv": int(os.environ.get("CT_VCAP_MV", "9500"))}
 
 
 def _vcap_decode(resp) -> dict | None:
