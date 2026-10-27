@@ -4,7 +4,8 @@ the SPACING with trigger="sim" and only the firmware TIMEOUT with an external
 trigger, and its docstring called it a "minimum gap". Now two names; the old
 one keeps its per-mode meaning; which one is logged once per process (it used
 to ride on every result, burying the real error -- 2026-10-15). Limits are refused,
-never silently changed (the sim used to raise <10 ms to 10). Offline: the
+never silently changed (the sim used to raise <10 ms to 10; the 10 ms floor
+itself is gone, 2026-10-27). Offline: the
 plan sent to the board is captured.
 
     python3 tests/test_pulse_timing.py
@@ -94,6 +95,13 @@ s = ct.shot_prepare(16, trigger="ext", **BASE)
 check("external defaults: timeout 3000", s["ok"] and seen["plan"]["config"]["interPulseMs"] == 3000, s)
 
 
+# 3b. A sim spacing under the old 10 ms floor is accepted as given: that floor
+#     came from the HTTP-per-pulse sim loop; the train is a hardware timer now.
+ct, seen = make()
+s = ct.shot_prepare(16, pulse_interval_ms=5, trigger="sim", **{**BASE, "width_us": 1000})
+check("sim 5 ms: accepted as given", s["ok"] and s["pulse_interval_ms"] == 5, s)
+
+
 # 4. Refusals -- with the reason, nothing sent.
 def refused(desc, want, **kw):
     ct, seen = make()
@@ -102,7 +110,7 @@ def refused(desc, want, **kw):
 
 
 refused("both names", "not both", inter_pulse_ms=100, pulse_interval_ms=100)
-refused("sim < 10 ms (was silently raised to 10)", "below the 10 ms", pulse_interval_ms=5, trigger="sim")
+refused("sim < 1 ms", "below the 1 ms", pulse_interval_ms=0, trigger="sim")
 refused("timeout not longer than interval", "must be longer", pulse_interval_ms=500,
         trigger_timeout_ms=500, trigger="sim")
 refused("interval not longer than the pulse", "not longer than width_us", pulse_interval_ms=10,
@@ -150,12 +158,14 @@ check("shv_set_config both -> refused", not ct.shv_set_config(1, 2500, trigger_t
 
 # 8. One name, two defaults across the library (2026-10-14).
 import inspect  # noqa: E402
-check("defaults: SHOT 400, TRAIN 100", CTClient.SHOT_PULSE_INTERVAL_MS == 400
+check("defaults: SHOT 500, TRAIN 100", CTClient.SHOT_PULSE_INTERVAL_MS == 500
       and CTClient.TRAIN_PULSE_INTERVAL_MS == 100)
 ct, seen = make()
 s = ct.shot_prepare(16, trigger="sim", **BASE)
-check("fire/shot default spacing is SHOT (400), timeout 900", s["pulse_interval_ms"] == 400
-      and s["trigger_timeout_ms"] == 900, s)
+check("fire/shot default spacing is SHOT (500), timeout 1100", s["pulse_interval_ms"] == 500
+      and s["trigger_timeout_ms"] == 1100, s)
+check("...and both defaults divide 1 s: exact on ESP32 firmware without period_us",
+      1000 % CTClient.SHOT_PULSE_INTERVAL_MS == 0 and 1000 % CTClient.TRAIN_PULSE_INTERVAL_MS == 0)
 for fn in ("mosfet_test", "mosfet_sweep", "emission_vs_heating", "measure_emission_pedestal",
            "emission_ramp", "emission_calibration", "simulate_sync", "fire_single_pulse",
            "shot_prepare", "measure_pulse_current"):

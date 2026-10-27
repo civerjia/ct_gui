@@ -2060,13 +2060,33 @@ def sync_post_abort(host: str, timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dic
     return _post_result(status, text)
 
 
-def sync_post_burst(host: str, count: int, rate_hz: int,
+#: ESP32 firmware before period_us takes only an integer rate_hz, which can
+#: express only periods that divide 1 s (400 ms went out as 2 Hz = 500 ms).
+_BURST_OLD_FW = "need count>0 & rate_hz>0"
+
+
+def sync_post_burst(host: str, count: int, period_us: int,
                     timeout: float = ADC_DEFAULT_HTTP_TIMEOUT) -> dict[str, Any]:
-    """Arm the HARDWARE-timed pulse train: ONE call, the ESP32 esp_timer emits
-    `count` SyncOut pulses at `rate_hz` and stops itself. No HTTP per pulse — the
-    cadence is hardware-timed at the real trigger rate."""
-    status, text = _http_post_form(f"http://{host}:{BRIDGE_HTTP_PORT}/sync/burst",
-                                   {"count": str(int(count)), "rate_hz": str(int(rate_hz))}, timeout)
+    """Arm the HARDWARE-timed pulse train: ONE call, the ESP32 gptimer emits
+    `count` SyncOut pulses `period_us` apart and stops itself. No HTTP per
+    pulse -- the cadence is hardware-timed at the real trigger rate.
+
+    Older ESP32 firmware has no period_us: there the train is sent as rate_hz
+    only when that is EXACT (period divides 1 s), and refused otherwise --
+    never sent at a different spacing than asked."""
+    url = f"http://{host}:{BRIDGE_HTTP_PORT}/sync/burst"
+    status, text = _http_post_form(url, {"count": str(int(count)), "period_us": str(int(period_us))},
+                                   timeout)
+    if status == 400 and _BURST_OLD_FW in text:
+        if period_us <= 0 or 1_000_000 % int(period_us):
+            return {"ok": False, "status": status,
+                    "error": (f"this ESP32's firmware takes the spacing only as a whole "
+                              f"rate in Hz, which cannot make {period_us / 1000:g} ms (only "
+                              f"periods that divide 1 s: 1, 2, 4, 5, 8, 10, 20, 25, 40, 50, "
+                              f"100, 125, 200, 250, 500, 1000 ms ...) -- flash the ESP32 "
+                              f"with period_us support, or use one of those")}
+        status, text = _http_post_form(url, {"count": str(int(count)),
+                                             "rate_hz": str(1_000_000 // int(period_us))}, timeout)
     try:
         body = json.loads(text) if text.strip() else {}
     except json.JSONDecodeError:

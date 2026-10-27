@@ -91,8 +91,8 @@ class _EmissionMixin:
                                             # a float = use that; 0.0 = subtract
                                             # nothing
         pulse_interval_ms: int | None = None,  # spacing between pulses (ms);
-                                               # default SHOT_PULSE_INTERVAL_MS = 400;
-                                               # sim 10..2147483597
+                                               # default SHOT_PULSE_INTERVAL_MS = 500;
+                                               # sim 1..2147483597
     ) -> dict:
         """PRECISE MEASUREMENT of one filament's emission against its heating current.
 
@@ -346,7 +346,7 @@ class _EmissionMixin:
         save_as: str | None = "emission_calibration",
         pulse_interval_ms: int | None = None,  # spacing between pulses (ms);
                                                # default TRAIN_PULSE_INTERVAL_MS = 100;
-                                               # sim 10..2147483597
+                                               # sim 1..2147483597
         ) -> dict:
         """Emission vs heating current for a RANGE of filaments, one ramp each.
 
@@ -824,7 +824,7 @@ class _EmissionMixin:
         save_as: str | None = None,
         pulse_interval_ms: int | None = None,  # spacing between pulses (ms);
                                                # default TRAIN_PULSE_INTERVAL_MS = 100;
-                                               # sim 10..2147483597
+                                               # sim 1..2147483597
         ) -> dict:
         """QUICK VERIFICATION. The whole curve in one ramp, seconds not a minute.
 
@@ -1395,7 +1395,7 @@ class _EmissionMixin:
                                   inter_pulse_ms: int | None = None,   # old name of pulse_interval_ms
                                   controller: int | None = None,
                                   pulse_interval_ms: int | None = None,  # spacing (ms); default
-                                                    # SHOT_PULSE_INTERVAL_MS = 400; sim 10..2147483597
+                                                    # SHOT_PULSE_INTERVAL_MS = 500; sim 1..2147483597
                                   ) -> dict:
         """Measure the non-emission part of a fired pulse's net current.
 

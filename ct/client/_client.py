@@ -1531,9 +1531,12 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
     #          (emission_ramp, emission_calibration): the spacing is the
     #          sampling of the climb, so it is short. 100 ms: calibration's
     #          rig-proven value; 30 pulses cover a ~3 s climb.
-    #    Range (sim): 10 .. 2147483597 ms, > width_us / 1000, and the train
+    #    Range (sim): 1 .. 2147483597 ms, > width_us / 1000, and the train
     #    must fit total_ms -- see fire_single_pulse's "Limits".
-    SHOT_PULSE_INTERVAL_MS = 400
+    # 500, not the 400 it said: the sim sent the spacing as a whole rate in Hz,
+    # so 400 ms went out as 2 Hz = 500 ms -- 500 is what was really fired, and
+    # it is exact on every ESP32 firmware (2026-10-27).
+    SHOT_PULSE_INTERVAL_MS = 500
     TRAIN_PULSE_INTERVAL_MS = 100
 
     _READY_TTL_FLOOR_MS = 60000     # never below the firmware's own default

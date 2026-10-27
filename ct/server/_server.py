@@ -1976,26 +1976,52 @@ def read_tps_status(link: "ControllerLink", cid: int) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) -> None:
-    # running/count/stop already claimed by the caller under _SIM_LOCK (atomic start).
-    # HARDWARE-timed trigger train: ONE call arms the ESP32 esp_timer, which clocks
-    # every pulse at the real rate. The host does NOT pace pulses — it only polls
-    # progress. (The old HTTP-per-pulse loop ran ~4.6x too slow: 47 ms/pulse instead
-    # of the real ~10 ms, which stretched the whole scan and tripped TotalTimeout.)
-    rate_hz = int(round(1000.0 / interval_ms)) if interval_ms > 0 else 1000
-    if rate_hz < 1:
-        rate_hz = 1
+def _sim_period_us(interval_ms: float) -> int:
+    """The train's spacing in whole us; 0 (no spacing given) is 1 ms, as before."""
+    return int(round(interval_ms * 1000.0)) if interval_ms > 0 else 1000
+
+
+def _sim_finish() -> None:
+    """End of a simulated train, whether it ran or never started."""
+    with _SIM_LOCK:
+        _SIM_STATE["running"] = False
+    # Stop the telemetry push and finalize the power-state report -- unless
+    # a scan_view holds it for the rest of its view.
+    for c2, l2 in CONTROLLERS.items():
+        if c2 in _LIVE_PUSH and l2.client.connected and not _PUSH_HOLD \
+                and time.monotonic() >= _PUSH_TAIL_UNTIL:
+            set_scan_telemetry(l2, c2 - 1, False)
+    RUN_RECORDER.stop()
+
+
+def _start_scan_sim(host: str, count: int, interval_ms: float) -> dict:
+    """Start the HARDWARE-timed trigger train: ONE call arms the ESP32's
+    gptimer, which clocks every pulse at the real spacing. Done in the request,
+    so a refused train (spacing too short for the pulse width, old firmware that
+    cannot make this spacing, a train already running) comes back to the caller
+    as the error -- it used to be dropped into _SIM_STATE and the caller only
+    saw its shot time out. (The old HTTP-per-pulse loop ran ~4.6x too slow: 47
+    ms/pulse instead of the real ~10 ms, which tripped TotalTimeout.)"""
+    period_us = _sim_period_us(interval_ms)
+    # How long the ESP32 took to START the train: the part of a simulated
+    # trigger's timing nobody controls (HTTP, shares the ESP32's loop).
+    t0 = time.monotonic()
     try:
-        # How long the ESP32 took to START the train: the part of a simulated
-        # trigger's timing nobody controls (HTTP, shares the ESP32's loop).
-        # Reported by /api/sync/simulate-status (how long the ESP32 took to start).
-        t0 = time.monotonic()
-        r = sync_post_burst(host, count, rate_hz, timeout=3.0)
-        with _SIM_LOCK:
-            _SIM_STATE["start_ms"] = round((time.monotonic() - t0) * 1000.0, 1)
-            _SIM_STATE["start_ok"] = bool(r.get("ok"))
-        if not r.get("ok"):
-            return
+        r = sync_post_burst(host, count, period_us, timeout=3.0)
+    except Exception as exc:
+        r = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    with _SIM_LOCK:
+        _SIM_STATE["start_ms"] = round((time.monotonic() - t0) * 1000.0, 1)
+        _SIM_STATE["start_ok"] = bool(r.get("ok"))
+        _SIM_STATE["period_us"] = period_us
+        _SIM_STATE["start_error"] = None if r.get("ok") else (r.get("error") or f"HTTP {r.get('status')}")
+    return r
+
+
+def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) -> None:
+    """Poll a started train until it has fired or is stopped. The host does NOT
+    pace pulses -- it only polls progress."""
+    try:
         time.sleep(0.3)   # let the train start before the first status poll
         while True:
             with _SIM_LOCK:
@@ -2016,15 +2042,7 @@ def _run_scan_sim(host: str, count: int, interval_ms: float, controller: int) ->
                 break   # train finished (all pulses fired) or was stopped
             time.sleep(0.3)
     finally:
-        with _SIM_LOCK:
-            _SIM_STATE["running"] = False
-        # Stop the telemetry push and finalize the power-state report -- unless
-        # a scan_view holds it for the rest of its view.
-        for c2, l2 in CONTROLLERS.items():
-            if c2 in _LIVE_PUSH and l2.client.connected and not _PUSH_HOLD \
-                    and time.monotonic() >= _PUSH_TAIL_UNTIL:
-                set_scan_telemetry(l2, c2 - 1, False)
-        RUN_RECORDER.stop()
+        _sim_finish()
 
 
 def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
@@ -5898,7 +5916,8 @@ class CtHandler(BaseHTTPRequestHandler):
                     # Claim it ATOMICALLY here (not inside the thread) so two near-
                     # simultaneous starts can't both pass the guard and double-fire.
                     _SIM_STATE.update(running=True, fired=0, count=count, stop=False, controller=cid,
-                                      start_ms=None, start_ok=None)
+                                      start_ms=None, start_ok=None, start_error=None,
+                                      period_us=None)
                 # Arm the run recorder with the scheduled filament set so the report
                 # can flag any that were scheduled but never reached ACTIVE.
                 RUN_RECORDER.start(expect=body.get("expect"),
@@ -5908,9 +5927,16 @@ class CtHandler(BaseHTTPRequestHandler):
                 for c2, l2 in CONTROLLERS.items():
                     if l2.client.connected:
                         set_scan_telemetry(l2, c2 - 1, True)
+                r = _start_scan_sim(link.host, count, interval_ms)
+                if not r.get("ok"):
+                    _sim_finish()
+                    return self._json({"ok": False, "error": "simulated trigger train refused by the "
+                                       f"ESP32: {_SIM_STATE.get('start_error')} -- nothing was fired"},
+                                      HTTPStatus.OK)
                 threading.Thread(target=_run_scan_sim, args=(link.host, count, interval_ms, cid),
                                  daemon=True).start()
-                self._json({"ok": True, "count": count, "interval_ms": interval_ms, "controller": cid})
+                self._json({"ok": True, "count": count, "interval_ms": interval_ms,
+                            "period_us": _sim_period_us(interval_ms), "controller": cid})
             elif path == "/api/live-push":
                 # scan_view: {"on": bool} holds/releases the 20 fps telemetry
                 # push for a whole view; {"firing": [fid, ...]} says what it is

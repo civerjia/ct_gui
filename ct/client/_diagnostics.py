@@ -142,7 +142,7 @@ class _DiagnosticsMixin:
                     controller: int | None = None,
                     progress=None,
                     pulse_interval_ms: int | None = None,  # spacing (ms); default
-                                      # SHOT_PULSE_INTERVAL_MS = 400; sim 10..2147483597
+                                      # SHOT_PULSE_INTERVAL_MS = 500; sim 1..2147483597
                     ) -> dict:
         """Prove each HV grid MOSFET actually CONDUCTS, by firing through it.
 
@@ -806,7 +806,7 @@ class _DiagnosticsMixin:
                      controller: int | None = None,
                      progress=None,
                      pulse_interval_ms: int | None = None,  # spacing (ms); default
-                                       # SHOT_PULSE_INTERVAL_MS = 400; sim 10..2147483597
+                                       # SHOT_PULSE_INTERVAL_MS = 500; sim 1..2147483597
                      ) -> dict:
         """The MOSFET test at n >= 3 emission voltages, judged on the SLOPE.
 

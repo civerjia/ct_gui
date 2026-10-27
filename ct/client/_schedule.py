@@ -906,12 +906,15 @@ class _ScheduleMixin:
     #                       external 3000.
     # inter_pulse_ms still works and keeps its old meaning per mode; which one
     # it was taken as is logged once per process.
-    _DEFAULT_PULSE_INTERVAL_MS = 400       # = CTClient.SHOT_PULSE_INTERVAL_MS
+    _DEFAULT_PULSE_INTERVAL_MS = 500       # = CTClient.SHOT_PULSE_INTERVAL_MS
     _DEFAULT_TRIGGER_TIMEOUT_MS = 3000
-    # The simulated trigger cannot space edges closer than this (the backend's
-    # sim loop). It used to RAISE a smaller value to 10 silently -- a 5 ms
-    # request fired at 10 ms; now refused.
-    _SIM_MIN_INTERVAL_MS = 10
+    # Whole ms, as the field is. The 10 ms floor this used to be came from the
+    # backend's old HTTP-per-pulse sim loop; the train is a hardware timer now
+    # (us resolution), so the real limits are the pulse width and, measuring,
+    # the backgrounds -- both checked where they apply. Spacings that do not
+    # divide 1 s need ESP32 firmware with period_us (the backend refuses them
+    # on older firmware rather than firing at a different spacing).
+    _SIM_MIN_INTERVAL_MS = 1
     # Largest spacing whose default timeout (2 x + 100) still fits the u32 field.
     _MAX_PULSE_INTERVAL_MS = (4294967295 - 100) // 2
 
@@ -1482,8 +1485,8 @@ class _ScheduleMixin:
                or self._range_error("max_on_ms", int(max_on_ms), self._U16_MAX))
         if not err and not 0 <= settle <= 60000:
             err = f"settle_ms={settle} out of range 0..60000"
-        if not err and interval < 10:
-            err = f"pulse_interval_ms={interval}: the simulated trigger needs >= 10 ms"
+        if not err and interval < self._SIM_MIN_INTERVAL_MS:
+            err = f"pulse_interval_ms={interval}: must be >= {self._SIM_MIN_INTERVAL_MS} ms"
         if not err and interval * 1000 <= int(width_us):
             err = f"pulse_interval_ms={interval} is not longer than width_us={width_us}"
         if not err and not 0 <= float(start_in_s) <= 600:
@@ -2174,8 +2177,9 @@ class _ScheduleMixin:
             num_pulses          1 .. 255                  (one byte on the wire)
             width_us            1 .. 65535 us             (u16); also <= max_on_ms x 1000
             max_on_ms           0 .. 65535 ms             (u16); checked at arm
-            pulse_interval_ms   sim: 10 .. 2147483597 ms  (the sim cannot space
-                                closer than 10 ms); > width_us/1000; with
+            pulse_interval_ms   sim: 1 .. 2147483597 ms   (exact; spacings that do
+                                not divide 1 s need ESP32 fw with period_us);
+                                > width_us/1000; with
                                 measure=True >= 0.5 ms (backgrounds need
                                 2 x (bg_gap 200 + window 50) us)
             trigger_timeout_ms  1 .. 4294967295 ms        (u32); > pulse_interval_ms
