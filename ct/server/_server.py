@@ -3149,21 +3149,67 @@ def _hv_guard_stop_hot(now: float, recent_s: float = None) -> list[int]:
     return stop
 
 
+_HVG_LAST_EMISS_V = [None]          # emission V (ADS) of the last tick with the rail on
+HV_GUARD_RAIL_BACK_FRAC = 0.95      # rail counts as back at this fraction of its pre-trip V
+HV_GUARD_RAIL_BACK_S = 5.0          # ... within this long, or the check cannot be made
+HV_GUARD_VERIFY_READS = 3           # STM32 window means compared with the trip baseline
+HV_GUARD_VERIFY_GAP_S = 0.2
+
+
+def _hv_guard_wait_rail(host: str, pre_v: float | None) -> float | None:
+    """Wait until the emission rail is back near its pre-trip voltage (fresh
+    ADS reads). Returns the voltage, or None if it never got there."""
+    if pre_v is None:
+        return None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < HV_GUARD_RAIL_BACK_S:
+        try:
+            r = stm32_ads1115(host)
+        except Exception:
+            r = None
+        v = (r or {}).get("emiss_v")
+        if isinstance(v, (int, float)) and abs(v) >= HV_GUARD_RAIL_BACK_FRAC * abs(pre_v):
+            return float(v)
+        time.sleep(0.1)
+    return None
+
+
+def _hv_guard_verify_counts(host: str) -> list:
+    """The STM32's own last window means (counts x 16), fresh: the same signal
+    and units as its trip baseline. last_x16 is updated every window, also
+    while it relearns after the rail came back."""
+    out = []
+    for _ in range(HV_GUARD_VERIFY_READS):
+        time.sleep(HV_GUARD_VERIFY_GAP_S)
+        try:
+            g = stm32_hv_guard(host)
+        except Exception:
+            g = {}
+        if g.get("ok") and g.get("last_x16"):
+            out.append(int(g["last_x16"]))
+    return out
+
+
 def _hv_guard_after_stm32_trip(now: float) -> dict:
-    """The STM32 already took the HV down (milliseconds). Now find out why.
+    """The STM32 already took the HV down (milliseconds). Decide by CURRENT
+    whether forcing the switches open fixed it -- not by the 165: the 595s
+    flip by themselves and the 165 read-back is not reliable either (the
+    user, 2026-10-27). The 165 is still read and logged, for the record.
 
-    A switch the 165 reads CLOSED with desired open = a 595 that flipped by
-    itself (several an hour on 2026-10-27; 15:21 one tripped the guard and
-    P1 CH6.1 was found closed a minute later). Forcing it open fixes it: no
-    heating is touched, the STM32 latch is cleared and the rails go back to
-    what they were (the user, 2026-10-27) -- unless that has happened
-    HV_GUARD_RECOVER_MAX times in HV_GUARD_RECOVER_WINDOW_S, then it latches.
-
-    Every switch reads open and the current was still up = a MOSFET is
-    conducting that nothing here can turn off: latch, and the filaments hot
-    now or within HV_GUARD_STOP_RECENT_S go to STOP."""
+    1. every grid switch forced open (zeros + /SRCLR: works on a flipped 595
+       whatever the 165 says);
+    2. the STM32 latch cleared, the rails put back as they were (preflight);
+    3. once the emission rail is back, the STM32's window means (same signal,
+       same units as its trip baseline) within thr/2 of that baseline -> it
+       was a flip and it is fixed: WARNING, no heat touched, no latch;
+       still over -> a MOSFET is conducting that nothing can open: HV off
+       again, filaments hot within 15 s to STOP, latched.
+    More than HV_GUARD_RECOVER_MAX recoveries in HV_GUARD_RECOVER_WINDOW_S,
+    or the check cannot be made (rail does not come back, STM32 unreadable):
+    latched, no second HV ON."""
     suspects = _hv_guard_suspects(now)
     rails_before = dict(_HVG_RAILS)
+    pre_v = _HVG_LAST_EMISS_V[0]
     link = CONTROLLERS.get(MASTER)
     host = link.host if link else None
     g = {}
@@ -3171,36 +3217,44 @@ def _hv_guard_after_stm32_trip(now: float) -> dict:
         g = stm32_hv_guard(host) if host else {}
     except Exception as exc:
         g = {"ok": False, "error": str(exc)}
-    base = (g.get("trip_base_x16") or 0) / 16.0
-    mean = (g.get("trip_mean_x16") or 0) / 16.0
-    rise_ma = (mean - base) * STM32_MA_PER_COUNT if g.get("ok") else None
-    strays = _hv_guard_strays()
+    base_x16 = int(g.get("trip_base_x16") or 0)
+    thr_x16 = int(g.get("thr_counts") or 36) * 16
+    rise_ma = ((int(g.get("trip_mean_x16") or 0) - base_x16) / 16.0 * STM32_MA_PER_COUNT
+               if g.get("ok") and base_x16 else None)
+    strays = _hv_guard_strays()                     # logged only (the 165 is not trusted)
     opened = _hv_guard_force_open_all()
-    stray_fids = sorted({MAPPING.filament_for_board(cid - 1, ch, pos)
-                         for cid, m in strays.items() for ch, mm in m.items()
-                         for pos in range(8) if mm & (1 << pos)} - {None})
     stray_txt = "; ".join(f"Power {cid} {_masks_text(m)}" for cid, m in sorted(strays.items()))
     rec = {"source": "stm32", "stm32_guard": g,
            "rise_ma_approx": None if rise_ma is None else round(rise_ma, 2),
-           "suspects": suspects, "forced_open": opened, "strays": stray_txt or None,
-           "stray_filaments": stray_fids, "rails_before": rails_before}
+           "suspects": suspects, "forced_open": opened, "read_back_165": stray_txt or "all open",
+           "rails_before": rails_before}
 
     _HVG_RECOVERIES[:] = [t for t in _HVG_RECOVERIES if now - t <= HV_GUARD_RECOVER_WINDOW_S]
-    if strays and all(opened.values()) and len(_HVG_RECOVERIES) < HV_GUARD_RECOVER_MAX:
-        # A 595 flip, fixed by the force-open: clear the STM32 latch and put
-        # the rails back as they were. HV ON still goes through the preflight.
-        _HVG_RECOVERIES.append(now)
+    why_not = None
+    if len(_HVG_RECOVERIES) >= HV_GUARD_RECOVER_MAX:
+        why_not = (f"{len(_HVG_RECOVERIES)} recoveries already in the last "
+                   f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min")
+    elif not base_x16:
+        why_not = "no STM32 trip baseline to compare with"
+    elif not rails_before.get("emission"):
+        why_not = "the emission rail was not on before the trip"
+    elif not all(opened.values()):
+        why_not = "a force-open was not confirmed"
+
+    verdict = None
+    if why_not is None:
         clr = {}
         try:
-            clr = stm32_hv_guard(host, "clear") if host else {"ok": False, "error": "no master"}
+            clr = stm32_hv_guard(host, "clear")
         except Exception as exc:
             clr = {"ok": False, "error": str(exc)}
+        rec["stm32_clear"] = clr
         restored = {}
         if clr.get("ok"):
             for ch in ("emission", "focus"):
                 if not rails_before.get(ch):
                     continue
-                pre = hv_preflight_switches(f"before {ch} ON (HV guard auto-recovery)")
+                pre = hv_preflight_switches(f"before {ch} ON (HV guard check)")
                 if not pre.get("ok"):
                     restored[ch] = f"not restored: {pre.get('error')}"
                     continue
@@ -3208,39 +3262,58 @@ def _hv_guard_after_stm32_trip(now: float) -> dict:
                     restored[ch] = bool(stm32_hv_enable_set(host, ch, True).get("ok"))
                 except Exception as exc:
                     restored[ch] = f"not restored: {exc}"
-        rec.update(stm32_clear=clr, restored=restored,
-                   recoveries_in_window=len(_HVG_RECOVERIES),
-                   message=(f"HV guard: a switch closed by itself ({stray_txt}, filament(s) "
-                            f"{stray_fids}) -- the STM32 cut the HV, the switch was forced open, "
-                            f"the HV was put back ({restored or 'it was off'}). No heating "
-                            f"touched. {len(_HVG_RECOVERIES)} such recovery(ies) in the last "
-                            f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min (latches after "
-                            f"{HV_GUARD_RECOVER_MAX})."))
+        rec["restored"] = restored
+        if restored.get("emission") is True:
+            v_back = _hv_guard_wait_rail(host, pre_v)
+            rec["rail_back_v"] = v_back
+            counts = _hv_guard_verify_counts(host) if v_back is not None else []
+            rec["after_counts"] = [round(c / 16.0, 1) for c in counts]
+            if counts:
+                over = sorted(counts)[len(counts) // 2] - base_x16
+                rec["after_over_baseline_ma"] = round(over / 16.0 * STM32_MA_PER_COUNT, 2)
+                verdict = "fixed" if over <= thr_x16 // 2 else "stuck"
+            else:
+                why_not = ("the emission rail did not come back to "
+                           f"{HV_GUARD_RAIL_BACK_FRAC:.0%} of {pre_v} V" if v_back is None
+                           else "the STM32 window means could not be read")
+        else:
+            why_not = f"the HV could not be put back ({restored or clr.get('error')})"
+
+    if verdict == "fixed":
+        _HVG_RECOVERIES.append(now)
+        rec["message"] = (f"HV guard: the current was over its baseline with no pulse; every switch "
+                          f"was forced open and, with the HV back, the current is back at its "
+                          f"baseline ({rec['after_over_baseline_ma']:+.2f} mA) -- a 595 that flipped "
+                          f"by itself (165 read-back at the trip: {rec['read_back_165']}). No heating "
+                          f"touched. {len(_HVG_RECOVERIES)} such recovery(ies) in "
+                          f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min (latches after {HV_GUARD_RECOVER_MAX}).")
         _HVG_HIST.clear()
-        if not clr.get("ok"):
-            rec["message"] += f" STM32 latch NOT cleared ({clr.get('error')}) -- HV stays off."
         log.warning("%s", rec["message"])
         _safety_record("hv_guard_recovered", rec)
         return {"action": "recovered", **rec}
 
-    # No stray switch (or too many recoveries): something conducts that the
-    # 595s cannot turn off. Stop the heat, latch.
+    # Stuck, or not checkable: HV off (again), stop the heat, latch.
+    off = {}
+    for ch in ("emission", "focus"):
+        try:
+            off[ch] = bool((stm32_hv_enable_set(host, ch, False) if host else {}).get("ok"))
+        except Exception:
+            off[ch] = False
     try:
         stop = _hv_guard_stop_hot(now)
     except Exception as exc:
         stop, rec["stop_error"] = [], str(exc)
-    rec["heating_stopped"] = stop
-    rec["hv_off"] = {"emission": True, "focus": True}
-    why = ("every grid switch read open" if not strays else
-           f"{len(_HVG_RECOVERIES)} switch flips auto-recovered in {HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min "
-           f"(this one: {stray_txt})")
-    rec["message"] = (f"HV OFF by the STM32 HV guard: the emission current between pulses stayed "
-                      f"{'' if rise_ma is None else f'~{rise_ma:.1f} mA '}over its baseline "
-                      f"({mean:.0f} vs {base:.0f} counts) and {why} -- a grid switch is conducting "
-                      f"that cannot be turned off (recently hot filaments, most recent first: "
-                      f"{suspects}). Heating set to STOP for {stop or 'none (no filament was hot)'}; "
-                      f"HV ON is refused until the latch is cleared (POST /api/hv-guard "
-                      f"{{\"clear\": true}}, which clears the STM32's too).")
+    rec.update(hv_off=off, heating_stopped=stop)
+    cause = (f"with every switch forced open and the HV back, the current stayed "
+             f"{rec.get('after_over_baseline_ma', 0):+.2f} mA over its baseline -- a grid switch is "
+             f"conducting that cannot be turned off" if verdict == "stuck"
+             else f"and it could not be checked ({why_not})")
+    rec["message"] = (f"HV OFF by the HV guard: the emission current between pulses stayed "
+                      f"{'' if rise_ma is None else f'~{rise_ma:.1f} mA '}over its baseline {cause} "
+                      f"(recently hot filaments, most recent first: {suspects}; 165 read-back at the "
+                      f"trip: {rec['read_back_165']}). Heating set to STOP for "
+                      f"{stop or 'none (no filament was hot)'}; HV ON is refused until the latch is "
+                      f"cleared (POST /api/hv-guard {{\"clear\": true}}, which clears the STM32's too).")
     with _HV_GUARD_LOCK:
         _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                                 **rec}
@@ -3282,6 +3355,7 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
         _HVG_HIGH_SINCE[0] = None
         _TAIL["armed"] = False
         return None
+    _HVG_LAST_EMISS_V[0] = float(r["emiss_v"])   # what "the rail is back" means after a trip
     tw = _tail_tick(now, float(r["emiss_i_ma"]))
     if tw:
         return tw

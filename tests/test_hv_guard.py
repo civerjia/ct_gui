@@ -83,8 +83,14 @@ def setup(rig):
 
     def _g(host, op=None, **k):
         rig.guard_ops.append(op)
-        return {"ok": True, "latched": op != "clear", "trip_base_x16": 1049 * 16, "trip_mean_x16": 1096 * 16}
+        return {"ok": True, "latched": op != "clear", "thr_counts": 36,
+                "trip_base_x16": 1049 * 16, "trip_mean_x16": 1096 * 16}
     S.stm32_hv_guard = _g
+    rig.after = [1096 * 16] * 3                       # STM32 window means once the HV is back
+    rig.rail_back = -197.8
+    S._hv_guard_wait_rail = lambda host, pre_v: rig.rail_back
+    S._hv_guard_verify_counts = lambda host: list(rig.after)
+    S._HVG_LAST_EMISS_V[0] = -197.8
     rig.fb = [[0] * 8, [0] * 8]                       # 165 read-back per controller (1, 2)
     S._hv_bytes = lambda link: ([0] * 8, list(rig.fb[0 if link is S.CONTROLLERS.get(1) else 1]))
     S.hv_preflight_switches = lambda reason: {"ok": True, "opened": {}, "unchecked": []}
@@ -248,62 +254,82 @@ S.board_monitor_snapshot = lambda cid: {"run_owns": False}
 S._SIM_STATE.update(started_at=-1e9)
 check("nothing armed, no sim -> quiet", QUIET(now))
 
-# 11. The STM32 tripped and every switch reads OPEN: a MOSFET nothing can turn
-#     off -> latched, only the filaments hot within 15 s to STOP.
+# 11. STM32 trip; switches forced open, HV put back, current STILL over the
+#     baseline (the measured current decides -- the 165 is not trusted): a
+#     MOSFET nothing can open -> HV off again, STOP within 15 s, latched.
 rig = Rig()
 setup(rig)
 S._LAST_HOT.clear()
 S._LAST_HOT.update({20: 99.0, 16: 40.0})       # 16 was hot a minute ago: innocent (15:21 case)
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
-check("STM32 trip, all switches open -> tripped here too, source stm32", r and r["action"] == "tripped"
-      and S._HV_GUARD["tripped"]["source"] == "stm32", r)
+check("still over after force-open + HV back -> tripped, source stm32", r and r["action"] == "tripped"
+      and S._HV_GUARD["tripped"]["source"] == "stm32" and "cannot be turned off" in r["message"], r and r.get("message"))
 check("...every switch forced open (both controllers)", rig.forced == 2, rig.forced)
+check("...HV was put back to check, then off again", rig.rails == [("emission", True), ("focus", True),
+                                                                  ("emission", False), ("focus", False)], rig.rails)
 check("...only the filament hot within 15 s to STOP (not 16, a minute cold)",
       rig.stopped == [([20], int(S.POWER_STATE_STOP))], rig.stopped)
-check("...rise from the STM32's own numbers (~2 mA)", r and 1.8 < r["rise_ma_approx"] < 2.2, r.get("rise_ma_approx"))
-check("...the HV not switched by the host, STM32 latch NOT cleared", rig.rails == [] and "clear" not in rig.guard_ops,
-      (rig.rails, rig.guard_ops))
 n = rig.forced
 S.hv_guard_tick(101.0)
 check("...handled once: latched, nothing repeated", rig.forced == n)
 
-# 12. The STM32 tripped and a switch reads CLOSED with desired 0: a 595 flip.
-#     Forced open fixes it -> STM32 latch cleared, rails back, no heat touched,
-#     no latch here (the user, 2026-10-27).
+# 12. Current back at the baseline once the switches were forced open: it was
+#     a 595 flip and it is fixed -> rails stay on, no heat touched, no latch.
 rig = Rig()
 setup(rig)
 S._LAST_HOT.clear()
 S._LAST_HOT.update({16: 95.0})
-rig.fb[0] = [0, 0, 0, 0, 0, 1, 0, 0]           # P1 CH6.1, as at 15:22
+rig.after = [1050 * 16, 1049 * 16, 1051 * 16]
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
-check("595 flip -> recovered, not latched", r and r["action"] == "recovered" and S._HV_GUARD["tripped"] is None, r)
-check("...names the switch and filament", r and "CH6.1" in (r.get("strays") or "")
-      and r["stray_filaments"] == [S.MAPPING.filament_for_board(0, 5, 0)], (r.get("strays"), r.get("stray_filaments")))
-check("...STM32 latch cleared, emission and focus back on", "clear" in rig.guard_ops
-      and ("emission", True) in rig.rails and ("focus", True) in rig.rails, (rig.guard_ops, rig.rails))
+check("current back at baseline -> recovered, not latched", r and r["action"] == "recovered"
+      and S._HV_GUARD["tripped"] is None, r)
+check("...STM32 latch cleared, emission and focus back on (and left on)", "clear" in rig.guard_ops
+      and rig.rails == [("emission", True), ("focus", True)], (rig.guard_ops, rig.rails))
 check("...no heating touched", rig.stopped == [], rig.stopped)
+
+# 12a. The 165 says a switch is closed but the current is fine -> still recovered
+#      (the 165 is only logged), and the reverse: 165 all open but current up -> tripped.
+rig = Rig()
+setup(rig)
+rig.fb[0] = [0, 0, 0, 0, 0, 1, 0, 0]
+rig.after = [1050 * 16] * 3
+rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
+r = S.hv_guard_tick(100.0)
+check("165 reads a switch closed, current fine -> recovered; the 165 only logged",
+      r and r["action"] == "recovered" and "CH6.1" in r["read_back_165"], r and r.get("read_back_165"))
 
 # 12b. Rails that were off before stay off.
 rig = Rig()
 setup(rig)
 S._HVG_RAILS.update(emission=True, focus=False)
-rig.fb[1] = [0, 2, 0, 0, 0, 0, 0, 0]
+rig.after = [1050 * 16] * 3
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
 check("...only the rails that were on come back", r and r["action"] == "recovered"
       and rig.rails == [("emission", True)], rig.rails)
 
-# 12c. Too many flips -> the next one latches.
+# 12c. Too many recoveries -> the next one latches without a second HV ON.
 rig = Rig()
 setup(rig)
 S._HVG_RECOVERIES[:] = [50.0, 60.0, 70.0]
-rig.fb[0] = [1, 0, 0, 0, 0, 0, 0, 0]
+rig.after = [1050 * 16] * 3
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
-check("4th flip within 10 min -> latched instead of recovering", r and r["action"] == "tripped"
-      and "auto-recovered" in r["message"] and "clear" not in rig.guard_ops, r and r.get("message"))
+check("4th within 10 min -> latched, HV not put back", r and r["action"] == "tripped"
+      and "recoveries already" in r["message"] and ("emission", True) not in rig.rails, r and r.get("message"))
+
+# 12d. The rail never comes back -> cannot check -> latched.
+rig = Rig()
+setup(rig)
+rig.rail_back = None
+rig.after = [1050 * 16] * 3
+rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
+r = S.hv_guard_tick(100.0)
+check("rail did not come back -> latched, HV off again", r and r["action"] == "tripped"
+      and "did not come back" in r["message"] and rig.rails[-2:] == [("emission", False), ("focus", False)],
+      (r and r.get("message"), rig.rails))
 
 rig = Rig()
 setup(rig)
