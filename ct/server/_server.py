@@ -3006,7 +3006,8 @@ HV_GUARD_RAIL_ON_V = -50.0      # emission rail below this = on
 # that way in a replay. CT_HV_GUARD_ABS_MA to change it.
 HV_GUARD_ABS_MA = float(os.environ.get("CT_HV_GUARD_ABS_MA", "16.0"))
 HV_GUARD_HOT_RECENT_S = 300.0   # suspects: filaments hot within this
-HV_GUARD_STOP_RECENT_S = 60.0   # on a trip, filaments hot within this go to STOP
+HV_GUARD_STOP_RECENT_S = 15.0   # on a latched trip, filaments hot within this go to STOP
+                                # (60 s took FID 16, a minute cold and innocent, 2026-10-27 15:21)
 
 _HV_GUARD = {"enabled": os.environ.get("CT_HV_GUARD", "1") != "0", "tripped": None}
 _HV_GUARD_LOCK = threading.Lock()
@@ -3080,7 +3081,38 @@ def _hv_guard_stm32_flags() -> dict | None:
         r = shared_read(("stm32-hv-status", host), SHARED_TTL_STM32_S, lambda: stm32_hv_status(host))
     except Exception:
         return None
+    if isinstance(r, dict) and r.get("ok") and not (r.get("flags", 0) & STM32_FLAG_HV_GUARD):
+        _HVG_RAILS.update(emission=bool(r.get("emission_on")), focus=bool(r.get("focus_on")))
     return r if isinstance(r, dict) and r.get("ok") else None
+
+
+_HVG_RAILS = {"emission": False, "focus": False}   # last rail state seen BEFORE a trip
+HV_GUARD_RECOVER_MAX = 3            # auto-recoveries within ...
+HV_GUARD_RECOVER_WINDOW_S = 600.0   # ... this long, then the next one latches
+_HVG_RECOVERIES: list = []          # monotonic times of auto-recoveries
+
+
+def _hv_guard_strays() -> dict:
+    """{cid: {ch: mask}} of switches the 165 reads CLOSED while the firmware's
+    desired byte says open -- a 595 that flipped by itself. Read before the
+    force-open, which would hide them. Unreadable controllers are left out."""
+    out = {}
+    for cid, link in sorted(CONTROLLERS.items()):
+        if not link or not link.client.connected:
+            continue
+        try:
+            got = _hv_bytes(link)
+        except Exception:
+            got = None
+        if got is None:
+            continue
+        desired, feedback = got
+        used = used_channel_mask(cid)
+        stray = {ch: feedback[ch] & ~desired[ch] & 0xFF for ch in range(8)
+                 if (used >> ch) & 1 and feedback[ch] & ~desired[ch] & 0xFF}
+        if stray:
+            out[cid] = stray
+    return out
 
 
 def _hv_guard_force_open_all() -> dict:
@@ -3102,13 +3134,15 @@ def _hv_guard_force_open_all() -> dict:
     return opened
 
 
-def _hv_guard_stop_hot(now: float) -> list[int]:
+def _hv_guard_stop_hot(now: float, recent_s: float = None) -> list[int]:
     """No heat, no thermionic electrons: filaments hot now or within
-    HV_GUARD_STOP_RECENT_S go to STOP (the user, 2026-10-27)."""
+    recent_s (default HV_GUARD_STOP_RECENT_S) go to STOP (the user,
+    2026-10-27)."""
+    recent_s = HV_GUARD_STOP_RECENT_S if recent_s is None else recent_s
     with _SAFETY_LOCK:
         hot_now = {int(f) for f, (st, _w) in LAST_POWER_STATE.items()
                    if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE)}
-        recent = {f for f, t in _LAST_HOT.items() if now - t <= HV_GUARD_STOP_RECENT_S}
+        recent = {f for f, t in _LAST_HOT.items() if now - t <= recent_s}
     stop = sorted(hot_now | recent)
     if stop:
         _safety_fallback_filaments(stop, POWER_STATE_STOP)
@@ -3116,33 +3150,97 @@ def _hv_guard_stop_hot(now: float) -> list[int]:
 
 
 def _hv_guard_after_stm32_trip(now: float) -> dict:
-    """The STM32 already took the HV down. Open every switch, stop the heat,
-    latch here too (HV ON refused by the backend as well), and say who."""
+    """The STM32 already took the HV down (milliseconds). Now find out why.
+
+    A switch the 165 reads CLOSED with desired open = a 595 that flipped by
+    itself (several an hour on 2026-10-27; 15:21 one tripped the guard and
+    P1 CH6.1 was found closed a minute later). Forcing it open fixes it: no
+    heating is touched, the STM32 latch is cleared and the rails go back to
+    what they were (the user, 2026-10-27) -- unless that has happened
+    HV_GUARD_RECOVER_MAX times in HV_GUARD_RECOVER_WINDOW_S, then it latches.
+
+    Every switch reads open and the current was still up = a MOSFET is
+    conducting that nothing here can turn off: latch, and the filaments hot
+    now or within HV_GUARD_STOP_RECENT_S go to STOP."""
     suspects = _hv_guard_suspects(now)
+    rails_before = dict(_HVG_RAILS)
     link = CONTROLLERS.get(MASTER)
+    host = link.host if link else None
     g = {}
     try:
-        g = stm32_hv_guard(link.host) if link and link.host else {}
+        g = stm32_hv_guard(host) if host else {}
     except Exception as exc:
         g = {"ok": False, "error": str(exc)}
-    opened = _hv_guard_force_open_all()
-    try:
-        stop = _hv_guard_stop_hot(now)
-    except Exception as exc:
-        stop, g["stop_error"] = [], str(exc)
     base = (g.get("trip_base_x16") or 0) / 16.0
     mean = (g.get("trip_mean_x16") or 0) / 16.0
     rise_ma = (mean - base) * STM32_MA_PER_COUNT if g.get("ok") else None
-    rec = {"source": "stm32", "stm32_guard": g, "rise_ma_approx": None if rise_ma is None else round(rise_ma, 2),
-           "suspects": suspects, "forced_open": opened, "heating_stopped": stop,
-           "hv_off": {"emission": True, "focus": True}}
+    strays = _hv_guard_strays()
+    opened = _hv_guard_force_open_all()
+    stray_fids = sorted({MAPPING.filament_for_board(cid - 1, ch, pos)
+                         for cid, m in strays.items() for ch, mm in m.items()
+                         for pos in range(8) if mm & (1 << pos)} - {None})
+    stray_txt = "; ".join(f"Power {cid} {_masks_text(m)}" for cid, m in sorted(strays.items()))
+    rec = {"source": "stm32", "stm32_guard": g,
+           "rise_ma_approx": None if rise_ma is None else round(rise_ma, 2),
+           "suspects": suspects, "forced_open": opened, "strays": stray_txt or None,
+           "stray_filaments": stray_fids, "rails_before": rails_before}
+
+    _HVG_RECOVERIES[:] = [t for t in _HVG_RECOVERIES if now - t <= HV_GUARD_RECOVER_WINDOW_S]
+    if strays and all(opened.values()) and len(_HVG_RECOVERIES) < HV_GUARD_RECOVER_MAX:
+        # A 595 flip, fixed by the force-open: clear the STM32 latch and put
+        # the rails back as they were. HV ON still goes through the preflight.
+        _HVG_RECOVERIES.append(now)
+        clr = {}
+        try:
+            clr = stm32_hv_guard(host, "clear") if host else {"ok": False, "error": "no master"}
+        except Exception as exc:
+            clr = {"ok": False, "error": str(exc)}
+        restored = {}
+        if clr.get("ok"):
+            for ch in ("emission", "focus"):
+                if not rails_before.get(ch):
+                    continue
+                pre = hv_preflight_switches(f"before {ch} ON (HV guard auto-recovery)")
+                if not pre.get("ok"):
+                    restored[ch] = f"not restored: {pre.get('error')}"
+                    continue
+                try:
+                    restored[ch] = bool(stm32_hv_enable_set(host, ch, True).get("ok"))
+                except Exception as exc:
+                    restored[ch] = f"not restored: {exc}"
+        rec.update(stm32_clear=clr, restored=restored,
+                   recoveries_in_window=len(_HVG_RECOVERIES),
+                   message=(f"HV guard: a switch closed by itself ({stray_txt}, filament(s) "
+                            f"{stray_fids}) -- the STM32 cut the HV, the switch was forced open, "
+                            f"the HV was put back ({restored or 'it was off'}). No heating "
+                            f"touched. {len(_HVG_RECOVERIES)} such recovery(ies) in the last "
+                            f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min (latches after "
+                            f"{HV_GUARD_RECOVER_MAX})."))
+        _HVG_HIST.clear()
+        if not clr.get("ok"):
+            rec["message"] += f" STM32 latch NOT cleared ({clr.get('error')}) -- HV stays off."
+        log.warning("%s", rec["message"])
+        _safety_record("hv_guard_recovered", rec)
+        return {"action": "recovered", **rec}
+
+    # No stray switch (or too many recoveries): something conducts that the
+    # 595s cannot turn off. Stop the heat, latch.
+    try:
+        stop = _hv_guard_stop_hot(now)
+    except Exception as exc:
+        stop, rec["stop_error"] = [], str(exc)
+    rec["heating_stopped"] = stop
+    rec["hv_off"] = {"emission": True, "focus": True}
+    why = ("every grid switch read open" if not strays else
+           f"{len(_HVG_RECOVERIES)} switch flips auto-recovered in {HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min "
+           f"(this one: {stray_txt})")
     rec["message"] = (f"HV OFF by the STM32 HV guard: the emission current between pulses stayed "
                       f"{'' if rise_ma is None else f'~{rise_ma:.1f} mA '}over its baseline "
-                      f"({mean:.0f} vs {base:.0f} counts) -- a grid switch is conducting that was "
-                      f"not fired (recently hot filaments, most recent first: {suspects}). Every grid "
-                      f"switch forced open, heating set to STOP for {stop or 'none (no filament was hot)'}; "
-                      f"HV ON is refused until the latch is cleared (POST /api/hv-guard {{\"clear\": true}}, "
-                      f"which clears the STM32's too).")
+                      f"({mean:.0f} vs {base:.0f} counts) and {why} -- a grid switch is conducting "
+                      f"that cannot be turned off (recently hot filaments, most recent first: "
+                      f"{suspects}). Heating set to STOP for {stop or 'none (no filament was hot)'}; "
+                      f"HV ON is refused until the latch is cleared (POST /api/hv-guard "
+                      f"{{\"clear\": true}}, which clears the STM32's too).")
     with _HV_GUARD_LOCK:
         _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                                 **rec}
