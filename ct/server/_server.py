@@ -2883,6 +2883,70 @@ def hv_preflight_switches(reason: str) -> dict:
     return out
 
 
+GRID_SWEEP_S = 5.0     # how often every grid switch is really read back (165)
+
+
+def grid_sweep_once() -> list[dict]:
+    """One pass of the stray-switch sweep: on every connected controller that
+    is not running a schedule, read the 165s for real and force OPEN any switch
+    that reads closed while the firmware's desired byte says open. Returns one
+    record per controller where something was found.
+
+    2026-10-27 11:37-11:53: with nothing commanding the grid, the emission
+    baseline stepped by whole diode-path currents (+2, +6, +4 mA) and back, and
+    the HV preflight then found P1 CH4.1 closed with desired 0. Switches change
+    state on their own, and only the preflight (at rail ON) was looking -- so
+    one stayed closed for minutes. This looks every GRID_SWEEP_S.
+
+    A run owns the shift chain (and the firmware returns its cache then), so an
+    armed/running controller is skipped. A run armed between the status read
+    and the force can still be disarmed by force_grid_off's escalation: that
+    costs one shot, never a closed switch."""
+    found = []
+    for cid, link in sorted(CONTROLLERS.items()):
+        if not link or not link.client.connected:
+            continue
+        try:
+            st = shv_status_retry(link)
+            if st and st.get("state") in (1, 2):
+                continue
+            got = _hv_bytes(link)
+        except Exception:
+            continue                    # unreadable now: the next sweep tries again
+        if got is None:
+            continue
+        desired, feedback = got
+        used = used_channel_mask(cid)   # an unused channel floats to 0xFF
+        stray = {ch: feedback[ch] & ~desired[ch] & 0xFF for ch in range(8)
+                 if (used >> ch) & 1 and feedback[ch] & ~desired[ch] & 0xFF}
+        if not stray:
+            continue
+        fids = [MAPPING.filament_for_board(cid - 1, ch, pos)
+                for ch, m in sorted(stray.items()) for pos in range(8) if m & (1 << pos)]
+        log.warning("grid sweep: Power %d switch(es) %s CLOSED with no command (desired %s, "
+                    "read-back %s, filaments %s) -- forcing open", cid, _masks_text(stray),
+                    desired, feedback, fids)
+        r = force_grid_off(link, cid, stray, reason="grid sweep: closed with no command")
+        if r.get("ok"):
+            _note_forced_open(cid, stray)
+        rec = {"controller": cid, "switches": _masks_text(stray), "filaments": fids,
+               "desired": desired, "read_back": feedback, "opened": bool(r.get("ok"))}
+        if not r.get("ok"):
+            rec["error"] = r.get("error")
+        _safety_record("grid_stray_closed", rec)
+        found.append(rec)
+    return found
+
+
+def _grid_sweep_loop() -> None:
+    while True:
+        time.sleep(GRID_SWEEP_S)
+        try:
+            grid_sweep_once()
+        except Exception as exc:          # never let the sweep die
+            log.exception("grid sweep failed: %s", exc)
+
+
 def hv_write_off_masks(command: str, body: dict) -> dict[int, int] | None:
     """Switches a raw HV write could have left in an unknown state, or None if
     `command` does not write the HV grid. Used when the write did not come back
@@ -2917,7 +2981,7 @@ def _note_raw_grid(controller: int, command: str, body: dict) -> None:
         bits = {(c, b): bool(v & (1 << b)) for c, v in bytes_by_ch.items() for b in range(8)}
     closed, opened = [], []
     for (ch, pos), on in bits.items():
-        fid = MAPPING.filament_for_board(controller, ch, pos)
+        fid = MAPPING.filament_for_board(controller - 1, ch, pos)   # mapping is 0-based
         key = int(fid) if fid is not None else -(1 + controller * 64 + ch * 8 + pos)
         (closed if on else opened).append(key)
     if opened:
@@ -2934,7 +2998,7 @@ def _note_forced_open(controller: int, masks: dict[int, int] | None) -> None:
     for ch, m in masks.items():
         for pos in range(8):
             if m & (1 << pos):
-                fid = MAPPING.filament_for_board(controller, ch, pos)
+                fid = MAPPING.filament_for_board(controller - 1, ch, pos)   # mapping is 0-based
                 keys.append(int(fid) if fid is not None else -(1 + controller * 64 + ch * 8 + pos))
     note_grid_commanded(False, keys)
 
@@ -3786,12 +3850,20 @@ class CtHandler(BaseHTTPRequestHandler):
             if not link or not link.client.connected:
                 return self._json({"ok": False, "error": "controller not connected"})
             cid = int(self._query().get("controller", "1") or 1)
-            ft, flags, payload = build_payload("HV_GET_ALL_BYTES", {})
-            resp = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
-            raw = resp.get("raw") if isinstance(resp, dict) else None
-            if not raw or len(raw) < 17 or raw[0] != 0:
-                return self._json({"ok": False, "error": "HV_GET_ALL_BYTES failed"})
-            desired, feedback = list(raw[1:9]), list(raw[9:17])
+            # feedback is a REAL 165 read (_hv_bytes), not HV_GET_ALL_BYTES:
+            # that is the firmware's cache, and on 2026-10-27 it said every
+            # switch was open while P1 CH4.1 was closed. While a run owns the
+            # shift chain the firmware can only answer from its cache, so the
+            # reply says which one it is.
+            try:
+                st = shv_status_retry(link)
+                got = _hv_bytes(link)
+            except Exception as exc:
+                return self._json({"ok": False, "error": f"switch read-back failed: {exc}"})
+            if got is None:
+                return self._json({"ok": False, "error": "switch read-back failed"})
+            desired, feedback = got
+            in_run = bool(st and st.get("state") in (1, 2))
             out = {}
             for f in MAPPING.filaments(cid - 1):
                 _, ch, pos, _ = filament_to_board(f)
@@ -3799,7 +3871,9 @@ class CtHandler(BaseHTTPRequestHandler):
                     continue
                 out[str(f)] = {"desired": bool(desired[ch] & (1 << pos)),
                                "feedback": bool(feedback[ch] & (1 << pos))}
-            self._json({"ok": True, "controller": cid, "filaments": out})
+            self._json({"ok": True, "controller": cid, "filaments": out,
+                        "feedback_from": "cache (a run owns the shift chain)" if in_run
+                        else "165 read-back"})
         elif path == "/api/filament-status":
             # Single-board heating status: the RP2350's own last-commanded
             # PowerState + fault kind for ONE filament (CH_GET_POWER_STATE,
@@ -6592,6 +6666,8 @@ def main() -> None:
     # Daemon: it must never hold the process open, and it has no state worth
     # draining on the way out.
     threading.Thread(target=_safety_loop, name="safety_watchdog", daemon=True).start()
+    # Grid switches that close with no command (see grid_sweep_once).
+    threading.Thread(target=_grid_sweep_loop, name="grid_sweep", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
     # Timed ACTIVE (active_s): returns filaments to IDLE when their time is up.

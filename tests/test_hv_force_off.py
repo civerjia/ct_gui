@@ -156,7 +156,7 @@ check("masks: not an HV write", S.hv_write_off_masks("CH_SET_POWER_STATE", {}) i
 import ct.server._access as A  # noqa: E402
 SF._GRID_CLOSED.clear()
 rp = FakeRp()
-fid = S.MAPPING.filament_for_board(2, 0, 2)
+fid = S.MAPPING.filament_for_board(2 - 1, 0, 2)   # Power 2 = mapping controller 1 (0-based)
 key = int(fid) if fid is not None else -(1 + 2 * 64 + 0 * 8 + 2)
 S.hv_raw_write(rp, 2, "HV_SET_BIT", body_on, S.build_payload, 2.0)
 check("raw ON -> watchdog tracks the switch", key in SF._GRID_CLOSED, (key, SF._GRID_CLOSED))

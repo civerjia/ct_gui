@@ -92,8 +92,10 @@ class _HvMixin:
         """Read per-filament HV-grid switch state on one controller.
 
         Returns {"ok", "filaments": {str(filament): {"desired": bool, "feedback": bool}}}.
-        `desired` is the last commanded state; `feedback` is the switch's own
-        sense line (a mismatch flags a stuck/dead switch).
+        `desired` is the last commanded state; `feedback` is the 74HC165
+        read-back, really re-read for this call (a mismatch flags a stuck/dead
+        switch). `feedback_from` says "cache (...)" while a run owns the shift
+        chain -- the firmware cannot read the 165s then.
         """
         r = self._get(f"/api/hv-grid-status?controller={controller}")
         # Backend replies keyed by FID (as a string) -- re-key to
