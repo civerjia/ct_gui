@@ -26,6 +26,7 @@ import json
 import logging
 import logging.handlers
 import os
+import socket
 import sys
 import threading
 import time
@@ -3550,7 +3551,13 @@ def series_get(names, since: float = 0.0, max_points: int = 4000) -> dict:
 # Lesker gauge through raspberrypi5:8769 (pressure_point, 2 s), and BROADCASTS
 # all of it to every client. This only listens: nothing is ever sent to it --
 # other programs drive that supply (the user, 2026-10-27).
+# CT_SPELLMAN_WS names it. Unset: on control2 itself (this backend then cannot
+# be on 8770 -- the Spellman backend has it) the local one is tried first,
+# then control2 over the LAN.
 SPELLMAN_WS_URL = os.environ.get("CT_SPELLMAN_WS", "ws://control2:8770")
+SPELLMAN_WS_CANDIDATES = ([os.environ["CT_SPELLMAN_WS"]] if os.environ.get("CT_SPELLMAN_WS") else
+                          (["ws://127.0.0.1:8770"] if os.environ.get("CT_GUI_PORT", "8770") != "8770" else [])
+                          + ["ws://control2:8770"])
 SPELLMAN_RECONNECT_S = 5.0
 SPELLMAN_STALE_S = 10.0         # older than this = no reading
 VACUUM_LIMIT_DEFAULT_TORR = float(os.environ.get("CT_VACUUM_LIMIT_TORR", "2.5e-5"))
@@ -3669,12 +3676,18 @@ def _spellman_loop() -> None:
             _SPELL["error"] = "the websockets package is not installed (pip install websockets) -- no Spellman / vacuum readings"
         log.warning("Spellman/vacuum reader off: %s", _SPELL["error"])
         return
+    global SPELLMAN_WS_URL
+    k = 0
     while not _STOPPING.is_set():
+        url = SPELLMAN_WS_CANDIDATES[k % len(SPELLMAN_WS_CANDIDATES)]
+        k += 1
         try:
-            with ws_connect(SPELLMAN_WS_URL, open_timeout=5, close_timeout=1, max_size=None) as ws:
+            with ws_connect(url, open_timeout=5, close_timeout=1, max_size=None) as ws:
+                SPELLMAN_WS_URL = url            # what the snapshots report as the source
+                k = SPELLMAN_WS_CANDIDATES.index(url)   # stay on the one that answered
                 with _SPELL_LOCK:
                     _SPELL["connected"], _SPELL["error"] = True, None
-                log.info("Spellman/vacuum reader connected to %s (read-only)", SPELLMAN_WS_URL)
+                log.info("Spellman/vacuum reader connected to %s (read-only)", url)
                 while not _STOPPING.is_set():
                     try:
                         raw = ws.recv(timeout=SPELLMAN_STALE_S)
@@ -3689,10 +3702,11 @@ def _spellman_loop() -> None:
         except Exception as exc:
             with _SPELL_LOCK:
                 was = _SPELL["connected"]
-                _SPELL["connected"], _SPELL["error"] = False, f"{type(exc).__name__}: {exc}"
+                _SPELL["connected"], _SPELL["error"] = False, f"{url}: {type(exc).__name__}: {exc}"
             if was:
-                log.warning("Spellman/vacuum reader lost %s: %s", SPELLMAN_WS_URL, exc)
-        _STOPPING.wait(SPELLMAN_RECONNECT_S)
+                log.warning("Spellman/vacuum reader lost %s: %s", url, exc)
+        if k % len(SPELLMAN_WS_CANDIDATES) == 0:   # every candidate tried: wait before the next round
+            _STOPPING.wait(SPELLMAN_RECONNECT_S)
 
 
 def _age(at, now):
@@ -7663,6 +7677,23 @@ def _update_watch_loop() -> None:
             time.sleep(5.0)
 
 
+class _CtHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that never SHARES its port. On Windows the stock
+    SO_REUSEADDR can let a second program bind a port another one listens on
+    (when that one also set SO_REUSEADDR), and connections then land on
+    either; otherwise it fails with a puzzling WinError 10013. control2
+    already serves its Spellman backend on 8770 (2026-10-27). Here the bind
+    is exclusive (SO_EXCLUSIVEADDRUSE): a taken port always fails, and the
+    start-up error says to set CT_GUI_PORT. Elsewhere unchanged (on
+    Linux/macOS SO_REUSEADDR does not share a listening port)."""
+    if sys.platform == "win32":
+        allow_reuse_address = False
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
 def _backend_already_running(port: int) -> str | None:
     """A description of the backend already answering on this port, or None.
     Only a real /api/version answer counts; a refused connection (nothing
@@ -7713,11 +7744,15 @@ def main() -> None:
     # released, so the bind is retried briefly instead of failing at once.
     for attempt in range(40):
         try:
-            server = ThreadingHTTPServer((host, port), CtHandler)
+            server = _CtHTTPServer((host, port), CtHandler)
             break
         except OSError as exc:
             if attempt == 39:
-                log.error("backend NOT started: port %d unavailable (%s)", port, exc)
+                log.error("backend NOT started: port %d is in use by another program (%s) -- on "
+                          "control2 that is the Spellman backend's 8770: start this one with "
+                          "CT_GUI_PORT=<free port> and point the clients at it", port, exc)
+                print(f"[ct] backend NOT started: port {port} is in use by another program ({exc}). "
+                      f"Set CT_GUI_PORT to a free port.", flush=True)
                 raise
             time.sleep(0.25)
     log.info("=== backend start — listening on http://%s:%d (%s) ===", host, port,

@@ -225,6 +225,29 @@ lists the scripts connected this way, with each one's `version` and `stale`.
   `ct.read_log(tail=100)`, `ct.read_log(grep="WARNING")`,
   `ct.read_log("client/ct_client_2026-09-24.jsonl", tail=20)`.
 
+### Moving the backend to another PC
+
+1. **Stop the old backend first.** Each ESP32 bridge accepts ONE client;
+   two backends fight over the controllers.
+2. **Port.** If the new PC already serves something on 8770 (control2 does:
+   the Spellman backend), start this one on another port:
+   `set CT_GUI_PORT=8780`. On Windows the backend binds its port
+   exclusively, so a taken port is a clear start-up error, never a shared
+   port.
+3. **Copy the state**, from the old copy's `state/` (filament order, dead
+   list, per-filament history, vacuum limit) and `calibration/` (HV LUTs).
+   Use a local clone, not a synced folder another PC also runs from --
+   both would write the same state files.
+4. **Spellman / vacuum.** On control2 itself (backend not on 8770) the local
+   Spellman backend is tried first (`ws://127.0.0.1:8770`), then
+   `ws://control2:8770`; `CT_SPELLMAN_WS` overrides both. The `websockets`
+   package must be installed, or the vacuum interlock has no reading and
+   refuses HV ON / ACTIVE.
+5. **Point everything at the new address:** scripts (`CTClient(host, port)`),
+   browser bookmarks, other programs that call the API, and any port
+   forwarding to the old PC.
+6. **Firewall:** allow the port for the LAN (and Tailscale if used).
+
 ## 8. Updates
 
 `import ct_simple_control` and `python backend.py` ask GitHub which version
