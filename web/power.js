@@ -885,8 +885,8 @@ const HV_HTML = `
       <div class="metric"><span class="metric-label">Emission V</span><span id="adsEmV" class="metric-value">—</span></div>
       <div class="metric"><span class="metric-label">Emission HV</span><span id="hvEmStatus" class="metric-value">—</span></div>
       <div class="metric"><span class="metric-label">Focus HV</span><span id="hvFocStatus" class="metric-value">—</span></div>
-      <div class="metric" title="Spellman output voltage (read-only, control2)"><span class="metric-label">60 kV V</span><span id="spKv" class="metric-value">—</span></div>
-      <div class="metric" title="Spellman output current (read-only, control2)"><span class="metric-label">60 kV I</span><span id="spMa" class="metric-value">—</span></div>
+      <div class="metric" title="Spellman output voltage (read-only, control2)"><span class="metric-label">Spellman V</span><span id="spKv" class="metric-value">—</span></div>
+      <div class="metric" title="Spellman output current (read-only, control2)"><span class="metric-label">Spellman I</span><span id="spMa" class="metric-value">—</span></div>
       <div class="metric" title="Lesker gauge via raspberrypi5 / control2. Over the limit, or no reading: HV ON and ACTIVE/VOLTAGE are refused."><span class="metric-label">Vacuum</span><span id="vacP" class="metric-value">—</span></div>
       <div class="metric" title="HV guard: STM32 (ms) + backend. Tripped = HV off and latched."><span class="metric-label">HV guard</span><span id="hvGuardState" class="metric-value">—</span></div>
     </div>
@@ -2368,7 +2368,7 @@ async function syncRefresh() {
 }
 
 // ---- target selector + gantt fold + lifecycle -------------------------------
-// Spellman 60 kV supply + vacuum + HV guard, 1 Hz from /api/safety: all three
+// Spellman HV supply + vacuum + HV guard, 1 Hz from /api/safety: all three
 // are the backend's cached state (the Spellman/vacuum reader listens to
 // control2; the guard is the backend's latch) -- this adds no request to the
 // ESP32/STM32. A reading the backend calls stale comes back null and is shown
