@@ -177,7 +177,9 @@ log = [{"filament": 16, "on_mismatch": i in (2, 6), "read165": {2: 8, 6: 0}.get(
 ct.shv_pulse_log = lambda c: log
 ems = [5.0] * 10
 ems[6] = None                                  # pulse 7: no current at all
-ct._collect_pulse_events = lambda since, n, *a: ([{"id": 50 + i, "emission_ma": ems[i]}
+ct._collect_pulse_events = lambda since, n, *a: ([{"id": 50 + i, "emission_ma": ems[i],
+                                                   "emission_mams": None if ems[i] is None else 110.0,
+                                                   "integral_mams": 1.0 if ems[i] is None else 150.0}
                                                   for i in range(10)], 1228)
 r = ct.fire_single_pulse(16, measure=True, timeout_s=6.0, **{**KW, "num_pulses": 10})
 e = r.get("error") or ""
@@ -186,8 +188,9 @@ check("10 pulses: names the 2 mismatched ones; bytes in detail",
       "pulse(s) 3, 7 of 10" in e and "pulse 3: wrote 0x04, read back 0x08 (the neighbouring bit)" in d
       and "pulse 7: wrote 0x04, read back 0x00 (no bit)" in d, (e, d))
 check("...pulse 3 current flowed: read-back wrong, good data",
-      "Pulse(s) 3 fired normally (5.00 mA flowed)" in e and "data is good" in e, e)
-check("...pulse 7 no current: did not fire", "Pulse(s) 7 did not fire" in e, e)
+      "Pulse(s) 3 fired normally (5.00 mA / 110.0 mA*ms flowed)" in e and "data is good" in e, e)
+check("...pulse 7 no current: did not fire, its measured mA*ms shown",
+      "Pulse(s) 7 did not fire (no current: 1.0 mA*ms measured" in e, e)
 check("...the 'not measured' placeholder is gone", "Not measured" not in e, e)
 check("...mosfet_conducted False (one did not)", r.get("mosfet_conducted") is False, r)
 

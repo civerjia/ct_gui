@@ -3361,14 +3361,22 @@ class _ScheduleMixin:
                     f"it is unknown whether those pulses fired.")
         flowed = [(i, em) for i, em in cur if em is not None]
         dead = [i for i, em in cur if em is None]
+
+        def mams(i, key):
+            v = measured[i].get(key)
+            return "n/a" if v is None else f"{v:.1f}"
         out = []
         if flowed:
+            each = ", ".join(f"{em:.2f} mA / {mams(i, 'emission_mams')} mA*ms" for i, em in flowed)
             out.append(f"Pulse(s) {self._pulse_list(i for i, _ in flowed)} fired normally "
-                       f"({', '.join(f'{em:.2f}' for _, em in flowed)} mA flowed) -- only the "
-                       f"MOSFET read-back is wrong (the 74HC165 or its cable); that data is good.")
+                       f"({each} flowed) -- only the MOSFET read-back is wrong (the 74HC165 or its "
+                       f"cable); that data is good.")
         if dead:
-            out.append(f"Pulse(s) {self._pulse_list(dead)} did not fire (no current: the "
-                       f"MOSFET did not close).")
+            # The measured charge of a dead pulse is shown too: "no current" is
+            # the verdict, the mA*ms is the evidence a reader checks it against.
+            out.append(f"Pulse(s) {self._pulse_list(dead)} did not fire (no current: "
+                       f"{', '.join(mams(i, 'integral_mams') for i in dead)} mA*ms measured; "
+                       f"the MOSFET did not close).")
         return " ".join(out)
 
     def shot_abort(self, shot: dict) -> None:

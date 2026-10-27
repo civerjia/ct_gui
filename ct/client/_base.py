@@ -387,14 +387,25 @@ class Result(dict):
                         + (" cache" if r.get("heat_from_cache") else ""),)
             if paired:
                 e = meas[n] if isinstance(meas[n], dict) else {}
-                row += (num(e.get("emission_ma"), "{:.3f}"), num(e.get("emission_mams"), "{:.2f}"))
+                # A pulse with no emission still shows the charge the detector
+                # measured, in brackets: an error must not hide the number.
+                q = e.get("emission_mams")
+                if q is None and e.get("integral_mams") is not None:
+                    q_txt = f"({e['integral_mams']:.2f})"
+                elif q is None and e.get("integral_mams_unavailable"):
+                    q_txt = f"n/a ({e['integral_mams_unavailable']})"
+                else:
+                    q_txt = num(q, "{:.2f}")
+                row += (num(e.get("emission_ma"), "{:.3f}"), q_txt)
                 if e.get("path_conducted") is False:
                     flags.append("NO-CURRENT")      # the path did not conduct: no emission
             rows.append(row + (" ".join(flags) or "-",))
         widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
         out = [f"  pulses: [{len(recs)}]  (heat = RP2350 reading nearest each trigger"
                + ("; read at = ms from the trigger, - before / + after, ~ = trigger time lost,"
-                  " cache = not the pulse-watch read" if timed else "") + ")"]
+                  " cache = not the pulse-watch read" if timed else "")
+               + ("; (mA*ms) = charge measured on a pulse with no emission" if paired else "")
+               + ")"]
         for r in rows:
             out.append("    " + "  ".join(c.rjust(w) if i < len(r) - 1 else c
                                           for i, (c, w) in enumerate(zip(r, widths))).rstrip())
