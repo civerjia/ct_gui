@@ -2282,56 +2282,78 @@ panel's "settle ms".
 
 ### Firing a list of filaments: `scan_view`
 
+Every argument, with what it does:
+
 ```python
-r = ct.scan_view([23, 24, 25, 26],   # the filaments to fire, in this order
-                 active_mv=5000,     # heating voltage, mV
-                 idle_ma=1200,       # back to this current after its pulses
-                 num_pulses=5, width_us=20000, settle_ms=500)
+def send_edges(filament):        # trigger="ext": called when `filament` is hot and armed
+    detector.trigger()           # your hardware: send this filament's edges NOW
+
+r = ct.scan_view(
+    [23, 24, 25],                # filaments, fired in this order
+    active_mv={23: 5000, 24: 5200, 25: 4900},  # EACH filament's own voltage, mV (required)
+    idle_ma=1200,                # back to this after its pulses, mA
+    num_pulses=5,                # pulses per filament
+    width_us=20000,              # pulse width, us
+    pulse_interval_ms=100,       # spacing of one filament's pulses, ms
+    settle_ms=500,               # voltage held +-150 mV this long before it fires, ms
+    k="auto",                    # heat ahead: "auto" (learnt per filament) or N filaments
+    k_max=6,                     # at most this many filaments hot at once
+    trigger="ext",               # "sim" = the library fires, "ext" = your hardware
+    on_armed=send_edges,         # "ext" only: on_armed(filament)
+    trigger_wait_s=10.0,         # "ext": that filament's edges counted within this, s
+    heat_timeout_s=8.0,          # each filament reaches its voltage within this (+ settle_ms), s
+    start_in_s=0,                # first pulse no sooner than this, s (0 / None = at once)
+    detector_center=None,        # GUI drawing only (None = the middle filament)
+    lead_margin_s=0.3,           # k="auto": start heating this much earlier still, s
+    max_on_ms=40)                # firmware cap on one pulse, ms
 print(r)
 ```
 
-The filaments fire one after another, in the order you give. For each one:
-1. heat it to `active_mv`;
-2. wait until its voltage holds within ±150 mV for `settle_ms`;
+**What it does.** For each filament, in the order given:
+1. heat it to its `active_mv`;
+2. wait until the voltage holds within ±150 mV for `settle_ms`;
 3. fire `num_pulses` pulses;
 4. put it back to `idle_ma`.
 
-The next filaments are already heating while one fires. At the end, every
-filament is at IDLE.
+At the end, every filament is at IDLE.
 
-**A different voltage per filament.** Give every filament in the list its own
-value:
+**`active_mv`.** A dict `{filament: mV}` with one entry for EVERY filament in
+the list. A single number is refused, and so is a missing filament; the error
+names it.
 
-```python
-ct.scan_view([23, 24, 25], active_mv={23: 5000, 24: 5200, 25: 4900}, idle_ma=1200)
-```
+**`k`: heating ahead.** While one filament fires, the next ones are already
+heating.
+- `k="auto"`: each filament starts heating when its turn is its own heating
+  time away, plus `lead_margin_s`. Its heating time is learnt per filament
+  (`filament_perf()`).
+- `k=N`: the next N filaments are always heating.
 
-**Who sends the trigger: `trigger`**
+Never more than `k_max` filaments are hot at once.
 
-- `"sim"` (default): the library sends the trigger edges itself.
+**`trigger`**
+- `"sim"`: the library sends the trigger edges itself. `on_armed` is not
+  used.
 - `"ext"`: your hardware sends them. When a filament is hot and armed, the
-  library calls `on_ready(filament)`. Send that filament's `num_pulses` edges
-  then, one pulse per edge. If they are not all counted within
-  `trigger_wait_s` (10 s), it stops.
+  library calls `on_armed(filament)`. Send that filament's `num_pulses` edges
+  then, one pulse per edge. Edges sent before `on_armed` are lost, or fire the
+  wrong filament.
 
-```python
-def send_edges(filament):          # called once per filament, when it is ready
-    detector.trigger()             # your hardware: the edge(s) for this filament
+**Timeouts.** Each of these stops the call:
 
-ct.scan_view([23, 24, 25], active_mv=5000, idle_ma=1200,
-             trigger="ext", on_ready=send_edges)
-```
-
-**Before you call it:** every filament in the list must be at IDLE. HV is not
-touched.
+| argument | what must happen in time |
+|---|---|
+| `heat_timeout_s` (8 s) | Each filament reaches its voltage within this, plus `settle_ms`. |
+| `trigger_wait_s` (10 s) | With `"ext"`: all of that filament's edges are counted within this, after `on_armed`. |
 
 **When something goes wrong, it stops.** It disarms, puts every filament back
 to `idle_ma`, and puts the reason in `r["error"]` and the filament in
-`r["failed_filament"]`. Ctrl-C does the same. The causes are:
-- a filament does not reach its voltage within `heat_timeout_s` (8 s);
+`r["failed_filament"]`. Ctrl-C does the same. Besides the timeouts, these stop
+it:
 - an SHV fault;
-- edges not counted;
-- `on_ready` raising.
+- `on_armed` raising.
+
+**Before you call it:** every filament in the list must be at IDLE. HV is not
+touched.
 
 **Result**
 
@@ -2344,21 +2366,12 @@ to `idle_ma`, and puts the reason in `r["error"]` and the filament in
 | `elapsed_s` | total time of the call |
 | `gantt` | a text timeline: `.` heating, `=` ready and waiting, `#` pulses |
 
-**Rarely needed**
-
-| argument | default | what it does |
-|---|---|---|
-| `start_in_s` | 0 | First pulse no sooner than this, for when something else (e.g. a motor) must finish first; heating overlaps the wait. |
-| `detector_center` | the middle filament | GUI drawing only. |
-| `k` | `"auto"` | How far ahead to heat: `"auto"`, or N filaments ahead. |
-| `k_max` | 6 | Never more than this many filaments hot at once. |
-| `lead_margin_s` | 0.3 | With `k="auto"`, heat this much earlier still. |
-| `max_on_ms` | 40 | Firmware cap on one pulse. |
+Times are seconds from the call.
 
 **`filament_perf(filaments=None)`** returns what `scan_view` has learnt about
 each filament, kept in `state/filament_perf.json`:
 - voltage;
-- time to reach it;
+- heating time;
 - V/I at the pulse;
 - ohms;
 - failures.

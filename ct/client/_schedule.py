@@ -1388,50 +1388,72 @@ class _ScheduleMixin:
 
     def scan_view(self,
                   filaments,                   # the filament numbers to fire, IN THIS ORDER
-                  active_mv,                   # heating mV: one number, or {filament: mV} for each
+                  active_mv: dict,             # {filament: mV} -- EVERY filament its own voltage
                   idle_ma: float,              # each filament back to this current after its pulses
                   num_pulses: int = 1,         # pulses per filament
                   width_us: int = 1000,        # pulse width
                   pulse_interval_ms: int = 100,   # spacing of one filament's pulses
                   settle_ms: int = 0,          # voltage held +-150 mV this long before it fires
+                  k="auto",                    # how many filaments ahead to heat: "auto" or N
+                  k_max: int = 6,              # never more than this many hot at once
                   trigger: str = "sim",        # "sim": the library fires; "ext": your hardware
-                  on_ready=None,               # "ext": on_ready(filament) = send its edges NOW
+                  on_armed=None,               # "ext": on_armed(filament) = send its edges NOW
                   trigger_wait_s: float = 10.0,   # "ext": its edges must arrive within this
                   heat_timeout_s: float = 8.0,    # longest wait for one filament's voltage
                   start_in_s: float = 0.0,     # first pulse no sooner than this; None = 0
                   detector_center=None,        # GUI drawing only; None = the middle filament
-                  k="auto",                    # heating lead: "auto" or N filaments ahead
-                  k_max: int = 6,              # never more than this many hot at once
                   lead_margin_s: float = 0.3,  # k="auto": heat this much earlier still
                   max_on_ms: int = 40) -> dict:
         """Fire a list of filaments one after another, then stop. Every
         filament ends at IDLE.
 
-            r = ct.scan_view([23, 24, 25, 26], active_mv=5000, idle_ma=1200,
-                             num_pulses=5, width_us=20000, settle_ms=500)
+            def send_edges(filament):        # trigger="ext": called when `filament`
+                detector.trigger()           # is hot and armed -- send its edges now
 
-        For each filament, in the order given: heat it to active_mv, wait until
-        its voltage holds (+-150 mV for settle_ms), fire num_pulses pulses,
-        put it back to idle_ma. The next filaments are already heating while
-        one fires, so there is little waiting.
+            r = ct.scan_view(
+                [23, 24, 25],                # filaments, fired in this order
+                active_mv={23: 5000, 24: 5200, 25: 4900},  # each one's voltage, mV
+                idle_ma=1200,                # back to this after its pulses, mA
+                num_pulses=5,                # pulses per filament
+                width_us=20000,              # pulse width, us
+                pulse_interval_ms=100,       # spacing of one filament's pulses, ms
+                settle_ms=500,               # voltage held +-150 mV this long first, ms
+                k="auto",                    # heat ahead: "auto" (learnt) or N filaments
+                k_max=6,                     # at most this many hot at once
+                trigger="ext",               # "sim" = library fires, "ext" = your hardware
+                on_armed=send_edges,         # "ext" only
+                trigger_wait_s=10.0,         # "ext": edges counted within this, s
+                heat_timeout_s=8.0,          # voltage reached within this, s
+                start_in_s=0,                # first pulse no sooner, s (0 = at once)
+                detector_center=None,        # GUI drawing only
+                lead_margin_s=0.3,           # k="auto": heat this much earlier, s
+                max_on_ms=40)                # firmware cap on one pulse, ms
+            print(r)
 
-        active_mv   5000 = all at 5000 mV; {23: 5000, 24: 5200, ...} = each its
-                    own (every filament in the list must be given one).
+        For each filament, in the order given: heat it to its active_mv, wait
+        until its voltage holds (+-150 mV for settle_ms), fire num_pulses
+        pulses, put it back to idle_ma.
+
+        active_mv   {filament: mV}, one entry for EVERY filament in the list.
+                    A single number is refused.
+        k           while one filament fires, the next ones are already
+                    heating. k = how far ahead:
+                      "auto": each filament starts heating when its turn is
+                              its own measured heating time (+ lead_margin_s)
+                              away -- learnt per filament, see filament_perf();
+                      N:      always the next N filaments are heating.
+                    Never more than k_max hot at once.
         trigger     "sim": the library sends the trigger edges itself.
-                    "ext": your hardware sends them. on_ready(filament) is
+                    "ext": your hardware sends them. on_armed(filament) is
                     called when that filament is hot and armed; send its
                     num_pulses edges then (one pulse per edge). Not all counted
                     within trigger_wait_s -> stopped.
 
-                        def send_edges(filament):
-                            detector.trigger()          # your hardware
-                        ct.scan_view([23, 24, 25], active_mv=5000, idle_ma=1200,
-                                     trigger="ext", on_ready=send_edges)
-
         Before: every filament in the list at IDLE. HV is not touched.
 
         Any failure (a filament not reaching its voltage within
-        heat_timeout_s, an SHV fault, edges not counted, on_ready raising)
+        heat_timeout_s + settle_ms, an SHV fault, edges not counted within
+        trigger_wait_s, on_armed raising)
         STOPS it: disarmed, every filament back to idle_ma, the reason in
         "error", the filament in "failed_filament". Ctrl-C does the same.
 
@@ -1453,8 +1475,8 @@ class _ScheduleMixin:
         if trigger not in ("sim", "ext"):
             return {"ok": False, "error": f"trigger must be 'sim' or 'ext', got {trigger!r}",
                     "rows": [], "elapsed_s": 0.0}
-        if trigger == "ext" and not callable(on_ready):
-            return {"ok": False, "error": "trigger='ext' needs on_ready=your_function(filament): "
+        if trigger == "ext" and not callable(on_armed):
+            return {"ok": False, "error": "trigger='ext' needs on_armed=your_function(filament): "
                                           "it is called when that filament is ready for its edges",
                     "rows": [], "elapsed_s": 0.0}
 
@@ -1468,12 +1490,16 @@ class _ScheduleMixin:
         dead = [f for f in fils if self._is_dead(f)]
         if dead:
             return fail(f"dead filament(s) {dead} in the view")
+        if not isinstance(active_mv, dict):
+            return fail(f"active_mv must be {{filament: mV}} with every filament's own voltage, "
+                        f"got {active_mv!r}")
         try:
             # Through the remote proxy a dict's int keys arrive as strings.
-            mv = {f: int((active_mv[f] if f in active_mv else active_mv[str(f)])
-                         if isinstance(active_mv, dict) else active_mv) for f in fils}
+            mv = {f: int(active_mv[f] if f in active_mv else active_mv[str(f)]) for f in fils}
         except (KeyError, TypeError, ValueError) as exc:
-            return fail(f"active_mv must be a number or give every filament one ({exc!r})")
+            missing = [f for f in fils if f not in active_mv and str(f) not in active_mv]
+            return fail(f"active_mv has no voltage for filament(s) {missing}" if missing else
+                        f"active_mv: bad voltage ({exc!r})")
         center = fils[len(fils) // 2] if detector_center is None else int(detector_center)
         auto = k == "auto"
         try:
@@ -1669,9 +1695,9 @@ class _ScheduleMixin:
                     self._post("/api/live-push", {"firing": [int(self._fid_of(f))]})
                 if trigger == "ext":
                     try:
-                        on_ready(f)
+                        on_armed(f)
                     except Exception as exc:
-                        raise self._ScanStop(f"filament {f}: on_ready raised "
+                        raise self._ScanStop(f"filament {f}: on_armed raised "
                                              f"{type(exc).__name__}: {exc} -- view stopped")
                     wait_edges_s = float(trigger_wait_s)
                 else:
@@ -1700,7 +1726,7 @@ class _ScheduleMixin:
                         raise self._ScanStop(f"filament {f}: controller {head} counted "
                                              f"{st.get('totalPulsesDone')} of {done} triggers"
                                              + (f" -- the external edges did not all arrive within "
-                                                f"{trigger_wait_s:g} s of on_ready" if trigger == "ext" else ""))
+                                                f"{trigger_wait_s:g} s of on_armed" if trigger == "ext" else ""))
                     time.sleep(0.05)
                 rows[f]["fired_s"] = since()
                 if push_on:
@@ -1819,7 +1845,7 @@ class _ScheduleMixin:
 
     def scan_views(self,
                    views,                    # scan_plan()["views"] (or a slice of it)
-                   active_mv,                # heating voltage (mV): one number or {filament: mV}
+                   active_mv,                # {filament: mV}, every filament of every view
                    idle_ma: float,           # back to this after each filament's pulses
                    settle_ms: int = 500,     # hold the voltage this long before firing
                    num_pulses: int = 1,      # pulses per filament
@@ -1829,8 +1855,8 @@ class _ScheduleMixin:
                    move_to=None,             # move_to(view): STARTS the motor move; None = no motor
                    heat_timeout_s: float = 8.0,
                    k="auto",
-                   trigger: str = "sim",     # "ext": on_ready(filament) per filament, see scan_view
-                   on_ready=None,
+                   trigger: str = "sim",     # "ext": on_armed(filament) per filament, see scan_view
+                   on_armed=None,
                    trigger_wait_s: float = 10.0) -> dict:
         """SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire many
         views in a row, VOLTAGE heating just in time. For each view:
@@ -1849,10 +1875,26 @@ class _ScheduleMixin:
         disarmed and its filaments go back to idle_ma. Ends at idle_ma.
 
             plan = ct.scan_plan()
-            r = ct.scan_views(plan["views"][:10], active_mv=5000, idle_ma=1200,
-                              num_pulses=5, width_us=20000, pulse_interval_ms=100,
-                              move_s=3.0, move_to=motor.start_move)
-            print(r)           # one line per view
+            plan = ct.scan_plan()            # the views; each {"view", "center", "filaments"}
+            views = plan["views"][:10]
+            mv = {f: 5000 for v in views for f in v["filaments"]}   # put each filament's own mV here
+
+            r = ct.scan_views(
+                views,                       # the views, in order
+                active_mv=mv,                # {filament: mV} for every filament of every view
+                idle_ma=1200,                # back to this after its pulses, mA
+                settle_ms=500,               # voltage held +-150 mV this long first, ms
+                num_pulses=5,                # pulses per filament
+                width_us=20000,              # pulse width, us
+                pulse_interval_ms=100,       # spacing of one filament's pulses, ms
+                move_s=3.0,                  # motor move time per view, s (None = 0)
+                move_to=motor.start_move,    # move_to(view): START the move, return (None = no motor)
+                heat_timeout_s=8.0,          # voltage reached within this, s
+                k="auto",                    # heat ahead: "auto" (learnt) or N filaments
+                trigger="ext",               # "sim" = library fires, "ext" = your hardware
+                on_armed=send_edges,         # "ext": on_armed(filament) -> send its edges
+                trigger_wait_s=10.0)         # "ext": edges counted within this, s
+            print(r)                         # one line per view
 
         Before the first view, filaments whose board gives no current reading
         are left out (with the reason). Returns {"ok", "error"?, "views_done",
@@ -1891,7 +1933,7 @@ class _ScheduleMixin:
                                    detector_center=v.get("center"), num_pulses=num_pulses,
                                    width_us=width_us, pulse_interval_ms=pulse_interval_ms,
                                    heat_timeout_s=heat_timeout_s, trigger=trigger,
-                                   on_ready=on_ready, trigger_wait_s=trigger_wait_s)
+                                   on_armed=on_armed, trigger_wait_s=trigger_wait_s)
                 n_p = sum(len(x.get("records") or []) for x in (r.get("rows") or []))
                 done_here |= {x["filament"] for x in (r.get("rows") or [])
                               if x.get("fired_s") is not None and "filament" in x}

@@ -21,7 +21,8 @@ from ct_simple_control import CTClient
 ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
 ap.add_argument("--host", default="localhost", help="the backend's IP")
 ap.add_argument("--views", type=int, default=10, help="how many views (96 = a rotation)")
-ap.add_argument("--mv", type=int, default=5000, help="heating voltage, mV")
+ap.add_argument("--mv", type=int, default=5000,
+                help="heating voltage, mV, written for every filament below -- put each one's own there")
 ap.add_argument("--move-s", type=float, default=3.0, help="motor move time per view, s")
 args = ap.parse_args()
 
@@ -37,13 +38,23 @@ def move_to(view):
 plan = ct.scan_plan()        # every view of a rotation, dead filaments left out
 print(f"{plan['n_views']} views; dead, left out: {plan['dead_left_out']}")
 
+views = plan["views"][:args.views]
+# EVERY filament its own voltage, mV. Here all the same; replace with yours.
+mv = {f: args.mv for v in views for f in v["filaments"]}
+
 with ct.lease(ttl=120, note="scan_views example"):
-    r = ct.scan_views(plan["views"][:args.views],
-                      active_mv=args.mv,         # or {filament: mV, ...}
-                      idle_ma=1200,              # IDLE current after each filament
-                      settle_ms=500,             # voltage held this long before firing
-                      num_pulses=5, width_us=20000, pulse_interval_ms=100,
-                      move_s=args.move_s, move_to=move_to)
+    r = ct.scan_views(views,
+                      active_mv=mv,              # {filament: mV} for every filament
+                      idle_ma=1200,              # back to this after its pulses, mA
+                      settle_ms=500,             # voltage held +-150 mV this long first, ms
+                      num_pulses=5,              # pulses per filament
+                      width_us=20000,            # pulse width, us
+                      pulse_interval_ms=100,     # spacing of one filament's pulses, ms
+                      move_s=args.move_s,        # motor move time per view, s
+                      move_to=move_to,           # starts the motor move (None = no motor)
+                      heat_timeout_s=8.0,        # voltage reached within this, s
+                      k="auto",                  # heat ahead: "auto" or N filaments
+                      trigger="sim")             # "ext": add on_armed=..., trigger_wait_s=...
 print(r)
 
 # What each filament did (arrival time, V/I at its pulses, failures), kept by

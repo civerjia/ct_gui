@@ -127,11 +127,11 @@ check("disarmed at the end", log[-1][0] in ("disarm", "settle") and any(e[0] == 
 
 # Not arriving stops the view and fires nothing on it; everything raised dropped.
 ct, log, st = make(never_arrives={5})
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200, heat_timeout_s=0.0, k=4)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200, heat_timeout_s=0.0, k=4)
 check("non-arrival stops the view", not r["ok"] and "filament 5" in r["error"] and r["fired"] == 0
       or (not r["ok"] and "filament" in r["error"]), r.get("error"))
 ct, log, st = make(never_arrives={5})
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200, k=4, heat_timeout_s=0.5)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200, k=4, heat_timeout_s=0.5)
 trig_after = [e for e in log if e[0] == "trigger"]
 check("filaments before 5 fired, 5 not", r["fired"] == 2 and len(trig_after) == 2, (r.get("error"), trig_after))
 check("everything still at VOLTAGE dropped by idle_one after disarm", not st["volt"], st["volt"])
@@ -150,7 +150,7 @@ check("old firmware with settle_ms: stopped before arming", not r["ok"] and not 
 # 0.6 + 0.3 s may be hot before the first trigger -> slots 0 and 1.
 ct, log, st = make()
 ct._scan_est = ct._ScanEstimate(arrive_s=0.6, cycle_s=0.5)
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200)
 first_trig = next(i for i, e in enumerate(log) if e[0] == "trigger")
 check("auto: just-in-time lead (2 raised before the first trigger)",
       [e[1] for e in log[:first_trig] if e[0] == "VOLT"] == V[:2], log[:first_trig])
@@ -162,7 +162,7 @@ check("gantt drawn, one line per filament", r["gantt"].count("\n") == len(V), r[
 ct, log, st = make()
 ct._scan_est = ct._ScanEstimate(arrive_s=0.2, cycle_s=0.5)
 t = time.monotonic()
-r = ct.scan_view(V[:2], active_mv=8000, idle_ma=1200, start_in_s=1.0)
+r = ct.scan_view(V[:2], active_mv={f: 8000 for f in V[:2]}, idle_ma=1200, start_in_s=1.0)
 check("start_in_s: first pulse not before the move ends", r["ok"] and r["start_s"] >= 1.0
       and r["rows"][0]["fired_s"] >= 1.0, r)
 check("start_in_s: heating started late in the move, not at once",
@@ -183,7 +183,7 @@ def state2(f, state, arg, op, extra=None):
         return {"ok": False, "error": "board did not ACK"}
     return real_state(f, state, arg, op, extra)
 ct.read_filament_current_cached, ct._state_one = cached2, state2
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200, k=4)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200, k=4)
 check("hiccups retried, view completes", r["ok"] and r["fired"] == 6, r.get("error"))
 
 # The trigger request errors but the burst DID start: it must not go out twice.
@@ -197,18 +197,18 @@ def post2(path, body, timeout=None):
         raise TimeoutError("reply lost")         # ...but the reply did not come back
     return real_post(path, body, timeout)
 ct._post = post2
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200, k=4)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200, k=4)
 check("lost trigger reply: not re-sent", r["ok"] and len([e for e in log if e[0] == "trigger"]) == 6,
       [e for e in log if e[0] == "trigger"])
 
 # --- per-filament table -----------------------------------------------------
 ct, log, st = make()
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200, settle_ms=500, k=4)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200, settle_ms=500, k=4)
 check("results recorded per filament (FID, mv, settle, arrival)",
       len(st["perf"]) == 6 and all(x["mv"] == 8000 and x["settle_ms"] == 500
                                    and x["arrive_s"] is not None for x in st["perf"]), st["perf"])
 ct, log, st = make(never_arrives={5})
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200, k=4, heat_timeout_s=0.3)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200, k=4, heat_timeout_s=0.3)
 check("a filament that did not arrive is recorded as a failure",
       any(x.get("error") and x["filament"] == int(ct._fid_of(5)) for x in st["perf"]), st["perf"])
 # Filament 6 is known to need 3 s at 8 V; the others 0.3 s: 6 is raised long
@@ -218,7 +218,7 @@ slow = [{"mv": 8000, "arrive_raw_s": 3.0}] * 3
 fast = [{"mv": 8000, "arrive_raw_s": 0.3}] * 3
 st["hist"] = {f: {"samples": slow if f == 6 else fast} for f in V}
 ct._scan_est = ct._ScanEstimate(arrive_s=0.3, cycle_s=0.5)
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200)
 first_trig = next(i for i, e in enumerate(log) if e[0] == "trigger")
 early = [e[1] for e in log[:first_trig] if e[0] == "VOLT"]
 check("auto + table: the slow filament 6 is raised before the first trigger, fast ones are not",
@@ -226,7 +226,7 @@ check("auto + table: the slow filament 6 is raised before the first trigger, fas
 ct, log, st = make()
 st["hist"] = {6: {"samples": [{"mv": 5000, "arrive_raw_s": 9.0}] * 3}}
 ct._scan_est = ct._ScanEstimate(arrive_s=0.3, cycle_s=0.5)
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200)
 first_trig = next(i for i, e in enumerate(log) if e[0] == "trigger")
 check("history at another voltage (5 V vs 8 V) is not used",
       6 not in [e[1] for e in log[:first_trig] if e[0] == "VOLT"])
@@ -285,7 +285,7 @@ ct, log, st = make()
 real_state = ct._state_one
 ct._state_one = lambda f, state, arg, op, extra=None: ({"ok": False, "error": "its board is not present"}
                                                       if (f == 6 and state == 6) else real_state(f, state, arg, op, extra))
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200, k=4)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200, k=4)
 check("VOLTAGE refused -> failed_filament set", not r["ok"] and r.get("failed_filament") == 6
       and "not present" in r["error"], (r.get("failed_filament"), r.get("error")))
 
@@ -304,7 +304,7 @@ r = ct.scan_views(plan["views"][1:], active_mv=5000, idle_ma=1200, move_s=None, 
 check("scan_views(move_s=None, move_to=None): runs, first pulse not delayed",
       r["ok"] and calls and calls[0][1] == 0.0, (r, calls))
 ct, log, st = make()
-r = ct.scan_view(V, active_mv=8000, idle_ma=1200, start_in_s=None)
+r = ct.scan_view(V, active_mv={f: 8000 for f in V}, idle_ma=1200, start_in_s=None)
 check("scan_view(start_in_s=None) = 0: no wait before the first filament", r.get("ok") and r.get("start_s", 1) < 0.5, (r.get("ok"), r.get("error"), r.get("start_s")))
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
