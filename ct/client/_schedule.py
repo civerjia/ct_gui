@@ -1287,41 +1287,10 @@ class _ScheduleMixin:
             return code, self._SHV_REJECT_NAMES.get(code, f"unknown reject code {code}")
         return None, (r.get("error") or "no reason given by the backend")
 
-    class _ScanStop(Exception):
-        """scan_view: stop the view here; the message is the result's error."""
-
-    class _ScanEstimate:
-        """k="auto"'s numbers, kept across views (one per client session).
-
-        arrive: raise -> "settled" (settle included) of filaments raised from
-        IDLE; cycle: one slot's own work -- trigger sent to the next filament's
-        turn, WITHOUT any wait for heating. Waiting is left out on purpose: put
-        it in and one slow arrival shortens the lead, which makes the next one
-        wait longer, which shortens it again.
-        Robust to a stray value: arrive uses the 90th percentile of the last
-        20, cycle the median of the last 20."""
-
-        def __init__(self, arrive_s: float, cycle_s: float):
-            import collections
-            self.arrive = collections.deque(maxlen=20)
-            self.cycle = collections.deque(maxlen=20)
-            self.arrive0, self.cycle0 = float(arrive_s), float(cycle_s)
-
-        @staticmethod
-        def _q(vals, q):
-            v = sorted(vals)
-            return v[min(len(v) - 1, int(q * len(v)))]
-
-        def arrive_s(self) -> float:
-            return self._q(self.arrive, 0.9) if len(self.arrive) >= 3 else self.arrive0
-
-        def cycle_s(self) -> float:
-            return self._q(self.cycle, 0.5) if len(self.cycle) >= 3 else self.cycle0
-
     def _scan_retry(self, fn, until_s: float = 10.0, ok=lambda r: bool(r and r.get("ok"))):
         """An IDEMPOTENT call, repeated until it succeeds or until_s runs out (a
         bridge that reconnects takes ~6 s). The last result, or a dict with the
-        exception. Never for the trigger -- see _scan_trigger."""
+        exception. Never for a trigger."""
         deadline = time.monotonic() + until_s
         last: dict = {}
         while True:
@@ -1334,39 +1303,6 @@ class _ScheduleMixin:
             if time.monotonic() >= deadline:
                 return last
             time.sleep(0.2)
-
-    def _scan_trigger(self, head: int, n: int, interval: int) -> str | None:
-        """Send one filament's n simulated triggers EXACTLY once. None = sent,
-        else why not. A request that failed is re-sent only when the head's
-        count and the sim state both say the first one never started."""
-        st = self._scan_retry(lambda: self.shv_status(head),
-                              ok=lambda r: r.get("totalPulsesDone") is not None)
-        base = st.get("totalPulsesDone")
-        if base is None:
-            return f"cannot read controller {head}'s trigger count"
-        free_by = time.monotonic() + 3.0
-        # The backend's previous burst thread outlives the RP2350's count of its
-        # edges, and a start while it runs is refused (first rig scan,
-        # 2026-10-26: "simulation already running" on the 3rd filament).
-        while (self.simulate_sync_status() or {}).get("running") and time.monotonic() < free_by:
-            time.sleep(0.02)
-        why = None
-        for _ in range(3):
-            try:
-                r = self._post("/api/sync/simulate", {"count": int(n), "interval_ms": float(interval),
-                                                      "controller": int(head)}, timeout=10.0)
-                if r.get("ok"):
-                    return None
-                why = r.get("error") or str(r)
-            except Exception as exc:
-                why = f"{type(exc).__name__}: {exc}"
-            time.sleep(0.3)
-            # Did it start after all? Then it must not go out twice.
-            sim = self.simulate_sync_status() or {}
-            now = (self.shv_status(head) or {}).get("totalPulsesDone")
-            if sim.get("running") or (now is not None and int(now) > int(base)):
-                return None
-        return f"simulated trigger failed 3 times: {why}"
 
     def filament_perf(self, filaments=None) -> dict:
         """The backend's per-filament performance table (what scan_view
@@ -1387,413 +1323,177 @@ class _ScheduleMixin:
         return self._post("/api/filament-perf", {"clear": which})
 
     def scan_view(self,
-                  filaments,                   # the filament numbers to fire, IN THIS ORDER
-                  active_mv: dict,             # {filament: mV} -- EVERY filament its own voltage
-                  idle_ma: float,              # each filament back to this current after its pulses
-                  num_pulses: int = 1,         # pulses per filament
-                  width_us: int = 1000,        # pulse width
-                  pulse_interval_ms: int = 100,   # spacing of one filament's pulses
-                  settle_ms: int = 0,          # voltage held +-150 mV this long before it fires
-                  k="auto",                    # how many filaments ahead to heat: "auto" or N
-                  k_max: int = 6,              # never more than this many hot at once
-                  trigger: str = "sim",        # "sim": the library fires; "ext": your hardware
-                  on_armed=None,               # "ext": on_armed(filament) = send its edges NOW
-                  trigger_wait_s: float = 10.0,   # "ext": its edges must arrive within this
-                  heat_timeout_s: float = 8.0,    # longest wait for one filament's voltage
-                  start_in_s: float = 0.0,     # first pulse no sooner than this; None = 0
-                  detector_center=None,        # GUI drawing only; None = the middle filament
-                  lead_margin_s: float = 0.3,  # k="auto": heat this much earlier still
-                  max_on_ms: int = 40) -> dict:
-        """Fire a list of filaments one after another, then stop. Every
-        filament ends at IDLE.
+                  filaments,                       # filament numbers, fired in THIS order
+                  active_mv: dict,                 # {filament: mV} -- every filament its own
+                  idle_ma: float,                  # each back to this after its pulses (mA)
+                  k: int = 2,                      # pre-heat the next k filaments
+                  on_error: str = "stop",          # "stop" the list, or "skip" the filament
+                  on_armed=None,                   # on_armed(filament): fire_single_pulse's
+                                                   # on_armed, told which filament
+                  # -- the rest is fire_single_pulse(), per filament, same meaning --
+                  num_pulses: int = 1,
+                  width_us: int = 1000,
+                  pulse_interval_ms: int | None = None,
+                  trigger_timeout_ms: int | None = None,
+                  max_on_ms: int = 40,
+                  total_ms: int = 15000,
+                  trigger: str = "sim",
+                  shot_wait_timeout_s: float = 15.0,
+                  verify: bool = True,
+                  reuse: bool = False,
+                  measure: bool = False,
+                  rate_hz: int = 1000000,
+                  bg_gap_us: float | None = None,
+                  bg_window_us: float | None = None,
+                  heat_timeout_s: float = 5.0,
+                  settle_ms: int | None = None) -> dict:
+        """fire_single_pulse(), filament after filament, with the next k
+        filaments heated ahead so each is already hot when its turn comes.
+        Every filament ends at IDLE.
 
-            def send_edges(filament):        # trigger="ext": called when `filament`
-                detector.trigger()           # is hot and armed -- send its edges now
+        Each filament is ONE fire_single_pulse(f, active_mv=active_mv[f],
+        idle_ma=idle_ma, ...) call with the arguments below, unchanged: same
+        heating arrival + settle_ms hold, same trigger handling ("sim" /
+        "ext" with on_armed), same measure / mAms, same 165 / HV-stuck checks,
+        same timeouts. See fire_single_pulse for each of them.
+
+            def send_trigger(filament):          # trigger="ext": this filament is
+                angle_trigger.fire()             # armed and hot -- send its edges
 
             r = ct.scan_view(
-                [23, 24, 25],                # filaments, fired in this order
-                active_mv={23: 5000, 24: 5200, 25: 4900},  # each one's voltage, mV
-                idle_ma=1200,                # back to this after its pulses, mA
-                num_pulses=5,                # pulses per filament
-                width_us=20000,              # pulse width, us
-                pulse_interval_ms=100,       # spacing of one filament's pulses, ms
-                settle_ms=500,               # voltage held +-150 mV this long first, ms
-                k="auto",                    # heat ahead: "auto" (learnt) or N filaments
-                k_max=6,                     # at most this many hot at once
-                trigger="ext",               # "sim" = library fires, "ext" = your hardware
-                on_armed=send_edges,         # "ext" only
-                trigger_wait_s=10.0,         # "ext": edges counted within this, s
-                heat_timeout_s=8.0,          # voltage reached within this, s
-                start_in_s=0,                # first pulse no sooner, s (0 = at once)
-                detector_center=None,        # GUI drawing only
-                lead_margin_s=0.3,           # k="auto": heat this much earlier, s
-                max_on_ms=40)                # firmware cap on one pulse, ms
+                [23, 24, 25],                    # fired in this order
+                active_mv={23: 7688, 24: 7698, 25: 8228},   # each one's voltage, mV
+                idle_ma=1100,                    # back to this after its pulses, mA
+                k=2,                             # pre-heat the next 2 filaments
+                on_error="stop",                 # "stop" | "skip" a failed filament
+                on_armed=send_trigger,           # trigger="ext": on_armed(filament)
+                num_pulses=20,                   # pulses per filament
+                width_us=15000,                  # pulse width, us
+                pulse_interval_ms=None,          # "sim": spacing, ms (None = default)
+                trigger_timeout_ms=30,           # longest wait for the next trigger, ms
+                max_on_ms=66,                    # firmware cap on one pulse, ms
+                total_ms=12000,                  # firmware timeout of one filament's run, ms
+                trigger="ext",                   # "sim" | "ext"
+                shot_wait_timeout_s=9.0,         # wait from armed for its run to finish, s
+                verify=True,                     # read the schedule back before arming
+                reuse=False,                     # never skip the download
+                measure=True,                    # STM32 measures each pulse (mA, mAms)
+                rate_hz=1000000,                 # STM32 ADC rate
+                bg_gap_us=100.0,                 # background: gap after the pulse, us
+                bg_window_us=50.0,               # background: averaging window, us
+                heat_timeout_s=6.0,              # its voltage must arrive within this, s
+                settle_ms=1000)                  # ...and hold +-150 mV this long, ms
             print(r)
 
-        For each filament, in the order given: heat it to its active_mv, wait
-        until its voltage holds (+-150 mV for settle_ms), fire num_pulses
-        pulses, put it back to idle_ma.
+        k: before each filament fires, the next k in the list are raised to
+        their voltage (timed: the backend drops one back to idle_ma if this
+        script dies). A pre-heated filament is not at IDLE when its own
+        fire_single_pulse comes, so the backend allows VOLTAGE -> VOLTAGE (a
+        filament already hot). k=0 = no pre-heating: each heats in its own
+        fire_single_pulse, as a plain loop would.
 
-        active_mv   {filament: mV}, one entry for EVERY filament in the list.
-                    A single number is refused.
-        k           while one filament fires, the next ones are already
-                    heating. k = how far ahead:
-                      "auto": each filament starts heating when its turn is
-                              its own measured heating time (+ lead_margin_s)
-                              away -- learnt per filament, see filament_perf();
-                      N:      always the next N filaments are heating.
-                    Never more than k_max hot at once.
-        trigger     "sim": the library sends the trigger edges itself.
-                    "ext": your hardware sends them. on_armed(filament) is
-                    called when that filament is hot and armed; send its
-                    num_pulses edges then (one pulse per edge). Not all counted
-                    within trigger_wait_s -> stopped.
+        on_error: a filament whose fire_single_pulse is not ok -- "stop": the
+        rest is not fired; "skip": go on with the next. Either way every
+        filament still hot goes back to idle_ma.
 
-        Before: every filament in the list at IDLE. HV is not touched.
+        Before: every filament at IDLE. HV is not touched.
 
-        Any failure (a filament not reaching its voltage within
-        heat_timeout_s + settle_ms, an SHV fault, edges not counted within
-        trigger_wait_s, on_armed raising)
-        STOPS it: disarmed, every filament back to idle_ma, the reason in
-        "error", the filament in "failed_filament". Ctrl-C does the same.
-
-        Returns {"ok", "error"?, "failed_filament"?, "rows": one per filament
-        {filament, mv, fired_s, heated_s (time hot), waited_s (hot, only
-        waiting), heat_mV, heat_mA, records (its pulses)}, "elapsed_s",
-        "gantt" (text timeline: '.' heating, '=' ready and waiting,
-        '#' pulses)}. Times are seconds from the call.
-
-        start_in_s: only if you start this while something else still has to
-        happen first (e.g. a motor still moving): the first pulse comes no
-        sooner, and the heating overlaps the wait.
+        Returns {"ok" (every filament fired ok), "error"?, "fired" (how many
+        ok), "failed": [filaments not ok], "results": [{"filament", **its
+        fire_single_pulse result}, ...] in firing order, "skipped": [never
+        fired, after a stop], "idle_errors"?: {filament: why it could not be
+        put back to IDLE}, "elapsed_s"}.
         """
         t0 = time.monotonic()
         fils = [int(f) for f in filaments]
-        if start_in_s is None:            # None = no motor move to wait for
-            start_in_s = 0.0
-        trigger = str(trigger or "sim").lower()
-        if trigger not in ("sim", "ext"):
-            return {"ok": False, "error": f"trigger must be 'sim' or 'ext', got {trigger!r}",
-                    "rows": [], "elapsed_s": 0.0}
-        if trigger == "ext" and not callable(on_armed):
-            return {"ok": False, "error": "trigger='ext' needs on_armed=your_function(filament): "
-                                          "it is called when that filament is ready for its edges",
-                    "rows": [], "elapsed_s": 0.0}
+        out: dict = {"ok": False, "fired": 0, "failed": [], "results": [], "skipped": []}
 
-        def fail(msg, **kw):
-            return {"ok": False, "error": msg, "rows": [], **kw}
+        def done(err=None):
+            if err:
+                out["error"] = err
+            out["elapsed_s"] = round(time.monotonic() - t0, 2)
+            return out
 
         if not fils:
-            return fail("no filaments")
+            return done("no filaments")
         if len(set(fils)) != len(fils):
-            return fail(f"a filament is listed twice: {fils}")
-        dead = [f for f in fils if self._is_dead(f)]
-        if dead:
-            return fail(f"dead filament(s) {dead} in the view")
+            return done(f"a filament is listed twice: {fils}")
+        if on_error not in ("stop", "skip"):
+            return done(f"on_error must be 'stop' or 'skip', got {on_error!r}")
         if not isinstance(active_mv, dict):
-            return fail(f"active_mv must be {{filament: mV}} with every filament's own voltage, "
+            return done(f"active_mv must be {{filament: mV}} with every filament's own voltage, "
                         f"got {active_mv!r}")
+        # Through the remote proxy a dict's int keys arrive as strings.
+        missing = [f for f in fils if f not in active_mv and str(f) not in active_mv]
+        if missing:
+            return done(f"active_mv has no voltage for filament(s) {missing}")
+        mv = {f: float(active_mv[f] if f in active_mv else active_mv[str(f)]) for f in fils}
         try:
-            # Through the remote proxy a dict's int keys arrive as strings.
-            mv = {f: int(active_mv[f] if f in active_mv else active_mv[str(f)]) for f in fils}
-        except (KeyError, TypeError, ValueError) as exc:
-            missing = [f for f in fils if f not in active_mv and str(f) not in active_mv]
-            return fail(f"active_mv has no voltage for filament(s) {missing}" if missing else
-                        f"active_mv: bad voltage ({exc!r})")
-        center = fils[len(fils) // 2] if detector_center is None else int(detector_center)
-        auto = k == "auto"
-        try:
-            kk = None if auto else max(1, int(k))
+            k = int(k)
         except (TypeError, ValueError):
-            return fail(f"k must be 'auto' or a number, got {k!r}")
-        k_max = max(1, int(k_max))
-        n, interval, settle = int(num_pulses), int(pulse_interval_ms), int(settle_ms or 0)
-        err = (self._range_error("num_pulses", n, self._U8_MAX)
-               or self._range_error("width_us", int(width_us), self._U16_MAX)
-               or self._range_error("max_on_ms", int(max_on_ms), self._U16_MAX))
-        if not err and not 0 <= settle <= 60000:
-            err = f"settle_ms={settle} out of range 0..60000"
-        if not err and interval < self._SIM_MIN_INTERVAL_MS:
-            err = f"pulse_interval_ms={interval}: must be >= {self._SIM_MIN_INTERVAL_MS} ms"
-        if not err and interval * 1000 <= int(width_us):
-            err = f"pulse_interval_ms={interval} is not longer than width_us={width_us}"
-        if not err and not 0 <= float(start_in_s) <= 600:
-            err = f"start_in_s={start_in_s} out of range 0..600"
-        if err:
-            return fail(err)
-        sites = {f: self.filament_to_board(f) for f in fils}
-        nosite = [f for f, s in sites.items() if not s]
-        if nosite:
-            return fail(f"filament(s) {nosite} have no board")
-        ctrls = sorted({int(s["controller"]) for s in sites.values()})
-        armed = set(ctrls)
-        for c in ctrls:
-            comp = self._envelope_companion(c)
-            if comp:
-                armed.add(comp)
-        master = (self.status() or {}).get("master")
-        head = int(master) if master is not None and int(master) in armed else ctrls[0]
-        armed = sorted(armed)
+            return done(f"k must be a number of filaments (0 = no pre-heating), got {k!r}")
+        if k < 0:
+            return done(f"k must be >= 0, got {k}")
+        if trigger == "ext" and not callable(on_armed):
+            return done("trigger='ext' needs on_armed=your_function(filament): it is called "
+                        "when that filament is armed and hot -- send its trigger then")
 
-        burst_s = n * interval / 1000.0
-        # Each filament's own arrival history at about this voltage (backend
-        # table); the session-wide estimate only for one with too little.
-        try:
-            hist = (self.filament_perf() or {}).get("filaments") or {}
-        except Exception:
-            hist = {}
-        est = getattr(self, "_scan_est", None)
-        if est is None:
-            est = self._scan_est = self._ScanEstimate(arrive_s=2.5 + settle / 1000.0,
-                                                      cycle_s=burst_s + 0.4)
-        wait_s = float(heat_timeout_s) + settle / 1000.0
-        # The firmware's trigger watchdog spans the start delay, the wait for
-        # heating and our retries (10 s) -- it must never fire first.
-        tmo_ms = int((wait_s + 15.0) * 1000) + n * interval
-        total_ms = min(self._U32_MAX, int(float(start_in_s) * 1000) + len(fils) * tmo_ms + 10000)
-        plan = {"config": {"interPulseMs": tmo_ms, "maxOnMs": int(max_on_ms),
-                           "totalMs": total_ms, "triggerEdge": 0},
-                "emission": [{"filament": f, "numPulses": n, "widthUs": int(width_us)}
-                             for f in fils],
-                "heating": []}
-        rows = {f: {"filament": f, "site": self._mosfet_site(f).strip(" ()"), "mv": mv[f],
-                    "raise_s": None, "settled_s": None, "fired_s": None, "arrival": None}
-                for f in fils}
-        raised: set = set()
-        settle_set = False
-        push_on = False
-        out: dict = {"ok": False}
-        since = lambda: round(time.monotonic() - t0, 3)  # noqa: E731
-        start_at = t0 + float(start_in_s)
+        # A pre-heated filament waits up to k turns for its own; each turn is at
+        # most its heating, settle and shot wait. The timed VOLTAGE must outlast
+        # that, or the backend drops it to IDLE before its turn.
+        turn_s = float(heat_timeout_s) + (settle_ms or 0) / 1000.0 + float(shot_wait_timeout_s) + 10.0
+        hold_s = min(3600.0, (k + 1) * turn_s)
+        hot: set = set()
 
-        def raise_(f):
-            r = self._scan_retry(lambda: self._state_one(
-                f, VOLTAGE, mv[f], "scan_view",
-                extra={"active_s": wait_s + float(start_in_s) + len(fils) * 2.0 + 30.0,
-                       "then_idle_ma": int(idle_ma), "in_run": True}))
-            if not r.get("ok"):
-                # This filament's own problem (board absent, not warm, dead...):
-                # named, so scan_views leaves it out and fires the rest.
-                out["failed_filament"] = f
-                out["failed_why"] = f"VOLTAGE {mv[f]} mV refused: {r.get('error')}"
-                raise self._ScanStop(f"filament {f}: {out['failed_why']}")
-            raised.add(f)
-            rows[f]["raise_s"] = since()
-
-        _pools: dict = {}
-
-        def pool_near(m):
-            if m in _pools:
-                return _pools[m]
-            _pools[m] = sorted(x["arrive_raw_s"] for e in hist.values() for x in (e.get("samples") or [])
-                          if x.get("arrive_raw_s") is not None and x.get("mv") is not None
-                          and abs(int(x["mv"]) - int(m)) <= 300)
-            return _pools[m]
-
-        def arrive_for(f):
-            near = sorted(x["arrive_raw_s"] for x in ((hist.get(f) or {}).get("samples") or [])
-                          if x.get("arrive_raw_s") is not None and x.get("mv") is not None
-                          and abs(int(x["mv"]) - mv[f]) <= 300)
-            if len(near) >= 2:
-                # 75th percentile: with a handful of samples a 90th IS the
-                # maximum, and one long read (2026-10-26) pulled every raise early.
-                return near[min(len(near) - 1, int(0.75 * len(near)))] + settle / 1000.0
-            # No history of its own: the MEDIAN of every filament's arrivals at
-            # about this voltage (user, 2026-10-26). The session's p90 was pulled
-            # up by a few slow filaments and raised all the unknown ones early.
-            if len(pool_near(mv[f])) >= 3:
-                pool = pool_near(mv[f])
-                return pool[len(pool) // 2] + settle / 1000.0
-            return est.arrive_s()
-
-        def due(j, turn_at):
-            """Raise every filament whose turn is close enough. turn_at = when
-            filament j (the next to fire) is expected to fire."""
-            for s in range(j, len(fils)):
-                f = fils[s]
-                if f in raised or rows[f]["raise_s"] is not None:
+        def preheat(upto: int):
+            for g in fils[upto:upto + k]:
+                if g in hot or g in out["failed"]:
                     continue
-                if len(raised) >= k_max:
-                    return
-                if auto:
-                    fire_at = max(turn_at, time.monotonic()) + (s - j) * est.cycle_s()
-                    if fire_at - time.monotonic() > arrive_for(f) + float(lead_margin_s):
-                        continue          # not yet; a faster-arriving one further on may be
-                elif s - j >= kk:
-                    return
-                raise_(f)
-
-        def watch_settled(extra=()):
-            got = self._scan_retry(lambda: self.read_filament_current_cached(sorted(raised | set(extra))),
-                                   until_s=2.0, ok=lambda r: bool(r)) if (raised or extra) else {}
-            got = {int(g): v for g, v in (got or {}).items() if str(g).lstrip("-").isdigit()}
-            for g in raised:
-                if (got.get(g) or {}).get("arrival") == "settled" and rows[g]["settled_s"] is None:
-                    rows[g]["settled_s"] = since()
-                    est.arrive.append(rows[g]["settled_s"] - rows[g]["raise_s"])
-            return got
+                r = self._scan_retry(lambda g=g: self.voltage_one(g, mv[g], active_s=hold_s,
+                                                                  then_idle_ma=idle_ma))
+                if r.get("ok"):
+                    hot.add(g)
+                else:
+                    # Not fatal here: its own fire_single_pulse heats it (or
+                    # reports why it cannot) when its turn comes.
+                    out.setdefault("preheat_errors", {})[g] = r.get("error") or str(r)
 
         try:
-            self._disarm_all(armed)
-            dl = self._scan_retry(lambda: self.download(plan))
-            if not dl.get("ok"):
-                raise self._ScanStop(f"download failed: {dl.get('error', dl)}")
-            v = self._verify_retrying_timeouts(plan)
-            if not v.get("ok"):
-                raise self._ScanStop(f"schedule verify mismatch after download: {v}")
-            if settle:
-                r = self._scan_retry(lambda: self.set_arrival_settle(settle))
-                if not r.get("ok"):
-                    raise self._ScanStop(f"settle_ms={settle}: {r.get('error')}")
-                settle_set = True
-            arm = self._post("/api/arm", {"repeats": 1, "controllers": armed})
-            per = arm.get("results") or {}
-            bad = {c: per.get(str(c), arm) for c in armed if not per.get(str(c), arm).get("ok")}
-            if bad:
-                raise self._ScanStop(f"arm failed: { {c: self._arm_failure(r)[1] for c, r in bad.items()} }")
-            # 20 fps live view for the WHOLE view (the GUI), not only per burst.
-            push_on = bool((self._post("/api/live-push", {
-                "on": True, "view": {"center": int(self._fid_of(center)),
-                                     "filaments": [int(self._fid_of(f)) for f in fils]}}) or {}).get("ok"))
-            # The move: nothing fires before start_at; the first filaments are
-            # raised so that they arrive about then.
-            while time.monotonic() < start_at:
-                due(0, start_at)
-                watch_settled()
-                time.sleep(0.05)
-            out["start_s"] = since()
-            done = 0
             for i, f in enumerate(fils):
-                due(i, time.monotonic())
-                if f not in raised:
-                    raise_(f)             # k_max reached and it is its turn: it goes now
-                deadline = t0 + rows[f]["raise_s"] + wait_s
-                d: dict = {}
-                while True:
-                    got = watch_settled((f,))
-                    d = got.get(f) or {}
-                    arrival = d.get("arrival")
-                    if arrival in ("settled", "capped") or d.get("cc_mode") in (2, 3) \
-                            or time.monotonic() >= deadline:
-                        break
-                    due(i, time.monotonic())
-                    time.sleep(0.05)
-                rows[f]["arrival"] = arrival
-                if arrival != "settled":
-                    why = ("output faulted" if d.get("cc_mode") in (2, 3) else
-                           "capped: the load is short of the voltage at the output's limit"
-                           if arrival == "capped" else
-                           f"not settled within {wait_s:g} s (arrival {arrival!r})")
-                    out["failed_filament"], out["failed_why"] = f, why
-                    raise self._ScanStop(f"filament {f} ({rows[f]['site']}) at {mv[f]} mV: "
-                                         f"{why} -- view stopped, nothing fired on it")
-                if rows[f]["settled_s"] is None:
-                    rows[f]["settled_s"] = since()
-                t_trig = time.monotonic()
-                rows[f]["trigger_s"] = since()
-                if push_on:
-                    self._post("/api/live-push", {"firing": [int(self._fid_of(f))]})
-                if trigger == "ext":
-                    try:
-                        on_armed(f)
-                    except Exception as exc:
-                        raise self._ScanStop(f"filament {f}: on_armed raised "
-                                             f"{type(exc).__name__}: {exc} -- view stopped")
-                    wait_edges_s = float(trigger_wait_s)
-                else:
-                    why = self._scan_trigger(head, n, interval)
-                    if why:
-                        raise self._ScanStop(f"filament {f}: {why}")
-                    wait_edges_s = 10.0
-                done += n
-                fire_deadline = time.monotonic() + burst_s + wait_edges_s
-                while True:
-                    # The others keep heating while this one fires: catch the
-                    # moment each settles HERE too. Missed until the next turn,
-                    # an arrival read 1-1.5 s long (first per-view rig run,
-                    # 2026-10-26), the estimate grew, and filaments were raised
-                    # ever earlier to wait ever longer.
-                    watch_settled()
-                    st = self._scan_retry(lambda: self.shv_status(head), until_s=2.0,
-                                          ok=lambda r: r.get("state") is not None)
-                    if st.get("state") == SHV_FAULT:
-                        raise self._ScanStop(
-                            f"SHV fault on controller {head} at filament {f}: reason "
-                            f"{self._SHV_STOP_REASON_NAMES.get(st.get('stopReason'), st.get('stopReason'))}")
-                    if int(st.get("totalPulsesDone") or 0) >= done:
-                        break
-                    if time.monotonic() >= fire_deadline:
-                        raise self._ScanStop(f"filament {f}: controller {head} counted "
-                                             f"{st.get('totalPulsesDone')} of {done} triggers"
-                                             + (f" -- the external edges did not all arrive within "
-                                                f"{trigger_wait_s:g} s of on_armed" if trigger == "ext" else ""))
-                    time.sleep(0.05)
-                rows[f]["fired_s"] = since()
-                if push_on:
-                    self._post("/api/live-push", {"firing": []})
-                rows[f]["heated_s"] = round(rows[f]["fired_s"] - rows[f]["raise_s"], 3)
-                # Settled -> its trigger: the time it was hot only waiting. Not
-                # to fired_s, which also holds its own burst and the count check.
-                rows[f]["waited_s"] = round(rows[f]["trigger_s"] - rows[f]["settled_s"], 3)
-                r = self._scan_retry(lambda: self._state_one(f, IDLE, int(idle_ma), "scan_view",
-                                                             extra={"in_run": True}))
+                preheat(i + 1)
+                cb = None
+                if callable(on_armed):
+                    cb = (lambda f=f: on_armed(f))
+                r = self.fire_single_pulse(
+                    f, num_pulses=num_pulses, width_us=width_us,
+                    pulse_interval_ms=pulse_interval_ms, trigger_timeout_ms=trigger_timeout_ms,
+                    max_on_ms=max_on_ms, total_ms=total_ms, trigger=trigger,
+                    shot_wait_timeout_s=shot_wait_timeout_s, verify=verify, reuse=reuse,
+                    measure=measure, rate_hz=rate_hz, bg_gap_us=bg_gap_us,
+                    bg_window_us=bg_window_us, on_armed=cb, active_mv=mv[f], idle_ma=idle_ma,
+                    heat_timeout_s=heat_timeout_s, settle_ms=settle_ms)
+                r = dict(r) if isinstance(r, dict) else {"ok": False, "error": repr(r)}
+                hot.discard(f)            # fire_single_pulse always drops it to idle_ma
+                out["results"].append({"filament": f, **r})
                 if r.get("ok"):
-                    raised.discard(f)
-                if i + 1 < len(fils):
-                    est.cycle.append(time.monotonic() - t_trig)
-            out["ok"] = True
-        except self._ScanStop as exc:
-            out["error"] = str(exc)
+                    out["fired"] += 1
+                    continue
+                out["failed"].append(f)
+                if on_error == "stop":
+                    out["skipped"] = fils[i + 1:]
+                    out["error"] = (f"filament {f}: {r.get('error') or 'not ok'} -- stopped, "
+                                    f"{len(fils) - i - 1} not fired")
+                    break
+            out["ok"] = not out["failed"]
+            if out["failed"] and "error" not in out:
+                out["error"] = f"{len(out['failed'])} filament(s) not ok: {out['failed']}"
         finally:
-            self._disarm_all(armed)
-            if push_on:
-                try:
-                    self._post("/api/live-push", {"on": False})
-                except Exception:
-                    pass
-            for f in sorted(raised):
-                r = self._scan_retry(lambda f=f: self.idle_one(f, idle_ma))
+            # Whatever happened (a stop, an exception, Ctrl-C): nothing stays hot.
+            for g in sorted(hot):
+                r = self._scan_retry(lambda g=g: self.idle_one(g, idle_ma))
                 if not r.get("ok"):
-                    out.setdefault("idle_errors", {})[f] = r.get("error")
-            if settle_set:
-                self._scan_retry(lambda: self.set_arrival_settle(0))
-        # The heating at each pulse, from the filament's OWN controller's log
-        # (the master also logs the entries it only framed).
-        for c in ctrls:
-            for rec in self.shv_pulse_log(c):
-                f = rec.get("filament")
-                if f in rows and int(sites[f]["controller"]) == c:
-                    rows[f].setdefault("records", []).append(rec)
-        fired = [rows[f] for f in fils if rows[f]["fired_s"] is not None]
-        for r in fired:
-            rec = (r.get("records") or [{}])[0]
-            r["heat_mV"], r["heat_mA"] = rec.get("heat_bus_mV"), rec.get("heat_meas_mA")
-        recs = [{"filament": int(self._fid_of(r["filament"])), "mv": r["mv"], "settle_ms": settle,
-                 "arrive_s": (None if r["settled_s"] is None
-                              else round(r["settled_s"] - r["raise_s"], 3)),
-                 "heat_mV": r.get("heat_mV"), "heat_mA": r.get("heat_mA"),
-                 "waited_s": r.get("waited_s")} for r in fired]
-        if out.get("failed_filament") is not None:
-            ff = out["failed_filament"]
-            recs.append({"filament": int(self._fid_of(ff)), "mv": mv[ff], "settle_ms": settle,
-                         "error": out.get("failed_why")})
-        if recs:
-            try:
-                pr = self._post("/api/filament-perf", {"records": recs})
-                if not pr.get("ok"):
-                    out["perf_error"] = pr.get("error")
-            except Exception as exc:
-                out["perf_error"] = str(exc)
-        mean = lambda key: (round(sum(r[key] for r in fired) / len(fired), 3)  # noqa: E731
-                            if fired else None)
-        out.update(rows=[rows[f] for f in fils], fired=len(fired), elapsed_s=since(),
-                   heated_mean_s=mean("heated_s"), waited_mean_s=mean("waited_s"),
-                   per_filament_s=(round((since() - out["start_s"]) / len(fired), 2)
-                                   if fired and out.get("start_s") is not None else None),
-                   settle_ms=settle, k=k, detector_center=center, estimate={"arrive_s": round(est.arrive_s(), 3),
-                                                     "cycle_s": round(est.cycle_s(), 3)},
-                   gantt=self._scan_gantt([rows[f] for f in fils], out.get("start_s")))
-        return out
+                    out.setdefault("idle_errors", {})[g] = r.get("error") or str(r)
+        return done()
 
     def scan_plan(self, mode: str = "stationary", **geometry) -> dict:
         """The list of VIEWS (angles) of one CT rotation. Fires nothing: it only
@@ -1844,149 +1544,80 @@ class _ScheduleMixin:
                 "truncated": sched.get("truncated"), "views": views}
 
     def scan_views(self,
-                   views,                    # scan_plan()["views"] (or a slice of it)
-                   active_mv,                # {filament: mV}, every filament of every view
-                   idle_ma: float,           # back to this after each filament's pulses
-                   settle_ms: int = 500,     # hold the voltage this long before firing
-                   num_pulses: int = 1,      # pulses per filament
-                   width_us: int = 1000,
-                   pulse_interval_ms: int = 100,
-                   move_s: float = 3.0,      # how long the motor takes to reach a view; None = 0
-                   move_to=None,             # move_to(view): STARTS the motor move; None = no motor
-                   heat_timeout_s: float = 8.0,
-                   k="auto",
-                   trigger: str = "sim",     # "ext": on_armed(filament) per filament, see scan_view
+                   views,                           # scan_plan()["views"], or [{"filaments": [...]}, ...]
+                   active_mv: dict,                 # {filament: mV}, every filament of every view
+                   idle_ma: float,                  # each back to this after its pulses (mA)
+                   move_to=None,                    # move_to(view): your motor, before each view
+                   move_s: float | None = 0.0,      # then wait this long before firing it (s)
+                   k: int = 2,
+                   on_error: str = "stop",
                    on_armed=None,
-                   trigger_wait_s: float = 10.0) -> dict:
-        """SOFTWARE SCAN PATCH (2026-10-26, until the new boards): fire many
-        views in a row, VOLTAGE heating just in time. For each view:
+                   num_pulses: int = 1,
+                   width_us: int = 1000,
+                   pulse_interval_ms: int | None = None,
+                   trigger_timeout_ms: int | None = None,
+                   max_on_ms: int = 40,
+                   total_ms: int = 15000,
+                   trigger: str = "sim",
+                   shot_wait_timeout_s: float = 15.0,
+                   verify: bool = True,
+                   reuse: bool = False,
+                   measure: bool = False,
+                   rate_hz: int = 1000000,
+                   bg_gap_us: float | None = None,
+                   bg_window_us: float | None = None,
+                   heat_timeout_s: float = 5.0,
+                   settle_ms: int | None = None) -> dict:
+        """scan_view() for several views in a row. Per view: move_to(view) if
+        given, wait move_s, then scan_view(view["filaments"], ...) with every
+        other argument unchanged (see scan_view and fire_single_pulse).
 
-          1. move_to(view) is called (if given) -- it should START the motor
-             and return; the view's first pulse comes move_s later, and the
-             first filaments are heated during the move so they are ready then;
-          2. scan_view() fires the view (see it for the heating rules);
-          3. a filament that does not reach its voltage (or is refused it: board
-             absent, not warm) is left out of the rest
-             of the run, and the view's filaments NOT YET FIRED are fired once
-             more without it; any other failure STOPS the run (nothing is
-             heated for nothing).
+        on_error="stop": a view with a failed filament ends the run.
+        on_error="skip": a failed filament is skipped and left out of every
+        later view; the run goes on.
 
-        Ctrl-C, or the script dying, stops it safely: the current view is
-        disarmed and its filaments go back to idle_ma. Ends at idle_ma.
-
-            plan = ct.scan_plan()
-            plan = ct.scan_plan()            # the views; each {"view", "center", "filaments"}
-            views = plan["views"][:10]
-            mv = {f: 5000 for v in views for f in v["filaments"]}   # put each filament's own mV here
-
-            r = ct.scan_views(
-                views,                       # the views, in order
-                active_mv=mv,                # {filament: mV} for every filament of every view
-                idle_ma=1200,                # back to this after its pulses, mA
-                settle_ms=500,               # voltage held +-150 mV this long first, ms
-                num_pulses=5,                # pulses per filament
-                width_us=20000,              # pulse width, us
-                pulse_interval_ms=100,       # spacing of one filament's pulses, ms
-                move_s=3.0,                  # motor move time per view, s (None = 0)
-                move_to=motor.start_move,    # move_to(view): START the move, return (None = no motor)
-                heat_timeout_s=8.0,          # voltage reached within this, s
-                k="auto",                    # heat ahead: "auto" (learnt) or N filaments
-                trigger="ext",               # "sim" = library fires, "ext" = your hardware
-                on_armed=send_edges,         # "ext": on_armed(filament) -> send its edges
-                trigger_wait_s=10.0)         # "ext": edges counted within this, s
-            print(r)                         # one line per view
-
-        Before the first view, filaments whose board gives no current reading
-        are left out (with the reason). Returns {"ok", "error"?, "views_done",
-        "views_total", "left_out", "left_out_why", "pulses", "elapsed_s", "per_view": [{view, center, ok, fired, n,
-        pulses, s, hot_s, waited_s, error?}]}. Each pulse's heating V/I is in
-        filament_perf() (and in scan_view()'s own result, view by view).
+        Returns {"ok", "error"?, "views_done", "views_total", "left_out"
+        (filaments that failed, left out after), "per_view": [{"view",
+        "center", "ok", "fired", "failed", "error"?, "elapsed_s"}],
+        "results": [each view's scan_view result], "elapsed_s"}.
         """
         t0 = time.monotonic()
-        left_out: set = set()
-        why_out: dict = {}
+        left_out: list = []
         per: list = []
-        pulses = 0
+        results: list = []
         out: dict = {"ok": True}
-        # Up front: a filament whose board gives no current reading cannot be
-        # heated -- left out now, not discovered mid-view.
-        every = sorted({int(f) for v in views for f in v["filaments"]})
-        try:
-            now = self.read_filament_current_cached(every) or {}
-        except Exception:
-            now = {}
-        for f in every:
-            if now and (now.get(f) or {}).get("current_mA") is None:
-                left_out.add(f)
-                why_out[f] = "no current reading before the run (board absent?)"
         for v in views:
-            done_here: set = set()
-            for attempt in (1, 2):
-                # A retry fires only what this view has NOT fired yet: the rest
-                # already has its pulses, heating it again would be for nothing.
-                fils = [f for f in v["filaments"] if f not in left_out and f not in done_here]
-                if callable(move_to) and attempt == 1:
-                    move_to(v)
-                r = self.scan_view(fils, active_mv=active_mv, idle_ma=idle_ma,
-                                   settle_ms=settle_ms, k=k,
-                                   start_in_s=float(move_s or 0.0) if attempt == 1 else 0.0,
-                                   detector_center=v.get("center"), num_pulses=num_pulses,
-                                   width_us=width_us, pulse_interval_ms=pulse_interval_ms,
-                                   heat_timeout_s=heat_timeout_s, trigger=trigger,
-                                   on_armed=on_armed, trigger_wait_s=trigger_wait_s)
-                n_p = sum(len(x.get("records") or []) for x in (r.get("rows") or []))
-                done_here |= {x["filament"] for x in (r.get("rows") or [])
-                              if x.get("fired_s") is not None and "filament" in x}
-                pulses += n_p
-                row = {"view": v.get("view"), "center": v.get("center"), "try": attempt,
-                       "ok": bool(r.get("ok")), "fired": r.get("fired"), "n": len(fils),
-                       "pulses": n_p, "s": r.get("elapsed_s"),
-                       "hot_s": r.get("heated_mean_s"), "waited_s": r.get("waited_mean_s")}
-                if not r.get("ok"):
-                    row["error"] = r.get("error")
-                per.append(row)
-                if r.get("ok"):
-                    break
-                ff = r.get("failed_filament")
-                if ff is None or attempt == 2:
-                    out.update(ok=False, error=f"view {v.get('view')}: {r.get('error')} -- run stopped")
-                    break
-                left_out.add(int(ff))
-                why_out[int(ff)] = f"view {v.get('view')}: {r.get('failed_why') or r.get('error')}"
-            if not out["ok"]:
+            fils = [f for f in v["filaments"] if f not in left_out]
+            if callable(move_to):
+                move_to(v)
+            if move_s:
+                time.sleep(float(move_s))
+            r = self.scan_view(fils, active_mv=active_mv, idle_ma=idle_ma, k=k,
+                               on_error=on_error, on_armed=on_armed, num_pulses=num_pulses,
+                               width_us=width_us, pulse_interval_ms=pulse_interval_ms,
+                               trigger_timeout_ms=trigger_timeout_ms, max_on_ms=max_on_ms,
+                               total_ms=total_ms, trigger=trigger,
+                               shot_wait_timeout_s=shot_wait_timeout_s, verify=verify,
+                               reuse=reuse, measure=measure, rate_hz=rate_hz,
+                               bg_gap_us=bg_gap_us, bg_window_us=bg_window_us,
+                               heat_timeout_s=heat_timeout_s, settle_ms=settle_ms)
+            results.append(r)
+            row = {"view": v.get("view"), "center": v.get("center"), "ok": bool(r.get("ok")),
+                   "fired": r.get("fired"), "failed": r.get("failed") or [],
+                   "elapsed_s": r.get("elapsed_s")}
+            if r.get("error"):
+                row["error"] = r["error"]
+            per.append(row)
+            left_out += [f for f in row["failed"] if f not in left_out]
+            if not r.get("ok") and on_error == "stop":
+                out.update(ok=False, error=f"view {v.get('view')}: {r.get('error')} -- run stopped")
                 break
+        if left_out and out["ok"]:
+            out.update(ok=False, error=f"filament(s) {left_out} failed and were left out")
         out.update(views_done=sum(1 for p in per if p["ok"]), views_total=len(views),
-                   left_out=sorted(left_out),
-                   left_out_why={f: why_out.get(f, "") for f in sorted(left_out)}, pulses=pulses,
-                   elapsed_s=round(time.monotonic() - t0, 1), per_view=per)
+                   left_out=left_out, per_view=per, results=results,
+                   elapsed_s=round(time.monotonic() - t0, 1))
         return out
-
-    @staticmethod
-    def _scan_gantt(rows, start_s, width: int = 64) -> str:
-        """What actually happened, one line per filament on a shared time axis:
-        '.' raised, still heating; '=' settled, waiting for its turn; '#' its
-        pulses; '|' the view start (motor in position)."""
-        ends = [r[k] for r in rows for k in ("fired_s", "settled_s", "raise_s") if r.get(k) is not None]
-        if not ends:
-            return ""
-        t_end = max(ends) + 0.5
-        col = lambda t: min(width - 1, int(t / t_end * width))  # noqa: E731
-        lines = [f"0 s{' ' * (width - 6)}{t_end:.1f} s"]
-        for r in rows:
-            line = [" "] * width
-            a, s, f = r.get("raise_s"), r.get("settled_s"), r.get("fired_s")
-            if a is not None:
-                for c in range(col(a), col(s if s is not None else (f or t_end))):
-                    line[c] = "."
-            if s is not None:
-                for c in range(col(s), col(f if f is not None else t_end)):
-                    line[c] = "="
-            if f is not None:
-                line[col(f)] = "#"
-            if start_s is not None and line[col(start_s)] == " ":
-                line[col(start_s)] = "|"
-            lines.append(f"{r['filament']:>3} {''.join(line)}")
-        return "\n".join(lines)
 
     def fire_single_pulse(
         self,

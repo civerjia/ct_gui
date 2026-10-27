@@ -429,8 +429,12 @@ def ladder_blocks_active(fid: int, arrival: str | None = None,
                 "connect, or the controller reconnected) — run the ladder "
                 "STOP→SLEEP→STANDBY→IDLE first")
     st, when = known
-    if st == POWER_STATE_ACTIVE:
-        return None          # re-commanding a new target while already ACTIVE
+    if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
+        # Re-commanding while already hot: both are only reachable from a
+        # settled IDLE (this guard), so the filament is warm. scan_view
+        # pre-heats the next filaments to VOLTAGE and their own
+        # fire_single_pulse then sets VOLTAGE again.
+        return None
     if st != POWER_STATE_IDLE:
         return (f"currently at {power_state_name(st)}; ACTIVE may only be entered "
                 f"from IDLE(4) — going straight to firing current damages the "

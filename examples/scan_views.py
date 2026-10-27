@@ -46,15 +46,17 @@ with ct.lease(ttl=120, note="scan_views example"):
     r = ct.scan_views(views,
                       active_mv=mv,              # {filament: mV} for every filament
                       idle_ma=1200,              # back to this after its pulses, mA
-                      settle_ms=500,             # voltage held +-150 mV this long first, ms
-                      num_pulses=5,              # pulses per filament
-                      width_us=20000,            # pulse width, us
-                      pulse_interval_ms=100,     # spacing of one filament's pulses, ms
-                      move_s=args.move_s,        # motor move time per view, s
-                      move_to=move_to,           # starts the motor move (None = no motor)
-                      heat_timeout_s=8.0,        # voltage reached within this, s
-                      k="auto",                  # heat ahead: "auto" or N filaments
-                      trigger="sim")             # "ext": add on_armed=..., trigger_wait_s=...
+                      move_to=move_to,           # your motor, before each view (None = none)
+                      move_s=args.move_s,        # wait after the move, s
+                      k=2,                       # pre-heat the next 2 filaments
+                      on_error="stop",           # "stop" | "skip" a failed filament
+                      num_pulses=5,              # --- fire_single_pulse's, per filament ---
+                      width_us=20000,
+                      pulse_interval_ms=100,
+                      trigger="sim",             # "ext": add on_armed=your_function(filament)
+                      measure=True,
+                      heat_timeout_s=6.0,
+                      settle_ms=500)
 print(r)
 
 # What each filament did (arrival time, V/I at its pulses, failures), kept by

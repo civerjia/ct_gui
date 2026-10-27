@@ -2282,99 +2282,84 @@ panel's "settle ms".
 
 ### Firing a list of filaments: `scan_view`
 
-Every argument, with what it does:
+`scan_view` is `fire_single_pulse()` called for each filament in turn, with
+one addition: the next `k` filaments are already heated ahead, so each is hot
+when its turn comes.
+
+**Each filament is one `fire_single_pulse(f, active_mv=active_mv[f],
+idle_ma=idle_ma, ...)` call.** Every other argument goes to it unchanged, so
+this behaves exactly as `fire_single_pulse` does:
+- heating arrival, and the `settle_ms` hold;
+- `"sim"` or `"ext"` trigger, with `on_armed`;
+- `measure` (mA, mAms);
+- the 165 / HV-stuck checks;
+- every timeout.
+
+See [fire_single_pulse](#single-filament-hv-pulse) for what each argument
+means.
 
 ```python
-def send_edges(filament):        # trigger="ext": called when `filament` is hot and armed
-    detector.trigger()           # your hardware: send this filament's edges NOW
+def send_trigger(filament):          # trigger="ext": this filament is armed and hot
+    angle_trigger.fire()             # send its trigger now
 
 r = ct.scan_view(
-    [23, 24, 25],                # filaments, fired in this order
-    active_mv={23: 5000, 24: 5200, 25: 4900},  # EACH filament's own voltage, mV (required)
-    idle_ma=1200,                # back to this after its pulses, mA
-    num_pulses=5,                # pulses per filament
-    width_us=20000,              # pulse width, us
-    pulse_interval_ms=100,       # spacing of one filament's pulses, ms
-    settle_ms=500,               # voltage held +-150 mV this long before it fires, ms
-    k="auto",                    # heat ahead: "auto" (learnt per filament) or N filaments
-    k_max=6,                     # at most this many filaments hot at once
-    trigger="ext",               # "sim" = the library fires, "ext" = your hardware
-    on_armed=send_edges,         # "ext" only: on_armed(filament)
-    trigger_wait_s=10.0,         # "ext": that filament's edges counted within this, s
-    heat_timeout_s=8.0,          # each filament reaches its voltage within this (+ settle_ms), s
-    start_in_s=0,                # first pulse no sooner than this, s (0 / None = at once)
-    detector_center=None,        # GUI drawing only (None = the middle filament)
-    lead_margin_s=0.3,           # k="auto": start heating this much earlier still, s
-    max_on_ms=40)                # firmware cap on one pulse, ms
+    [23, 24, 25],                    # fired in this order
+    active_mv={23: 7688, 24: 7698, 25: 8228},   # EACH filament's own voltage, mV (required)
+    idle_ma=1100,                    # back to this after its pulses, mA
+    k=2,                             # pre-heat the next 2 filaments (0 = none)
+    on_error="stop",                 # a failed filament: "stop" the rest, or "skip" it
+    on_armed=send_trigger,           # fire_single_pulse's on_armed, told the filament
+    # --- fire_single_pulse's arguments, per filament ---
+    num_pulses=20,                   # pulses per filament
+    width_us=15000,                  # pulse width, us
+    pulse_interval_ms=None,          # "sim": spacing, ms (None = fire_single_pulse's default)
+    trigger_timeout_ms=30,           # longest wait for the next trigger, ms
+    max_on_ms=66,                    # firmware cap on one pulse, ms
+    total_ms=12000,                  # firmware timeout of one filament's run, ms
+    trigger="ext",                   # "sim" | "ext"
+    shot_wait_timeout_s=9.0,         # wait from armed for its run to finish, s
+    verify=True,                     # read the schedule back before arming
+    reuse=False,                     # never skip the download
+    measure=True,                    # STM32 measures each pulse (mA, mAms)
+    rate_hz=1000000,                 # STM32 ADC rate
+    bg_gap_us=100.0,                 # background: gap after the pulse, us
+    bg_window_us=50.0,               # background: averaging window, us
+    heat_timeout_s=6.0,              # its voltage must arrive within this, s
+    settle_ms=1000)                  # ...and hold +-150 mV this long, ms
 print(r)
 ```
 
-**What it does.** For each filament, in the order given:
-1. heat it to its `active_mv`;
-2. wait until the voltage holds within ±150 mV for `settle_ms`;
-3. fire `num_pulses` pulses;
-4. put it back to `idle_ma`.
+**Arguments of its own**
 
-At the end, every filament is at IDLE.
-
-**`active_mv`.** A dict `{filament: mV}` with one entry for EVERY filament in
-the list. A single number is refused, and so is a missing filament; the error
-names it.
-
-**`k`: heating ahead.** While one filament fires, the next ones are already
-heating.
-- `k="auto"`: each filament starts heating when its turn is its own heating
-  time away, plus `lead_margin_s`. Its heating time is learnt per filament
-  (`filament_perf()`).
-- `k=N`: the next N filaments are always heating.
-
-Never more than `k_max` filaments are hot at once.
-
-**`trigger`**
-- `"sim"`: the library sends the trigger edges itself. `on_armed` is not
-  used.
-- `"ext"`: your hardware sends them. When a filament is hot and armed, the
-  library calls `on_armed(filament)`. Send that filament's `num_pulses` edges
-  then, one pulse per edge. Edges sent before `on_armed` are lost, or fire the
-  wrong filament.
-
-**Timeouts.** Each of these stops the call:
-
-| argument | what must happen in time |
+| argument | what it does |
 |---|---|
-| `heat_timeout_s` (8 s) | Each filament reaches its voltage within this, plus `settle_ms`. |
-| `trigger_wait_s` (10 s) | With `"ext"`: all of that filament's edges are counted within this, after `on_armed`. |
+| `active_mv` | `{filament: mV}`, one entry for every filament. A single number is refused, and so is a missing filament; the error names it. |
+| `k` | Before each filament fires, the next `k` are raised to their voltage. This is a timed VOLTAGE: the backend drops it back to `idle_ma` if the script dies. `k=0` means a plain loop, each filament heating in its own `fire_single_pulse`. |
+| `on_error` | What happens when a filament's `fire_single_pulse` is not ok. `"stop"`: the rest is not fired. `"skip"`: go on with the next. |
+| `on_armed` | `on_armed(filament)`: `fire_single_pulse`'s `on_armed`, called with which filament it is. Required with `trigger="ext"`. |
 
-**When something goes wrong, it stops.** It disarms, puts every filament back
-to `idle_ma`, and puts the reason in `r["error"]` and the filament in
-`r["failed_filament"]`. Ctrl-C does the same. Besides the timeouts, these stop
-it:
-- an SHV fault;
-- `on_armed` raising.
+Whatever ends it (finished, stopped, an exception, Ctrl-C), every filament
+still hot goes back to `idle_ma`.
 
-**Before you call it:** every filament in the list must be at IDLE. HV is not
-touched.
+**Before:** every filament at IDLE. HV is not touched.
 
 **Result**
 
 | key | what it is |
 |---|---|
-| `ok` | whether every filament fired |
-| `error` | why it stopped |
-| `failed_filament` | which filament it stopped at |
-| `rows` | one row per filament: `filament`, `mv`, `fired_s`, `heated_s` (time hot), `waited_s` (hot, only waiting), `heat_mV` / `heat_mA` at its pulses, `records` (its pulses) |
-| `elapsed_s` | total time of the call |
-| `gantt` | a text timeline: `.` heating, `=` ready and waiting, `#` pulses |
+| `ok` | every filament fired ok |
+| `error` | why not |
+| `fired` | how many filaments fired ok |
+| `failed` | the filaments that were not ok |
+| `skipped` | never fired, because of a stop |
+| `results` | one `{"filament", ...}` per filament, in firing order: that filament's whole `fire_single_pulse` result (records, measured, mAms, heating...) |
+| `idle_errors` | present only if a filament could not be put back to IDLE |
+| `elapsed_s` | how long the call took |
 
-Times are seconds from the call.
-
-**`filament_perf(filaments=None)`** returns what `scan_view` has learnt about
-each filament, kept in `state/filament_perf.json`:
-- voltage;
-- heating time;
-- V/I at the pulse;
-- ohms;
-- failures.
+`scan_views(views, ...)` does the same for several lists in a row. It takes
+the same arguments, plus `move_to(view)` and `move_s` (a wait after the move).
+With `on_error="skip"`, a filament that failed is left out of every later
+view.
 
 #### VOLTAGE heating in `fire_single_pulse` (`active_mv=`)
 
