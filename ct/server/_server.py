@@ -485,7 +485,7 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
 
 def _board_monitor_loop() -> None:
     mark_low_priority()     # its reads give way to every command (see _PriorityLock)
-    while True:
+    while not _STOPPING.is_set():          # see _safety_loop
         t0 = time.monotonic()
         for cid, link in list(CONTROLLERS.items()):
             try:
@@ -1424,7 +1424,11 @@ def _safety_loop() -> None:
     # nobody reads.
     _safety_held_for_run = False
     _safety_unknown_run = False
-    while True:
+    # Ends with the process's restart (_STOPPING): on Windows the old process
+    # stays alive behind the new one, and a watchdog left running there acts
+    # on the state it had -- 2026-10-27 it retried a timed VOLTAGE every second
+    # against links it had already handed over ("controller not connected").
+    while not _STOPPING.is_set():
         time.sleep(SAFETY_TICK_S)
         try:
             now = time.monotonic()
@@ -1567,7 +1571,7 @@ def _active_deadline_loop() -> None:
     schedule is armed or running (the run owns the heating, as for the
     dead-man watchdog) and retried after a failed write; recorded either way."""
     deferred_logged = False
-    while True:
+    while not _STOPPING.is_set():          # see _safety_loop
         time.sleep(ACTIVE_DEADLINE_TICK_S)
         try:
             now = time.monotonic()
@@ -2939,7 +2943,7 @@ def grid_sweep_once() -> list[dict]:
 
 
 def _grid_sweep_loop() -> None:
-    while True:
+    while not _STOPPING.is_set():          # see _safety_loop
         time.sleep(GRID_SWEEP_S)
         try:
             grid_sweep_once()

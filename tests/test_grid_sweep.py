@@ -134,5 +134,22 @@ found = run({1: p})
 check("welded switch -> recorded, opened False, error", len(found) == 1 and not found[0]["opened"]
       and found[0].get("error"), found)
 
+# 7. A restart (_STOPPING) ends the sweep and the other background loops. On
+#    Windows the old process stays alive behind the new one; 2026-10-27 its
+#    watchdog kept retrying a timed VOLTAGE against links it had handed over.
+import threading  # noqa: E402
+S.GRID_SWEEP_S, S.SAFETY_TICK_S, S.ACTIVE_DEADLINE_TICK_S = 0.01, 0.01, 0.01
+S.CONTROLLERS.clear()
+S._STOPPING.set()
+try:
+    for fn in (S._grid_sweep_loop, S._safety_loop, S._active_deadline_loop, S._board_monitor_loop):
+        t = threading.Thread(target=fn, daemon=True)
+        t.start()
+        t.join(timeout=3.0)
+        check(f"{fn.__name__} ends once the process is restarting", not t.is_alive())
+finally:
+    S._STOPPING.clear()
+    S.CONTROLLERS.update(saved)
+
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)
