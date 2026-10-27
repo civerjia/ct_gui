@@ -1393,7 +1393,7 @@ class _ScheduleMixin:
                   settle_ms: int = 0,          # hold arrival this long first (firmware-timed)
                   k="auto",                    # "auto", or a fixed number of filaments ahead
                   k_max: int = 6,              # never more than this many hot at once
-                  start_in_s: float = 0.0,     # first pulse no sooner than this (motor moving)
+                  start_in_s: float = 0.0,     # first pulse no sooner than this (motor moving); None = 0
                   detector_center=None,        # filament the detector faces; None = the middle one
                   num_pulses: int = 1,         # pulses per filament
                   width_us: int = 1000,
@@ -1455,6 +1455,8 @@ class _ScheduleMixin:
         """
         t0 = time.monotonic()
         fils = [int(f) for f in filaments]
+        if start_in_s is None:            # None = no motor move to wait for
+            start_in_s = 0.0
 
         def fail(msg, **kw):
             return {"ok": False, "error": msg, "rows": [], **kw}
@@ -1792,7 +1794,7 @@ class _ScheduleMixin:
                    num_pulses: int = 1,      # pulses per filament
                    width_us: int = 1000,
                    pulse_interval_ms: int = 100,
-                   move_s: float = 3.0,      # how long the motor takes to reach a view
+                   move_s: float = 3.0,      # how long the motor takes to reach a view; None = 0
                    move_to=None,             # move_to(view): STARTS the motor move; None = no motor
                    heat_timeout_s: float = 8.0,
                    k="auto") -> dict:
@@ -1851,7 +1853,7 @@ class _ScheduleMixin:
                     move_to(v)
                 r = self.scan_view(fils, active_mv=active_mv, idle_ma=idle_ma,
                                    settle_ms=settle_ms, k=k,
-                                   start_in_s=float(move_s) if attempt == 1 else 0.0,
+                                   start_in_s=float(move_s or 0.0) if attempt == 1 else 0.0,
                                    detector_center=v.get("center"), num_pulses=num_pulses,
                                    width_us=width_us, pulse_interval_ms=pulse_interval_ms,
                                    heat_timeout_s=heat_timeout_s)

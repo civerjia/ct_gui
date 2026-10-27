@@ -283,5 +283,16 @@ r = ct.scan_views(plan["views"][1:], active_mv=5000, idle_ma=1200)
 check("no current reading before the run -> left out up front, with the reason",
       2 in r["left_out"] and "no current reading" in r["left_out_why"][2] and all(2 not in c[0] for c in calls), (r, calls))
 
+# None = no motor: move_s=None and start_in_s=None mean 0, not a TypeError.
+calls.clear()
+ct.scan_view = fake_view
+ct.read_filament_current_cached = lambda fs: {f: {"current_mA": 1200} for f in fs}
+r = ct.scan_views(plan["views"][1:], active_mv=5000, idle_ma=1200, move_s=None, move_to=None)
+check("scan_views(move_s=None, move_to=None): runs, first pulse not delayed",
+      r["ok"] and calls and calls[0][1] == 0.0, (r, calls))
+ct, log, st = make()
+r = ct.scan_view(V, active_mv=8000, idle_ma=1200, start_in_s=None)
+check("scan_view(start_in_s=None) = 0", r.get("ok") and r.get("start_s", 0) == 0, (r.get("ok"), r.get("error"), r.get("start_s")))
+
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 raise SystemExit(1 if FAILS else 0)
