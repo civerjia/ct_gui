@@ -115,14 +115,14 @@ class RemoteCTClient:
         """Build a proxy for CTClient(*args, **kwargs), or None when the backend
         has no remote API (older backend) -- the caller then falls back to a
         local client."""
-        from ._client import CTClient
+        from ._client import CTClient, backend_base
         try:
             bound = inspect.signature(CTClient.__init__).bind(None, *args, **kwargs)
         except TypeError:
             return None                        # let the local constructor report it
         bound.apply_defaults()
         a = bound.arguments
-        base = f"http://{a['host']}:{a['port']}"
+        base = backend_base(a["host"], a["port"])
         init = {"timeout": a["timeout"], "record": a["record"], "keepalive": a["keepalive"]}
         try:
             r = requests.post(base + "/api/remote/open",

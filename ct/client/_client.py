@@ -187,6 +187,22 @@ from ._diagnostics import _DiagnosticsMixin
 from ._decode import _DecodeMixin
 
 
+def backend_base(host: str, port: int) -> str:
+    """The backend URL for CTClient(host, port). host may carry its own port
+    ("control2:8780", "http://192.168.8.118:8780"), so a program that passes
+    only a host string -- from a config box or an environment variable -- can
+    still reach a backend that is not on 8770. A port in host wins over the
+    port argument."""
+    h = str(host).strip()
+    if "://" in h:
+        h = h.split("://", 1)[1]
+    h = h.rstrip("/")
+    m = re.fullmatch(r"(\[[^\]]+\]|[^:\[\]]+):(\d{1,5})", h)
+    if m:
+        return f"http://{m.group(1)}:{int(m.group(2))}"
+    return f"http://{h}:{int(port)}"
+
+
 class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMixin, _DiagnosticsMixin, _DecodeMixin):
     """Thin HTTP client for the CT backend. All hardware logic lives server-side.
 
@@ -281,7 +297,7 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         port: 8770 by default, matching backend.py's default
               (overridable there via the CT_GUI_PORT environment variable).
         """
-        self.base = f"http://{host}:{port}"
+        self.base = backend_base(host, port)
         self.client_id = client_id
         self.record = bool(record)
         self.record_dir = (Path(record_dir) if record_dir is not None

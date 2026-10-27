@@ -188,6 +188,15 @@ class _CallJob:
             self.events.put({"ok": True, "callback": {
                 "cid": self.cid, "id": fid, "args": s.enc(list(args)), "kwargs": s.enc(kwargs)}})
             self.waiting = True
+            # Logged both ways: a callback is the script's only signal at that
+            # instant (on_armed = "send the trigger now"), so when a shot times
+            # out waiting for its trigger, this says whether the script was
+            # told and when it answered.
+            name = str(self.body.get("name"))
+            t0 = time.monotonic()
+            log.info("remote session %s (%s): %s -> callback #%d sent to the script",
+                     s.sid[:8], s.client_id, name, fid)
+            slow_warned = False
             try:
                 while True:
                     try:
@@ -195,10 +204,22 @@ class _CallJob:
                         break
                     except queue.Empty:
                         if s.closed:
+                            log.warning("remote session %s (%s): %s -> callback #%d: the "
+                                        "script went away before answering", s.sid[:8],
+                                        s.client_id, name, fid)
                             raise RuntimeError("remote script gone while its callback ran")
+                        if not slow_warned and time.monotonic() - t0 > 2.0:
+                            slow_warned = True
+                            log.warning("remote session %s (%s): %s -> callback #%d: no "
+                                        "answer from the script after 2 s", s.sid[:8],
+                                        s.client_id, name, fid)
             finally:
                 self.waiting = False
                 s.last = time.monotonic()
+            log.info("remote session %s (%s): %s -> callback #%d answered in %.0f ms%s",
+                     s.sid[:8], s.client_id, name, fid, (time.monotonic() - t0) * 1000,
+                     f" (raised {r['exc'].get('type')}: {r['exc'].get('message')})"
+                     if r.get("exc") else "")
             if r.get("exc"):
                 e = r["exc"]
                 cls = _CALLBACK_EXC.get(e.get("type"), RuntimeError)
