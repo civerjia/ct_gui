@@ -2993,6 +2993,7 @@ HV_GUARD_RAIL_ON_V = -50.0      # emission rail below this = on
 # that way in a replay. CT_HV_GUARD_ABS_MA to change it.
 HV_GUARD_ABS_MA = float(os.environ.get("CT_HV_GUARD_ABS_MA", "16.0"))
 HV_GUARD_HOT_RECENT_S = 300.0   # suspects: filaments hot within this
+HV_GUARD_STOP_RECENT_S = 60.0   # on a trip, filaments hot within this go to STOP
 
 _HV_GUARD = {"enabled": os.environ.get("CT_HV_GUARD", "1") != "0", "tripped": None}
 _HV_GUARD_LOCK = threading.Lock()
@@ -3035,10 +3036,13 @@ def _hv_guard_read() -> dict | None:
 
 
 def _hv_guard_suspects(now: float) -> list[int]:
+    """Filaments hot right now first, then the recently hot, most recent first."""
     with _SAFETY_LOCK:
+        hot_now = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
+                         if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
         hot = sorted(((t, f) for f, t in _LAST_HOT.items() if now - t <= HV_GUARD_HOT_RECENT_S),
                      reverse=True)
-    return [f for _, f in hot]
+    return hot_now + [f for _, f in hot if f not in hot_now]
 
 
 def hv_guard_tick(now: float | None = None) -> dict | None:
@@ -3117,13 +3121,28 @@ def _hv_guard_act(base: float | None, ma: float, focus: float, now: float) -> di
                 break
         off[ch] = bool(res and res.get("ok"))
     rec["hv_off"] = off
+    # And no heat: a MOSFET that will not open still passes nothing from a cold
+    # filament -- no thermionic electrons. The ones hot now or within the last
+    # HV_GUARD_STOP_RECENT_S go to STOP (the user, 2026-10-27).
+    with _SAFETY_LOCK:
+        hot_now = {int(f) for f, (st, _w) in LAST_POWER_STATE.items()
+                   if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE)}
+        recent = {f for f, t in _LAST_HOT.items() if now - t <= HV_GUARD_STOP_RECENT_S}
+    stop = sorted(hot_now | recent)
+    if stop:
+        try:
+            _safety_fallback_filaments(stop, POWER_STATE_STOP)
+        except Exception as exc:
+            rec["stop_error"] = str(exc)
+    rec["heating_stopped"] = stop
     was = ("unreadable" if ma2 is None else f"{ma2:.2f} mA")
     ref = (f"its {base:.2f} mA baseline" if base is not None else
            f"the {HV_GUARD_ABS_MA:.1f} mA ceiling (no baseline yet)")
     rec["message"] = (f"HV OFF: emission was still {was} against {ref} with every grid switch "
                       f"forced open -- a grid MOSFET is "
                       f"conducting that cannot be turned off (recently hot filaments, most recent "
-                      f"first: {suspects}). Emission and focus switched off; turning HV on is "
+                      f"first: {suspects}). Emission and focus switched off; heating set to STOP "
+                      f"for {stop or 'none (no filament was hot)'}; turning HV on is "
                       f"refused until the latch is cleared (POST /api/hv-guard {{\"clear\": true}}).")
     with _HV_GUARD_LOCK:
         _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),

@@ -74,6 +74,9 @@ def setup(rig):
     S.HV_GUARD_RECHECK_S = 0.0
     S.CONTROLLERS.clear()
     S.CONTROLLERS.update({1: _Link(), 2: _Link()})
+    S.LAST_POWER_STATE.clear()
+    rig.stopped = []
+    S._safety_fallback_filaments = lambda fids, state: rig.stopped.append((sorted(fids), int(state)))
 
 
 def run(rig, seconds, t0, step=1.0):
@@ -94,6 +97,7 @@ rig.ma = 16.4
 r, t = run(rig, 5, t)
 check("595 flip: forced open and cleared", r and r["action"] == "cleared" and rig.forced == 2, r)
 check("...HV left on", rig.rails == [] and S._HV_GUARD["tripped"] is None, rig.rails)
+check("...and no heating touched", rig.stopped == [], rig.stopped)
 
 # 2. A blown FET: still high with every switch open -> both rails off, latched, suspects named.
 rig = Rig()
@@ -111,9 +115,24 @@ check("...latched, with the suspects most recent first", S._HV_GUARD["tripped"]
       and S._HV_GUARD["tripped"]["suspects"] == [20, 3], S._HV_GUARD["tripped"])
 check("...message says HV OFF and how to clear", "HV OFF" in S._HV_GUARD["tripped"]["message"]
       and "/api/hv-guard" in S._HV_GUARD["tripped"]["message"])
+check("...heating of the recently hot filaments set to STOP (no heat, no electrons)",
+      rig.stopped == [([3, 20], int(S.POWER_STATE_STOP))], rig.stopped)
 n = len(rig.rails)
 run(rig, 10, t)
 check("...latched: no further action while tripped", len(rig.rails) == n and rig.forced == 2)
+
+# 2b. Only what is hot now or within 60 s is stopped; an old one is left alone.
+rig = Rig()
+setup(rig)
+S._LAST_HOT.clear()
+S._LAST_HOT.update({7: 0.0})                 # hot 100+ s before the trip
+S.LAST_POWER_STATE[33] = (int(S.POWER_STATE_VOLTAGE), 0.0)   # hot right now
+rig.fixable = False
+_, t = run(rig, 100, 0.0)
+rig.ma = 16.4
+r, t = run(rig, 5, t)
+check("trip stops the filament hot NOW, not one hot 100 s ago", rig.stopped == [([33], int(S.POWER_STATE_STOP))]
+      and r["heating_stopped"] == [33] and r["suspects"][0] == 33, (rig.stopped, r.get("suspects")))
 
 # 3. Not sustained long enough -> nothing.
 rig = Rig()
