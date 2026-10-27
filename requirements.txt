@@ -1,3 +1,6 @@
 # Python 3.11+. backend.py and the Python client (ct_simple_control) are
 # standard library only -- nothing to install to run or to script the rig.
 matplotlib>=3.6   # OPTIONAL -- only emission_plot.py needs it
+websockets>=11    # OPTIONAL -- backend only: Spellman V/I + vacuum from control2 (read-only).
+                  # Without it the vacuum interlock has no reading and refuses HV ON /
+                  # ACTIVE / VOLTAGE (set CT_VACUUM_INTERLOCK=0 to run without it).

@@ -77,6 +77,13 @@ S.note_power_state([live_f], S.POWER_STATE_STANDBY)
 ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", single(lch, lpos, state=5, arg=2600))
 check("STANDBY->ACTIVE is refused", ref and "STANDBY" in ref["error"], str(ref))
 S.note_power_state([live_f], S.POWER_STATE_IDLE, {live_f: 1500})
+# No vacuum reading -> refused (the interlock: an unknown vacuum is not a good one).
+ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", single(lch, lpos, state=5, arg=2600))
+check("IDLE->ACTIVE with no vacuum reading: refused by the vacuum interlock",
+      ref and "vacuum interlock" in ref["error"], str(ref))
+# A fresh, good reading from the gauge (control2 relays it).
+S._spellman_on_message({"type": "pressure_point", "data": {"pressure_torr": 5.9e-6, "raw": "VAC=5.9e-06"}},
+                       S.time.monotonic())
 ref, fl, st = S._raw_power_guard(1, "CH_SET_POWER_STATE", single(lch, lpos, state=5, arg=2600))
 check("IDLE->ACTIVE is allowed, with the fid and state to track",
       ref is None and fl == [live_f] and st == 5, f"{ref} {fl} {st}")

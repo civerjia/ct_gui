@@ -1728,6 +1728,10 @@ def _raw_power_guard(cid: int, command: str, body: dict) -> tuple[dict | None, l
                  "error": f"{what} refused — nothing was sent. " + "; ".join(blocked[:6])
                           + (f"; and {len(blocked) - 6} more" if len(blocked) > 6 else "")},
                 fids, state)
+    if state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):   # last: see /api/filament-state
+        vr = vacuum_refusal(f"raw {command} to {power_state_name(state)}")
+        if vr:
+            return {"ok": False, "refused": True, "error": vr}, fids, state
     return None, fids, state
 
 
@@ -2020,6 +2024,8 @@ def _start_scan_sim(host: str, count: int, interval_ms: float) -> dict:
         _SIM_STATE["period_us"] = period_us
         _SIM_STATE["start_error"] = None if r.get("ok") else (r.get("error") or f"HTTP {r.get('status')}")
         _SIM_STATE["started_at"] = time.monotonic()   # the HV guard: this run is sim-driven
+    if r.get("ok"):
+        _tail_on_train_start(time.monotonic())
     return r
 
 
@@ -3162,6 +3168,9 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
     now = time.monotonic() if now is None else now
     if _HV_GUARD["tripped"]:
         return None
+    vt = _vacuum_tick(now)
+    if vt:
+        return vt
     st = _hv_guard_stm32_flags()
     # The flag, not the reason: the reason is first-wins until the STM32 resets,
     # so after a cleared latch it still says 8 and would re-trip at once.
@@ -3173,7 +3182,11 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
     if r is None or (r.get("emiss_v") or 0.0) > HV_GUARD_RAIL_ON_V:
         _HVG_HIST.clear()               # rail off / unreadable: the baseline starts over
         _HVG_HIGH_SINCE[0] = None
+        _TAIL["armed"] = False
         return None
+    tw = _tail_tick(now, float(r["emiss_i_ma"]))
+    if tw:
+        return tw
     if not _hv_guard_quiet(now):
         _HVG_HIGH_SINCE[0] = None       # a pulse is not a rise; not baseline either
         return None
@@ -3273,6 +3286,7 @@ def hv_guard_snapshot() -> dict:
     now = time.monotonic()
     base = min((m for _, m, _f in _HVG_HIST), default=None)
     return {"ok": True, "enabled": _HV_GUARD["enabled"], "tripped": _HV_GUARD["tripped"],
+            "vacuum": vacuum_snapshot(), "hv_supply": hv_supply_snapshot(),
             "baseline_ma": None if base is None else round(base, 2),
             "baseline_span_s": round(now - _HVG_HIST[0][0], 1) if _HVG_HIST else 0.0,
             "rise_ma": HV_GUARD_RISE_MA, "hold_s": HV_GUARD_HOLD_S, "ceiling_ma": HV_GUARD_ABS_MA}
@@ -3285,6 +3299,289 @@ def _hv_guard_loop() -> None:
             hv_guard_tick()
         except Exception as exc:          # never let the guard die
             log.exception("HV guard failed: %s", exc)
+
+
+# ── Spellman HV supply + vacuum, READ-ONLY (control2's spellman_backend) ──────
+# spellman_control_v6/spellman_backend.py on control2 (WebSocket :8770) polls
+# the Spellman itself (~1.3 s: GetStatus, GetkVMonitor, GetmAMonitor) and the
+# Lesker gauge through raspberrypi5:8769 (pressure_point, 2 s), and BROADCASTS
+# all of it to every client. This only listens: nothing is ever sent to it --
+# other programs drive that supply (the user, 2026-10-27).
+SPELLMAN_WS_URL = os.environ.get("CT_SPELLMAN_WS", "ws://control2:8770")
+SPELLMAN_RECONNECT_S = 5.0
+SPELLMAN_STALE_S = 10.0         # older than this = no reading
+VACUUM_LIMIT_TORR = float(os.environ.get("CT_VACUUM_LIMIT_TORR", "2.5e-5"))
+VACUUM_INTERLOCK = os.environ.get("CT_VACUUM_INTERLOCK", "1") != "0"
+VACUUM_TRIP_READINGS = 2        # consecutive fresh readings over the limit -> trip
+
+_SPELL_LOCK = threading.Lock()
+_SPELL: dict = {"connected": False, "error": None, "last_msg": None,
+                "kv": None, "kv_at": None, "ma": None, "ma_at": None,
+                "status_bits": None, "status_at": None,
+                "pressure_torr": None, "pressure_at": None, "pressure_raw": None,
+                "lesker": None}
+_SPELL_MA_HIST: list = []       # (monotonic, mA) of the last ~10 min, for the tail check
+_VAC_OVER = {"n": 0, "last_at": None}   # consecutive NEW readings over the limit
+
+
+def _spellman_number(v):
+    """spellman_response data: a number, or [] when its parse failed. Never a
+    made-up 0 for the [] case."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, list) and len(v) == 1 and isinstance(v[0], (int, float)):
+        return float(v[0])
+    return None
+
+
+def _spellman_on_message(m: dict, now: float) -> None:
+    t = m.get("type")
+    with _SPELL_LOCK:
+        _SPELL["last_msg"] = now
+        if t == "spellman_response":
+            cmd, data = m.get("cmd"), m.get("data")
+            if cmd == "GetkVMonitor":
+                v = _spellman_number(data)
+                if v is not None:
+                    _SPELL["kv"], _SPELL["kv_at"] = v, now
+            elif cmd == "GetmAMonitor":
+                v = _spellman_number(data)
+                if v is not None:
+                    _SPELL["ma"], _SPELL["ma_at"] = v, now
+                    _SPELL_MA_HIST.append((now, v))
+                    del _SPELL_MA_HIST[:-500]
+            elif cmd == "GetStatus" and isinstance(data, list) and data:
+                _SPELL["status_bits"], _SPELL["status_at"] = list(data), now
+        elif t == "conditioning_point" and isinstance(m.get("data"), dict):
+            d = m["data"]
+            if isinstance(d.get("measured_kv"), (int, float)):
+                _SPELL["kv"], _SPELL["kv_at"] = float(d["measured_kv"]), now
+            if isinstance(d.get("measured_mA"), (int, float)):
+                _SPELL["ma"], _SPELL["ma_at"] = float(d["measured_mA"]), now
+                _SPELL_MA_HIST.append((now, float(d["measured_mA"])))
+                del _SPELL_MA_HIST[:-500]
+        elif t == "pressure_point" and isinstance(m.get("data"), dict):
+            p = m["data"].get("pressure_torr")
+            if isinstance(p, (int, float)) and not isinstance(p, bool):
+                _SPELL["pressure_torr"], _SPELL["pressure_at"] = float(p), now
+                _SPELL["pressure_raw"] = m["data"].get("raw")
+        elif t == "lesker_status":
+            _SPELL["lesker"] = m.get("data")
+
+
+def _spellman_loop() -> None:
+    try:
+        from websockets.sync.client import connect as ws_connect
+    except ImportError:
+        with _SPELL_LOCK:
+            _SPELL["error"] = "the websockets package is not installed (pip install websockets) -- no Spellman / vacuum readings"
+        log.warning("Spellman/vacuum reader off: %s", _SPELL["error"])
+        return
+    while not _STOPPING.is_set():
+        try:
+            with ws_connect(SPELLMAN_WS_URL, open_timeout=5, close_timeout=1, max_size=None) as ws:
+                with _SPELL_LOCK:
+                    _SPELL["connected"], _SPELL["error"] = True, None
+                log.info("Spellman/vacuum reader connected to %s (read-only)", SPELLMAN_WS_URL)
+                while not _STOPPING.is_set():
+                    try:
+                        raw = ws.recv(timeout=SPELLMAN_STALE_S)
+                    except TimeoutError:
+                        continue          # silence: the readings go stale on their own
+                    try:
+                        m = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(m, dict):
+                        _spellman_on_message(m, time.monotonic())
+        except Exception as exc:
+            with _SPELL_LOCK:
+                was = _SPELL["connected"]
+                _SPELL["connected"], _SPELL["error"] = False, f"{type(exc).__name__}: {exc}"
+            if was:
+                log.warning("Spellman/vacuum reader lost %s: %s", SPELLMAN_WS_URL, exc)
+        _STOPPING.wait(SPELLMAN_RECONNECT_S)
+
+
+def _age(at, now):
+    return None if at is None else round(now - at, 1)
+
+
+def hv_supply_snapshot() -> dict:
+    now = time.monotonic()
+    with _SPELL_LOCK:
+        s = dict(_SPELL)
+    fresh = lambda at: at is not None and now - at <= SPELLMAN_STALE_S
+    return {"ok": True, "source": SPELLMAN_WS_URL, "read_only": True,
+            "connected": s["connected"], "error": s["error"],
+            "kv": s["kv"] if fresh(s["kv_at"]) else None, "kv_age_s": _age(s["kv_at"], now),
+            "ma": s["ma"] if fresh(s["ma_at"]) else None, "ma_age_s": _age(s["ma_at"], now),
+            "status_bits": s["status_bits"] if fresh(s["status_at"]) else None,
+            "status_age_s": _age(s["status_at"], now)}
+
+
+def vacuum_snapshot() -> dict:
+    now = time.monotonic()
+    with _SPELL_LOCK:
+        p, at, raw, les, conn, err = (_SPELL["pressure_torr"], _SPELL["pressure_at"], _SPELL["pressure_raw"],
+                                      _SPELL["lesker"], _SPELL["connected"], _SPELL["error"])
+    fresh = at is not None and now - at <= SPELLMAN_STALE_S
+    return {"ok": True, "source": SPELLMAN_WS_URL, "connected": conn, "error": err,
+            "pressure_torr": p if fresh else None, "age_s": _age(at, now), "raw": raw if fresh else None,
+            "limit_torr": VACUUM_LIMIT_TORR, "interlock": VACUUM_INTERLOCK,
+            "within_limit": (p <= VACUUM_LIMIT_TORR) if fresh else None, "lesker": les}
+
+
+def vacuum_refusal(action: str) -> str | None:
+    """Why `action` (HV ON, heating to ACTIVE/VOLTAGE) may not happen now, or
+    None. No fresh reading counts as NOT OK: an unknown vacuum is not a good
+    one. CT_VACUUM_INTERLOCK=0 turns this off."""
+    if not VACUUM_INTERLOCK:
+        return None
+    v = vacuum_snapshot()
+    if v["pressure_torr"] is None:
+        since = "ever" if v["age_s"] is None else "%.0f s" % v["age_s"]
+        why = " (%s)" % v["error"] if v["error"] else ""
+        return (f"vacuum interlock: no pressure reading for {since} from {SPELLMAN_WS_URL}{why} "
+                f"-- refusing {action}. "
+                f"Start control2's spellman_backend (it relays the Lesker gauge), or set "
+                f"CT_VACUUM_INTERLOCK=0 to run without the interlock")
+    if v["pressure_torr"] > VACUUM_LIMIT_TORR:
+        return (f"vacuum interlock: {v['pressure_torr']:.2e} Torr is over the {VACUUM_LIMIT_TORR:.1e} "
+                f"Torr limit -- refusing {action}")
+    return None
+
+
+def _vacuum_trip(p: float, now: float) -> dict:
+    """Pressure over the limit with HV possibly on: rails off, hot filaments
+    back to their IDLE (not STOP: IDLE keeps the vacuum -- the rig's rule),
+    latched like the HV guard."""
+    link = CONTROLLERS.get(MASTER)
+    off = {}
+    for ch in ("emission", "focus"):
+        try:
+            off[ch] = bool((stm32_hv_enable_set(link.host, ch, False) if link and link.host else {}).get("ok"))
+        except Exception:
+            off[ch] = False
+    with _SAFETY_LOCK:
+        hot = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
+                     if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+        to_idle, no_idle = [], []
+        for f in hot:
+            ma = (ACTIVE_DEADLINES.get(f) or (None, LAST_IDLE_MA.get(f)))[1]
+            if ma:
+                ACTIVE_DEADLINES[f] = (now, int(ma))    # the timed-ACTIVE loop takes it to IDLE now
+                to_idle.append(f)
+            else:
+                no_idle.append(f)
+    if no_idle:
+        _safety_fallback_filaments(no_idle, POWER_STATE_SLEEP)   # no IDLE current known
+    rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": VACUUM_LIMIT_TORR, "hv_off": off,
+           "to_idle": to_idle, "to_sleep_no_idle_known": no_idle,
+           "message": (f"HV OFF: vacuum {p:.2e} Torr over the {VACUUM_LIMIT_TORR:.1e} Torr limit -- "
+                       f"emission and focus switched off, heating back to IDLE for {to_idle or 'none'}"
+                       f"{f', SLEEP for {no_idle} (no IDLE current known)' if no_idle else ''}; HV ON is "
+                       f"refused until the vacuum recovers and the latch is cleared "
+                       f"(POST /api/hv-guard {{\"clear\": true}})")}
+    with _HV_GUARD_LOCK:
+        _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), **rec}
+    log.error("HV guard TRIPPED (vacuum): %s", rec["message"])
+    _safety_record("hv_guard_tripped", rec)
+    return {"action": "tripped", **rec}
+
+
+def _vacuum_tick(now: float) -> dict | None:
+    if not VACUUM_INTERLOCK or _HV_GUARD["tripped"]:
+        return None
+    v = vacuum_snapshot()
+    p = v["pressure_torr"]
+    if p is None or p <= VACUUM_LIMIT_TORR:
+        _VAC_OVER["n"] = 0
+        return None
+    with _SPELL_LOCK:
+        at = _SPELL["pressure_at"]
+    if at == _VAC_OVER["last_at"]:
+        return None                         # the gauge sends every 2 s; ticks are 1 s
+    _VAC_OVER["last_at"] = at
+    _VAC_OVER["n"] += 1
+    if _VAC_OVER["n"] < VACUUM_TRIP_READINGS:
+        return None
+    _VAC_OVER["n"] = 0
+    return _vacuum_trip(p, now)
+
+
+# Slow turn-off early warning. 2026-10-27, FID 20 (P2 CH2.1): before the
+# isolator failed outright, the current took seconds to fall after its shots
+# (seen on the Spellman). In the 1 Hz emission data it is the only filament
+# with a tail: +2.43 mA 1-5 s after its 09:02 shot, three hours before the
+# 12:18 failure (+4.3 mA); every other filament ~0. So after every sim train
+# the emission (and the Spellman mA, when it reads) 1-5 s after the train is
+# compared with just before it.
+TAIL_WARN_MA = 0.5
+TAIL_FROM_S, TAIL_TO_S = 1.0, 5.0
+_TAIL: dict = {"armed": False}
+
+
+def _tail_on_train_start(now: float) -> None:
+    """Called when a sim train starts: the baseline and who is firing."""
+    with _SAFETY_LOCK:
+        firing = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
+                        if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+    pre = [m for t, m, _f in _HVG_HIST if now - t <= 10.0]
+    with _SPELL_LOCK:
+        spre = [m for t, m in _SPELL_MA_HIST if now - 6.0 <= t <= now]
+    _TAIL.clear()
+    _TAIL.update(armed=bool(pre), start=now, base=min(pre) if pre else None,
+                 spell_base=min(spre) if spre else None, filaments=firing, reads=[])
+
+
+def _tail_tick(now: float, ma: float | None) -> dict | None:
+    """Collect 1-5 s after the train; warn once if the tail is over."""
+    if not _TAIL.get("armed"):
+        return None
+    with _SIM_LOCK:
+        ended, running, started = (_SIM_STATE.get("ended_at", 0.0), _SIM_STATE.get("running"),
+                                   _SIM_STATE.get("started_at", 0.0))
+    if running or ended < _TAIL["start"]:
+        return None                          # this train still running
+    if started > _TAIL["start"]:
+        return _tail_judge(ended)            # the next train began: judge what we have
+    if now - ended < TAIL_FROM_S:
+        return None
+    if ma is not None and now - ended <= TAIL_TO_S:
+        _TAIL["reads"].append(ma)
+    if now - ended > TAIL_TO_S:
+        return _tail_judge(ended)
+    return None
+
+
+def _tail_judge(ended: float) -> dict | None:
+    reads, base = _TAIL.get("reads") or [], _TAIL.get("base")
+    _TAIL["armed"] = False
+    if len(reads) < 2 or base is None:
+        return None
+    reads.sort()
+    tail = reads[len(reads) // 2] - base
+    spell_tail = None
+    with _SPELL_LOCK:
+        spost = [m for t, m in _SPELL_MA_HIST if ended + TAIL_FROM_S <= t <= ended + TAIL_TO_S]
+    if spost and _TAIL.get("spell_base") is not None:
+        spost.sort()
+        spell_tail = spost[len(spost) // 2] - _TAIL["spell_base"]
+    if tail < TAIL_WARN_MA:
+        return None
+    rec = {"filaments": _TAIL.get("filaments"), "tail_ma": round(tail, 2),
+           "baseline_ma": round(base, 2), "reads": [round(r, 2) for r in reads],
+           "spellman_tail_ma": None if spell_tail is None else round(spell_tail, 3),
+           "message": (f"slow turn-off: emission stayed {tail:+.2f} mA over its pre-shot "
+                       f"{base:.2f} mA for {TAIL_FROM_S:.0f}-{TAIL_TO_S:.0f} s after the train "
+                       f"(filaments fired: {_TAIL.get('filaments')}) -- the early sign FID 20 gave "
+                       f"3 h before its grid switch stuck on (2026-10-27). Check that sub-board.")}
+    log.warning("HV guard: %s", rec["message"])
+    _safety_record("slow_turn_off_warning", rec)
+    return {"action": "warning", **rec}
 
 
 def _grid_sweep_loop() -> None:
@@ -3782,6 +4079,10 @@ class CtHandler(BaseHTTPRequestHandler):
                         "lock": _lease_snapshot()})
         elif path == "/api/safety":
             self._json(safety_snapshot())
+        elif path == "/api/hv-supply":
+            self._json(hv_supply_snapshot())
+        elif path == "/api/vacuum":
+            self._json(vacuum_snapshot())
         elif path == "/api/hv-guard":
             snap = hv_guard_snapshot()
             link = CONTROLLERS.get(MASTER)
@@ -5287,6 +5588,14 @@ class CtHandler(BaseHTTPRequestHandler):
                                            + (" (in_run covers only IDLE/VOLTAGE on the "
                                               "running schedule's own filaments)"
                                               if body.get("in_run") else "")}, HTTPStatus.OK)
+                # Last, after every request-level check above (dead, floor,
+                # ceiling, cap, ladder, run): the vacuum is the state of the
+                # machine, not of this request, and those refusals say more.
+                if state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
+                    vr = vacuum_refusal(f"heating filament {filament} to {power_state_name(state)}")
+                    if vr:
+                        return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
+                                          HTTPStatus.OK)
                 ft, flags, payload = build_payload("CH_SET_POWER_STATE", {
                     "channel": ch, "mux_port": pos, "state": state, "arg": arg,
                 })
@@ -5338,6 +5647,11 @@ class CtHandler(BaseHTTPRequestHandler):
                 timed, err = _parse_timed_active(body, state, filaments)
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                if state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
+                    vr = vacuum_refusal(f"heating to {power_state_name(state)}")
+                    if vr:
+                        return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
+                                          HTTPStatus.OK)
                 results = {}
                 for cid, link in CONTROLLERS.items():
                     if not link.client.connected:
@@ -6179,6 +6493,11 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 _hv_ch, _hv_on = str(body.get("ch", "emission")), bool(body.get("on"))
                 preflight = None
+                if _hv_on:
+                    vr = vacuum_refusal(f"{_hv_ch} ON")
+                    if vr:
+                        return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
+                                          HTTPStatus.OK)
                 tripped = _HV_GUARD.get("tripped")
                 if _hv_on and tripped:
                     return self._json({"ok": False, "hv_guard": tripped,
@@ -7069,6 +7388,8 @@ def main() -> None:
     threading.Thread(target=_grid_sweep_loop, name="grid_sweep", daemon=True).start()
     # A grid switch that will not turn off at all (see hv_guard_tick).
     threading.Thread(target=_hv_guard_loop, name="hv_guard", daemon=True).start()
+    # Spellman V/I + vacuum from control2, read-only (see _spellman_loop).
+    threading.Thread(target=_spellman_loop, name="spellman_reader", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
     # Timed ACTIVE (active_s): returns filaments to IDLE when their time is up.
