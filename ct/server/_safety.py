@@ -108,6 +108,12 @@ _GRID_CLOSED: set[int] = set()
 _SAFETY_EVENTS: list[dict] = []
 
 
+# FID -> monotonic time it was last hot (commanded ACTIVE/VOLTAGE, or commanded
+# out of it). The HV guard names these as the suspects when a grid switch will
+# not turn off: a blown FET only shows while its filament is hot enough to emit.
+_LAST_HOT: dict[int, float] = {}
+
+
 def safety_touch_filaments(fids, when: float | None = None) -> None:
     """Renew the dead-man timer for these filaments. COMMANDS ONLY."""
     t = when if when is not None else time.monotonic()
@@ -372,6 +378,9 @@ def note_power_state(fids, state: int, args=None) -> None:
                 POWER_OWNER[int(f)] = owner
             prev = LAST_POWER_STATE.get(int(f))
             note_active_transition(int(f), prev[0] if prev else None, int(state), now)
+            if int(state) in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE) or \
+                    (prev and prev[0] in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE)):
+                _LAST_HOT[int(f)] = now
             LAST_POWER_STATE[int(f)] = (int(state), now)
             ACTIVE_DEADLINES.pop(int(f), None)
             if int(state) == POWER_STATE_IDLE and args is not None:

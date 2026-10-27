@@ -124,6 +124,7 @@ from ._link import *  # noqa: F401,F403,E402
 from ._logfiles import *  # noqa: F401,F403,E402
 from ._mapping import *  # noqa: F401,F403,E402
 from ._monitor import *  # noqa: F401,F403,E402
+from ._safety import _LAST_HOT  # noqa: E402
 from ._schedule import *  # noqa: F401,F403,E402
 from ._reads import *  # noqa: F401,F403,E402
 from ._recording import *  # noqa: F401,F403,E402
@@ -1385,6 +1386,7 @@ def safety_snapshot() -> dict:
             "active_filaments": active,
             "grid_closed": grid_closed,
             "hv_idle_for_s": round(hv_age, 1) if hv_age is not None else None,
+            "hv_guard": hv_guard_snapshot(),
             "events": events}
 
 
@@ -1985,6 +1987,7 @@ def _sim_finish() -> None:
     """End of a simulated train, whether it ran or never started."""
     with _SIM_LOCK:
         _SIM_STATE["running"] = False
+        _SIM_STATE["ended_at"] = time.monotonic()   # the HV guard waits out the last pulse
     # Stop the telemetry push and finalize the power-state report -- unless
     # a scan_view holds it for the rest of its view.
     for c2, l2 in CONTROLLERS.items():
@@ -2015,6 +2018,7 @@ def _start_scan_sim(host: str, count: int, interval_ms: float) -> dict:
         _SIM_STATE["start_ok"] = bool(r.get("ok"))
         _SIM_STATE["period_us"] = period_us
         _SIM_STATE["start_error"] = None if r.get("ok") else (r.get("error") or f"HTTP {r.get('status')}")
+        _SIM_STATE["started_at"] = time.monotonic()   # the HV guard: this run is sim-driven
     return r
 
 
@@ -2960,6 +2964,194 @@ def grid_sweep_once() -> list[dict]:
     return found
 
 
+# ── HV guard: a grid switch that will not turn off -> HV off, latched ────────
+# 2026-10-27 12:18: FID 20's grid MOSFET was blown. Its own OFF read-back was 0
+# -- the 165 reads the 595, upstream of the gate -- so neither the per-pulse
+# verify nor the grid sweep could see it, and the emission supply carried
+# filament 20's current for 70 s after the shot. The emission current itself
+# is the only thing that sees every way a switch stays on, so it is watched
+# between pulses: a sustained rise first gets every switch forced open (a 595
+# that flipped by itself, as at 11:37-11:53, is fixed by that); if the current
+# does not come down with every switch confirmed open, a MOSFET is conducting
+# that nothing can turn off, and the rails go off and stay off until a person
+# clears the latch.
+HV_GUARD_TICK_S = 1.0
+HV_GUARD_RISE_MA = 1.5          # one sub-board's diode path alone is ~1.95 mA
+HV_GUARD_HOLD_S = 2.0           # sustained this long between pulses -> act (3 readings at 1 Hz)
+HV_GUARD_CLEARED_MA = 1.0       # back within this of the baseline -> it was a 595
+HV_GUARD_RECHECK_S = 1.5        # after forcing every switch open, read again
+HV_GUARD_BASE_WINDOW_S = 120.0  # baseline = lowest quiet reading this far back
+HV_GUARD_MIN_BASE_S = 10.0      # quiet history needed before it may act at all
+HV_GUARD_AFTER_TRAIN_S = 1.5    # a sim train's last pulse is not "between pulses"
+HV_GUARD_SIM_RECENT_S = 30.0    # a sim started this recently -> the run is sim-driven
+HV_GUARD_FOCUS_TOL_V = 1.5      # the standing current follows focus: new focus, new baseline
+HV_GUARD_RAIL_ON_V = -50.0      # emission rail below this = on
+# Above this between pulses is wrong whatever the learned baseline says. The
+# rig's standing current is 10-13.6 mA (it follows focus); a rail turned on
+# with a switch already conducting would otherwise LEARN the fault as its
+# baseline -- 08:31 and 08:39 on 2026-10-27 (+10-12 mA for 2 min) were missed
+# that way in a replay. CT_HV_GUARD_ABS_MA to change it.
+HV_GUARD_ABS_MA = float(os.environ.get("CT_HV_GUARD_ABS_MA", "16.0"))
+HV_GUARD_HOT_RECENT_S = 300.0   # suspects: filaments hot within this
+
+_HV_GUARD = {"enabled": os.environ.get("CT_HV_GUARD", "1") != "0", "tripped": None}
+_HV_GUARD_LOCK = threading.Lock()
+_HVG_HIST: list = []            # quiet (t, mA, focus_v) samples, oldest first
+_HVG_HIGH_SINCE: list = [None]  # monotonic start of the current rise, or None
+
+
+def _hv_guard_quiet(now: float) -> bool:
+    """Nothing should be pulsing: no sim train (or its tail), no grid switch
+    the host commanded closed, and no run on EXTERNAL triggers. A sim-driven
+    run pulses only while its train runs, so its armed wait (the heating
+    before the trigger, seconds per shot) is quiet -- treating every armed
+    controller as busy left no 2 s gap in a scripted series, and the 08:31 /
+    08:39 rises (2026-10-27) went unseen in a replay."""
+    with _SIM_LOCK:
+        if _SIM_STATE.get("running") or now - _SIM_STATE.get("ended_at", 0.0) < HV_GUARD_AFTER_TRAIN_S:
+            return False
+        sim_driven = now - _SIM_STATE.get("started_at", -1e9) < HV_GUARD_SIM_RECENT_S
+    with _SAFETY_LOCK:
+        if _GRID_CLOSED:
+            return False
+    if sim_driven:
+        return True
+    return not any((board_monitor_snapshot(cid) or {}).get("run_owns")
+                   for cid, link in CONTROLLERS.items() if link and link.client.connected)
+
+
+def _hv_guard_read() -> dict | None:
+    link = CONTROLLERS.get(MASTER)
+    if not link or not link.client.connected or not link.host:
+        return None
+    host = link.host
+    try:
+        r = shared_read(("stm32-ads1115", host), SHARED_TTL_STM32_S, lambda: stm32_ads1115(host))
+    except Exception:
+        return None
+    if not isinstance(r, dict) or not r.get("ok") or r.get("emiss_i_ma") is None:
+        return None
+    return r
+
+
+def _hv_guard_suspects(now: float) -> list[int]:
+    with _SAFETY_LOCK:
+        hot = sorted(((t, f) for f, t in _LAST_HOT.items() if now - t <= HV_GUARD_HOT_RECENT_S),
+                     reverse=True)
+    return [f for _, f in hot]
+
+
+def hv_guard_tick(now: float | None = None) -> dict | None:
+    """One look at the emission current. Returns what it did (cleared / tripped)
+    or None. See the block comment above."""
+    now = time.monotonic() if now is None else now
+    if not _HV_GUARD["enabled"] or _HV_GUARD["tripped"]:
+        return None
+    r = _hv_guard_read()
+    if r is None or (r.get("emiss_v") or 0.0) > HV_GUARD_RAIL_ON_V:
+        _HVG_HIST.clear()               # rail off / unreadable: the baseline starts over
+        _HVG_HIGH_SINCE[0] = None
+        return None
+    if not _hv_guard_quiet(now):
+        _HVG_HIGH_SINCE[0] = None       # a pulse is not a rise; not baseline either
+        return None
+    ma, focus = float(r["emiss_i_ma"]), float(r.get("focus_v") or 0.0)
+    if _HVG_HIST and abs(focus - _HVG_HIST[-1][2]) > HV_GUARD_FOCUS_TOL_V:
+        _HVG_HIST.clear()
+        _HVG_HIGH_SINCE[0] = None
+    _HVG_HIST.append((now, ma, focus))
+    while _HVG_HIST and now - _HVG_HIST[0][0] > HV_GUARD_BASE_WINDOW_S:
+        _HVG_HIST.pop(0)
+    base = (min(m for _, m, _f in _HVG_HIST)
+            if now - _HVG_HIST[0][0] >= HV_GUARD_MIN_BASE_S else None)
+    high = ma >= HV_GUARD_ABS_MA or (base is not None and ma >= base + HV_GUARD_RISE_MA)
+    if not high:
+        _HVG_HIGH_SINCE[0] = None
+        return None
+    if _HVG_HIGH_SINCE[0] is None:
+        _HVG_HIGH_SINCE[0] = now
+    if now - _HVG_HIGH_SINCE[0] < HV_GUARD_HOLD_S:
+        return None
+    _HVG_HIGH_SINCE[0] = None
+    return _hv_guard_act(base, ma, focus, now)
+
+
+def _hv_guard_act(base: float | None, ma: float, focus: float, now: float) -> dict:
+    """base None: no baseline learned yet (tripped on HV_GUARD_ABS_MA); the
+    switches then count as fixed once the current is back under that ceiling
+    less one diode path."""
+    suspects = _hv_guard_suspects(now)
+    ok_below = (base + HV_GUARD_CLEARED_MA) if base is not None else (HV_GUARD_ABS_MA - HV_GUARD_RISE_MA)
+    log.warning("HV guard: emission %.2f mA between pulses (baseline %s, ceiling %.1f mA) -- "
+                "forcing every grid switch open (recently hot: %s)", ma,
+                "unknown" if base is None else f"{base:.2f} mA", HV_GUARD_ABS_MA, suspects)
+    opened = {}
+    for cid, link in sorted(CONTROLLERS.items()):
+        if link and link.client.connected:
+            fr = force_grid_off(link, cid, None, reason="HV guard: emission current over baseline")
+            if fr.get("ok"):
+                _note_forced_open(cid, None)
+            opened[str(cid)] = bool(fr.get("ok"))
+    time.sleep(HV_GUARD_RECHECK_S)
+    r2 = _hv_guard_read()
+    ma2 = float(r2["emiss_i_ma"]) if r2 else None
+    rec = {"baseline_ma": None if base is None else round(base, 2), "emission_ma": round(ma, 2),
+           "after_force_open_ma": None if ma2 is None else round(ma2, 2),
+           "focus_v": focus, "suspects": suspects, "forced_open": opened}
+    if ma2 is not None and ma2 < ok_below:
+        _safety_record("hv_guard_cleared_by_force_open", rec)
+        return {"action": "cleared", **rec}
+    # Still high (or unreadable) with every switch forced open: something is
+    # conducting that the 595s cannot turn off. Rails off, latched.
+    link = CONTROLLERS.get(MASTER)
+    host = link.host if link else None
+    off = {}
+    for ch in ("emission", "focus"):
+        res = None
+        for _ in range(3):
+            try:
+                res = stm32_hv_enable_set(host, ch, False) if host else {"ok": False, "error": "no master"}
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            if res.get("ok"):
+                break
+        off[ch] = bool(res and res.get("ok"))
+    rec["hv_off"] = off
+    was = ("unreadable" if ma2 is None else f"{ma2:.2f} mA")
+    ref = (f"its {base:.2f} mA baseline" if base is not None else
+           f"the {HV_GUARD_ABS_MA:.1f} mA ceiling (no baseline yet)")
+    rec["message"] = (f"HV OFF: emission was still {was} against {ref} with every grid switch "
+                      f"forced open -- a grid MOSFET is "
+                      f"conducting that cannot be turned off (recently hot filaments, most recent "
+                      f"first: {suspects}). Emission and focus switched off; turning HV on is "
+                      f"refused until the latch is cleared (POST /api/hv-guard {{\"clear\": true}}).")
+    with _HV_GUARD_LOCK:
+        _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                                **rec}
+    _HVG_HIST.clear()
+    log.error("HV guard TRIPPED: %s", rec["message"])
+    _safety_record("hv_guard_tripped", rec)
+    return {"action": "tripped", **rec}
+
+
+def hv_guard_snapshot() -> dict:
+    now = time.monotonic()
+    base = min((m for _, m, _f in _HVG_HIST), default=None)
+    return {"ok": True, "enabled": _HV_GUARD["enabled"], "tripped": _HV_GUARD["tripped"],
+            "baseline_ma": None if base is None else round(base, 2),
+            "baseline_span_s": round(now - _HVG_HIST[0][0], 1) if _HVG_HIST else 0.0,
+            "rise_ma": HV_GUARD_RISE_MA, "hold_s": HV_GUARD_HOLD_S, "ceiling_ma": HV_GUARD_ABS_MA}
+
+
+def _hv_guard_loop() -> None:
+    while not _STOPPING.is_set():          # see _safety_loop
+        time.sleep(HV_GUARD_TICK_S)
+        try:
+            hv_guard_tick()
+        except Exception as exc:          # never let the guard die
+            log.exception("HV guard failed: %s", exc)
+
+
 def _grid_sweep_loop() -> None:
     while not _STOPPING.is_set():          # see _safety_loop
         time.sleep(GRID_SWEEP_S)
@@ -3455,6 +3647,8 @@ class CtHandler(BaseHTTPRequestHandler):
                         "lock": _lease_snapshot()})
         elif path == "/api/safety":
             self._json(safety_snapshot())
+        elif path == "/api/hv-guard":
+            self._json(hv_guard_snapshot())
         elif path == "/api/remote/sessions":
             self._json({"ok": True, "sessions": _remote.sessions()})
         elif path == "/api/status":
@@ -4711,6 +4905,24 @@ class CtHandler(BaseHTTPRequestHandler):
                         f"Power {c}: {r.get('error') or 'refused'}"
                         for c, r in sorted(results.items()) if not r.get("ok"))
                 self._json(out)
+            elif path == "/api/hv-guard":
+                # {"clear": true}: a person has dealt with the switch that would
+                # not turn off -- HV may come on again. {"enabled": bool}: switch
+                # the guard (it starts enabled; CT_HV_GUARD=0 at start-up).
+                with _HV_GUARD_LOCK:
+                    if body.get("clear"):
+                        was = _HV_GUARD["tripped"]
+                        _HV_GUARD["tripped"] = None
+                        if was:
+                            log.warning("HV guard latch cleared by %s (tripped %s, suspects %s)",
+                                        self._client(body), was.get("at"), was.get("suspects"))
+                    if "enabled" in body:
+                        _HV_GUARD["enabled"] = bool(body["enabled"])
+                        log.warning("HV guard %s by %s", "enabled" if _HV_GUARD["enabled"]
+                                    else "DISABLED", self._client(body))
+                _HVG_HIST.clear()
+                _HVG_HIGH_SINCE[0] = None
+                self._json(hv_guard_snapshot())
             elif path == "/api/safety":
                 # Dead-man watchdog: read the state, or change the rules.
                 # POST with any of enabled / active_timeout_s /
@@ -5815,6 +6027,11 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 _hv_ch, _hv_on = str(body.get("ch", "emission")), bool(body.get("on"))
                 preflight = None
+                tripped = _HV_GUARD.get("tripped")
+                if _hv_on and tripped:
+                    return self._json({"ok": False, "hv_guard": tripped,
+                                       "error": "HV guard tripped -- refusing HV ON. "
+                                                + tripped.get("message", "")}, HTTPStatus.OK)
                 if _hv_on:
                     preflight = hv_preflight_switches(f"before {_hv_ch} ON (by {self._client(body)})")
                     if not preflight["ok"]:
@@ -6698,6 +6915,8 @@ def main() -> None:
     threading.Thread(target=_safety_loop, name="safety_watchdog", daemon=True).start()
     # Grid switches that close with no command (see grid_sweep_once).
     threading.Thread(target=_grid_sweep_loop, name="grid_sweep", daemon=True).start()
+    # A grid switch that will not turn off at all (see hv_guard_tick).
+    threading.Thread(target=_hv_guard_loop, name="hv_guard", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
     # Timed ACTIVE (active_s): returns filaments to IDLE when their time is up.
