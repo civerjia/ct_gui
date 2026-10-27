@@ -15,6 +15,7 @@ STM32 = the device's HTTP /stm32 status (age_ms).
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import copy
 import csv
@@ -1729,7 +1730,7 @@ def _raw_power_guard(cid: int, command: str, body: dict) -> tuple[dict | None, l
                           + (f"; and {len(blocked) - 6} more" if len(blocked) > 6 else "")},
                 fids, state)
     if state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):   # last: see /api/filament-state
-        vr = vacuum_refusal(f"raw {command} to {power_state_name(state)}")
+        vr = heat_refusal(f"raw {command} to {power_state_name(state)}")
         if vr:
             return {"ok": False, "refused": True, "error": vr}, fids, state
     return None, fids, state
@@ -3044,6 +3045,7 @@ def _hv_guard_read() -> dict | None:
         r = shared_read(("stm32-ads1115", host), SHARED_TTL_STM32_S, lambda: stm32_ads1115(host))
     except Exception:
         return None
+    series_from_ads(r)
     if not isinstance(r, dict) or not r.get("ok") or r.get("emiss_i_ma") is None:
         return None
     return r
@@ -3191,6 +3193,15 @@ def _hv_guard_verify_counts(host: str) -> list:
 
 
 def _hv_guard_after_stm32_trip(now: float) -> dict:
+    """See _hv_guard_after_stm32_trip_. The heat block is always lifted, also
+    if that raises: a stuck _HVG_CHECKING would refuse every ACTIVE forever."""
+    try:
+        return _hv_guard_after_stm32_trip_(now)
+    finally:
+        _HVG_CHECKING[0] = False
+
+
+def _hv_guard_after_stm32_trip_(now: float) -> dict:
     """The STM32 already took the HV down (milliseconds). Decide by CURRENT
     whether forcing the switches open fixed it -- not by the 165: the 595s
     flip by themselves and the 165 read-back is not reliable either (the
@@ -3243,6 +3254,15 @@ def _hv_guard_after_stm32_trip(now: float) -> dict:
 
     verdict = None
     if why_not is None:
+        # No heating while the HV is back on to measure (the user, 2026-10-27):
+        # everything at ACTIVE/VOLTAGE to IDLE first, new heating refused.
+        _HVG_CHECKING[0] = True
+        to_idle, no_idle = drop_hot_to_idle(now)
+        still_hot = _wait_not_hot()
+        rec.update(cooled_to_idle=to_idle, cooled_to_sleep=no_idle)
+        if still_hot:
+            why_not = f"filament(s) {still_hot} did not leave ACTIVE/VOLTAGE"
+    if why_not is None:
         clr = {}
         try:
             clr = stm32_hv_guard(host, "clear")
@@ -3279,6 +3299,7 @@ def _hv_guard_after_stm32_trip(now: float) -> dict:
         else:
             why_not = f"the HV could not be put back ({restored or clr.get('error')})"
 
+    _HVG_CHECKING[0] = False
     if verdict == "fixed":
         _HVG_RECOVERIES.append(now)
         rec["message"] = (f"HV guard: the current was over its baseline with no pulse; every switch "
@@ -3473,6 +3494,55 @@ def _hv_guard_loop() -> None:
             log.exception("HV guard failed: %s", exc)
 
 
+# ── Time series for the GUI trend plot ─────────────────────────────────────────
+# Every reading as it arrives (no fixed rate: a Spellman broadcast, a pressure
+# point, an ADS read -- whatever pace they come at), wall-clock stamped, kept
+# SERIES_KEEP_S. /api/series hands out what is newer than ?since=.
+SERIES_KEEP_S = 3600.0
+SERIES_MAX_POINTS = 200_000         # per series, whatever the rate
+SERIES_NAMES = ("sp_kv", "sp_ma", "vac", "em_v", "em_i")
+_SERIES_LOCK = threading.Lock()
+_SERIES = {n: collections.deque(maxlen=SERIES_MAX_POINTS) for n in SERIES_NAMES}
+_SERIES_LAST_ADS = [None]           # the shared ADS result last recorded (no duplicates)
+
+
+def series_add(name: str, value: float, t: float | None = None) -> None:
+    t = time.time() if t is None else t
+    with _SERIES_LOCK:
+        d = _SERIES[name]
+        d.append((t, value))
+        while d and t - d[0][0] > SERIES_KEEP_S:
+            d.popleft()
+
+
+def series_from_ads(r) -> None:
+    """Record an ADS read once, however many callers share it."""
+    if not isinstance(r, dict) or not r.get("ok") or r is _SERIES_LAST_ADS[0]:
+        return
+    _SERIES_LAST_ADS[0] = r
+    t = time.time()
+    if isinstance(r.get("emiss_v"), (int, float)):
+        series_add("em_v", float(r["emiss_v"]), t)
+    if isinstance(r.get("emiss_i_ma"), (int, float)):
+        series_add("em_i", float(r["emiss_i_ma"]), t)
+
+
+def series_get(names, since: float = 0.0, max_points: int = 4000) -> dict:
+    """{name: [[t, v], ...]} newer than `since`, each thinned to max_points by
+    taking every k-th point (the first load of an hour of 10 Hz data)."""
+    out = {}
+    with _SERIES_LOCK:
+        for n in names:
+            if n not in _SERIES:
+                continue
+            pts = [p for p in _SERIES[n] if p[0] > since]
+            if len(pts) > max_points:
+                k = -(-len(pts) // max_points)
+                pts = pts[::k] + ([pts[-1]] if (len(pts) - 1) % k else [])
+            out[n] = [[round(t, 3), v] for t, v in pts]
+    return {"ok": True, "now": round(time.time(), 3), "keep_s": SERIES_KEEP_S, "series": out}
+
+
 # ── Spellman HV supply + vacuum, READ-ONLY (control2's spellman_backend) ──────
 # spellman_control_v6/spellman_backend.py on control2 (WebSocket :8770) polls
 # the Spellman itself (~1.3 s: GetStatus, GetkVMonitor, GetmAMonitor) and the
@@ -3518,27 +3588,32 @@ def _spellman_on_message(m: dict, now: float) -> None:
                 v = _spellman_number(data)
                 if v is not None:
                     _SPELL["kv"], _SPELL["kv_at"] = v, now
+                    series_add("sp_kv", v)
             elif cmd == "GetmAMonitor":
                 v = _spellman_number(data)
                 if v is not None:
                     _SPELL["ma"], _SPELL["ma_at"] = v, now
                     _SPELL_MA_HIST.append((now, v))
                     del _SPELL_MA_HIST[:-500]
+                    series_add("sp_ma", v)
             elif cmd == "GetStatus" and isinstance(data, list) and data:
                 _SPELL["status_bits"], _SPELL["status_at"] = list(data), now
         elif t == "conditioning_point" and isinstance(m.get("data"), dict):
             d = m["data"]
             if isinstance(d.get("measured_kv"), (int, float)):
                 _SPELL["kv"], _SPELL["kv_at"] = float(d["measured_kv"]), now
+                series_add("sp_kv", float(d["measured_kv"]))
             if isinstance(d.get("measured_mA"), (int, float)):
                 _SPELL["ma"], _SPELL["ma_at"] = float(d["measured_mA"]), now
                 _SPELL_MA_HIST.append((now, float(d["measured_mA"])))
                 del _SPELL_MA_HIST[:-500]
+                series_add("sp_ma", float(d["measured_mA"]))
         elif t == "pressure_point" and isinstance(m.get("data"), dict):
             p = m["data"].get("pressure_torr")
             if isinstance(p, (int, float)) and not isinstance(p, bool):
                 _SPELL["pressure_torr"], _SPELL["pressure_at"] = float(p), now
                 _SPELL["pressure_raw"] = m["data"].get("raw")
+                series_add("vac", float(p))
         elif t == "lesker_status":
             _SPELL["lesker"] = m.get("data")
 
@@ -3626,17 +3701,10 @@ def vacuum_refusal(action: str) -> str | None:
     return None
 
 
-def _vacuum_trip(p: float, now: float) -> dict:
-    """Pressure over the limit with HV possibly on: rails off, hot filaments
-    back to their IDLE (not STOP: IDLE keeps the vacuum -- the rig's rule),
-    latched like the HV guard."""
-    link = CONTROLLERS.get(MASTER)
-    off = {}
-    for ch in ("emission", "focus"):
-        try:
-            off[ch] = bool((stm32_hv_enable_set(link.host, ch, False) if link and link.host else {}).get("ok"))
-        except Exception:
-            off[ch] = False
+def drop_hot_to_idle(now: float) -> tuple[list, list]:
+    """Every filament at ACTIVE/VOLTAGE back to its IDLE current now (the
+    timed-ACTIVE loop does the write), SLEEP if no IDLE current is known.
+    IDLE, not lower: IDLE keeps the vacuum (the rig's rule)."""
     with _SAFETY_LOCK:
         hot = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
                      if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
@@ -3650,6 +3718,48 @@ def _vacuum_trip(p: float, now: float) -> dict:
                 no_idle.append(f)
     if no_idle:
         _safety_fallback_filaments(no_idle, POWER_STATE_SLEEP)   # no IDLE current known
+    return to_idle, no_idle
+
+
+def _wait_not_hot(timeout_s: float = 3.0) -> list:
+    """Until no filament reads ACTIVE/VOLTAGE (the deadline loop runs at
+    10 Hz); returns the ones still hot when it gave up."""
+    t0 = time.monotonic()
+    while True:
+        with _SAFETY_LOCK:
+            hot = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
+                         if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+        if not hot or time.monotonic() - t0 >= timeout_s:
+            return hot
+        time.sleep(0.1)
+
+
+# While the HV guard has the rails back on to measure (1-3 s), nothing may be
+# heated to ACTIVE/VOLTAGE (the user, 2026-10-27): the heat gates refuse.
+_HVG_CHECKING = [False]
+
+
+def heat_refusal(action: str) -> str | None:
+    """Why heating to ACTIVE/VOLTAGE may not happen now, or None: the vacuum
+    interlock, or an HV guard check in progress."""
+    if _HVG_CHECKING[0]:
+        return (f"HV guard check in progress (the HV is back on for 1-3 s to measure whether "
+                f"a grid switch still conducts) -- refusing {action}; try again in a few seconds")
+    return vacuum_refusal(action)
+
+
+def _vacuum_trip(p: float, now: float) -> dict:
+    """Pressure over the limit with HV possibly on: rails off, hot filaments
+    back to their IDLE (not STOP: IDLE keeps the vacuum -- the rig's rule),
+    latched like the HV guard."""
+    link = CONTROLLERS.get(MASTER)
+    off = {}
+    for ch in ("emission", "focus"):
+        try:
+            off[ch] = bool((stm32_hv_enable_set(link.host, ch, False) if link and link.host else {}).get("ok"))
+        except Exception:
+            off[ch] = False
+    to_idle, no_idle = drop_hot_to_idle(now)
     rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": VACUUM_LIMIT_TORR, "hv_off": off,
            "to_idle": to_idle, "to_sleep_no_idle_known": no_idle,
            "message": (f"HV OFF: vacuum {p:.2e} Torr over the {VACUUM_LIMIT_TORR:.1e} Torr limit -- "
@@ -4251,6 +4361,15 @@ class CtHandler(BaseHTTPRequestHandler):
                         "lock": _lease_snapshot()})
         elif path == "/api/safety":
             self._json(safety_snapshot())
+        elif path == "/api/series":
+            q = self._query()
+            names = [n for n in (q.get("names") or ",".join(SERIES_NAMES)).split(",") if n]
+            try:
+                since = float(q.get("since") or 0)
+                maxp = max(10, min(int(q.get("max_points") or 4000), 50_000))
+            except ValueError:
+                return self._json({"ok": False, "error": "since must be a number (epoch s), max_points an integer"})
+            self._json(series_get(names, since, maxp))
         elif path == "/api/hv-supply":
             self._json(hv_supply_snapshot())
         elif path == "/api/vacuum":
@@ -4612,9 +4731,12 @@ class CtHandler(BaseHTTPRequestHandler):
             # mV, and engineering units) over the STM32's I2C bus. Routed to
             # whichever controller is MASTER (STM32 hangs off one power only).
             host, err = self._master_host()
-            self._json({"ok": False, "error": err} if err else
-                       shared_read(("stm32-ads1115", host), SHARED_TTL_STM32_S,
-                                   lambda: stm32_ads1115(host)))
+            if err:
+                self._json({"ok": False, "error": err})
+            else:
+                r = shared_read(("stm32-ads1115", host), SHARED_TTL_STM32_S, lambda: stm32_ads1115(host))
+                series_from_ads(r)
+                self._json(r)
         elif path == "/api/stm32/adc-window":
             # Proxy to `/stm32/adc_window?n=` — a pulse-INDEPENDENT windowed
             # summary (min/max/mean/rms/std/pp) over the next n high-speed ADC
@@ -5764,7 +5886,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # ceiling, cap, ladder, run): the vacuum is the state of the
                 # machine, not of this request, and those refusals say more.
                 if state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
-                    vr = vacuum_refusal(f"heating filament {filament} to {power_state_name(state)}")
+                    vr = heat_refusal(f"heating filament {filament} to {power_state_name(state)}")
                     if vr:
                         return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
                                           HTTPStatus.OK)
@@ -5820,7 +5942,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 if state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
-                    vr = vacuum_refusal(f"heating to {power_state_name(state)}")
+                    vr = heat_refusal(f"heating to {power_state_name(state)}")
                     if vr:
                         return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
                                           HTTPStatus.OK)

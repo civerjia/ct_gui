@@ -24,6 +24,7 @@ import { initControllers } from './controllers.js';
 import { initScheduleTable } from './schedule.js';
 import { ScheduleGantt } from './gantt.js';
 import { initPower, renderMaskBits } from './power.js';
+import { initTrends } from './trends.js';
 import { initMapping } from './mapping.js';
 import { initTests } from './tests.js';
 import { initSticky } from './sticky.js';
@@ -2202,6 +2203,7 @@ function init() {
   geo = new CTGeometry($('ctCanvas'));
   initControllers();
   initPower();
+  initTrends();
   initMapping();
   initTests();
 

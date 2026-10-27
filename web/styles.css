@@ -901,3 +901,6 @@ button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 .shot-panel #shotFire { margin-left: auto; }
 .shot-panel .numlabel { flex: 0 0 auto; width: auto; }
 .shot-panel .numlabel select { width: auto !important; min-width: 0; }
+
+/* supply & vacuum trend (trends.js) */
+.trend-canvas { display: block; width: 100%; margin-top: 6px; cursor: crosshair; }

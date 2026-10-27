@@ -434,6 +434,23 @@
             <button id="hvGuardClear2" class="xs" hidden title="The switch / vacuum was dealt with: clear the latch (HV stays off; turn it on again yourself)">Clear HV guard latch</button>
           </details>
 
+          <!-- Spellman V/I, emission V/I, vacuum over time: trends.js, from
+               /api/series (every reading as the backend received it). -->
+          <details id="trendCard" class="card module foldable" data-module="trends" open>
+            <summary class="section-head foldable-summary">
+              <h2>Supply &amp; Vacuum Trend <span class="hint">— Spellman (control2, read-only) · emission (ADS1115) · vacuum</span></h2>
+            </summary>
+            <div class="row compact">
+              <span class="hint">window</span>
+              <div class="seg sm" id="trendWindow">
+                <button class="seg-btn active" data-s="120">2 min</button>
+                <button class="seg-btn" data-s="600">10 min</button>
+                <button class="seg-btn" data-s="3600">1 h</button>
+              </div>
+            </div>
+            <canvas id="trendCanvas" class="trend-canvas"></canvas>
+          </details>
+
         </aside>
       </section>
 

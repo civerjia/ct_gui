@@ -338,5 +338,44 @@ r = S.hv_guard_tick(100.0)
 check("reason 8 without the flag (latch cleared; reason is first-wins until reset) -> not a trip",
       r is None and rig.forced == 0, r)
 
+# 13. No heating while the HV is back on to measure (the user, 2026-10-27):
+#     a VOLTAGE filament goes to its IDLE before the rails come back, and any
+#     ACTIVE/VOLTAGE request during the check is refused; lifted afterwards.
+rig = Rig()
+setup(rig)
+S.LAST_POWER_STATE[20] = (int(S.POWER_STATE_VOLTAGE), 0.0)
+S.ACTIVE_DEADLINES.clear()
+S.ACTIVE_DEADLINES[20] = (1e12, 1100)
+order, refused_during = [], []
+
+
+def _wait():
+    order.append("cooled" if S.ACTIVE_DEADLINES.get(20, (1e12,))[0] < 1e11 else "not cooled")
+    S.LAST_POWER_STATE[20] = (int(S.POWER_STATE_IDLE), 0.0)   # what the deadline loop would do
+    return []
+
+
+S._wait_not_hot = _wait
+_rail = S.stm32_hv_enable_set
+
+
+def _rail_check(host, ch, on):
+    if on:
+        order.append("rails on")
+        refused_during.append(S.heat_refusal("test"))
+    return _rail(host, ch, on)
+
+
+S.stm32_hv_enable_set = _rail_check
+rig.after = [1050 * 16] * 3
+rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
+r = S.hv_guard_tick(100.0)
+check("VOLTAGE filament sent to its IDLE (1100 mA) before the HV came back",
+      order[:2] == ["cooled", "rails on"] and r and r.get("cooled_to_idle") == [20], (order, r and r.get("cooled_to_idle")))
+check("...heating refused while the HV is on for the check",
+      refused_during and all(x and "HV guard check in progress" in x for x in refused_during), refused_during)
+S._SPELL["pressure_torr"], S._SPELL["pressure_at"] = 6e-6, S.time.monotonic()
+check("...and allowed again once the check is over", S.heat_refusal("test") is None, S.heat_refusal("test"))
+
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)
