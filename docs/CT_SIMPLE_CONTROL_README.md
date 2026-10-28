@@ -2250,8 +2250,11 @@ arrival check.
 
 **`active_mv`** (default `None`) — the same, but the heat-up is **VOLTAGE
 mode** at `active_mv` mV of LOAD voltage instead of ACTIVE at a current.
-`voltage_settle_s` (the old fixed wait) is accepted and IGNORED, with a
-warning: the wait is now the arrival, up to `heat_timeout_s`.
+The wait is the firmware's arrival (+-150 mV, at most `heat_timeout_s`)
+plus `settle_ms` (below). `scan_view`'s `settle_ms` has the same name but a
+different rule: it counts from the FIRST arrival and ignores wobble ("HOT");
+here every exit from the band restarts the clock. Both are drawn in the API
+reference (`fire_single_pulse`, `scan_view`).
 
 > **Heating is entirely host software — in both modes.** The schedule this
 > downloads holds ONE emission entry (`heating: []`); the RP2350's own heating
@@ -2262,10 +2265,11 @@ warning: the wait is now the arrival, up to `heat_timeout_s`.
 > arrival; the schedule fires (PIO pulse, 165 read-backs, envelope) and writes
 > the pulse record with the heating reading nearest the trigger.
 
-**`sim_delay_ms`** — **removed** (2026-10-26). It was a host-side sleep between
-arrival and the simulated trigger; `settle_ms` below does the same wait in the
-RP2350, for every trigger source. Passing it returns an error and nothing is
-done.
+**`sim_delay_ms`**, **`voltage_settle_s`** — **deleted** (2026-10-28;
+passing one is a `TypeError`). Both were host-side sleeps: `sim_delay_ms`
+between arrival and the simulated trigger, `voltage_settle_s` a fixed 2 s
+after the VOLTAGE command (ignored since 2026-10-23). `settle_ms` below does
+the wait in the RP2350, for every trigger source.
 
 **`settle_ms`** (default `None`, with `active_ma` or `active_mv`, 0..60000) —
 how long the heating must **stay** arrived before `on_armed` is called and the

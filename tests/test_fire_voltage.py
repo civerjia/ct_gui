@@ -110,22 +110,16 @@ for cached, word, kw2 in (([{"current_mA": None, "cc_mode": 3, "arrival": None}]
           not r["ok"] and "trigger" not in calls and calls[-1] == "idle"
           and word in str(r.get("error")), (calls, r.get("error")))
 
-# 3b. voltage_settle_s: accepted, ignored with a warning (timeout = heat_timeout_s).
-import warnings as _w
-ct, calls, seen = make()
-with _w.catch_warnings(record=True) as caught:
-    _w.simplefilter("always")
-    r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, voltage_settle_s=0.01, **KW)
-check("voltage_settle_s ignored (fired normally) and warned",
-      r["ok"] and any("voltage_settle_s is ignored" in str(w.message) for w in caught)
-      and seen["total_ms"] == 6000 + 5000 + 1000, (r.get("error"), [str(w.message) for w in caught]))
-
-# 3c. sim_delay_ms was removed 2026-10-26 (settle_ms, firmware-timed, replaces
-#     it): passing it is an error and nothing is done.
-ct, calls, seen = make()
-r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, sim_delay_ms=500, **KW)
-check("sim_delay_ms -> refused, points at settle_ms, nothing done",
-      not r["ok"] and "settle_ms" in (r.get("error") or "") and not calls, (r, calls))
+# 3b. voltage_settle_s / sim_delay_ms were REMOVED (2026-10-28; settle_ms
+#     replaces both): passing either is a TypeError and nothing is done.
+for old in ("voltage_settle_s", "sim_delay_ms"):
+    ct, calls, seen = make()
+    try:
+        ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, **{old: 1}, **KW)
+        raised = False
+    except TypeError:
+        raised = True
+    check(f"{old} -> TypeError, nothing done", raised and not calls, calls)
 
 # 4. Both / neither idle_ma.
 ct, calls, seen = make()

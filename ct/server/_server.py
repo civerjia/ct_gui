@@ -5615,7 +5615,7 @@ class CtHandler(BaseHTTPRequestHandler):
             elif path == "/api/shot":
                 # GUI single shot: body {filament (physical), active_ma | active_mv,
                 # idle_ma?, num_pulses?, width_us?, pulse_interval_ms?,
-                # heat_timeout_s?, voltage_settle_s?}. Runs fire_single_pulse in
+                # heat_timeout_s?, settle_ms?}. Runs fire_single_pulse in
                 # the backend; GET /api/shot for the result.
                 self._json(shot_start(body))
             elif path == "/api/tests/emission-cal":
@@ -5974,6 +5974,17 @@ class CtHandler(BaseHTTPRequestHandler):
                 out = {"ok": _status_ok(resp) and applied, "filament": filament,
                        "controller": cid, "channel": ch, "mux_port": pos,
                        "state": state, "arg": arg}
+                if not out["ok"]:
+                    # Without this the result had no error at all and the audit
+                    # line read just "failed" (filament 11 -> IDLE, 2026-10-28).
+                    # The reply does not say WHICH step failed; ccstat on that
+                    # RP2350's USB console does (1 rail/EN, 2 output enable,
+                    # 3 REF target, 4 refused).
+                    st_txt = resp.get("status") if isinstance(resp, dict) else None
+                    out["error"] = (f"P{cid} CH{ch + 1}.{pos + 1} did not apply "
+                                    f"{power_state_name(state)} (firmware status {st_txt}, "
+                                    f"raw {raw}): an I2C step of the transition failed -- "
+                                    f"ccstat on that RP2350 names the step")
                 if applied and timed:
                     set_active_deadlines([filament], timed["active_s"], timed["idle_ma"])
                     out["active_s"] = timed["active_s"]

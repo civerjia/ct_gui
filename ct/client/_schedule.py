@@ -14,7 +14,6 @@ _base.__all__) or, for CTClient itself, is bound in by _client.py.
 from ._base import *  # noqa: F401,F403
 import logging
 import threading
-import warnings
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:   # editors only: at run time _client.py binds CTClient into this module
@@ -1450,6 +1449,19 @@ class _ScheduleMixin:
         has not been interrupted since (output fault, lost board, or more than
         max_voltage_drop_mv below target on 3 reads). Wobble does not matter.
 
+            VOLTAGE   first      wobbles out of the      HOT: may fire
+            raised    arrival    +-150 mV band: ignored  (and stays HOT)
+              |         |          |                       |
+            --*---------*==========~~~~~~~=================*=========>
+                        |<----------- settle_ms ---------->|
+                        (from the FIRST arrival, not restarted)
+              a drop > max_voltage_drop_mv below target on 3 reads, or an
+              output fault -> "interrupted": not HOT, that filament skipped
+
+        This is NOT fire_single_pulse's settle_ms, where every exit from the
+        band restarts the clock (a "settled" filament has held the band
+        continuously). Same name and range (0..60000 ms), different rule.
+
         ORDER: one gated schedule for the whole list. The firmware fires only
         the row the host RELEASED, and only while that row's filament is hot;
         any other edge is dropped and counted. So a filament that is hot early
@@ -1776,6 +1788,10 @@ class _ScheduleMixin:
                     rows[j]["raise_s"] = since()
                 else:
                     rows[j]["skipped"] = f"VOLTAGE {mv[f]} mV refused: {r.get('error')}"
+                    # The ladder guard's "not warm yet": its IDLE has not come
+                    # back yet -- a state of the moment, not of the filament.
+                    if "not warm yet" in str(r.get("error")):
+                        rows[j]["skip_transient"] = True
 
             def preheat(i):
                 """Raise what is due among rows i.. (row i = the current turn), in
@@ -2190,7 +2206,10 @@ class _ScheduleMixin:
         given, wait move_s, then scan_view(view["filaments"], active_mv,
         idle_ma, settle_ms, **scan_view_args) -- every other argument is
         scan_view's, unchanged. A filament skipped in one view (data lost) is
-        left out of the later ones; a dangerous stop ends the run.
+        left out of the later ones -- except one refused only because its IDLE
+        was not warm yet (row["skip_transient"]): that is the moment, not the
+        filament, and the next view tries it again (the guard still refuses it
+        if it is still cold). A dangerous stop ends the run.
 
         Returns {"ok", "stopped"?, "views_done", "views_total", "left_out",
         "per_view": [{"view", "center", "ok", "fired", "skipped", "partial",
@@ -2215,7 +2234,8 @@ class _ScheduleMixin:
             if r.get("stopped") or r.get("error"):
                 row["stopped"] = r.get("stopped") or r.get("error")
             per.append(row)
-            left_out += [f for f in row["skipped"] if f not in left_out]
+            transient = {x["filament"] for x in (r.get("rows") or []) if x.get("skip_transient")}
+            left_out += [f for f in row["skipped"] if f not in left_out and f not in transient]
             if row.get("stopped"):
                 out.update(ok=False, stopped=f"view {v.get('view')}: {row['stopped']}")
                 break
@@ -2267,10 +2287,6 @@ class _ScheduleMixin:
         on_armed=None,               # callable() run after arming,
                                       # immediately before the trigger
                                       # -- see emission_ramp()
-        sim_delay_ms=None,           # REMOVED 2026-10-26: passing it is an
-                                      # error -- use settle_ms (the firmware
-                                      # holds on_armed until the heating has
-                                      # stayed arrived that long)
         active_ma: float | None = None,  # heat to ACTIVE at this current
                                           # only AFTER the arm, fire, and
                                           # drop to idle_ma at once -- see
@@ -2289,9 +2305,6 @@ class _ScheduleMixin:
         active_mv: float | None = None,  # INSTEAD of active_ma: heat at this
                                           # VOLTAGE (no CC loop) -- see
                                           # "active_mv" in the docstring
-        voltage_settle_s: float | None = None,  # REMOVED: ignored with a
-                                          # warning -- active_mv waits for
-                                          # arrival, up to heat_timeout_s
         timeout_s: float | None = None,  # old name of shot_wait_timeout_s, still accepted
         pulse_interval_ms: int | None = None,   # spacing between pulses (ms):
                                                  # what trigger="sim" fires.
@@ -2347,19 +2360,38 @@ class _ScheduleMixin:
         arrived before on_armed is called and the trigger goes out, timed by the
         RP2350 (CH_ARRIVAL_SETTLE, fw 903cd23+): the board reads arrival
         "settling" until it has held the ACTIVE current (CC converged) or the
-        voltage (+-150 mV) for settle_ms continuously, then "settled"; dropping
+        voltage (+-150 mV) for settle_ms CONTINUOUSLY, then "settled"; dropping
         out restarts the clock. So an external trigger source can fire blindly
         on on_armed. 0..60000 ms; written to every connected controller for
-        this shot and set back to 0 after it. heat_timeout_s is the wait for
-        ARRIVAL; settle_ms is added on top of it. Older firmware: error, not
-        fired.
+        this shot and set back to 0 after it. Older firmware: error, not fired.
+
+            VOLTAGE      arrived     out of    back in          settled:
+            (or ACTIVE)  (+-150 mV)  the band  the band         on_armed, trigger
+              |            |            |        |                 |
+            --*------------*============x--------*=================*----->
+              |<- arrive ->|<- clock -->|        |<-- settle_ms -->|
+              |            |  restarts  |        |  (continuous)   |
+              |<-------- heat_timeout_s + settle_ms: or not fired ->|
+
+            heat_timeout_s bounds the wait for ARRIVAL; settle_ms is added
+            to that deadline, so the whole wait is at most their sum.
 
             ct.fire_single_pulse(f, active_mv=8000, idle_ma=1200, settle_ms=1500,
                                  trigger="ext", on_armed=tell_the_source)
 
-        sim_delay_ms: REMOVED (2026-10-26). It was a host-side sleep between
-        arrival and the simulated trigger; settle_ms does it in the firmware for
-        every trigger source. Passing it returns an error, nothing is done.
+        NOT scan_view's settle_ms. Same name and range, different rule:
+        scan_view counts from the FIRST arrival and a wobble out of the band
+        does not restart it ("HOT"; only a drop of more than
+        max_voltage_drop_mv on 3 reads, or an output fault, interrupts it).
+        Here every exit from the band restarts the clock.
+
+        Two old parameters are GONE (passing one is a TypeError): settle_ms
+        replaces both. voltage_settle_s (2026-10-14 .. 10-28) was a fixed host
+        sleep after the VOLTAGE command, default 2.0 s, ignored since 10-23;
+        the wait is now the firmware's arrival (+-150 mV, at most
+        heat_timeout_s) plus settle_ms. sim_delay_ms (.. 2026-10-26) was a host
+        sleep between arrival and the simulated trigger; settle_ms does it in
+        the firmware, for every trigger source.
 
         IT DOES NOT HEAT THE FILAMENT. The schedule it builds carries an EMPTY
         heating table and this method calls nothing in the power-state ladder,
@@ -2683,11 +2715,6 @@ class _ScheduleMixin:
         if active_ma is not None and active_mv is not None:
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "error": "give active_ma OR active_mv, not both"}
-        if sim_delay_ms is not None:
-            return {"ok": False, "fired": 0, "records": [], "status": {},
-                    "error": "sim_delay_ms was removed (2026-10-26): use settle_ms -- the "
-                             "RP2350 then holds on_armed and the trigger until the heating "
-                             "has stayed arrived that long, for any trigger source"}
         settle = None
         if settle_ms is not None:
             if active_ma is None and active_mv is None:
@@ -2709,7 +2736,7 @@ class _ScheduleMixin:
                 filament, num_pulses, width_us, interval, tmo, max_on_ms, total_ms,
                 controller, trigger, shot_wait_timeout_s, verify, reuse, measure,
                 rate_hz, bg_gap_us, bg_window_us, on_armed, active_ma, idle_ma,
-                heat_timeout_s, active_mv, voltage_settle_s, settle is not None)
+                heat_timeout_s, active_mv, settle is not None)
         finally:
             if settle:
                 try:
@@ -2725,20 +2752,10 @@ class _ScheduleMixin:
                                max_on_ms, total_ms, controller, trigger,
                                shot_wait_timeout_s, verify, reuse, measure, rate_hz,
                                bg_gap_us, bg_window_us, on_armed, active_ma, idle_ma,
-                               heat_timeout_s, active_mv, voltage_settle_s,
-                               fast_poll) -> dict:
+                               heat_timeout_s, active_mv, fast_poll) -> dict:
         """fire_single_pulse's dispatch: heated by voltage, heated by current,
         or unheated. Arguments already validated by fire_single_pulse."""
         if active_mv is not None:
-            if voltage_settle_s is not None:
-                # The fixed settle sleep is gone: active_mv now waits for the
-                # firmware's voltage arrival. Accepted, ignored, said.
-                logging.getLogger("ct_gui").warning(
-                    "fire_single_pulse: voltage_settle_s=%s is ignored -- active_mv now "
-                    "waits for the voltage to ARRIVE (+-150 mV), up to heat_timeout_s=%s",
-                    voltage_settle_s, heat_timeout_s)
-                warnings.warn("voltage_settle_s is ignored: active_mv waits for the "
-                              "voltage to arrive, up to heat_timeout_s", stacklevel=3)
             res = self._fire_heated(
                 filament, None, idle_ma, float(heat_timeout_s),
                 dict(num_pulses=num_pulses, width_us=width_us,

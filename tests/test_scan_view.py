@@ -152,6 +152,10 @@ def make(rig: Rig):
                                     if (f < 48) == (c == 1)]
 
     def state_one(f, state, arg, op, extra=None):
+        if int(state) == VOLTAGE and getattr(rig, "not_warm", {}).get(f, 0) > 0:
+            rig.not_warm[f] -= 1
+            return {"ok": False, "error": f"filament {f} may not go to timed VOLTAGE: "
+                                          f"not warm yet: at IDLE for 40 s"}
         rig.log.append(("state", f, int(state), arg))
         if int(state) == VOLTAGE:
             rig.raised[f] = Clock.t
@@ -187,6 +191,7 @@ def make(rig: Rig):
                 return {"ok": True, "response": {"raw": raw + [0, 0, 0, 0]}}
         if path == "/api/arm":
             rig.state = 1
+            rig.cur, rig.in_row, rig.released = 0, 0, {}   # an ARM starts the table over
             rig.log.append(("arm", tuple(body["controllers"])))
             return {"ok": True, "results": {str(c): {"ok": True} for c in body["controllers"]}}
         if path == "/api/disarm":
@@ -388,6 +393,19 @@ wrong = [x["filament"] for x in r["rows"] if x["measured"] is not None
 check("ring overrun: lost rows have NO measurement, never another row's",
       not wrong and r.get("measure_lost") and any(x.get("measure_lost") for x in r["rows"]),
       (wrong, r.get("measure_note")))
+
+# --- scan_views: "not warm yet" is the moment, not the filament ---------------
+rig = Rig(hot_after={72: None})                 # 72 never gets hot: really lost
+rig.not_warm = {71: 1}                          # 71 refused once, then fine
+# (skipped rows first: the fake walks ONE shared row pointer, so it cannot skip the last row)
+V = [{"view": 0, "filaments": [72, 71, 70]}, {"view": 1, "filaments": [72, 71, 70]}]
+r = make(rig).scan_views(V, active_mv=MV, idle_ma=1100, settle_ms=500, trigger="ext",
+                         on_armed=ext_on_armed(rig, []), num_pulses=3, width_us=1000,
+                         heat_timeout_s=3.0, shot_wait_timeout_s=2.0)
+v0, v1 = r["results"]
+check("not warm: skipped in view 0, fired in view 1; never-hot 72 left out",
+      71 in v0["skipped"] and any(x["filament"] == 71 and x["fired"] == 3 for x in v1["rows"])
+      and r["left_out"] == [72], (r["left_out"], v0["skipped"], [(x["filament"], x["fired"]) for x in v1["rows"]]))
 
 # --- sim: the backend still says "already running" just after a train --------
 rig = Rig()
