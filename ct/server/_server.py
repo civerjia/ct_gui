@@ -1079,7 +1079,10 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
                              "heat_meas_dt_ms": meas_dt, "heat_bus_dt_ms": bus_dt,
                              "heat_dt_unavailable": dt_why,
                              "trigger_time_approx": bool(fl & 0x08),
-                             "heat_from_cache": from_cache})
+                             "heat_from_cache": from_cache,
+                             # gated run: staged 0x00, the filament was not hot --
+                             # the edge was used up and NOTHING was emitted
+                             "suppressed_not_hot": bool(fl & 0x20)})
                 off += size
             return {"ok": True, "total": _le(raw, 1, 2), "records": recs,
                     "record_bytes": size if n else None}
@@ -2101,9 +2104,12 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
         labels.append("currents"); cur_fil.append(f)
 
     cfg = plan.get("config") or {}
+    # gated (scan_view, fw 5c77778+) is a 12th byte, sent only when asked for:
+    # older firmware refuses a 12-byte config. 11 bytes = ungated.
     reqs.append((SHV_SET_CONFIG,
                  _u32(int(cfg.get("interPulseMs", 3000))) + _u16(int(cfg.get("maxOnMs", 40)))
-                 + _u32(int(cfg.get("totalMs", 60000))) + bytes([int(cfg.get("triggerEdge", 0)) & 0xFF]), 0))
+                 + _u32(int(cfg.get("totalMs", 60000))) + bytes([int(cfg.get("triggerEdge", 0)) & 0xFF])
+                 + (b"\x01" if cfg.get("gated") else b""), 0))
     labels.append("config"); cur_fil.append(None)
 
     # emission table — full global list (entry carries global filament 0-95)

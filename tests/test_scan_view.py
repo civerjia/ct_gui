@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""scan_view = fire_single_pulse() per filament, in order, with the next k
-filaments pre-heated to their own VOLTAGE; every fire_single_pulse argument
-passed through unchanged; nothing left hot on any exit. Offline: the hardware
-calls are faked.
+"""scan_view (docs/scan_view_design.md) against a fake gated RP2350: rows fire
+strictly in list order, each once HOT; a filament hot early waits its turn and
+then goes without a new wait; data-loss faults skip one filament and the run
+goes on; dangerous faults stop it; everything ends at IDLE. Offline.
 
     python3 tests/test_scan_view.py
 """
 import _path  # noqa: F401
 
 import os
+import threading
 import time
 
 os.environ.setdefault("CT_NO_AUTO_UPDATE", "1")
 
 from ct.client._client import CTClient  # noqa: E402
-import ct.server._safety as SAF  # noqa: E402
-from ct.server._common import POWER_STATE_IDLE, POWER_STATE_VOLTAGE  # noqa: E402
 
 FAILS = []
 
@@ -26,126 +25,328 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-time.sleep = lambda s: None
-MV = {23: 7688, 24: 7698, 25: 8228, 26: 7700}
+class Clock:
+    t = 1000.0
 
 
-def make(fail_on=(), raise_in=None):
+def _sleep(s):
+    Clock.t += max(float(s), 0.001)
+
+
+time.monotonic = lambda: Clock.t
+time.sleep = _sleep
+
+VOLTAGE, IDLE = 6, 4
+
+
+class Rig:
+    """A gated SHV run on two controllers (P1 = master, filaments 0..47; P2 48..95)."""
+
+    def __init__(self, hot_after=None, interrupted=(), fault_cc=(), edges_short=(),
+                 dead=(), hv=True):
+        self.hot_after = dict(hot_after or {})      # filament -> s after raise (None = never)
+        self.interrupted, self.fault_cc = set(interrupted), set(fault_cc)
+        self.edges_short = dict(edges_short)        # filament -> edges actually sent
+        self.dead, self.hv = set(dead), hv
+        self.log = []
+        self.raised = {}                            # filament -> raise time
+        self.rows, self.cur, self.in_row = [], 0, 0
+        self.released = {}                          # controller -> rows released there
+        self.done, self.dropped, self.state, self.fault = 0, 0, 0, False
+        self.counted = {}                           # filament -> pulses
+        self.tripped = None
+
+    # firmware model ----------------------------------------------------------
+    def edges(self, k):
+        for _ in range(k):
+            if self.state not in (1, 2) or self.cur >= max(self.released.values() or [0]):
+                self.dropped += 1
+                continue
+            self.state = 2
+            f = self.rows[self.cur]["filament"]
+            self.done += 1
+            self.in_row += 1
+            self.counted[f] = self.counted.get(f, 0) + 1
+            if self.in_row >= self.rows[self.cur]["numPulses"]:
+                self._advance()
+
+    def _advance(self):
+        self.cur += 1
+        self.in_row = 0
+        if self.cur >= len(self.rows):
+            self.state = 3
+
+    def row_cmd(self, c, row, action):
+        """Every armed controller gets the same row command; the shared row
+        pointer moves once (both controllers walk the same table in step)."""
+        rel = self.released.get(c, 0)
+        if action == 2 and row + 1 == rel and row < self.cur:
+            return 0          # the other controller already moved the shared pointer on
+        if self.state not in (1, 2):
+            return 2
+        first = all(v <= rel for v in self.released.values())
+        if action in (0, 1):
+            if row != rel or (first and row != self.cur):
+                return 3
+            self.released[c] = rel + 1
+            if first:
+                self.log.append(("release" if action == 0 else "skip", row))
+                if action == 1:
+                    self._advance()
+            return 0
+        if action == 2:
+            if row + 1 != rel:
+                return 3
+            if row == self.cur:
+                self.log.append(("skiprest", row))
+                self._advance()
+            return 0
+        return 5
+
+    def hot(self, f):
+        if f not in self.raised or f in self.interrupted:
+            return False
+        after = self.hot_after.get(f, 1.0)
+        return after is not None and Clock.t - self.raised[f] >= after
+
+
+def make(rig: Rig):
     ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
-    log = []
+    site = lambda f: {"controller": 1 if f < 48 else 2, "channel": (f % 48) // 8,  # noqa: E731
+                      "position": f % 8, "slot": f % 48}
+    ct.filament_to_board = site
+    ct._is_dead = lambda f: f in rig.dead
+    ct._fid_of = lambda f: f
+    ct._envelope_companion = lambda c: None if c == 1 else 1
+    ct.status = lambda: {"master": 1, "controllers": {"1": {"connected": True},
+                                                       "2": {"connected": True}}}
+    ct.hv_status = lambda: {"ok": True, "emission_on": rig.hv, "focus_on": rig.hv}
+    ct._get = lambda path, timeout=None: ({"tripped": rig.tripped, "vacuum": {"within_limit": True}}
+                                          if path == "/api/hv-guard" else {})
+    ct.filament_perf = lambda fils=None: {"ok": True, "filaments": {}}
 
-    def voltage_one(f, mv, active_s=None, then_idle_ma=None, **kw):
-        log.append(("preheat", f, mv, then_idle_ma))
+    def download(plan):
+        rig.rows = list(plan["emission"])
+        rig.config = plan["config"]
+        rig.log.append(("download", [e["filament"] for e in plan["emission"]], plan["config"].get("gated")))
         return {"ok": True}
+    ct.download = download
+    ct._verify_retrying_timeouts = lambda plan: {"ok": True}
 
-    def idle_one(f, ma, **kw):
-        log.append(("idle", f, ma))
+    def shv_status(c=1):
+        return {"state": 4 if rig.fault else rig.state, "stopReason": 5 if rig.fault else 0,
+                "totalPulsesDone": rig.done, "entryIndex": rig.cur, "gated": True,
+                "unsafeSlots": 0, "off_mismatches": 0, "droppedEdges": rig.dropped,
+                "suppressedNotHot": 0}
+    ct.shv_status = shv_status
+    ct.shv_pulse_log = lambda c=1: [{"filament": f, "suppressed_not_hot": False}
+                                    for f, k in rig.counted.items() for _ in range(k)
+                                    if (f < 48) == (c == 1)]
+
+    def state_one(f, state, arg, op, extra=None):
+        rig.log.append(("state", f, int(state), arg))
+        if int(state) == VOLTAGE:
+            rig.raised[f] = Clock.t
+        else:
+            rig.raised.pop(f, None)
         return {"ok": True}
+    ct._state_one = state_one
+    ct.sleep_one = lambda f, **kw: rig.log.append(("sleep", f)) or {"ok": True}
+    ct.read_filament_current_cached = lambda fs: {fs: {"cc_mode": 3 if fs in rig.fault_cc else 0}}
 
-    def fire(f, **kw):
-        log.append(("fire", f, kw))
-        if raise_in == f:
-            raise KeyboardInterrupt()
-        if callable(kw.get("on_armed")):
-            kw["on_armed"]()
-        if f in fail_on:
-            return {"ok": False, "fired": 0, "error": f"filament {f} not settled"}
-        return {"ok": True, "fired": kw["num_pulses"], "records": [{}] * kw["num_pulses"]}
+    def post(path, body, timeout=None):
+        if path == "/api/cmd":
+            cmd = body["command"]
+            if cmd == "CH_ARRIVAL_SETTLE":
+                rig.log.append(("settle", body["controller"], body["settle_ms"],
+                                body.get("max_voltage_drop_mv")))
+                return {"ok": True, "response": {"raw": [0, 0, 0, 0x60, 0xEA, 0xF4, 0x01]}}
+            if cmd == "SHV_ROW":
+                return {"ok": True, "response": {"raw": [0, rig.row_cmd(body["controller"], body["row"],
+                                                                        body["action"])]}}
+            if cmd == "CH_GET_HOT":
+                c = body["controller"]
+                raw = [0, 8]
+                for ch in range(8):
+                    hot = intr = 0
+                    for p in range(8):
+                        f = (0 if c == 1 else 48) + ch * 8 + p
+                        if rig.hot(f):
+                            hot |= 1 << p
+                        if f in rig.interrupted and f in rig.raised:
+                            intr |= 1 << p
+                    raw += [hot, intr]
+                return {"ok": True, "response": {"raw": raw + [0, 0, 0, 0]}}
+        if path == "/api/arm":
+            rig.state = 1
+            rig.log.append(("arm", tuple(body["controllers"])))
+            return {"ok": True, "results": {str(c): {"ok": True} for c in body["controllers"]}}
+        if path == "/api/disarm":
+            rig.log.append(("disarm", tuple(body["controllers"])))
+            rig.state = 0
+            return {"ok": True}
+        if path == "/api/sync/simulate":
+            f = rig.rows[rig.cur]["filament"] if rig.cur < len(rig.rows) else None
+            rig.edges(rig.edges_short.get(f, body["count"]))
+            return {"ok": True}
+        return {"ok": True}
+    ct._post = post
+    return ct
 
-    ct.voltage_one, ct.idle_one, ct.fire_single_pulse = voltage_one, idle_one, fire
-    return ct, log
+
+MV = {f: 7000 + f for f in range(96)}
+ARGS = dict(active_mv=MV, idle_ma=1100, settle_ms=500, num_pulses=3, width_us=1000,
+            heat_timeout_s=3.0, shot_wait_timeout_s=2.0)
 
 
-ALL = dict(num_pulses=20, width_us=15000, pulse_interval_ms=None, trigger_timeout_ms=30,
-           max_on_ms=66, total_ms=12000, trigger="ext", shot_wait_timeout_s=9.0, verify=True,
-           reuse=False, measure=True, rate_hz=1000000, bg_gap_us=100.0, bg_window_us=50.0,
-           heat_timeout_s=6.0, settle_ms=1000)
+def ext_on_armed(rig, calls):
+    def on_armed(f):
+        calls.append((f, Clock.t))
+        rig.edges(rig.edges_short.get(f, 3))
+    return on_armed
 
-# --- normal run: order, pre-heating, every argument passed through ------------
-ct, log = make()
-armed = []
-r = ct.scan_view([23, 24, 25, 26], active_mv=MV, idle_ma=1100, k=2,
-                 on_armed=lambda f: armed.append(f), **ALL)
-fires = [e for e in log if e[0] == "fire"]
-check("fires every filament once, in the given order", [e[1] for e in fires] == [23, 24, 25, 26],
-      [e[1] for e in fires])
-check("each fire_single_pulse gets its OWN voltage and idle_ma",
-      all(e[2]["active_mv"] == MV[e[1]] and e[2]["idle_ma"] == 1100 for e in fires))
-check("every fire_single_pulse argument passed through unchanged",
-      all(all(e[2][k] == v for k, v in ALL.items()) for e in fires),
-      [(k, fires[0][2].get(k), v) for k, v in ALL.items() if fires[0][2].get(k) != v])
-check("on_armed is called with the filament", armed == [23, 24, 25, 26], armed)
-pre = [(e[1]) for e in log if e[0] == "preheat"]
-check("the next k=2 are pre-heated before each fire, each once", pre == [24, 25, 26], pre)
-check("pre-heat uses that filament's voltage and the IDLE to fall back to",
-      all(e[2] == MV[e[1]] and e[3] == 1100 for e in log if e[0] == "preheat"))
-first_fire_of = {f: next(i for i, e in enumerate(log) if e[0] == "fire" and e[1] == f) for f in MV}
-first_pre_of = {e[1]: i for i, e in reversed(list(enumerate(log))) if e[0] == "preheat"}
-check("a filament is pre-heated before its own fire", all(first_pre_of[f] < first_fire_of[f] for f in first_pre_of))
-check("result: ok, 4 fired, one result per filament",
-      r["ok"] and r["fired"] == 4 and [x["filament"] for x in r["results"]] == [23, 24, 25, 26], r)
 
-# --- k=0: a plain loop ---------------------------------------------------------
-ct, log = make()
-r = ct.scan_view([23, 24], active_mv=MV, idle_ma=1100, k=0)
-check("k=0: no pre-heating", not [e for e in log if e[0] == "preheat"] and r["ok"])
+# --- the normal run: order, hot early waits, no new wait, all to IDLE ----------
+rig = Rig(hot_after={10: 2.0, 11: 0.5, 12: 0.5})
+calls = []
+r = make(rig).scan_view([10, 11, 12], trigger="ext", on_armed=ext_on_armed(rig, calls), **ARGS)
+check("fired 10, 11, 12 in list order", [f for f, _ in calls] == [10, 11, 12], calls)
+check("one gated schedule for the list, downloaded once",
+      [e for e in rig.log if e[0] == "download"] == [("download", [10, 11, 12], 1)])
+check("each raised to its OWN voltage",
+      all(e[3] == MV[e[1]] for e in rig.log if e[0] == "state" and e[2] == VOLTAGE))
+i_rel2 = rig.log.index(("release", 1))
+i_idle1 = next(i for i, e in enumerate(rig.log) if e[:3] == ("state", 10, IDLE))
+check("11 was hot before 10 and fired only after it; released before 10 goes IDLE",
+      i_rel2 < i_idle1 and calls[1][1] - calls[0][1] < 0.5, (i_rel2, i_idle1, calls))
+check("11 waited its turn hot (waited_s > 0), no new wait after 10",
+      r["rows"][1]["waited_s"] > 0 and r["rows"][1]["gap_s"] < 0.5, r["rows"][1])
+check("ok, all fired 3/3, nothing hot at the end",
+      r["ok"] and r["fired"] == 3 and not rig.raised and all(x["fired"] == 3 for x in r["rows"]), r)
+check("settle and max drop set, settle back to 0 at the end",
+      ("settle", 1, 500, 500) in rig.log and ("settle", 1, 0, None) in rig.log)
+check("disarmed at the end",
+      any(e[0] == "disarm" for e in rig.log[rig.log.index(("release", 2)):]))
 
-# --- refusals before anything is touched ---------------------------------------
-ct, log = make()
-r1 = ct.scan_view([23, 24], active_mv=7000, idle_ma=1100)
-r2 = ct.scan_view([23, 24], active_mv={23: 7000}, idle_ma=1100)
-r3 = ct.scan_view([23, 24], active_mv=MV, idle_ma=1100, trigger="ext")
-check("a single voltage is refused", not r1["ok"] and "every filament" in r1["error"], r1)
-check("a missing voltage is refused, naming the filament", not r2["ok"] and "[24]" in r2["error"], r2)
-check("trigger='ext' without on_armed is refused", not r3["ok"] and "on_armed" in r3["error"], r3)
-check("...and nothing was touched", not log, log)
+# --- preheat_ahead=N and max_hot ----------------------------------------------
+rig = Rig()
+make(rig).scan_view(list(range(20, 28)), trigger="sim", preheat_ahead=2, max_hot=6, **ARGS)
+first_rel = rig.log.index(("release", 0))
+pre = [e[1] for e in rig.log[:first_rel] if e[0] == "state" and e[2] == VOLTAGE]
+check("preheat_ahead=2: rows 0..2 heated before the first release", pre == [20, 21, 22], pre)
+rig = Rig()
+make(rig).scan_view(list(range(20, 30)), trigger="sim", preheat_ahead=9, max_hot=3, **ARGS)
+hot, peak = set(), 0
+for e in rig.log:
+    if e[0] == "state":
+        (hot.add if e[2] == VOLTAGE else hot.discard)(e[1])
+        peak = max(peak, len(hot))
+check("max_hot=3 is never exceeded", peak == 3, peak)
 
-# --- a failure: stop, or skip --------------------------------------------------
-ct, log = make(fail_on=(24,))
-r = ct.scan_view([23, 24, 25, 26], active_mv=MV, idle_ma=1100, k=2, on_error="stop")
-check("on_error='stop': nothing after the failed filament fires",
-      [e[1] for e in log if e[0] == "fire"] == [23, 24] and r["skipped"] == [25, 26]
-      and r["failed"] == [24] and not r["ok"], r)
-check("...and the pre-heated ones go back to IDLE",
-      sorted(e[1] for e in log if e[0] == "idle") == [25, 26], [e for e in log if e[0] == "idle"])
+# --- data lost: skipped, the run goes on ---------------------------------------
+rig = Rig(hot_after={31: None})
+calls = []
+r = make(rig).scan_view([30, 31, 32], trigger="ext", on_armed=ext_on_armed(rig, calls), **ARGS)
+check("never hot: skipped (not released), the rest fired, filament back to IDLE",
+      [f for f, _ in calls] == [30, 32] and ("skip", 1) in rig.log and r["skipped"] == [31]
+      and "not hot" in r["rows"][1]["skipped"] and 31 not in rig.raised and not r.get("stopped"), r)
 
-ct, log = make(fail_on=(24,))
-r = ct.scan_view([23, 24, 25, 26], active_mv=MV, idle_ma=1100, k=2, on_error="skip")
-check("on_error='skip': the rest still fires", [e[1] for e in log if e[0] == "fire"] == [23, 24, 25, 26]
-      and r["failed"] == [24] and r["fired"] == 3 and not r["ok"], r)
+rig = Rig(interrupted=[34], fault_cc=[34])
+calls = []
+r = make(rig).scan_view([33, 34, 35], trigger="ext", on_armed=ext_on_armed(rig, calls), **ARGS)
+check("output fault: skipped, IDLE during the run, SLEEP after the disarm",
+      [f for f, _ in calls] == [33, 35] and "output fault" in r["rows"][1]["skipped"]
+      and rig.log.index(("sleep", 34)) > max(i for i, e in enumerate(rig.log) if e[0] == "disarm"), r)
 
-# --- Ctrl-C mid-way: nothing left hot ------------------------------------------
-ct, log = make(raise_in=24)
-try:
-    ct.scan_view([23, 24, 25, 26], active_mv=MV, idle_ma=1100, k=2)
-except KeyboardInterrupt:
-    pass
-check("Ctrl-C mid-fire: the firing one and the pre-heated ones back to IDLE",
-      sorted(e[1] for e in log if e[0] == "idle") == [24, 25, 26], [e for e in log if e[0] == "idle"])
+rig = Rig(edges_short={37: 1})
+calls = []
+r = make(rig).scan_view([36, 37, 38], trigger="ext", on_armed=ext_on_armed(rig, calls), **ARGS)
+check("edges short: the rest of that row skipped, 1 of 3 recorded, run goes on",
+      ("skiprest", 1) in rig.log and r["rows"][1]["fired"] == 1 and r["partial"] == [37]
+      and r["rows"][2]["fired"] == 3 and not r.get("stopped"), r)
 
-# --- scan_views: per view, left_out, stop -------------------------------------
-ct, log = make(fail_on=(24,))
-moved = []
-views = [{"view": 0, "center": 24, "filaments": [23, 24, 25]},
-         {"view": 1, "center": 25, "filaments": [24, 25, 26]}]
-r = ct.scan_views(views, active_mv=MV, idle_ma=1100, k=1, on_error="skip",
-                  move_to=lambda v: moved.append(v["view"]), move_s=3.0)
-check("scan_views: motor per view; a failed filament is left out of later views",
-      moved == [0, 1] and [e[1] for e in log if e[0] == "fire"] == [23, 24, 25, 25, 26]
-      and r["left_out"] == [24], (moved, [e[1] for e in log if e[0] == "fire"], r.get("left_out")))
-ct, log = make(fail_on=(24,))
-r = ct.scan_views(views, active_mv=MV, idle_ma=1100, on_error="stop")
-check("scan_views on_error='stop': the run ends at the failed view",
-      not r["ok"] and r["views_total"] == 2 and len(r["per_view"]) == 1, r)
+rig = Rig()
 
-# --- backend ladder: VOLTAGE may be re-commanded while hot ---------------------
-SAF.LAST_POWER_STATE[901] = (POWER_STATE_VOLTAGE, time.monotonic())
-SAF.LAST_POWER_STATE[902] = (POWER_STATE_IDLE, time.monotonic())
-check("ladder: a filament already at VOLTAGE may be set to VOLTAGE again",
-      SAF.ladder_blocks_active(901) is None, SAF.ladder_blocks_active(901))
-check("ladder: from IDLE it is still checked as before",
-      SAF.ladder_blocks_active(902, arrival="cannot_start", arrival_known=True,
-                               current_ma=0, target_ma=1100) is not None)
+
+def raising(f):
+    if f == 41:
+        raise RuntimeError("detector busy")
+    rig.edges(3)
+
+
+r = make(rig).scan_view([40, 41, 42], trigger="ext", on_armed=raising, **ARGS)
+check("on_armed raised: that row's rest skipped and recorded, run goes on",
+      "detector busy" in (r["rows"][1].get("skipped") or "") and r["rows"][2]["fired"] == 3
+      and not r.get("stopped"), r)
+
+# --- dangerous: stop now ------------------------------------------------------
+rig = Rig()
+r = make(rig).scan_view([43, 44], trigger="ext", on_armed=lambda: None, **ARGS)
+check("on_armed taking no argument: stopped, nothing left hot",
+      "ONE argument" in (r.get("stopped") or "") and not rig.raised, r.get("stopped"))
+
+rig = Rig()
+gate = threading.Event()
+r = make(rig).scan_view([45, 46], trigger="ext", on_armed=lambda f: gate.wait(), on_armed_timeout_s=1.0,
+                        **ARGS)
+gate.set()
+check("on_armed hanging: stopped after on_armed_timeout_s, nothing left hot",
+      "on_armed_timeout_s" in (r.get("stopped") or "") and not rig.raised, r.get("stopped"))
+
+rig = Rig()
+
+
+def faulting(f):
+    rig.edges(1)
+    rig.fault = True
+
+
+r = make(rig).scan_view([50, 51, 52], trigger="ext", on_armed=faulting, **ARGS)
+check("SHV fault: stopped, disarmed, nothing left hot, 51/52 never fired",
+      "SHV fault" in (r.get("stopped") or "") and not rig.raised and 51 not in rig.counted, r.get("stopped"))
+
+rig = Rig()
+r = make(rig).scan_view([53, 54, 57, 58], trigger="ext", on_armed=lambda f: None, **ARGS)
+check("no edges at all: no_pulse_timeout_s stops the run",
+      "no_pulse_timeout_s" in (r.get("stopped") or "") and not rig.raised, r)
+
+rig = Rig()
+
+
+def hv_off(f):
+    rig.edges(3)
+    rig.hv = False
+
+
+r = make(rig).scan_view([55, 56, 59, 60, 61], trigger="ext", on_armed=hv_off, **ARGS)
+check("HV switched off mid-run: stopped before the rest", "HV switched off" in (r.get("stopped") or "")
+      and len(rig.counted) < 5 and not rig.raised, (r.get("stopped"), rig.counted))
+rig = Rig()
+
+
+def hv_off_last(f):
+    rig.edges(3)
+    if f == 63:
+        rig.hv = False
+
+
+r = make(rig).scan_view([62, 63], trigger="ext", on_armed=hv_off_last, **ARGS)
+check("HV off during the LAST filament: not ok, stopped", not r["ok"]
+      and "HV switched off" in (r.get("stopped") or ""), r.get("stopped"))
+
+# --- refused before anything is touched -----------------------------------------
+for name, kw, want in (
+        ("a single voltage", dict(active_mv=7000), "every filament"),
+        ("a missing voltage", dict(active_mv={60: 7000}), "[61]"),
+        ("ext without on_armed", dict(trigger="ext"), "on_armed"),
+        ("a dead filament", dict(), "dead")):
+    rig = Rig(dead=[61] if name == "a dead filament" else [])
+    a = {**ARGS, **kw}
+    r = make(rig).scan_view([60, 61], **a)
+    check(f"refused: {name}", not r["ok"] and want in (r.get("error") or "") and not rig.log, r.get("error"))
+rig = Rig(hv=False)
+r = make(rig).scan_view([60, 61], **ARGS)
+check("refused: HV off at the start", "HV is not on" in (r.get("error") or "") and not rig.log, r.get("error"))
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 raise SystemExit(1 if FAILS else 0)

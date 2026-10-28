@@ -498,6 +498,7 @@ __all__ = [
     "DOWNLOAD_WINDOW",
     "DOWNLOAD_PARALLEL",
     "POWER_OWNER", "_REQUEST_OWNER", "set_request_owner", "request_owner", "owned_filaments",
+    "_LAST_HOT",
     "RETRY_TIMEOUTS_S", "request_retry", "shv_status_retry",
     "deque",
     "ACTIVE_FLOOR_MA", "ALL_BOARDS_MASK", "Any", "BRIDGE_DOWN_REMIND_S", "BRIDGE_PORT",

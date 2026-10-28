@@ -2282,130 +2282,109 @@ panel's "settle ms".
 
 ### Firing a list of filaments: `scan_view`
 
-`scan_view` is `fire_single_pulse()` called for each filament in turn, with
-one addition: the next `k` filaments are already heated ahead, so each is hot
-when its turn comes.
+**Design and flow** (timeline and who-tells-whom diagrams, every fault and
+timeout): [`docs/scan_view_design.md`](scan_view_design.md). Needs RP2350
+firmware 5c77778+ on every controller it uses.
 
-**Each filament is one `fire_single_pulse(f, active_mv=active_mv[f],
-idle_ma=idle_ma, ...)` call.** Every other argument goes to it unchanged, so
-this behaves exactly as `fire_single_pulse` does:
-- heating arrival, and the `settle_ms` hold;
-- `"sim"` or `"ext"` trigger, with `on_armed`;
-- `measure` (mA, mAms);
-- the 165 / HV-stuck checks;
-- every timeout.
-
-See [fire_single_pulse](#single-filament-hv-pulse) for what each argument
-means.
+`scan_view` fires a list of filaments **strictly in that order**, each the
+moment it is **hot**, with the next ones already heating. Every filament ends
+at IDLE.
 
 ```python
-# ---- on_armed: YOUR function, called ONCE PER FILAMENT ----------------------
-# scan_view calls on_armed(filament) for each filament of the list, in the
-# list's order: on_armed(23), then on_armed(24), then on_armed(25).
-# `filament` = the one whose turn it is. It is called only when ALL of this
-# is true for that filament:
-#   - its schedule is downloaded and verified;
-#   - the STM32 is armed to measure it (measure=True);
-#   - its controller is ARMED and waiting for the trigger;
-#   - its voltage has arrived and held +-150 mV for settle_ms.
-# What to do in it, with trigger="ext": make your hardware send this
-# filament's num_pulses trigger edges (one pulse per edge), then return.
-#   - Return quickly: the wait for the edges (shot_wait_timeout_s) starts
-#     when it returns.
-#   - NEVER send an edge before on_armed: the board is already armed while
-#     the filament heats, so an early edge is lost or fires a cold filament.
-#   - Raising an exception here: that filament is not fired (disarmed, back
-#     to IDLE); on_error decides what happens to the rest.
-# With trigger="sim" the library sends the edges itself; on_armed is still
-# called once per filament (e.g. to log or to tell the detector), or pass None.
-# It must take ONE argument (the filament). fire_single_pulse's own
-# on_armed takes none -- do not pass that one here.
-def on_armed(filament):
-    print("armed and hot:", filament, "-- sending its trigger")
-    angle_trigger.fire()             # your hardware: this filament's edges
+def on_armed(filament):        # the SYSTEM calls this, once per filament,
+    angle_trigger.fire()       # in list order: that filament is hot and
+                               # its row released -- send its edges now
 
 r = ct.scan_view(
-    [23, 24, 25],                    # filaments, fired one by one in THIS order
-    active_mv={23: 7688,             # EACH filament's own heating voltage, mV.
-               24: 7698,             # Every filament of the list must be here;
-               25: 8228},            # a single number is refused.
-    idle_ma=1100,                    # each goes back to this current after its pulses, mA
-    k=2,                             # while one fires, the next 2 are already heating
-                                     # (0 = each heats only on its own turn)
-    on_error="stop",                 # a filament that fails: "stop" = fire no more,
-                                     # "skip" = go on with the next one
-    on_armed=on_armed,               # see above; required with trigger="ext"
-    # ---- per filament, exactly fire_single_pulse()'s arguments --------------
-    trigger="ext",                   # "ext" = your hardware sends the edges,
-                                     # "sim" = the library sends them
-    num_pulses=20,                   # pulses per filament (= edges per filament with "ext")
-    width_us=15000,                  # pulse width, us
-    pulse_interval_ms=None,          # "sim" only: spacing of its pulses, ms (None = default)
-    trigger_timeout_ms=30,           # firmware: longest wait for the NEXT edge, ms;
-                                     # longer than that and its run faults
-    max_on_ms=66,                    # firmware cap on one pulse, ms (must be > width)
-    total_ms=12000,                  # firmware timeout of one filament's whole run, ms
-                                     # (heating time is added to it automatically)
-    shot_wait_timeout_s=9.0,         # after on_armed returns: its pulses must all be
-                                     # done within this, s -- else not fired, disarmed
-    heat_timeout_s=6.0,              # its voltage must arrive within this, s ...
-    settle_ms=1000,                  # ... and then hold +-150 mV this long, ms;
-                                     # not arrived = on_armed never called, not fired
-    measure=True,                    # STM32 measures every pulse: mA, mAms
-    rate_hz=1000000,                 # STM32 ADC sample rate (measure=True)
-    bg_gap_us=100.0,                 # background: start this long after the pulse, us
-    bg_window_us=50.0,               # background: average over this long, us
-    verify=True,                     # read each schedule back before arming
-    reuse=False)                     # always download (do not skip an unchanged one)
-
-# ---- the result ------------------------------------------------------------
-# r["ok"]       True only if EVERY filament fired ok
-# r["error"]    why not
-# r["fired"]    how many filaments fired ok
-# r["failed"]   the ones that did not, e.g. [24]
-# r["skipped"]  never fired because of on_error="stop", e.g. [25]
-# r["results"]  one entry per filament, in firing order; each is that
-#               filament's complete fire_single_pulse result plus "filament":
-for x in r["results"]:
-    print(x["filament"], "ok" if x["ok"] else x.get("error"))
-    for m in x.get("measured") or []:        # measure=True: one per pulse
-        print("   ", m["emission_ma"], "mA", m["integral_mams"], "mAms")
-# Before the call: every filament of the list at IDLE. HV is not touched.
-# Whatever ends it (done, stopped, exception, Ctrl-C): every filament still
-# hot goes back to idle_ma.
+    [23, 24, 25],              # fired in this order
+    active_mv={23: 7688, 24: 7698, 25: 8228},  # each one's voltage, mV
+    idle_ma=1100,              # back to this after its pulses, mA
+    settle_ms=1000,            # hot = this long after its FIRST arrival, ms
+    preheat_ahead="auto",      # heat ahead: "auto" (learnt) or N filaments
+    preheat_margin_s=0.3,      # "auto": start heating this much earlier, s
+    max_hot=6,                 # at most this many heating at once
+    max_voltage_drop_mv=500,   # dropping more than this below = not hot
+    on_armed=on_armed,         # required with trigger="ext"
+    trigger="ext",             # "sim" = the library fires, "ext" = your edges
+    num_pulses=20,             # pulses per filament = edges per filament
+    width_us=15000,            # pulse width, us
+    pulse_interval_ms=None,    # "sim": spacing of its pulses, ms
+    trigger_timeout_ms=30,     # firmware: longest wait for the next edge
+                               # of the SAME filament, ms (not between them)
+    max_on_ms=66,              # firmware cap on one pulse, ms
+    total_ms=None,             # firmware cap on the whole list (None = computed)
+    shot_wait_timeout_s=9.0,   # its pulses done within this after on_armed, s
+    heat_timeout_s=6.0,        # first arrival within this after its raise, s
+    on_armed_timeout_s=None,   # on_armed must return within this (None = 9.0)
+    no_pulse_timeout_s=None,   # stop if no pulse at all for this long
+                               # (None = heat_timeout_s + settle + shot_wait)
+    link_lost_timeout_s=5.0,   # stop if a controller is lost this long, s
+    verify=True,               # read the schedule back before arming
+    measure=True,              # STM32 measures every pulse: mA, mAms
+    rate_hz=1000000, bg_gap_us=100.0, bg_window_us=50.0)
+for x in r["rows"]:
+    print(x["filament"], x["fired"], x.get("skipped"), x.get("mams"))
 ```
 
-**Arguments of its own**
+**Hot** is decided by the RP2350 (`CH_GET_HOT`): `settle_ms` has passed
+since the filament FIRST arrived at its voltage (within 150 mV), and its
+heating has not been interrupted since. Interrupted means:
+- an output fault;
+- a lost board;
+- more than `max_voltage_drop_mv` below its target on 3 reads.
 
-| argument | what it does |
-|---|---|
-| `active_mv` | `{filament: mV}`, one entry for every filament. A single number is refused, and so is a missing filament; the error names it. |
-| `k` | Before each filament fires, the next `k` are raised to their voltage. This is a timed VOLTAGE: the backend drops it back to `idle_ma` if the script dies. `k=0` means a plain loop, each filament heating in its own `fire_single_pulse`. |
-| `on_error` | What happens when a filament's `fire_single_pulse` is not ok. `"stop"`: the rest is not fired. `"skip"`: go on with the next. |
-| `on_armed` | `on_armed(filament)`: `fire_single_pulse`'s `on_armed`, called with which filament it is. Required with `trigger="ext"`. |
+Voltage wobble short of that does not matter.
 
-Whatever ends it (finished, stopped, an exception, Ctrl-C), every filament
-still hot goes back to `idle_ma`.
+**Order.** The whole list is one gated schedule. The firmware fires only the
+row the host released, and only while that row's filament is hot. Any other
+edge is dropped and counted (`dropped_edges`). So:
+- a filament that is hot early waits for its turn, and then goes at once;
+- a stray or extra edge can never fire another filament.
 
-**Before:** every filament at IDLE. HV is not touched.
+**`on_armed(filament)`.** The SYSTEM calls your function once per filament,
+in list order, with the filament number, when that filament is hot and its row
+is released. Send its `num_pulses` edges there and return. It runs in its own
+thread and must return within `on_armed_timeout_s`. Faults are still watched
+while it runs.
 
-**Result**
+**Faults.**
 
-| key | what it is |
-|---|---|
-| `ok` | every filament fired ok |
-| `error` | why not |
-| `fired` | how many filaments fired ok |
-| `failed` | the filaments that were not ok |
-| `skipped` | never fired, because of a stop |
-| `results` | one `{"filament", ...}` per filament, in firing order: that filament's whole `fire_single_pulse` result (records, measured, mAms, heating...) |
-| `idle_errors` | present only if a filament could not be put back to IDLE |
-| `elapsed_s` | how long the call took |
+Dangerous ones stop the run at once (disarm, everything to IDLE). The reason
+is in `r["stopped"]`.
+- SHV fault;
+- a MOS stuck on after a pulse;
+- HV guard tripped;
+- vacuum over its limit;
+- HV switched off;
+- a controller lost longer than `link_lost_timeout_s`;
+- host and firmware disagree on the row;
+- `on_armed` still running after `on_armed_timeout_s`, or taking the wrong
+  arguments;
+- no pulse at all for `no_pulse_timeout_s`;
+- Ctrl-C.
 
-`scan_views(views, ...)` does the same for several lists in a row. It takes
-the same arguments, plus `move_to(view)` and `move_s` (a wait after the move).
-With `on_error="skip"`, a filament that failed is left out of every later
-view.
+Data loss is recorded on that filament's row, and the rest goes on.
+- never hot within `heat_timeout_s` + `settle_ms`: skipped;
+- heating interrupted: skipped; a faulted output is put to SLEEP after the
+  run;
+- `on_armed` raised;
+- its edges incomplete within `shot_wait_timeout_s`: the rest of its pulses
+  are skipped.
+
+**Before:** every filament of the list at IDLE. HV (emission and focus) must
+be ON; it is refused otherwise.
+
+`scan_views(views, active_mv, idle_ma, settle_ms, move_to=..., move_s=...,
+**scan_view_args)` runs `scan_view` per view. A filament skipped in one view
+is left out of the later ones. A dangerous stop ends the run.
+
+**`filament_perf(filaments=None)`** returns the per-filament table that
+`scan_view` keeps (`state/filament_perf.json`), which `preheat_ahead="auto"`
+learns from:
+- voltage;
+- time to arrive;
+- time hot and only waiting;
+- failures.
 
 #### VOLTAGE heating in `fire_single_pulse` (`active_mv=`)
 

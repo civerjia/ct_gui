@@ -72,6 +72,8 @@ TYPE_NAMES = {
     0x3A: "CH_GET_CACHED_CURRENTS",
     0x3B: "CH_VOLTAGE_CAP",
     0x83: "CH_ARRIVAL_SETTLE",
+    0x84: "SHV_ROW",            # gated run: release / skip the next row (fw 5c77778+)
+    0x85: "CH_GET_HOT",         # which boards are hot / heating interrupted (fw 5c77778+)
     0x3D: "CH_GET_BOARD_CACHE",
     0x3E: "CH_GET_BOARD_HEALTH",
     0x3F: "CH_GET_I2C_STATS",

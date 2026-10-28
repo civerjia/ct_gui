@@ -126,9 +126,19 @@ def build_payload(command: str, b: dict):
         # Settle time after ARRIVAL, one per RP2350 (fw 903cd23+): an ACTIVE or
         # VOLTAGE board reports "settling" until it has held arrival this long,
         # then "settled". 0 = off. Clamped to max, not rejected; not persisted.
+        # max_voltage_drop_mv (fw 5c77778+): a VOLTAGE board more than this
+        # below its target on 3 reads has its heating INTERRUPTED (not hot).
         if b.get("settle_ms") is None:
             return 0x83, 0, b""
+        if b.get("max_voltage_drop_mv") is not None:
+            return 0x83, 0, _u16(int(b["settle_ms"])) + _u16(int(b["max_voltage_drop_mv"]))
         return 0x83, 0, _u16(int(b["settle_ms"]))
+    if command == "SHV_ROW":                 # 0x84: [row16, action] -> [status, result, ...]
+        # Gated runs only (fw 5c77778+): 0 release the next row, 1 skip it,
+        # 2 skip the rest of the released row. result 4 = busy: ask again.
+        return 0x84, 0, _u16(int(b["row"])) + bytes([int(b.get("action", 0)) & 0xFF])
+    if command == "CH_GET_HOT":              # 0x85: empty -> per channel hot / interrupted masks
+        return 0x85, 0, b""
     if command == "CH_SLEW_RATE":            # 0x3C: empty=GET, 6 bytes=SET
         # Three voltage-ramp slew rates, runtime-settable. Out-of-range CLAMPS
         # rather than rejecting, and the response is always the values IN FORCE
@@ -379,6 +389,14 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         # of /api/sync/simulate is not evidence that a real pin-triggered run
         # would be equal too.
         "rbIrqs": le32(63) if len(p) >= 67 else None,
+        # Gated run (fw 5c77778+; None before): rows released, edges that found
+        # nothing staged (dropped), pulses staged 0x00 because the filament was
+        # not hot (suppressed), rows skipped.
+        "gated": bool(p[67]) if len(p) >= 68 else None,
+        "releasedRows": le16(68) if len(p) >= 70 else None,
+        "droppedEdges": le32(70) if len(p) >= 74 else None,
+        "suppressedNotHot": le32(74) if len(p) >= 78 else None,
+        "skippedRows": le16(78) if len(p) >= 80 else None,
     }
 
 

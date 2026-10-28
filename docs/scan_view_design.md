@@ -199,8 +199,7 @@ def send_trigger(filament):      # the system calls this: "filament is hot and i
     cautious guess for `"ext"`.
 - **Raise filament j at:** (predicted start of its turn) − (its heating time)
   − `preheat_margin_s`.
-- **Never more hot at once than** `max_hot`, `max_hot_per_board` and
-  `max_hot_per_controller`.
+- **Never more than `max_hot` filaments heating at once.**
 - **It corrects itself.** Each filament's time hot and only waiting (too
   early), and time its turn waited for it (too late), are recorded. The lead
   is adjusted from them and saved in `filament_perf` for next time.
@@ -217,7 +216,7 @@ Same meaning as in `fire_single_pulse`, so same name:
 - `shot_wait_timeout_s`, `heat_timeout_s`, `verify`, `measure`, `rate_hz`,
   `bg_gap_us`, `bg_window_us`.
 - `settle_ms`: here it means the wait from first arrival to hot (see Words
-  used here).
+  used here). Required: there is no default.
 
 Not here:
 - `reuse`: always downloaded.
@@ -230,9 +229,7 @@ New:
 | `preheat_ahead` | how far ahead to heat: `"auto"` or a number of filaments | `"auto"` |
 | `preheat_margin_s` | `"auto"`: start heating this much earlier still | 0.3 |
 | `max_hot` | at most this many filaments hot at once, in total | 6 |
-| `max_hot_per_board` | at most this many hot on one 8-way board | **to decide** |
-| `max_hot_per_controller` | at most this many hot on one controller | **to decide** |
-| `max_voltage_drop_mv` | a drop below `active_mv` larger than this (3 reads) interrupts the heating | **to decide** |
+| `max_voltage_drop_mv` | a drop below `active_mv` larger than this (3 reads) interrupts the heating | 500 |
 | `on_armed_timeout_s` | longest your `on_armed` may run | `shot_wait_timeout_s` |
 | `no_pulse_timeout_s` | stop if no pulse at all for this long | `heat_timeout_s + settle_ms/1000 + shot_wait_timeout_s` |
 | `link_lost_timeout_s` | stop if a controller is lost for this long | 5 |
@@ -261,15 +258,16 @@ New:
   - the time from each filament's last pulse to the next `on_armed`;
   - the elapsed time.
 
-## Still to decide
+## Decisions taken (say if one is wrong)
 
-1. `max_hot_per_board` and `max_hot_per_controller`, or a total current
-   limit instead.
-2. `max_voltage_drop_mv`: how big a drop counts as "dropped a lot".
-3. The safe state for a filament skipped for an output fault: SLEEP (proposed)
-   or another.
-4. Whether HV must be on (checked at the start, and a stop if it goes off).
-5. The firmware change above.
+- `max_voltage_drop_mv` = 500 (user, 2026-10-27).
+- A filament skipped for an output fault is put to SLEEP after the run. During
+  the run it goes to IDLE: the backend lets a running schedule's own
+  filaments change only between IDLE and VOLTAGE.
+- HV (emission and focus) must be on: checked before anything is touched, and
+  the run stops if it goes off.
+- The firmware change: RP2350 5c77778 (branch feat/scan-row-release), on P1
+  and P2 since 2026-10-27.
 
 ## Tests, before it is used
 
