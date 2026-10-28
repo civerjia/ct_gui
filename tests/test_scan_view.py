@@ -334,6 +334,19 @@ r = make(rig).scan_view([62, 63], trigger="ext", on_armed=hv_off_last, **ARGS)
 check("HV off during the LAST filament: not ok, stopped", not r["ok"]
       and "HV switched off" in (r.get("stopped") or ""), r.get("stopped"))
 
+# --- a refused raise is not retried for 10 s -----------------------------------
+rig = Rig()
+ct = make(rig)
+real = ct._state_one
+ct._state_one = lambda f, state, arg, op, extra=None: (
+    {"ok": False, "error": "currently at SLEEP(2); ACTIVE may only be entered from IDLE(4)"}
+    if (f == 71 and state == VOLTAGE) else real(f, state, arg, op, extra))
+t_start = Clock.t
+r = ct.scan_view([70, 71], trigger="sim", **ARGS)
+check("a refused VOLTAGE skips that filament at once (no 10 s retry), the rest fires",
+      r["skipped"] == [71] and "SLEEP" in r["rows"][1]["skipped"] and r["rows"][0]["fired"] == 3
+      and Clock.t - t_start < 9.0, (r.get("skipped"), round(Clock.t - t_start, 2)))
+
 # --- refused before anything is touched -----------------------------------------
 for name, kw, want in (
         ("a single voltage", dict(active_mv=7000), "every filament"),

@@ -1287,6 +1287,10 @@ class _ScheduleMixin:
             return code, self._SHV_REJECT_NAMES.get(code, f"unknown reject code {code}")
         return None, (r.get("error") or "no reason given by the backend")
 
+    # Error texts that mean the LINK, not the request: worth asking again.
+    _LINK_TROUBLE = ("not connected", "timed out", "timeout", "did not ack", "unreachable",
+                     "connection", "bridge")
+
     def _scan_retry(self, fn, until_s: float = 10.0, ok=lambda r: bool(r and r.get("ok"))):
         """An IDEMPOTENT call, repeated until it succeeds or until_s runs out (a
         bridge that reconnects takes ~6 s). The last result, or a dict with the
@@ -1297,6 +1301,12 @@ class _ScheduleMixin:
             try:
                 last = fn() or {}
                 if ok(last):
+                    return last
+                # A definite refusal (ladder, dead, voltage cap, a running
+                # schedule...) does not change by asking again: return it now.
+                # Only the link -- a bridge reconnecting -- is worth the wait.
+                why = str(last.get("error") or "").lower()
+                if last and not any(w in why for w in self._LINK_TROUBLE):
                     return last
             except Exception as exc:              # link errors are what this is for
                 last = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
