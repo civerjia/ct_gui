@@ -1,18 +1,23 @@
 # Examples
 
-## `scan_views.py` — scan CT views, heating each filament just in time
+## `scan_view.py` — fire a list of filaments in order, each as soon as it is hot
 
 ```bash
-python3 scan_views.py --host 192.168.8.218                 # first 10 views, 5 V
-python3 scan_views.py --host 192.168.8.218 --views 96      # a whole rotation
+python3 scan_view.py --host 192.168.8.118:8780                  # trigger="sim"
+python3 scan_view.py --host 192.168.8.118:8780 --trigger ext    # your hardware sends the edges
+python3 scan_view.py --host 192.168.8.118:8780 --hv-on          # turn emission + focus on first, off after
 ```
 
-`ct.scan_plan()` gives every view of a rotation (dead filaments left out);
-`ct.scan_views()` fires them in order. Per view the motor moves (`move_to` --
-put your motor there; the example only prints) and the view's first filaments
-heat during the move; each filament fires once its voltage has settled and
-drops straight back to IDLE. Filaments must be at IDLE before; HV is not
-touched; Ctrl-C stops safely; everything ends at IDLE.
+One `ct.scan_view()` call with **every argument written out and commented**.
+Edit `FILAMENTS`, `ACTIVE_MV` (every filament its own voltage), `IDLE_MA`,
+`NUM_PULSES` and `on_armed()` at the top. The docstring draws how a run goes:
+the next filaments heat while the current one fires, each fires once it is
+**hot** (`settle_ms` after its voltage first arrived), strictly in list order,
+and goes back to IDLE. `on_armed(filament)` is called by the system once per
+filament, in order -- put your command (detector, trigger box) there. It
+prints one row per filament: pulses fired, heat time, time waiting for its
+turn, gap after the previous one, mAms, and what went wrong if anything.
+Before: filaments at IDLE, HV on (or `--hv-on`). After: every filament at IDLE.
 
 ## `external_trigger.py` — fire on an external trigger, and know when to send it
 

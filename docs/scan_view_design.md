@@ -118,7 +118,7 @@ voltage wobble. Only an interruption (above) stops it.
 
 ```python
 def send_trigger(filament):      # the system calls this: "filament is hot and its row is
-    angle_trigger.fire()         # released -- fire it now". Your trigger command goes here.
+    my_trigger.send(20)          # released -- fire it now". Your trigger command goes here.
 ```
 
 - **Called once per filament, in list order, with the filament number.** The

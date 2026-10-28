@@ -2282,6 +2282,7 @@ panel's "settle ms".
 
 ### Firing a list of filaments: `scan_view`
 
+**Runnable example** with every argument: [`examples/scan_view.py`](../examples/scan_view.py).
 **Design and flow** (timeline and who-tells-whom diagrams, every fault and
 timeout): [`docs/scan_view_design.md`](scan_view_design.md). Needs RP2350
 firmware 5c77778+ on every controller it uses.
@@ -2292,8 +2293,9 @@ at IDLE.
 
 ```python
 def on_armed(filament):        # the SYSTEM calls this, once per filament,
-    angle_trigger.fire()       # in list order: that filament is hot and
+    my_trigger.send(20)        # in list order: that filament is hot and
                                # its row released -- send its edges now
+                               # (my_trigger = your trigger source)
 
 r = ct.scan_view(
     [23, 24, 25],              # fired in this order

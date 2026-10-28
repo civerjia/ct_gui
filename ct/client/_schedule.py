@@ -1411,8 +1411,9 @@ class _ScheduleMixin:
         filament ends at IDLE. Design and flow: docs/scan_view_design.md.
 
             def on_armed(filament):        # the SYSTEM calls this, once per filament,
-                angle_trigger.fire()       # in list order: that filament is hot and
+                my_trigger.send(20)        # in list order: that filament is hot and
                                            # its row released -- send its edges now
+                                           # (my_trigger = your trigger source)
 
             r = ct.scan_view(
                 [23, 24, 25],              # fired in this order
