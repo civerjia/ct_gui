@@ -1816,6 +1816,9 @@ class _ScheduleMixin:
                     dangers(first_armed_at, last_pulse_at)
                     links_ok()
                     check_at = time.monotonic() + 0.5
+                # Count BEFORE the release: once released, an edge fires at once
+                # (ext), and a count read after it would not include that pulse.
+                done0 = (self.shv_status(own) or {}).get("totalPulsesDone") or 0
                 res = self._shv_row(armed, i, 0)
                 if any(v != 0 for v in res.values()):
                     raise self._ScanStop(
@@ -1825,7 +1828,6 @@ class _ScheduleMixin:
                 if pending_idle is not None:
                     to_idle(pending_idle)              # after the next one went, not before
                     pending_idle = None
-                done0 = (self.shv_status(own) or {}).get("totalPulsesDone") or 0
                 if push_on:
                     try:
                         self._post("/api/live-push", {"firing": [int(self._fid_of(f))]})

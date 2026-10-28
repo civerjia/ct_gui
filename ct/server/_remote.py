@@ -194,8 +194,10 @@ class _CallJob:
             # told and when it answered.
             name = str(self.body.get("name"))
             t0 = time.monotonic()
-            log.info("remote session %s (%s): %s -> callback #%d sent to the script",
-                     s.sid[:8], s.client_id, name, fid)
+            # #fid = WHICH function (on_armed is #1 every time); the args say which call.
+            what = ", ".join([repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()])
+            log.info("remote session %s (%s): %s -> callback #%d(%s) sent to the script",
+                     s.sid[:8], s.client_id, name, fid, what[:80])
             slow_warned = False
             try:
                 while True:
@@ -216,8 +218,8 @@ class _CallJob:
             finally:
                 self.waiting = False
                 s.last = time.monotonic()
-            log.info("remote session %s (%s): %s -> callback #%d answered in %.0f ms%s",
-                     s.sid[:8], s.client_id, name, fid, (time.monotonic() - t0) * 1000,
+            log.info("remote session %s (%s): %s -> callback #%d(%s) answered in %.0f ms%s",
+                     s.sid[:8], s.client_id, name, fid, what[:80], (time.monotonic() - t0) * 1000,
                      f" (raised {r['exc'].get('type')}: {r['exc'].get('message')})"
                      if r.get("exc") else "")
             if r.get("exc"):
