@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="400" viewBox="0 0 940 400" role="img" aria-label="scan_view: the edges of one filament">
+  <title>scan_view: the edges of one filament</title>
+  <rect width="940" height="400" fill="#ffffff"/>
+  <line x1="60" y1="104" x2="890" y2="104" stroke="#cbd5e1" stroke-width="1"/>
+  <rect x="300" y="70" width="42" height="34" rx="2" fill="#334155"/>
+  <rect x="460" y="70" width="42" height="34" rx="2" fill="#334155"/>
+  <rect x="620" y="70" width="42" height="34" rx="2" fill="#334155"/>
+  <rect x="780" y="70" width="42" height="34" rx="2" fill="#334155"/>
+  <line x1="90" y1="38" x2="90" y2="350" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="90" y="26" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">release</text>
+  <line x1="170" y1="38" x2="170" y2="350" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="170" y="26" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">on_armed(A)</text>
+  <line x1="300" y1="38" x2="300" y2="350" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="300" y="26" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">edge 1</text>
+  <line x1="460" y1="38" x2="460" y2="350" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="460" y="26" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">edge 2</text>
+  <line x1="620" y1="38" x2="620" y2="350" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="620" y="26" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">edge 3</text>
+  <line x1="90" y1="150" x2="300" y2="150" stroke="#475569" stroke-width="3"/>
+  <line x1="90" y1="143" x2="90" y2="157" stroke="#475569" stroke-width="2"/>
+  <line x1="300" y1="143" x2="300" y2="157" stroke="#475569" stroke-width="2"/>
+  <path d="M291,145 L299,150 L291,155" fill="none" stroke="#475569" stroke-width="2"/>
+  <text x="195.0" y="140" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#475569" text-anchor="middle">not timed by the firmware</text>
+  <text x="195.0" y="172" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="middle">(the host's shot_wait_timeout_s covers it)</text>
+  <line x1="300" y1="214" x2="342" y2="214" stroke="#475569" stroke-width="3"/>
+  <line x1="300" y1="207" x2="300" y2="221" stroke="#475569" stroke-width="2"/>
+  <line x1="342" y1="207" x2="342" y2="221" stroke="#475569" stroke-width="2"/>
+  <path d="M333,209 L341,214 L333,219" fill="none" stroke="#475569" stroke-width="2"/>
+  <text x="321.0" y="204" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#475569" text-anchor="middle">width_us</text>
+  <text x="354" y="218" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">&#8804; max_on_ms (checked at ARM)</text>
+  <line x1="300" y1="262" x2="460" y2="262" stroke="#475569" stroke-width="3"/>
+  <line x1="300" y1="255" x2="300" y2="269" stroke="#475569" stroke-width="2"/>
+  <line x1="460" y1="255" x2="460" y2="269" stroke="#475569" stroke-width="2"/>
+  <path d="M451,257 L459,262 L451,267" fill="none" stroke="#475569" stroke-width="2"/>
+  <text x="380.0" y="252" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#475569" text-anchor="middle">gap</text>
+  <text x="380.0" y="284" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="middle">sim: pulse_interval_ms  |  ext: your source</text>
+  <line x1="460" y1="330" x2="690" y2="330" stroke="#b91c1c" stroke-width="3"/>
+  <line x1="460" y1="323" x2="460" y2="337" stroke="#b91c1c" stroke-width="2"/>
+  <line x1="690" y1="323" x2="690" y2="337" stroke="#b91c1c" stroke-width="2"/>
+  <path d="M681,325 L689,330 L681,335" fill="none" stroke="#b91c1c" stroke-width="2"/>
+  <text x="575.0" y="320" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#b91c1c" text-anchor="middle">trigger_timeout_ms</text>
+  <text x="702" y="334" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">next edge before this</text>
+  <text x="702" y="346" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="start">(restarts at every edge)</text>
+  <line x1="24" y1="384" x2="50" y2="384" stroke="#b91c1c" stroke-width="3"/>
+  <text x="58" y="388" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">runs out: the whole run STOPS</text>
+  <line x1="304.4" y1="384" x2="330.4" y2="384" stroke="#b45309" stroke-width="3"/>
+  <text x="338.4" y="388" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">runs out: this filament is skipped, the run goes on</text>
+  <line x1="752.0" y1="384" x2="778.0" y2="384" stroke="#475569" stroke-width="3"/>
+  <text x="786.0" y="388" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">a wait, not a timeout</text>
+</svg>

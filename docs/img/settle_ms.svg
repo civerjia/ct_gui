@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="420" viewBox="0 0 940 420" role="img" aria-label="settle_ms: fire_single_pulse vs scan_view">
+  <title>settle_ms: fire_single_pulse vs scan_view</title>
+  <rect width="940" height="420" fill="#ffffff"/>
+  <rect x="60" y="61" width="820" height="18" rx="0" fill="#e2e8f0"/>
+  <text x="66" y="57" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="start">ACTIVE_MV &#177; 150 mV (arrived)</text>
+  <text x="54" y="194" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="end">IDLE</text>
+  <path d="M60,190 L100,190 C180,190 190,100 250,79 C264,75 276,71 294,71 L380,71 C400,72 404,96 420,96 L450,96 C466,96 470,71 490,70 L880,70 L880,70" fill="none" stroke="#0f766e" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <text x="504" y="100" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="start">&#8592; a wobble out of the band</text>
+  <line x1="60" y1="140" x2="880" y2="140" stroke="#b91c1c" stroke-width="1" stroke-dasharray="6 4"/>
+  <text x="880" y="156" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#b91c1c" text-anchor="end">target &#8722; max_voltage_drop_mv: below this on 3 reads = interrupted (scan_view only)</text>
+  <line x1="100" y1="42" x2="100" y2="390" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="100" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">VOLTAGE</text>
+  <line x1="250" y1="42" x2="250" y2="390" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="250" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">first arrival</text>
+  <text x="24" y="236" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="15" font-weight="600" fill="#1e293b" text-anchor="start">fire_single_pulse(settle_ms=...): held CONTINUOUSLY</text>
+  <line x1="250" y1="270" x2="410" y2="270" stroke="#475569" stroke-width="3"/>
+  <line x1="250" y1="263" x2="250" y2="277" stroke="#475569" stroke-width="2"/>
+  <line x1="410" y1="263" x2="410" y2="277" stroke="#475569" stroke-width="2"/>
+  <path d="M401,265 L409,270 L401,275" fill="none" stroke="#475569" stroke-width="2"/>
+  <text x="330.0" y="260" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#475569" text-anchor="middle">clock</text>
+  <text x="422" y="274" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#b91c1c" text-anchor="start">restarts</text>
+  <line x1="480" y1="270" x2="710" y2="270" stroke="#475569" stroke-width="3"/>
+  <line x1="480" y1="263" x2="480" y2="277" stroke="#475569" stroke-width="2"/>
+  <line x1="710" y1="263" x2="710" y2="277" stroke="#475569" stroke-width="2"/>
+  <path d="M701,265 L709,270 L701,275" fill="none" stroke="#475569" stroke-width="2"/>
+  <text x="595.0" y="260" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#475569" text-anchor="middle">settle_ms</text>
+  <text x="722" y="274" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">settled: on_armed + trigger</text>
+  <text x="24" y="336" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="15" font-weight="600" fill="#1e293b" text-anchor="start">scan_view(settle_ms=...): HOT, from the FIRST arrival</text>
+  <line x1="250" y1="370" x2="480" y2="370" stroke="#475569" stroke-width="3"/>
+  <line x1="250" y1="363" x2="250" y2="377" stroke="#475569" stroke-width="2"/>
+  <line x1="480" y1="363" x2="480" y2="377" stroke="#475569" stroke-width="2"/>
+  <path d="M471,365 L479,370 L471,375" fill="none" stroke="#475569" stroke-width="2"/>
+  <text x="365.0" y="360" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#475569" text-anchor="middle">settle_ms</text>
+  <text x="492" y="374" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">HOT: may fire (the wobble did not restart it)</text>
+</svg>

@@ -1,0 +1,7 @@
+/* Timing figures (docs/img, scripts/make_doc_figures.py): fit the text column. */
+.pdoc .docstring img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 0.8rem 0 1.2rem;
+}

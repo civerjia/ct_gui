@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="410" viewBox="0 0 940 410" role="img" aria-label="scan_view: one filament's turn and its timeouts">
+  <title>scan_view: one filament's turn and its timeouts</title>
+  <rect width="940" height="410" fill="#ffffff"/>
+  <rect x="400" y="52" width="120" height="250" rx="0" fill="#f1f5f9"/>
+  <text x="460.0" y="164" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="middle">waits for</text>
+  <text x="460.0" y="180" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="middle">its turn</text>
+  <rect x="60" y="65" width="820" height="18" rx="0" fill="#e2e8f0"/>
+  <text x="66" y="61" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="start">ACTIVE_MV &#177; 150 mV (arrived)</text>
+  <text x="54" y="140" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="end">IDLE</text>
+  <path d="M60,136 L110,136 C190,136 220,104 280,83 C294,79 306,75 324,75 L860,74 C900,74 880,136 910,136 L880,136" fill="none" stroke="#0f766e" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <text x="910" y="152" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="end">IDLE once the next</text>
+  <text x="910" y="167" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="end">one is released</text>
+  <rect x="696" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <rect x="713" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <rect x="730" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <rect x="747" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <rect x="764" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <rect x="781" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <rect x="798" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <rect x="815" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <rect x="832" y="172" width="7" height="16" rx="1" fill="#334155"/>
+  <text x="772.5" y="204" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="middle">its num_pulses pulses</text>
+  <line x1="110" y1="52" x2="110" y2="356" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="110" y="40" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">raise to VOLTAGE</text>
+  <line x1="280" y1="52" x2="280" y2="356" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="280" y="40" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">first arrival</text>
+  <line x1="400" y1="52" x2="400" y2="356" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="400" y="40" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">HOT</text>
+  <line x1="520" y1="52" x2="520" y2="356" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="520" y="40" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">release + on_armed(A)</text>
+  <line x1="840" y1="52" x2="840" y2="356" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="840" y="40" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="middle">all pulses counted</text>
+  <line x1="110" y1="226" x2="280" y2="226" stroke="#b45309" stroke-width="3"/>
+  <line x1="110" y1="219" x2="110" y2="233" stroke="#b45309" stroke-width="2"/>
+  <line x1="280" y1="219" x2="280" y2="233" stroke="#b45309" stroke-width="2"/>
+  <path d="M271,221 L279,226 L271,231" fill="none" stroke="#b45309" stroke-width="2"/>
+  <text x="195.0" y="216" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#b45309" text-anchor="middle">heat_timeout_s</text>
+  <line x1="280" y1="226" x2="400" y2="226" stroke="#475569" stroke-width="3"/>
+  <line x1="280" y1="219" x2="280" y2="233" stroke="#475569" stroke-width="2"/>
+  <line x1="400" y1="219" x2="400" y2="233" stroke="#475569" stroke-width="2"/>
+  <path d="M391,221 L399,226 L391,231" fill="none" stroke="#475569" stroke-width="2"/>
+  <text x="340.0" y="216" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#475569" text-anchor="middle">settle_ms</text>
+  <line x1="520" y1="272" x2="690" y2="272" stroke="#b91c1c" stroke-width="3"/>
+  <line x1="520" y1="265" x2="520" y2="279" stroke="#b91c1c" stroke-width="2"/>
+  <line x1="690" y1="265" x2="690" y2="279" stroke="#b91c1c" stroke-width="2"/>
+  <path d="M681,267 L689,272 L681,277" fill="none" stroke="#b91c1c" stroke-width="2"/>
+  <text x="605.0" y="262" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#b91c1c" text-anchor="middle">on_armed_timeout_s</text>
+  <text x="605.0" y="290" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="middle">until on_armed RETURNS</text>
+  <line x1="520" y1="332" x2="840" y2="332" stroke="#b45309" stroke-width="3"/>
+  <line x1="520" y1="325" x2="520" y2="339" stroke="#b45309" stroke-width="2"/>
+  <line x1="840" y1="325" x2="840" y2="339" stroke="#b45309" stroke-width="2"/>
+  <path d="M831,327 L839,332 L831,337" fill="none" stroke="#b45309" stroke-width="2"/>
+  <text x="680.0" y="322" font-family="SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="15" font-weight="600" fill="#b45309" text-anchor="middle">shot_wait_timeout_s</text>
+  <text x="680.0" y="350" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="400" fill="#64748b" text-anchor="middle">until ALL its pulses are counted; else the rest of A is skipped</text>
+  <line x1="24" y1="392" x2="50" y2="392" stroke="#b91c1c" stroke-width="3"/>
+  <text x="58" y="396" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">runs out: the whole run STOPS</text>
+  <line x1="304.4" y1="392" x2="330.4" y2="392" stroke="#b45309" stroke-width="3"/>
+  <text x="338.4" y="396" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">runs out: this filament is skipped, the run goes on</text>
+  <line x1="752.0" y1="392" x2="778.0" y2="392" stroke="#475569" stroke-width="3"/>
+  <text x="786.0" y="396" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="400" fill="#64748b" text-anchor="start">a wait, not a timeout</text>
+</svg>

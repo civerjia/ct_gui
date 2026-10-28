@@ -22,5 +22,10 @@ python3 -m pdoc ct.client '!ct.client._*' \
     --output-directory docs/api \
     --no-show-source \
     --no-search \
-    --docformat markdown
+    --docformat markdown \
+    --template-directory docs/pdoc_templates
+# The timing figures the docstrings link as ../img/<name>.svg (drawn by
+# scripts/make_doc_figures.py, committed in docs/img).
+mkdir -p docs/api/img
+cp docs/img/*.svg docs/api/img/
 echo "-> docs/api/ct/client.html"
