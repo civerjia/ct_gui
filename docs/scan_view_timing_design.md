@@ -62,8 +62,10 @@ step 6 and closes at step 13 at the latest.
 8. **Its turn** (the previous filament's pulses are all counted): release its
    row on every armed controller.
 9. **`on_armed(f)`** is called. trigger="ext": your code starts your edges.
-10. **Edges:** sim — the library sends `num_pulses` edges `pulse_interval_ms`
-    apart; ext — yours. Release → first edge is not timed by the firmware.
+10. **Edges:** sim — after `on_armed` returns, ONE request to the MASTER's
+    ESP32 starts a hardware-timed train of `num_pulses` edges
+    `pulse_interval_ms` apart (§4b); ext — yours. Release → first edge is not
+    timed by the firmware.
 11. **Pulses:** the firmware fires one `width_us` pulse per edge, only for the
     released row, only while that filament is HOT. Any other edge is dropped
     and counted. From the first edge, each gap must be < `trigger_timeout_ms`.
@@ -117,6 +119,49 @@ Proposal:
   down, nothing drops a heated filament: the backend's timer fires but its
   IDLE cannot arrive (Q8).
 
+## 4b. trigger="sim": a path of its own
+
+How a simulated edge is made (ESP32 `sync_io.cpp`, `config_portal.cpp`):
+
+```
+backend --HTTP /sync/burst--> MASTER ESP32 hardware timer
+        --ReadyIn wire--> master RP2350 (fires its released row)
+        --SyncOut--> the other RP2350's SyncIn (fires its released row)
+```
+
+What follows from it:
+
+- **Only the master can start a train.** The other controller's filaments get
+  their edges through SyncOut → SyncIn (L6). With the master's L2 down,
+  nothing can fire, even on the other controller.
+- **Starting costs a request inside the window.** One HTTP request per
+  filament, after `on_armed` returns, served by the ESP32's single-threaded
+  web server (≈ 65 ms idle, 200–300 ms under load). It is part of the step-4
+  budget.
+- **One train at a time.** The ESP32 refuses a second while one runs. The
+  backend learns a train has ended only on its next ESP32 poll (every 0.3 s),
+  so right after a filament it still says "already running"; today the host
+  retries that for up to 2 s, which comes out of the next filament's window.
+  Proposal: when its flag says running, the backend asks the ESP32 at once
+  instead of the host retrying (Q11).
+- **The train runs on its own.** Once started, the ESP32 sends every edge
+  whatever the host decides. If a filament ends early (its window runs out,
+  or the run stops) and the next row is released while the old train is still
+  going, **its remaining edges fire the NEXT filament**. Today scan_view never
+  stops a train (it only disarms), and the backend's `simulate-stop` only sets
+  a flag its 0.3 s poll acts on. Rule: a filament that ends before its train
+  does → stop the train and CONFIRM it stopped (ESP32 status `running=false`)
+  before the next row is released; every STOP also stops the train (Q10).
+- **Spacing limits.** `pulse_interval_ms` > `width_us` (an edge while the
+  pulse is still on is discarded); the ESP32 minimum period is the SyncOut
+  width + 20 µs; measuring needs ≥ 0.5 ms (the backgrounds); a spacing that
+  does not divide 1 s needs ESP32 firmware with `period_us`.
+- **`trigger_timeout_ms` in sim** only catches a lost edge or a dead train
+  (the spacing is hardware-timed): the default 2 × `pulse_interval_ms` + 100
+  is enough.
+- **`on_armed` in sim** is optional; the train starts only after it returns,
+  so its time is inside the window.
+
 ## 5. Names across the API
 
 | meaning | scan_view | fire_single_pulse | low level (`voltage_one` / `active_one`) |
@@ -157,5 +202,10 @@ filament nobody renews for 4 s falls back), which a long window must not trip.
 - **Q8** RP2350 firmware: a timed VOLTAGE of its own (the board drops to IDLE
   by itself after `heat_timeout_s`), so a heated filament is safe even with L2
   or L3 down. Firmware change, test board first.
+- **Q10** sim: stop and confirm the train before releasing the next row when
+  a filament ends early, and on every STOP (§4b)? Without it a leftover train
+  fires the next filament.
+- **Q11** sim "already running" right after a filament: fix it in the backend
+  (ask the ESP32 directly) and drop the host's 2 s retry?
 - **Q9** `settle_ms` in fire_single_pulse is "held continuously"; in scan_view
   "from the first arrival". Make them the same (which one)?
