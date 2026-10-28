@@ -1606,7 +1606,7 @@ async function hwArm() {
     try {
       // Pass the per-filament idleA setpoints so arm-prerequisite idling lands on
       // the plan's currents (the backend applies currents[idx] only to `filaments`).
-      const jp = await postJSON('/api/filament-prep', { state: STATE.IDLE, filaments: parts0, currents: prepCurrents('idleA') });
+      const jp = await postJSON('/api/filament-prep', { state: STATE.IDLE, filaments: prepFids(parts0), currents: prepCurrents('idleA') });
       if (!jp.ok) hwMsg(`⚠ Idle prep partial (applied ${jp.applied || 0}/${parts0.length}) — arming anyway…`);
     } catch (e) { hwMsg('Idle prep failed: ' + e + ' — aborting arm.'); return; }
   }
@@ -1745,12 +1745,18 @@ async function hwPrep(state, label, opts) {
     if (j.ok && state === STATE.ACTIVE) { runState.prepActive = true; refreshRunGate(); }
   } catch (e) { hwMsg(`✗ ${label} failed — ` + e); }
 }
-// per-filament CC current (mA) so Idle/Active land on the right setpoint
+// per-filament CC current (mA) so Idle/Active land on the right setpoint.
+// Keyed by FID: `filaments` is indexed by RING POSITION, the backend takes FIDs.
 function prepCurrents(field) {
   const out = {};
-  filaments.forEach((f, i) => { if (!f.dead && !f.noHeat) out[i] = Math.round(f[field] * 1000); });
+  filaments.forEach((f, i) => { if (!f.dead && !f.noHeat) out[fidOfRing(i)] = Math.round(f[field] * 1000); });
   return out;
 }
+// Ring positions -> the FIDs /api/filament-prep takes. Sending ring positions
+// as FIDs left out the board whose ring slot was dead (P1 CH5.5, FID 72, at
+// ring 71, while ring 72 = FID 50 is dead) and powered the wrong boards
+// whenever the filament order is not the identity (2026-10-28).
+const prepFids = (rings) => rings.map(fidOfRing);
 // Filaments that participate in heating: neither dead nor noHeat.
 // Used to exclude disabled/emission-only filaments from prep commands.
 function heatedFilaments() {
@@ -2255,19 +2261,19 @@ function init() {
   refreshRunGate();   // initial gate/lock state
   $('hwPrepStop').addEventListener('click', () => hwPrep(STATE.STOP, 'Stop all'));
   $('hwPrepSleep').addEventListener('click', () => hwPrep(STATE.SLEEP, 'Sleep all'));
-  $('hwPrepStandby').addEventListener('click', () => { const f = heatedFilaments(); hwPrep(STATE.STANDBY, `Standby heated (${f.length})`, { filaments: f }); });
+  $('hwPrepStandby').addEventListener('click', () => { const f = heatedFilaments(); hwPrep(STATE.STANDBY, `Standby heated (${f.length})`, { filaments: prepFids(f) }); });
   $('hwPrepIdle').addEventListener('click', () => {
     const f = heatedFilaments();
     if (f.some((i) => filaments[i].idleA == null)) {
       hwMsg && hwMsg('IDLE current unknown: the backend default (/api/defaults) could not be read -- set "idle A" first.');
       return;
     }
-    hwPrep(STATE.IDLE, `Idle heated (${f.length})`, { filaments: f, currents: prepCurrents('idleA') });
+    hwPrep(STATE.IDLE, `Idle heated (${f.length})`, { filaments: prepFids(f), currents: prepCurrents('idleA') });
   });
   $('hwPrepActive').addEventListener('click', () => {
     const fils = firstBatchFilaments();
     if (!fils || !fils.length) { hwMsg('No heating plan — build a schedule first.'); return; }
-    hwPrep(STATE.ACTIVE, `Active first batch (${fils.length})`, { filaments: fils, currents: prepCurrents('activeA') });
+    hwPrep(STATE.ACTIVE, `Active first batch (${fils.length})`, { filaments: prepFids(fils), currents: prepCurrents('activeA') });
   });
   $('schApplyBtn').addEventListener('click', () => {
     const pulses = Math.max(1, parseInt($('schPulses').value, 10) || 1);
