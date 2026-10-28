@@ -3,7 +3,10 @@
  * vacuum, one strip each on a shared time axis (different units -> separate
  * y-axes, never one dual-axis plot). Data from /api/series: every reading as
  * the backend received it (Spellman broadcasts, pressure points, ADS reads),
- * fetched incrementally once a second. Drawn only while the card is open.
+ * fetched incrementally (4x a second while the card is open, once a second
+ * when folded). Drawn only while the card is open, on the BACKEND's clock: the
+ * points are stamped there, and a browser clock 1 s behind it (the rig PC,
+ * 2026-10-28) put the newest second past the right edge.
  */
 import { $ } from './dom.js';
 import { postJ } from './net.js';
@@ -23,6 +26,7 @@ export function initTrends() {
   if (!card || !canvas) return;
   const data = Object.fromEntries(STRIPS.map((s) => [s.key, []]));
   let last = 0, windowS = 120, hoverX = null;
+  let clockOffset = 0;   // backend time - browser time, s (from each reply's `now`)
 
   const seg = $('trendWindow');
   if (seg) seg.querySelectorAll('button').forEach((b) => {
@@ -37,8 +41,10 @@ export function initTrends() {
 
   async function fetchNew() {
     try {
+      const t0 = Date.now() / 1000;
       const r = await (await fetch(`/api/series?since=${last}&max_points=4000`)).json();
       if (!r.ok) return;
+      if (typeof r.now === 'number') clockOffset = r.now - (t0 + Date.now() / 1000) / 2;
       if (typeof r.vacuum_limit_torr === 'number') {
         STRIPS[4].limit = r.vacuum_limit_torr;
         const inp = $('vacLimit');
@@ -65,7 +71,7 @@ export function initTrends() {
     const ctx = canvas.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
-    const t1 = Date.now() / 1000, t0 = t1 - windowS, pw = W - LEFT - RIGHT;
+    const t1 = Date.now() / 1000 + clockOffset, t0 = t1 - windowS, pw = W - LEFT - RIGHT;
     const xOf = (t) => LEFT + ((t - t0) / windowS) * pw;
     ctx.font = '10px ui-monospace, Menlo, monospace';
     const hoverT = hoverX != null && hoverX >= LEFT ? t0 + ((hoverX - LEFT) / pw) * windowS : null;
@@ -158,6 +164,6 @@ export function initTrends() {
   };
   card.addEventListener('toggle', draw);
   window.addEventListener('resize', draw);
-  const loop = async () => { await fetchNew(); draw(); setTimeout(loop, 1000); };
+  const loop = async () => { await fetchNew(); draw(); setTimeout(loop, card.open ? 250 : 1000); };
   loop();
 }

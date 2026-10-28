@@ -10,7 +10,7 @@ import { calApi, liveRefV, setLiveRefV, peakToMa } from './tests.js';
 import { $ as $p, setMsg, clampNumberInputs } from './dom.js';
 import { postJ, sleep } from './net.js';
 import { state } from './state.js';
-import { filamentToBoard } from './app.js';
+import { filamentToBoard, ringOfFid } from './app.js';
 
 let pwTarget = 1;                       // selected controller (1 or 2) — boards/HV-grid
 // The STM32 (HV monitor/setpoints + ADC waveform/pulses) lives only on the MASTER
@@ -1863,7 +1863,7 @@ const EMI_HTML = `
     <div class="block-title shot-panel-title">Single shot <span class="hint">— fire_single_pulse in the backend: heat → fire (simulated trigger) → measure → back to IDLE</span></div>
     <div class="hint" style="margin:2px 0 6px">The same call a script makes. The filament must be at IDLE; it is heated only after the arm and dropped back to the IDLE current as soon as the pulses are done. Set the emission rail in High Voltage first — this panel does not touch HV.</div>
     <div class="bm-set-row">
-      <label class="numlabel" title="Physical filament index (0-95), as on the CT Geometry ring.">filament <input id="shotFil" type="number" min="0" max="95" value="0" /></label>
+      <label class="numlabel" title="PHYSICAL filament (FID, 0-95) -- NOT the number drawn on the CT Geometry ring (that is the ring position). The board and the ring position it sits at are shown beside it.">filament FID <input id="shotFil" type="number" min="0" max="95" value="0" /></label>
       <span id="shotSite" class="hint"></span>
     </div>
     <div class="bm-set-row">
@@ -2147,7 +2147,9 @@ function parseShvEntries() { return rowTableValues('shvEntries', SHV_ENTRY_COLS)
 let shotTimer = null;
 function shotSite() {
   const fid = +$p('shotFil').value, b = filamentToBoard && filamentToBoard(fid);
-  $p('shotSite').textContent = b ? `P${b.controller} CH${b.channel + 1}.${(b.mux ?? b.mux_port ?? 0) + 1}` : '(no board mapped)';
+  $p('shotSite').textContent = b
+    ? `P${b.controller} CH${b.channel + 1}.${(b.mux ?? b.mux_port ?? 0) + 1} · ring ${ringOfFid(fid)}`
+    : '(no board mapped)';
 }
 function renderShot(r) {
   const body = $p('shotBody'); if (!body) return;
@@ -2185,6 +2187,9 @@ function shotSummary(j) {
 }
 function wireShot() {
   $p('shotFil').addEventListener('input', shotSite); shotSite();
+  // The mapping and the filament order arrive after start-up and can change:
+  // recompute the label (local only, no request) instead of keeping the first one.
+  setInterval(shotSite, 2000);
   fetch('/api/defaults').then((r) => r.json()).then((d) => { if (d && d.idle_ma != null && !$p('shotIdle').value) $p('shotIdle').value = d.idle_ma; }).catch(() => {});
   $p('shotFire').onclick = async () => {
     const fid = +$p('shotFil').value, mode = $p('shotMode').value, heat = +$p('shotHeat').value;

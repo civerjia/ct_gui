@@ -68,7 +68,7 @@ const CH_USED = 6;
 // Identity until the order is read (and when none is set).
 let ringToFid = null, fidToRing = null;
 const fidOfRing = (r) => (ringToFid ? ringToFid[r] : r);
-const ringOfFid = (f) => (fidToRing && fidToRing[f] != null ? fidToRing[f] : f);
+export const ringOfFid = (f) => (fidToRing && fidToRing[f] != null ? fidToRing[f] : f);
 async function syncBackendOrder() {
   let j;
   try { j = await (await fetch('/api/filament-order')).json(); } catch { return; }
@@ -1886,7 +1886,9 @@ async function pollRunStatus() {
     if (s.state === 4) fault = { ctrl: k, fil: s.faultFilament, reason: s.stopReason };
     // firmware-reported live firing filament (255 = none/idle)
     if (s.filamentIndex != null && s.filamentIndex !== 255) firingFil = ringOfFid(s.filamentIndex);
-    const fil = (s.filamentIndex == null || s.filamentIndex === 255) ? '—' : s.filamentIndex;
+    // Both numbers: the ring draws ring positions, the firmware reports FIDs.
+    const fil = (s.filamentIndex == null || s.filamentIndex === 255) ? '—'
+      : `ring ${ringOfFid(s.filamentIndex)} (FID ${s.filamentIndex})`;
     // Poll succeeded => responsive. A stale heartbeat here is just a soft note.
     const hb = stale ? ' · ⚠hb-stale' : '';
     statePieces.push(`P${k}: ${SHV_STATE_NAME[s.state] || s.state} · firing fil ${fil} · pulse ${s.totalPulsesDone}/${s.totalPulsesTarget || '?'}${hb}`);
@@ -1926,7 +1928,7 @@ async function pollRunStatus() {
   // arm-state badge (firmware-authoritative). A dead/unresponsive RP2350 is the
   // most critical state — surface it above run state so it can't be missed.
   if (anyDead) setArmState('✗ RP2350 unresponsive', 'fault');
-  else if (fault) setArmState(`✗ fault fil${fault.fil} · ${SHV_STOP_NAME[fault.reason] || fault.reason}`, 'fault');
+  else if (fault) setArmState(`✗ fault ${fault.fil == null || fault.fil === 255 ? 'fil —' : `ring ${ringOfFid(fault.fil)} (FID ${fault.fil})`} · ${SHV_STOP_NAME[fault.reason] || fault.reason}`, 'fault');
   else if (anyRunning) setArmState('● running', 'running');
   else if (anyArmed) setArmState('● armed', 'armed');
   else if (anyComplete) setArmState('✓ complete', 'complete');
