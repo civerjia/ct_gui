@@ -91,10 +91,10 @@ sequenceDiagram
     H->>R: 8. release row f
     H->>U: 9. on_armed(f)
     U-->>R: 10. edges (or the library's, sim)
-    R->>R: 11. pulse per edge; gap < trigger_timeout_ms
+    R->>R: 11. one pulse per edge, each gap shorter than trigger_timeout_ms
     R-->>H: 13. all pulses counted
     H->>R: f to IDLE (once the next is released)
-    B-->>R: window ends first: f to IDLE, rest skipped
+    B-->>R: window ends first - f to IDLE, the rest skipped
 ```
 
 ## 4. "Link": which one
