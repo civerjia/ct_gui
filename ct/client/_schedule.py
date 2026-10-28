@@ -1867,8 +1867,19 @@ class _ScheduleMixin:
                                 f"{err_box['error']}")
                         row["on_armed_error"] = err_box["error"]
                 if trigger == "sim" and not err_box.get("error"):
-                    r = self._post("/api/sync/simulate", {"count": n, "interval_ms": float(interval),
-                                                         "controller": int(head)}, timeout=10.0)
+                    # The previous row's train has fired and been counted (its row
+                    # is done), but the backend clears its "running" flag only on
+                    # its next ~0.3 s status poll: "already running" right after a
+                    # row is that tail, not a second train. It skipped a hot
+                    # filament per view on 2026-10-28; wait it out, briefly.
+                    busy_end = time.monotonic() + 2.0
+                    while True:
+                        r = self._post("/api/sync/simulate", {"count": n, "interval_ms": float(interval),
+                                                             "controller": int(head)}, timeout=10.0)
+                        if (r.get("ok") or "already running" not in str(r.get("error", ""))
+                                or time.monotonic() > busy_end):
+                            break
+                        time.sleep(0.05)
                     if not r.get("ok"):
                         row["on_armed_error"] = f"simulated trigger refused: {r.get('error', r)}"
                 # 3. its pulses, within shot_wait_timeout_s

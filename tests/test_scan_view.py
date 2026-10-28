@@ -186,6 +186,9 @@ def make(rig: Rig):
             rig.state = 0
             return {"ok": True}
         if path == "/api/sync/simulate":
+            if getattr(rig, "sim_busy", 0) > 0:   # the backend's poll tail of the last train
+                rig.sim_busy -= 1
+                return {"ok": False, "error": "simulation already running"}
             f = rig.rows[rig.cur]["filament"] if rig.cur < len(rig.rows) else None
             rig.edges(rig.edges_short.get(f, body["count"]))
             return {"ok": True}
@@ -357,6 +360,13 @@ for name, kw, want in (
     a = {**ARGS, **kw}
     r = make(rig).scan_view([60, 61], **a)
     check(f"refused: {name}", not r["ok"] and want in (r.get("error") or "") and not rig.log, r.get("error"))
+# --- sim: the backend still says "already running" just after a train --------
+rig = Rig()
+rig.sim_busy = 2
+r = make(rig).scan_view([62, 63], trigger="sim", pulse_interval_ms=30, **ARGS)
+check("sim 'already running' tail: waited out, nothing skipped",
+      r["ok"] and not r["skipped"] and r["fired"] == 2 and rig.sim_busy == 0, r)
+
 rig = Rig(hv=False)
 r = make(rig).scan_view([60, 61], **ARGS)
 check("refused: HV off at the start", "HV is not on" in (r.get("error") or "") and not rig.log, r.get("error"))
