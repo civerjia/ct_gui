@@ -142,23 +142,51 @@ res = job.next_event()
 check("closed mid-callback: call fails, cleanup ran",
       not res["ok"] and "gone" in res["exc"]["message"] and fake.cleaned, res)
 
-# 7. Version check.
+# 7. Version check: WHICH side is behind, from GitHub's newest commit (the
+#    installs have no git). 2026-10-28 a client NEWER than the backend was
+#    told it ran "OLD" code and to restart itself.
 check("no version -> stale (pre-2026-10-14 client)", sr.version_check(None)["stale"])
-sr_v = sr._backend_version
-sr._backend_version = lambda: {"commit": "new1234", "tree": "aaaa"}
+sr_v, sr_l = sr._backend_version, sr._github_latest
+sr._backend_version = lambda: {"commit": "back111", "tree": "aaaa"}
 try:
+    check("same tree -> fine, nothing to say", not sr.version_check({"tree": "aaaa"}).get("why"))
+    sr._github_latest = lambda: "back111"          # backend is the newest
     v = sr.version_check({"commit": "old5678", "tree": "bbbb"})
-    check("different tree -> stale, both named", v["stale"] and "old5678" in v["why"] and "new1234" in v["why"], v)
-    check("same tree -> fine", not sr.version_check({"tree": "aaaa"})["stale"])
+    check("backend newest -> CLIENT older: stale, restart this program",
+          v["stale"] and not v["backend_behind"] and "OLDER" in v["why"]
+          and "restart this program" in v["action"], v)
+    sr._github_latest = lambda: "new9999"          # client is the newest
+    v = sr.version_check({"commit": "new9999", "tree": "cccc"})
+    check("client newest -> BACKEND behind: not stale, backend updates itself",
+          not v["stale"] and v["backend_behind"] and "NEWER" in v["why"]
+          and "restart_backend" in v["action"], v)
+    v = sr.version_check({"commit": "mid5555", "tree": "dddd"})
+    check("neither newest -> all three named, no guess",
+          not v["stale"] and not v["backend_behind"] and "mid5555" in v["why"]
+          and "back111" in v["why"] and "new9999" in v["why"], v)
+    sr._github_latest = lambda: None               # not checked yet
+    v = sr.version_check({"commit": "mid5555", "tree": "dddd"})
+    check("GitHub not checked -> says the order is unknown", "unknown" in v["why"], v)
 finally:
-    sr._backend_version = sr_v
+    sr._backend_version, sr._github_latest = sr_v, sr_l
 
 import io, contextlib  # noqa: E401,E402
 buf = io.StringIO()
 with contextlib.redirect_stderr(buf):
-    cr._warn_stale("combined_backend", {"version": {"stale": True, "why": "client runs ct_gui old5678"}})
-check("stale -> loud warning naming the program", "combined_backend" in buf.getvalue()
-      and "Restart" in buf.getvalue(), buf.getvalue())
+    cr._warn_stale("combined_backend", {"version": {
+        "stale": True, "why": "client runs ct_gui old5678, OLDER than the backend's back111",
+        "action": "restart this program to load the backend's version"}})
+check("client older -> loud warning naming the program and what to do",
+      "combined_backend" in buf.getvalue() and "restart this program" in buf.getvalue(),
+      buf.getvalue())
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+    cr._warn_stale("scan_view_example", {"version": {
+        "stale": False, "backend_behind": True,
+        "why": "client runs ct_gui new9999 (the newest on GitHub), NEWER than the backend's back111",
+        "action": "nothing to do in this program: the backend updates itself"}})
+check("backend behind -> says so, never 'restart this program'",
+      "NEWER" in buf.getvalue() and "restart this program" not in buf.getvalue(), buf.getvalue())
 
 # 8. Backend down when the program builds its client: still a PROXY (no
 #    session yet), never a local client running this process's code.

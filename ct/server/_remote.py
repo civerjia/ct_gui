@@ -107,24 +107,65 @@ def _backend_version() -> dict:
         return {}
 
 
+def _github_latest() -> str | None:
+    """The newest commit on GitHub, from the backend's own update check (no
+    network here). None until the first check has answered."""
+    try:
+        from ._server import _UPDATE_LOCK, _UPDATE_STATUS
+        with _UPDATE_LOCK:
+            st = dict(_UPDATE_STATUS)
+    except Exception:
+        return None
+    return st.get("latest") if st.get("ok") else None
+
+
 def version_check(client_v: dict | None) -> dict:
-    """Is the proxy's own code older than this backend's? The client LOGIC
-    runs here, so an old proxy mostly still gets new behaviour -- but the
-    proxy itself (and anything a script imports from ct beside CTClient) is
-    whatever that process loaded at start. 2026-10-13: a proxy too old to
-    send callbacks ran every on_armed fire on its own stale client and 60 of
-    62 read-back failures came from it. Compared by content tree."""
+    """Does the proxy run the same ct_gui as this backend -- and if not, WHICH
+    one is behind? The client LOGIC runs here, so an old proxy mostly still
+    gets new behaviour -- but the proxy itself (and anything a script imports
+    from ct beside CTClient) is whatever that process loaded at start.
+    2026-10-13: a proxy too old to send callbacks ran every on_armed fire on
+    its own stale client and 60 of 62 read-back failures came from it.
+
+    Compared by content tree. The installs have no git, so the ORDER comes
+    from GitHub's newest commit (the update check): the one that is not the
+    newest is behind. 2026-10-28 this said "client runs OLD code, restart
+    it" to a client NEWER than the backend -- restarting the script did
+    nothing; the backend was the one waiting to update.
+
+    stale          = the CLIENT is behind: restart that program.
+    backend_behind = the BACKEND is behind: it updates itself once the rig is
+                     quiet (or ct.restart_backend() now).
+    why / action   = the words, for the log and the client's banner."""
     mine = _backend_version()
     cv = client_v if isinstance(client_v, dict) else {}
     if not cv.get("tree"):
-        return {"stale": True, "client": None, "backend": mine,
+        return {"stale": True, "backend_behind": False, "client": None, "backend": mine,
                 "why": "the client sent no version: its ct_gui predates the "
-                       "version check (2026-10-14) and runs on-armed fires on its own old code"}
-    if mine.get("tree") and cv["tree"] != mine["tree"]:
-        return {"stale": True, "client": cv, "backend": mine,
-                "why": f"client runs ct_gui {cv.get('commit') or cv['tree']}, "
-                       f"backend {mine.get('commit') or mine['tree']}"}
-    return {"stale": False, "client": cv, "backend": mine}
+                       "version check (2026-10-14) and runs on-armed fires on its own old code",
+                "action": "restart this program to load the backend's version"}
+    if not mine.get("tree") or cv["tree"] == mine["tree"]:
+        return {"stale": False, "backend_behind": False, "client": cv, "backend": mine}
+    c_id = cv.get("commit") or cv["tree"]
+    b_id = mine.get("commit") or mine["tree"]
+    latest = _github_latest()
+    out = {"client": cv, "backend": mine, "github_latest": latest}
+    if latest and mine.get("commit") == latest:
+        return {**out, "stale": True, "backend_behind": False,
+                "why": f"client runs ct_gui {c_id}, OLDER than the backend's {b_id} "
+                       f"(the newest on GitHub)",
+                "action": "restart this program to load the backend's version"}
+    if latest and cv.get("commit") == latest:
+        return {**out, "stale": False, "backend_behind": True,
+                "why": f"client runs ct_gui {c_id} (the newest on GitHub), NEWER than the "
+                       f"backend's {b_id}",
+                "action": "nothing to do in this program: the backend updates itself once "
+                          "the rig is quiet, or call ct.restart_backend() to update it now"}
+    return {**out, "stale": False, "backend_behind": False,
+            "why": f"client runs ct_gui {c_id}, backend {b_id}"
+                   + (f", GitHub newest {latest}" if latest else
+                      " (GitHub not checked yet: which is newer is unknown)"),
+            "action": "restart whichever of the two is not the newest"}
 
 
 def open_session(body: dict) -> dict:
@@ -136,9 +177,8 @@ def open_session(body: dict) -> dict:
         _SESS[s.sid] = s
     _start_reaper()
     log.info("remote session %s opened for %s", s.sid[:8], client_id)
-    if vc["stale"]:
-        log.warning("remote client %s runs OLD ct_gui code (%s) -- restart that program "
-                    "to load the backend's version", client_id, vc["why"])
+    if vc.get("why"):
+        log.warning("remote client %s: %s -- %s", client_id, vc["why"], vc["action"])
     return {"ok": True, "sid": s.sid, "idle_s": SESSION_IDLE_S,
             "callbacks": True,              # this backend calls functions back (see call())
             "version": vc}

@@ -62,10 +62,17 @@ def _my_version() -> dict:
 
 def _warn_stale(client_id: str, j: dict) -> None:
     vc = j.get("version") if isinstance(j.get("version"), dict) else None
-    if not vc or not vc.get("stale"):
+    if not vc or not vc.get("why"):
         return
-    msg = (f"[ct] WARNING: {client_id!r} runs OLD ct_gui code ({vc.get('why')}). "
-           "Restart this program to load the backend's version.")
+    if vc.get("action"):
+        # The backend says which side is behind and what to do (2026-10-28):
+        # it used to call a client NEWER than the backend "OLD".
+        msg = f"[ct] WARNING: {client_id!r}: {vc['why']} -- {vc['action']}."
+    elif vc.get("stale"):           # an older backend: "stale" was all it said
+        msg = (f"[ct] WARNING: {client_id!r} runs different ct_gui code than the backend "
+               f"({vc.get('why')}). If the backend is the newer one, restart this program.")
+    else:
+        return
     print("\n" + "!" * 78 + "\n" + msg + "\n" + "!" * 78, file=sys.stderr, flush=True)
     import logging
     logging.getLogger("ct_gui").warning(msg)
