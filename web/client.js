@@ -20,11 +20,14 @@ const RENEW_MS = 10_000;
 
 // Per-tab id: two tabs of the same GUI are two clients (they can hold the lease
 // independently), but a reload keeps the same identity so a lease survives it.
+// Storage can throw (site data blocked in the browser); that must not stop the
+// whole GUI from loading -- fall back to an id for this page load only.
 function makeId() {
-  let id = sessionStorage.getItem('ctgui.clientId');
+  let id = null;
+  try { id = sessionStorage.getItem('ctgui.clientId'); } catch { /* blocked */ }
   if (!id) {
     id = 'gui-' + Math.random().toString(16).slice(2, 8);
-    sessionStorage.setItem('ctgui.clientId', id);
+    try { sessionStorage.setItem('ctgui.clientId', id); } catch { /* blocked */ }
   }
   return id;
 }

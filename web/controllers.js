@@ -155,8 +155,8 @@ export function initControllers() {
   // status: the one it holds describes the arrangement BEFORE the swap).
   async function autoArrangeByStm32(st) {
     if (userPinnedMaster || hasAutoArranged) return false;
-    const c1 = st.controllers['1'];
-    const c2 = st.controllers['2'];
+    const c1 = (st.controllers || {})['1'];
+    const c2 = (st.controllers || {})['2'];
     const c1HasStm = c1 && c1.connected && c1.stm32 && c1.stm32.ever_seen;
     const c2HasStm = c2 && c2.connected && c2.stm32 && c2.stm32.ever_seen;
     if (!c1HasStm && !c2HasStm) return false;   // STM32 not visible on either yet — wait
@@ -253,7 +253,7 @@ export function initControllers() {
     }
     for (const card of cards) {
       const cid = parseInt(card.dataset.ctrl, 10);
-      const c = st.controllers[card.dataset.ctrl];
+      const c = (st.controllers || {})[card.dataset.ctrl];
       if (!c) continue;
       const wasConn = connected[card.dataset.ctrl];
       connected[card.dataset.ctrl] = c.connected;
@@ -292,8 +292,9 @@ export function initControllers() {
         rp.className = 'hb idle';
         stm.className = 'hb idle';
       } else {
-        rp.className = 'hb ' + hbClass(c.rp2350.age_ms, c.rp2350.age_ms != null);
-        stm.className = 'hb ' + hbClass(c.stm32.age_ms, c.stm32.ever_seen);
+        const rpHb = c.rp2350 || {}, stHb = c.stm32 || {};   // absent block = no heartbeat known
+        rp.className = 'hb ' + hbClass(rpHb.age_ms, rpHb.age_ms != null);
+        stm.className = 'hb ' + hbClass(stHb.age_ms, stHb.ever_seen);
       }
     }
     state.master = master;

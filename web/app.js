@@ -75,17 +75,26 @@ async function syncBackendOrder() {
   if (!j || !j.ok) return;
   const o = Array.isArray(j.order) && j.order.length === N ? j.order.map(Number) : null;
   if (JSON.stringify(o) === JSON.stringify(ringToFid)) return;
+  const changed = ringToFid !== null;   // not the first read
   ringToFid = o;
   fidToRing = o ? Object.fromEntries(o.map((fid, ring) => [fid, ring])) : null;
+  // The firmware holds a table built under the OLD order: arming it would idle
+  // and fire other boards. Make the user download again.
+  if (changed && typeof invalidateRun === 'function') {
+    invalidateRun();
+    if (typeof hwMsg === 'function') hwMsg('Filament order changed -- download the schedule again before arming.');
+  }
   if (typeof syncBackendDead === 'function') syncBackendDead();
 }
+// The board a RING POSITION's filament sits on, from the live mapping (the
+// same filamentToBoard the HUD and the backend use), or null when it has no
+// board. It used to assume fixed wiring (FID < 48 -> P1, channel = FID%48 / 8),
+// which disagrees with the backend's alternating groups of 12: the Debug popup
+// then sent state / OCP / Fire / DC HV to another board (2026-10-28).
 function filamentToHw(ring) {
-  const i = fidOfRing(ring);              // the board at this ring position
-  const controller = i < 48 ? 1 : 2;
-  const local = i % 48;
-  const channel = Math.floor(local / 8); // 0..5
-  const mux = local % 8;                  // 0..7
-  return { controller, channel, mux, label: `P${controller} · CH${channel + 1}.${mux + 1}` };
+  const b = filamentToBoard(fidOfRing(ring));
+  if (!b) return null;
+  return { ...b, label: `P${b.controller} · CH${b.channel + 1}.${b.mux + 1}` };
 }
 
 // Filament -> board id via the live ACTIVE-LIST mapping (mapping.js), not the
@@ -669,7 +678,7 @@ function renderPower() {
     else if (f.state === STATE.IDLE) { w = live ? vi : powerEst.idleW; idle += w; }
     else if (f.state === STATE.STANDBY) { w = live ? vi : 0; standby += w; }
     else continue;
-    const c = getCtrl ? getCtrl(i) : -1;   // split heating power by the controller that drives it
+    const c = getCtrl ? getCtrl(fidOfRing(i)) : -1;   // filamentController takes a FID   // split heating power by the controller that drives it
     if (c === 0) p1 += w; else if (c === 1) p2 += w;
   }
   const fmt = (w) => (w >= 1000 ? (w / 1000).toFixed(2) + ' kW' : w.toFixed(1) + ' W');
@@ -784,14 +793,16 @@ let lastRunActive = false;   // set by pollTelemetry from the run state
 // advance smoothly. Idle reads the backend's board monitor (the same snapshot
 // as the boards matrix, no link traffic of its own) at 1 s.
 const TELE_FAST_MS = 50, TELE_IDLE_MS = 1000;
+let liveTelemetryGen = 0;   // a tick of an older start() exits instead of rescheduling
 function startLiveTelemetry() {
   if (liveTelemetryTimer || liveTelemetryStop === 'running') return;
   liveTelemetryStop = false;
+  const gen = ++liveTelemetryGen;
   const tick = async () => {
-    if (liveTelemetryStop || viewMode !== 'live') { liveTelemetryTimer = null; return; }
+    if (gen !== liveTelemetryGen || liveTelemetryStop || viewMode !== 'live') { if (gen === liveTelemetryGen) liveTelemetryTimer = null; return; }
     const t0 = performance.now();
     await pollTelemetry();
-    if (liveTelemetryStop || viewMode !== 'live') { liveTelemetryTimer = null; return; }
+    if (gen !== liveTelemetryGen || liveTelemetryStop || viewMode !== 'live') { if (gen === liveTelemetryGen) liveTelemetryTimer = null; return; }
     // The period counts from the START of the poll: waiting a full 50 ms AFTER
     // a ~60 ms request made it ~110 ms (9 fps, measured 2026-10-26).
     const period = lastRunActive ? TELE_FAST_MS : TELE_IDLE_MS;
@@ -801,6 +812,7 @@ function startLiveTelemetry() {
 }
 function stopLiveTelemetry() {
   liveTelemetryStop = true;
+  liveTelemetryGen++;
   if (liveTelemetryTimer) { clearTimeout(liveTelemetryTimer); liveTelemetryTimer = null; }
 }
 
@@ -865,6 +877,7 @@ let heatTarget = -1;
 
 async function cmd(fil, command, extra) {
   const hw = filamentToHw(fil);
+  if (!hw) return { ok: false, error: `ring ${fil} has no board in the current mapping -- nothing sent` };
   const body = { controller: hw.controller, command, target: 'single', channel: hw.channel, mux_port: hw.mux, ...extra };
   const r = await fetch('/api/cmd', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -872,6 +885,16 @@ async function cmd(fil, command, extra) {
   return r.json();
 }
 const heatMsg = (m) => setMsg('heatStatus', m);
+// /api/cmd says ok once the frame went out; the firmware's own status byte
+// (response.raw[0], 0 = OK; response.status is its name) says whether it was
+// applied. No reply byte = not known to be applied.
+function fwOk(j) {
+  if (!j || !j.ok) return j;
+  const raw = j.response && j.response.raw;
+  if (!raw || !raw.length) return { ...j, ok: false, error: 'no status from the firmware' };
+  if (raw[0] !== 0) return { ...j, ok: false, error: `firmware refused it (${j.response.status || 'status ' + raw[0]})` };
+  return j;
+}
 function highlightState(st) {
   document.querySelectorAll('#heatStateSeg button').forEach((b) => b.classList.toggle('active', +b.dataset.state === st));
   // Active/Idle expose the CC current; Voltage exposes the manual mV.
@@ -888,7 +911,8 @@ async function dbgSetState(i, st) {
   let arg = 0;
   if (st === STATE.IDLE || st === STATE.ACTIVE) arg = Math.round(Math.max(0, parseFloat($('heatI').value) || 0) * 1000);
   else if (st === STATE.VOLTAGE) arg = Math.round(Math.max(0, parseFloat($('heatV').value) || 0) * 1000);
-  const j = await cmd(i, 'CH_SET_POWER_STATE', { state: st, arg });
+  if ((st === STATE.IDLE || st === STATE.ACTIVE) && !(arg > 0)) { heatMsg('Set the current (A) first -- nothing sent.'); return; }
+  const j = fwOk(await cmd(i, 'CH_SET_POWER_STATE', { state: st, arg }));
   const argTxt = st === STATE.VOLTAGE ? mvToV(arg) : (st === STATE.IDLE || st === STATE.ACTIVE) ? maToA(arg) : '';
   if (j.ok) { filaments[i].state = st; highlightState(st); sync(); }
   heatMsg(j.ok ? `${STATE_NAME[st]}${arg ? ' @ ' + argTxt : ''} set.` : `${STATE_NAME[st] || 'State'} not set — ${j.error}`);
@@ -902,8 +926,8 @@ async function dbgSetI(i) {
 async function dbgSetV(i) { await dbgSetState(i, STATE.VOLTAGE); }
 async function dbgSetOcp(i) {
   const ma = Math.round(Math.max(0, parseFloat($('heatOcp').value) || 0) * 1000);   // A → mA
-  filaments[i].ocp = ma;
-  const j = await cmd(i, 'CH_SET_TPS_OCP_THRESHOLD', { threshold_mA: ma });
+  const j = fwOk(await cmd(i, 'CH_SET_TPS_OCP_THRESHOLD', { threshold_mA: ma }));
+  if (j.ok) filaments[i].ocp = ma;   // only once the board took it
   heatMsg(j.ok ? `OCP set to ${maToA(ma)}.` : `OCP: ${j.error}`);
 }
 async function dbgReadState(i) {
@@ -919,6 +943,7 @@ async function dbgFire(i) {
   const f = filaments[i];
   f.durationUs = Math.max(1, parseInt($('heatPw').value, 10) || 1);
   const hw = filamentToHw(i);
+  if (!hw) { heatMsg(`Fire: ring ${i} has no board -- nothing sent`); return; }
   const j = await cmd(i, 'HV_PULSE', { channel: hw.channel, bit: hw.mux, width_us: f.durationUs, verify_mode: 0 });
   if (j.ok) { f.mAs += f.activeA * (f.durationUs / 1e6) * 1000; sync(); }
   heatMsg(j.ok ? `Pulsed ${f.durationUs} µs.` : `Fire: ${j.error}`);
@@ -931,7 +956,7 @@ async function popupRefresh(i) {
     const hw = filamentToHw(i);
     const [t, h] = await Promise.all([
       fetch('/api/telemetry').then((r) => r.json()).catch(() => null),
-      fetch(`/api/hv-snapshot?controller=${hw.controller}`).then((r) => r.json()).catch(() => null),
+      hw ? fetch(`/api/hv-snapshot?controller=${hw.controller}`).then((r) => r.json()).catch(() => null) : null,
     ]);
     if (heatTarget !== i) return;  // popup moved on while this was in flight
     const row = t && (t.telemetry || []).find((x) => x.index === fidOfRing(i));
@@ -949,13 +974,14 @@ async function popupRefresh(i) {
           + (row.dead ? ` · DEAD${row.dead_reason ? ': ' + row.dead_reason : ''}` : '');
       }
     }
-    if (h && h.ok && h.feedback) setHvButton(i, !!(h.feedback[hw.channel] & (1 << hw.mux)));
+    if (hw && h && h.ok && h.feedback) setHvButton(i, !!(h.feedback[hw.channel] & (1 << hw.mux)));
     else setHvButton(i, null);
   } finally { popupBusy = false; }
 }
 async function dbgToggleHv(i) {
   const next = !filaments[i].dcHv;
   const hw = filamentToHw(i);
+  if (!hw) { heatMsg(`HV: ring ${i} has no board -- nothing sent`); return; }
   const j = await cmd(i, 'HV_SET_BIT', { channel: hw.channel, bit: hw.mux, value: next, verify: true });
   if (j.ok) setHvButton(i, next);
   heatMsg(j.ok ? `DC HV ${next ? 'ON' : 'off'}.` : `HV: ${j.error}`);
@@ -971,9 +997,12 @@ function showHeatPopup(clientX, clientY, fil) {
   heatTarget = fil;
   const f = filaments[fil], hw = filamentToHw(fil);
   $('heatFil').textContent = fil;
-  $('heatAddr').textContent = hw.label;
-  // inputs in A / V (model stays mV/mA)
-  $('heatI').value = +((f.current_mA ? f.current_mA / 1000 : f.activeA)).toFixed(2);
+  $('heatAddr').textContent = hw ? hw.label : 'no board';
+  // inputs in A / V (model stays mV/mA). The current field feeds BOTH Idle and
+  // Active; prefilled with the measured current, else the IDLE target -- the
+  // active one made the Idle button send 3 A (2026-10-28). Empty when unknown.
+  const iPre = f.current_mA ? f.current_mA / 1000 : f.idleA;
+  $('heatI').value = iPre == null ? '' : +iPre.toFixed(2);
   $('heatV').value = +((f.voltage_mV > 0 ? f.voltage_mV / 1000 : 0.8)).toFixed(2);
   $('heatOcp').value = +(f.ocp / 1000).toFixed(2);
   $('heatPw').value = f.durationUs;
@@ -1150,7 +1179,7 @@ async function detectPresent() {
     // links the detected hardware to the plan (✕ marks) and the schedule.
     let alive = 0, dead = 0;
     for (let i = 0; i < N; i++) {
-      const shouldDie = !present.has(i) || !!filaments[i].hwDead;   // backend-dead stays dead
+      const shouldDie = !present.has(fidOfRing(i)) || !!filaments[i].hwDead;   // present = FIDs   // backend-dead stays dead
       if (filaments[i].dead !== shouldDie) {
         filaments[i].dead = shouldDie;
         if (shouldDie) { filaments[i].state = STATE.STOP; filaments[i].mAs = 0; }
@@ -1529,8 +1558,13 @@ function buildPlan() {
   return { emission, heating, currents, config };
 }
 
+// A heated filament with no IDLE current would go out as IDLE 0 mA.
+function idleUnknown() {
+  return filaments.some((f) => !f.dead && !f.noHeat && f.idleA == null);
+}
 async function hwDownload() {
   if (!schedule.length) { hwMsg('No schedule to download — build one first.'); return; }
+  if (idleUnknown()) { hwMsg('IDLE current unknown: /api/defaults could not be read -- set "idle A" first. Nothing downloaded.'); return; }
   const v = heatingPlan && heatingPlan.validation;
   if (v && !v.ok && !confirm('Settle time is NOT satisfied. Download anyway?')) { hwMsg('Download cancelled.'); return; }
   hwMsg(`Downloading ${schedule.length} emission + ${heatRows.length} heating…`);
@@ -1591,6 +1625,7 @@ async function hwVerify() {
 
 async function hwArm() {
   const repeats = Math.max(1, parseInt($('hwRepeats').value, 10) || 1);
+  if (idleUnknown()) { hwMsg('IDLE current unknown: /api/defaults could not be read -- set "idle A" first. Not armed.'); return; }
   if (!runState.override && !runState.prepActive && !confirm('Pre-heat (Active first batch) has not been run — the lead filaments may fire cold. Arm anyway?')) return;
   // The firmware arm gate requires every participating filament at PowerState
   // >= Sleep (isolated-12V on); a board left in Stop => IsoOff. So bring the
@@ -1613,20 +1648,21 @@ async function hwArm() {
   // Re-send ShvSetConfig with the current rotation × repeats so totalMs is always
   // consistent with what is actually being armed — even if repeats changed since download.
   const armConfig = buildPlan().config;
-  try {
-    await Promise.all([1, 2].map((c) =>
-      postJSON('/api/shv', { controller: c, op: 'set_config', ...armConfig }).catch(() => {})
-    ));
-  } catch { /* non-fatal */ }
-  // Set fault policy before arming so the firmware uses the chosen policy for this run.
+  // Both must land on every CONNECTED controller, or the run would use the
+  // previous run's totalMs / fault policy: their results used to be dropped.
+  const conn = [1, 2].filter((c) => (ctState.connected || {})[c]);
   const faultBoard    = $('hwFaultContBoard')    && $('hwFaultContBoard').checked    ? 1 : 0;
   const faultMismatch = $('hwFaultContMismatch') && $('hwFaultContMismatch').checked ? 1 : 0;
-  try {
-    await Promise.all([1, 2].map((c) =>
-      postJSON('/api/shv', { controller: c, op: 'fault_policy', board: faultBoard, mismatch: faultMismatch })
-        .catch(() => {})
-    ));
-  } catch { /* non-fatal; old firmware without 0x81 just ignores this */ }
+  for (const [what, body] of [['set_config', { op: 'set_config', ...armConfig }],
+                              ['fault_policy', { op: 'fault_policy', board: faultBoard, mismatch: faultMismatch }]]) {
+    const res = await Promise.all(conn.map((c) => postJSON('/api/shv', { controller: c, ...body })));
+    const bad = conn.filter((c, k) => !(res[k] && res[k].ok));
+    if (bad.length) {
+      hwMsg(`✗ Not armed: ${what} failed on ${bad.map((c) => 'P' + c).join(', ')} -- `
+        + bad.map((c) => res[conn.indexOf(c)].error || 'no reason given').join('; '));
+      return;
+    }
+  }
   hwMsg('Arming…');
   try {
     const j = await postJSON('/api/arm', { repeats });
@@ -1709,7 +1745,7 @@ async function hwSimulateScan() {
   if (!count) { hwMsg('No schedule to simulate — build & download one first.'); return; }
   // The scheduled filament set + a nominal active target, so the run recorder can
   // flag any filament that was scheduled to fire but never reached ACTIVE current.
-  const expect = [...new Set(schedule.map((r) => r.filament))];
+  const expect = [...new Set(schedule.map((r) => fidOfRing(r.filament)))];   // FIDs, as telemetry
   const activeMa = Math.round(Math.max(...filaments.map((f) => f.activeA || 0), 2.9) * 1000);
   try {
     // No controller: the backend fires the current MASTER, the head of the
@@ -2207,11 +2243,12 @@ async function i2cMuxReset() {
 
 function init() {
   geo = new CTGeometry($('ctCanvas'));
-  initControllers();
-  initPower();
-  initTrends();
-  initMapping();
-  initTests();
+  // One panel failing to set up must not leave the rest of the GUI (and the
+  // ring, drawn by sync() at the end of init) dead.
+  for (const [name, fn] of [['controllers', initControllers], ['power', initPower],
+                            ['trends', initTrends], ['mapping', initMapping], ['tests', initTests]]) {
+    try { fn(); } catch (e) { console.error(`init ${name} failed:`, e); setStatus(`⚠ the ${name} panel failed to start: ${e && e.message || e}`); }
+  }
 
   // scan schedule
   scheduleTable = initScheduleTable({
