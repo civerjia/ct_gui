@@ -55,6 +55,7 @@ class Rig:
         self.done, self.dropped, self.state, self.fault = 0, 0, 0, False
         self.counted = {}                           # filament -> pulses
         self.tripped = None
+        self.ev_ring, self.ev_next, self.ev_cap = [], 1, 128   # the ESP32's pulse-event ring
 
     # firmware model ----------------------------------------------------------
     def edges(self, k):
@@ -67,6 +68,9 @@ class Rig:
             self.done += 1
             self.in_row += 1
             self.counted[f] = self.counted.get(f, 0) + 1
+            self.ev_ring = (self.ev_ring + [{"id": self.ev_next, "filament": f,
+                                             "integral_mams": 1.0}])[-self.ev_cap:]
+            self.ev_next += 1
             if self.in_row >= self.rows[self.cur]["numPulses"]:
                 self._advance()
 
@@ -139,6 +143,10 @@ def make(rig: Rig):
                 "unsafeSlots": 0, "off_mismatches": 0, "droppedEdges": rig.dropped,
                 "suppressedNotHot": 0}
     ct.shv_status = shv_status
+    ct.shot_measure_arm = lambda shot, rate_hz, **kw: {"ok": True, "since": rig.ev_next - 1}
+    ct.ready_disarm = lambda: {"ok": True}
+    ct.pulse_events_ma = lambda since=0: {"ok": True, "events": [e for e in rig.ev_ring
+                                                                   if e["id"] > since]}
     ct.shv_pulse_log = lambda c=1: [{"filament": f, "suppressed_not_hot": False}
                                     for f, k in rig.counted.items() for _ in range(k)
                                     if (f < 48) == (c == 1)]
@@ -360,6 +368,27 @@ for name, kw, want in (
     a = {**ARGS, **kw}
     r = make(rig).scan_view([60, 61], **a)
     check(f"refused: {name}", not r["ok"] and want in (r.get("error") or "") and not rig.log, r.get("error"))
+# --- measure: more pulses than the ESP32's 128-event ring -------------------
+FILS = list(range(20, 30))                      # 10 x 20 = 200 pulses
+rig = Rig()
+r = make(rig).scan_view(FILS, trigger="ext", on_armed=lambda f: rig.edges(20), measure=True,
+                        **{**ARGS, "num_pulses": 20})
+own = all(r2["measured"] is not None and len(r2["measured"]) == 20
+          and all(e["filament"] == r2["filament"] for e in r2["measured"]) for r2 in r["rows"])
+check("measure, 200 pulses through a 128 ring: every row has its OWN 20 events",
+      own and r["measured_events"] == 200 and not r.get("measure_lost"),
+      [(x["filament"], x["measured"] and len(x["measured"])) for x in r["rows"]])
+
+rig = Rig()
+rig.ev_cap = 10                                 # overrun between reads
+r = make(rig).scan_view(FILS, trigger="ext", on_armed=lambda f: rig.edges(20), measure=True,
+                        **{**ARGS, "num_pulses": 20})
+wrong = [x["filament"] for x in r["rows"] if x["measured"] is not None
+         and any(e["filament"] != x["filament"] for e in x["measured"])]
+check("ring overrun: lost rows have NO measurement, never another row's",
+      not wrong and r.get("measure_lost") and any(x.get("measure_lost") for x in r["rows"]),
+      (wrong, r.get("measure_note")))
+
 # --- sim: the backend still says "already running" just after a train --------
 rig = Rig()
 rig.sim_busy = 2

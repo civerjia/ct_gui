@@ -1568,6 +1568,30 @@ class _ScheduleMixin:
                 for f in fils]
         hot_now: set = set()          # raised, not yet dropped
         measuring = None
+        # Measured events, read DURING the run: the ESP32 keeps only the last 128
+        # (stm32_link g_pulse_ring), so reading them once at the end lost all but
+        # the last 128 of a 660-pulse view -- and handed those to the FIRST rows
+        # (2026-10-28). gap_at = pool index where ids jumped: events were lost
+        # there and nothing from it on can be matched to a row by order.
+        ev = {"pool": [], "cursor": 0, "gap_at": None, "lost": 0}
+
+        def take_events(batch):
+            if not batch:
+                return
+            first = int(batch[0].get("id") or 0)
+            if first != ev["cursor"] + 1 and ev["gap_at"] is None:
+                ev["gap_at"] = len(ev["pool"])
+                ev["lost"] = max(0, first - ev["cursor"] - 1)
+            ev["pool"].extend(batch)
+            ev["cursor"] = int(batch[-1].get("id") or ev["cursor"])
+
+        def drain_events():
+            try:
+                r = self.pulse_events_ma(ev["cursor"])
+            except Exception:
+                return
+            if r.get("ok"):
+                take_events(r.get("events") or [])
         settle_set = False
         stop_why = None
         push_on = False
@@ -1615,6 +1639,7 @@ class _ScheduleMixin:
                 if not m.get("ok"):
                     return refuse(m.get("error"))
                 measuring = m
+                ev["cursor"] = int(m["since"])
             arm_all = self._post("/api/arm", {"repeats": 1, "controllers": armed})
             per = arm_all.get("results") or {}
             for c in armed:
@@ -1885,12 +1910,17 @@ class _ScheduleMixin:
                 # 3. its pulses, within shot_wait_timeout_s
                 wait_end = time.monotonic() + float(shot_wait_timeout_s)
                 fired = 0
+                counted_before = sum(r["counted"] for r in rows)
                 while True:
                     st = self.shv_status(own) or {}
                     fired_now = int(st.get("totalPulsesDone") or 0) - int(done0)
                     if fired_now > fired:
                         fired = fired_now
                         last_pulse_at = time.monotonic()
+                    # Half the ESP32's 128-event ring unread: read it now, while
+                    # waiting for pulses anyway (nothing waits on this read).
+                    if measuring is not None and counted_before + fired - len(ev["pool"]) >= 64:
+                        drain_events()
                     if (st.get("entryIndex") or 0) > i or st.get("state") == SHV_COMPLETE:
                         break
                     if err_box.get("error") or time.monotonic() > wait_end:
@@ -1980,18 +2010,31 @@ class _ScheduleMixin:
         if measuring is not None:
             want = sum(r["counted"] for r in rows)   # an envelope for every counted pulse
             try:
-                events, ref_mv = self._collect_pulse_events(int(measuring["since"]), want)
+                rest, _ref_mv = self._collect_pulse_events(ev["cursor"], want - len(ev["pool"]))
+                take_events(rest)
             finally:
                 try:
                     self.ready_disarm()
                 except Exception:
                     pass
+            events = ev["pool"]
             out["measured_events"] = len(events)
-            if len(events) != want:
+            if ev["gap_at"] is not None:
+                out["measure_lost"] = ev["lost"]
+                out["measure_note"] = (f"{ev['lost']} measured event(s) lost (ESP32 ring overrun) "
+                                       f"after event {ev['gap_at']}: rows from there on have no "
+                                       f"measurement, rather than someone else's")
+            elif len(events) != want:
                 out["measure_note"] = (f"{len(events)} measured events for {want} pulses: "
                                        f"matched in order, the tail may be misattributed")
             k = 0
             for row in rows:
+                if ev["gap_at"] is not None and k + row["counted"] > ev["gap_at"]:
+                    row["measured"] = None          # absent, not another row's events
+                    row["mams"] = None
+                    row["measure_lost"] = True
+                    k += row["counted"]
+                    continue
                 mine = events[k:k + row["counted"]]
                 k += row["counted"]
                 row["measured"] = mine
