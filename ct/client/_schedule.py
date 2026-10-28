@@ -1455,6 +1455,80 @@ class _ScheduleMixin:
         any other edge is dropped and counted. So a filament that is hot early
         waits for its turn, and a stray or extra edge can never fire another.
 
+        TIMEOUTS -- where each one starts and where it stops. Time runs to
+        the right; A is one filament of the list.
+
+        1) One filament's turn, as the host sees it:
+
+            raise A               first          HOT      release A                A's pulses
+            (VOLTAGE)             arrival                 + on_armed(A)            all counted
+              |                     |             |         |                           |
+            --*---------------------*-------------* wait ---*===========================*-->
+              |<- heat_timeout_s -->|               turn
+                                    |< settle_ms >|
+                                                            |< on_armed_timeout_s ->|
+                                                            |  (until on_armed RETURNS)
+                                                            |<-- shot_wait_timeout_s -->|
+                                                            |  (until ALL its pulses)
+
+        2) Inside the row, as the RP2350 sees it (num_pulses edges):
+
+            release  on_armed   edge 1           edge 2           edge 3
+              |         |         |                |                |
+            --*---------*---------#####------------#####------------#####--->
+              |                   |<-->| width_us (<= max_on_ms)
+              |                   |<-- gap 1 ----->|<-- gap 2 ----->|
+              |<- not timed by -->|
+              |   the firmware    |  every gap < trigger_timeout_ms, or the
+                                     firmware faults (InterPulseTimeout)
+              "sim": gap = pulse_interval_ms (the library sends the edges)
+              "ext": gap = whatever YOUR trigger source does
+
+        3) The whole list, at any moment:
+
+            arm -------------------------------------------------- last row done
+              |<---------------------- total_ms -------------------------->|
+              no pulse anywhere for no_pulse_timeout_s    -> STOP
+              a controller unreachable for link_lost_timeout_s -> STOP
+
+            name                starts            stops              if it runs out
+            ------------------  ----------------  -----------------  ----------------------
+            heat_timeout_s      A raised to       A arrives (within  A skipped (back to
+                                VOLTAGE           150 mV); HOT must  IDLE), the run goes on
+                                                  follow within
+                                                  + settle_ms + 0.5 s
+            settle_ms           A's FIRST         A is HOT           (not a timeout: the
+                                arrival                              wait itself)
+            on_armed_timeout_s  on_armed(A)       on_armed returns   STOP (dangerous)
+              (None = shot_wait_timeout_s)
+            shot_wait_timeout_s on_armed(A)       A's num_pulses     the rest of A skipped
+                                called            pulses counted     ("partial"), run goes on
+            trigger_timeout_ms  each edge of A    the NEXT edge of   firmware fault
+              (firmware)        (from the FIRST   A                  (InterPulseTimeout)
+                                one; not from                        -> STOP
+                                the release*)
+            max_on_ms           checked at ARM:   width_us must be <= max_on_ms, else
+              (firmware)        the arm is refused and nothing fires
+            total_ms            arm               the last row done  firmware fault
+              (firmware; None = computed: every row's worst case + 30 s)  -> STOP
+            no_pulse_timeout_s  the last pulse    the next pulse     STOP
+              (None = heat_timeout_s + settle_ms + shot_wait_timeout_s)
+            link_lost_timeout_s a controller      it is back         STOP
+                                goes missing
+
+            * RP2350 firmware before 766874d timed trigger_timeout_ms from the
+              release for every filament after the first, so the host's own
+              work between release and the first edge (idling the previous
+              filament, on_armed, the sim request: ~0.1-0.2 s) counted against
+              it: trigger_timeout_ms=60 stopped the run at the second filament
+              (2026-10-28).
+
+        CHOOSING THEM. trigger_timeout_ms: a little over your real edge
+        spacing (sim: > pulse_interval_ms; the default is 2 x interval + 100,
+        ext 3000). shot_wait_timeout_s: on_armed's own time + num_pulses x
+        spacing + margin. on_armed should start the trigger source and return
+        -- it does not have to wait for the pulses.
+
         FAULTS. Dangerous -> stop at once (disarm, everything to IDLE): SHV
         fault; MOS stuck on after a pulse; HV guard tripped; vacuum over its
         limit; HV switched off; a controller lost > link_lost_timeout_s; host
@@ -2221,8 +2295,8 @@ class _ScheduleMixin:
         timeout_s: float | None = None,  # old name of shot_wait_timeout_s, still accepted
         pulse_interval_ms: int | None = None,   # spacing between pulses (ms):
                                                  # what trigger="sim" fires.
-                                                 # Default 3000. Range: sim
-                                                 # 10..2147483597; must be >
+                                                 # Default 500. Range: sim
+                                                 # 1..2147483597; must be >
                                                  # width_us/1000; (num_pulses-1)
                                                  # x it must fit total_ms;
                                                  # measure=True needs >= 0.5.
@@ -2402,15 +2476,26 @@ class _ScheduleMixin:
             num_pulses:     pulses in the burst.
             width_us:       pulse width (µs).
             pulse_interval_ms: spacing between pulses (ms). trigger="sim"
-                            fires at this spacing (default 3000). External
+                            fires at this spacing (default 500). External
                             trigger: your source sets the spacing; pass it
                             only so the measure check / detector TTL know it.
+                            It is a SETTING (what happens), not a limit.
             trigger_timeout_ms: the LONGEST wait for the next trigger (ms) —
                             a RUNTIME watchdog: no trigger within this long
                             faults the WHOLE run (stopReason=
                             InterPulseTimeout), it does not skip a late one.
                             Default: sim 2 x pulse_interval_ms + 100,
                             external 3000. Must exceed pulse_interval_ms.
+                            It starts at the FIRST trigger; the wait from
+                            ARM to the first trigger is bounded by total_ms
+                            only (the firmware is still "Armed" then):
+
+                ARM        trigger 1          trigger 2          trigger 3
+                 |             |                  |                  |
+                 |<-- wait  -->|<--- gap 1 ------>|<--- gap 2 ------>|
+                 |  (total_ms) |  every gap < trigger_timeout_ms
+                 |<------------------- total_ms ------------------------->|
+                 "sim": gap 1, 2, ... = pulse_interval_ms
             inter_pulse_ms: OLD NAME, still accepted with its old meaning per
                             mode — sim: pulse_interval_ms; external:
                             trigger_timeout_ms. Which one is logged once
