@@ -229,8 +229,142 @@ def fig_single():
     s.save("fire_single_pulse_triggers.svg")
 
 
+
+# ---- the timing design (docs/scan_view_timing_design.md) -------------------
+HEATFILL, HOTFILL, FIREFILL = "#99d5cc", "#2a9d8f", "#1e293b"
+
+
+def _lane(s, x, w_s, y, segs, h=22):
+    """One filament's lane: segs = [(t0, t1, kind)], kind heat|hot|fire."""
+    s.line(x(0), y + h / 2, x(w_s), y + h / 2, RULE, 1.5)
+    fills = {"heat": HEATFILL, "hot": HOTFILL, "fire": FIREFILL, "wait": HOTFILL}
+    for t0, t1, kind in segs:
+        if kind == "pulses":
+            continue
+        s.rect(x(t0), y, x(t1) - x(t0), h, fills[kind], 3)
+
+
+def _pulses(s, x, t0, n, gap, y, h=22):
+    for i in range(n):
+        xi = x(t0 + i * gap)
+        s.line(xi, y + 3, xi, y + h - 3, "#ffffff", 2)
+
+
+def _window(s, x, t0, t1, y, label=True):
+    """The heating window: a dashed bracket from the raise to its hard end."""
+    s.add(f'<rect x="{x(t0)}" y="{y - 7}" width="{x(t1) - x(t0)}" height="36" rx="5" '
+          f'fill="none" stroke="{SKIP}" stroke-width="1.5" stroke-dasharray="5 4"/>')
+    if label:
+        s.text(x(t1) - 4, y - 11, "window ends (heat_timeout_s)", 12.5, SKIP, "end")
+
+
+def fig_timing_normal():
+    W, L, PX = 1020, 150, 62          # 1 s = 62 px from x=L
+    x = lambda t: L + t * PX          # noqa: E731
+    s = Svg(W, 470, "scan_view timing: three filaments, normal run")
+    top = 34
+    # time axis
+    for t in range(0, 14):
+        s.line(x(t), top + 4, x(t), 430, "#eef2f6", 1)
+        s.text(x(t), top, f"{t} s", 12, MUTED, "middle")
+    # host row
+    yh = 64
+    s.text(L - 14, yh + 8, "release +", 14, INK, "end", 600)
+    s.text(L - 14, yh + 25, "on_armed", 14, INK, "end", 600)
+    for t, lab in ((3.0, "A"), (4.5, "B"), (6.8, "C")):
+        s.line(x(t), yh, x(t), yh + 22, INK, 2)
+        s.text(x(t) + 6, yh + 16, lab, 14, INK, weight=600)
+    # edges row (sim trains)
+    ye = 104
+    s.text(L - 14, ye + 15, "edges", 14, INK, "end", 600)
+    for t0 in (3.2, 4.7, 7.0):
+        for i in range(20):
+            xi = x(t0 + i * 0.03)
+            s.line(xi, ye + 3, xi, ye + 19, PULSE, 1.2)
+    # lanes
+    lanes = [("A", 0.0, 2.0, 3.0, 3.0, 3.2, 3.8, 8.0),
+             ("B", 1.5, 3.5, 4.5, 4.5, 4.7, 5.3, 9.5),
+             ("C", 3.8, 5.8, 6.8, 6.8, 7.0, 7.6, 11.8)]
+    y = 172
+    for name, raise_, arr, hot, rel, f0, f1, wend in lanes:
+        s.text(L - 14, y + 16, f"filament {name}", 14, INK, "end", 600)
+        _window(s, x, raise_, wend, y, label=(name == "A"))
+        _lane(s, x, 13.2, y, [(raise_, hot, "heat"), (hot, rel, "hot"), (rel, f1, "fire")])
+        _pulses(s, x, f0, 20, 0.03, y)
+        s.line(x(arr), y - 2, x(arr), y + 24, "#ffffff", 2)
+        y += 70
+    # annotations under the lanes
+    s.text(x(0.0), y - 18, "", 1)
+    yl = y - 6
+    s.rect(L, yl, 26, 14, HEATFILL, 3); s.line(L + 13, yl, L + 13, yl + 14, "#ffffff", 2)
+    s.text(L + 34, yl + 12, "heating; white tick = first arrival, then settle_ms", 13, MUTED)
+    s.rect(L + 360, yl, 26, 14, HOTFILL, 3); s.text(L + 394, yl + 12, "HOT, waiting for its turn", 13, MUTED)
+    s.rect(L + 610, yl, 26, 14, FIREFILL, 3); s.text(L + 644, yl + 12, "firing its pulses", 13, MUTED)
+    s.text(L, yl + 40, "Each filament: back to IDLE once its pulses are counted. Its window (dashed) "
+           "is a hard limit; a normal turn ends well inside it.", 13, MUTED)
+    s.text(L, yl + 60, "B is raised early (preheat_ahead) so it is HOT about when A is done; "
+           "C is raised when A is done.", 13, MUTED)
+    s.save("timing_normal.svg")
+
+
+def fig_timing_failures():
+    W, L, PX = 1060, 300, 52          # window = 8 s
+    x = lambda t: L + t * PX          # noqa: E731
+    WEND = 8.0
+    rows = [
+        ("never gets HOT", "was: heat_timeout_s (arrival)",
+         [(0, WEND, "heat")], None, "back to IDLE, skipped", SKIP),
+        ("HOT, its turn comes late", "was: renewed timed VOLTAGE",
+         [(0, 3, "heat"), (3, WEND, "hot")], None, "back to IDLE, re-heated at its turn (Q1)", WAIT),
+        ("on_armed hangs", "was: on_armed_timeout_s",
+         [(0, 3, "heat"), (3, WEND, "fire")], "onarmed", "STOP (your code is stuck)", STOP),
+        ("no edge ever comes", "was: shot_wait_timeout_s",
+         [(0, 3, "heat"), (3, WEND, "fire")], None, "back to IDLE, skipped; 2 in a row: STOP", SKIP),
+        ("edges stop half way", "kept: trigger_timeout_ms",
+         [(0, 3, "heat"), (3, 4.6, "fire")], "gap", "STOP (firmware) -- or skip the rest (Q2)", STOP),
+        ("pulses outlast the window", "was: shot_wait_timeout_s",
+         [(0, 3, "heat"), (3, WEND, "fire")], "slow", "stop the sim train, then IDLE; rest skipped", SKIP),
+    ]
+    s = Svg(W, 120 + 72 * len(rows), "scan_view timing: what ends each failure, now")
+    top = 30
+    for t in range(0, 10):
+        s.line(x(t), top + 6, x(t), 70 + 72 * len(rows), "#eef2f6", 1)
+        s.text(x(t), top, f"{t} s", 12, MUTED, "middle")
+    s.text(16, top, "one filament, heat_timeout_s = 8 s", 13, MUTED)
+    y = 64
+    for name, was, segs, extra, outcome, color in rows:
+        s.text(16, y + 10, name, 14.5, INK, weight=600)
+        s.text(16, y + 28, was, 13, MUTED)
+        s.add(f'<rect x="{x(0)}" y="{y - 7}" width="{x(WEND) - x(0)}" height="36" rx="5" '
+              f'fill="none" stroke="{SKIP}" stroke-width="1.5" stroke-dasharray="5 4"/>')
+        _lane(s, x, 9.2, y, segs)
+        if segs[-1][2] == "fire" and extra != "onarmed":
+            if extra == "gap":
+                _pulses(s, x, 3.2, 8, 0.15, y)
+            elif extra == "slow":
+                _pulses(s, x, 3.2, 25, 0.2, y)
+        if extra == "onarmed":
+            s.text(x(5.5), y + 16, "on_armed still running", 12.5, "#ffffff", "middle")
+        if extra is None and segs[-1][2] == "fire":
+            s.text(x(5.5), y + 16, "released, waiting for edges", 12.5, "#ffffff", "middle")
+        if extra == "gap":
+            s.text(x(4.6) + 8, y + 16, "gap > trigger_timeout_ms", 12.5, STOP)
+            end_x = x(4.6) + 4
+        else:
+            end_x = x(WEND)
+        s.line(end_x, y - 10, end_x, y + 32, color, 3)
+        s.text(x(WEND) + 22, y + 16, outcome, 13.5, color, weight=600)
+        y += 72
+    s.text(16, y + 6, "The window is the one per-filament limit: whatever has not happened "
+           "by its end is caught there. trigger_timeout_ms stays", 13, MUTED)
+    s.text(16, y + 24, "because a stalled train must not keep the firmware armed; total_ms is "
+           "computed (filaments x heat_timeout_s + 30 s) as the firmware's last backstop.", 13, MUTED)
+    s.save("timing_failures.svg")
+
 if __name__ == "__main__":
     fig_turn()
     fig_edges()
     fig_settle()
     fig_single()
+    fig_timing_normal()
+    fig_timing_failures()

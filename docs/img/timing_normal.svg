@@ -1,0 +1,193 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="470" viewBox="0 0 1020 470" role="img" aria-label="scan_view timing: three filaments, normal run">
+  <title>scan_view timing: three filaments, normal run</title>
+  <rect width="1020" height="470" fill="#ffffff"/>
+  <line x1="150" y1="38" x2="150" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="150" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">0 s</text>
+  <line x1="212" y1="38" x2="212" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="212" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">1 s</text>
+  <line x1="274" y1="38" x2="274" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="274" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">2 s</text>
+  <line x1="336" y1="38" x2="336" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="336" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">3 s</text>
+  <line x1="398" y1="38" x2="398" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="398" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">4 s</text>
+  <line x1="460" y1="38" x2="460" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="460" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">5 s</text>
+  <line x1="522" y1="38" x2="522" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="522" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">6 s</text>
+  <line x1="584" y1="38" x2="584" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="584" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">7 s</text>
+  <line x1="646" y1="38" x2="646" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="646" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">8 s</text>
+  <line x1="708" y1="38" x2="708" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="708" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">9 s</text>
+  <line x1="770" y1="38" x2="770" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="770" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">10 s</text>
+  <line x1="832" y1="38" x2="832" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="832" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">11 s</text>
+  <line x1="894" y1="38" x2="894" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="894" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">12 s</text>
+  <line x1="956" y1="38" x2="956" y2="430" stroke="#eef2f6" stroke-width="1"/>
+  <text x="956" y="34" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">13 s</text>
+  <text x="136" y="72" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="end">release +</text>
+  <text x="136" y="89" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="end">on_armed</text>
+  <line x1="336.0" y1="64" x2="336.0" y2="86" stroke="#1e293b" stroke-width="2"/>
+  <text x="342.0" y="80" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="start">A</text>
+  <line x1="429.0" y1="64" x2="429.0" y2="86" stroke="#1e293b" stroke-width="2"/>
+  <text x="435.0" y="80" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="start">B</text>
+  <line x1="571.5999999999999" y1="64" x2="571.5999999999999" y2="86" stroke="#1e293b" stroke-width="2"/>
+  <text x="577.5999999999999" y="80" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="start">C</text>
+  <text x="136" y="119" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="end">edges</text>
+  <line x1="348.4" y1="107" x2="348.4" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="350.26" y1="107" x2="350.26" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="352.12" y1="107" x2="352.12" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="353.98" y1="107" x2="353.98" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="355.84000000000003" y1="107" x2="355.84000000000003" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="357.70000000000005" y1="107" x2="357.70000000000005" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="359.56000000000006" y1="107" x2="359.56000000000006" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="361.42" y1="107" x2="361.42" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="363.28000000000003" y1="107" x2="363.28000000000003" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="365.14" y1="107" x2="365.14" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="367.0" y1="107" x2="367.0" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="368.86" y1="107" x2="368.86" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="370.72" y1="107" x2="370.72" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="372.58000000000004" y1="107" x2="372.58000000000004" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="374.44" y1="107" x2="374.44" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="376.3" y1="107" x2="376.3" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="378.15999999999997" y1="107" x2="378.15999999999997" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="380.02" y1="107" x2="380.02" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="381.88" y1="107" x2="381.88" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="383.74" y1="107" x2="383.74" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="441.40000000000003" y1="107" x2="441.40000000000003" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="443.26000000000005" y1="107" x2="443.26000000000005" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="445.12" y1="107" x2="445.12" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="446.98" y1="107" x2="446.98" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="448.84000000000003" y1="107" x2="448.84000000000003" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="450.70000000000005" y1="107" x2="450.70000000000005" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="452.56" y1="107" x2="452.56" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="454.42" y1="107" x2="454.42" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="456.28000000000003" y1="107" x2="456.28000000000003" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="458.14000000000004" y1="107" x2="458.14000000000004" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="460.0" y1="107" x2="460.0" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="461.86" y1="107" x2="461.86" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="463.72" y1="107" x2="463.72" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="465.58" y1="107" x2="465.58" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="467.44" y1="107" x2="467.44" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="469.3" y1="107" x2="469.3" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="471.15999999999997" y1="107" x2="471.15999999999997" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="473.02" y1="107" x2="473.02" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="474.88" y1="107" x2="474.88" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="476.74" y1="107" x2="476.74" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="584.0" y1="107" x2="584.0" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="585.86" y1="107" x2="585.86" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="587.72" y1="107" x2="587.72" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="589.5799999999999" y1="107" x2="589.5799999999999" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="591.44" y1="107" x2="591.44" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="593.3" y1="107" x2="593.3" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="595.16" y1="107" x2="595.16" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="597.02" y1="107" x2="597.02" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="598.88" y1="107" x2="598.88" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="600.74" y1="107" x2="600.74" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="602.5999999999999" y1="107" x2="602.5999999999999" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="604.46" y1="107" x2="604.46" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="606.3199999999999" y1="107" x2="606.3199999999999" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="608.1800000000001" y1="107" x2="608.1800000000001" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="610.04" y1="107" x2="610.04" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="611.9000000000001" y1="107" x2="611.9000000000001" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="613.76" y1="107" x2="613.76" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="615.62" y1="107" x2="615.62" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="617.48" y1="107" x2="617.48" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <line x1="619.34" y1="107" x2="619.34" y2="123" stroke="#334155" stroke-width="1.2"/>
+  <text x="136" y="188" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="end">filament A</text>
+  <rect x="150.0" y="165" width="496.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="642.0" y="161" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#b45309" text-anchor="end">window ends (heat_timeout_s)</text>
+  <line x1="150" y1="183.0" x2="968.4" y2="183.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="150.0" y="172" width="186.0" height="22" rx="3" fill="#99d5cc"/>
+  <rect x="336.0" y="172" width="0.0" height="22" rx="3" fill="#2a9d8f"/>
+  <rect x="336.0" y="172" width="49.60000000000002" height="22" rx="3" fill="#1e293b"/>
+  <line x1="348.4" y1="175" x2="348.4" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="350.26" y1="175" x2="350.26" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="352.12" y1="175" x2="352.12" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="353.98" y1="175" x2="353.98" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="355.84000000000003" y1="175" x2="355.84000000000003" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="357.70000000000005" y1="175" x2="357.70000000000005" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="359.56000000000006" y1="175" x2="359.56000000000006" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="361.42" y1="175" x2="361.42" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="363.28000000000003" y1="175" x2="363.28000000000003" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="365.14" y1="175" x2="365.14" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="367.0" y1="175" x2="367.0" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="368.86" y1="175" x2="368.86" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="370.72" y1="175" x2="370.72" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="372.58000000000004" y1="175" x2="372.58000000000004" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="374.44" y1="175" x2="374.44" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="376.3" y1="175" x2="376.3" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="378.15999999999997" y1="175" x2="378.15999999999997" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="380.02" y1="175" x2="380.02" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="381.88" y1="175" x2="381.88" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="383.74" y1="175" x2="383.74" y2="191" stroke="#ffffff" stroke-width="2"/>
+  <line x1="274.0" y1="170" x2="274.0" y2="196" stroke="#ffffff" stroke-width="2"/>
+  <text x="136" y="258" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="end">filament B</text>
+  <rect x="243.0" y="235" width="496.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="150" y1="253.0" x2="968.4" y2="253.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="243.0" y="242" width="186.0" height="22" rx="3" fill="#99d5cc"/>
+  <rect x="429.0" y="242" width="0.0" height="22" rx="3" fill="#2a9d8f"/>
+  <rect x="429.0" y="242" width="49.599999999999966" height="22" rx="3" fill="#1e293b"/>
+  <line x1="441.40000000000003" y1="245" x2="441.40000000000003" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="443.26000000000005" y1="245" x2="443.26000000000005" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="445.12" y1="245" x2="445.12" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="446.98" y1="245" x2="446.98" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="448.84000000000003" y1="245" x2="448.84000000000003" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="450.70000000000005" y1="245" x2="450.70000000000005" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="452.56" y1="245" x2="452.56" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="454.42" y1="245" x2="454.42" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="456.28000000000003" y1="245" x2="456.28000000000003" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="458.14000000000004" y1="245" x2="458.14000000000004" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="460.0" y1="245" x2="460.0" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="461.86" y1="245" x2="461.86" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="463.72" y1="245" x2="463.72" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="465.58" y1="245" x2="465.58" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="467.44" y1="245" x2="467.44" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="469.3" y1="245" x2="469.3" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="471.15999999999997" y1="245" x2="471.15999999999997" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="473.02" y1="245" x2="473.02" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="474.88" y1="245" x2="474.88" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="476.74" y1="245" x2="476.74" y2="261" stroke="#ffffff" stroke-width="2"/>
+  <line x1="367.0" y1="240" x2="367.0" y2="266" stroke="#ffffff" stroke-width="2"/>
+  <text x="136" y="328" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="end">filament C</text>
+  <rect x="385.6" y="305" width="496.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="150" y1="323.0" x2="968.4" y2="323.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="385.6" y="312" width="185.9999999999999" height="22" rx="3" fill="#99d5cc"/>
+  <rect x="571.5999999999999" y="312" width="0.0" height="22" rx="3" fill="#2a9d8f"/>
+  <rect x="571.5999999999999" y="312" width="49.600000000000136" height="22" rx="3" fill="#1e293b"/>
+  <line x1="584.0" y1="315" x2="584.0" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="585.86" y1="315" x2="585.86" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="587.72" y1="315" x2="587.72" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="589.5799999999999" y1="315" x2="589.5799999999999" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="591.44" y1="315" x2="591.44" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="593.3" y1="315" x2="593.3" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="595.16" y1="315" x2="595.16" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="597.02" y1="315" x2="597.02" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="598.88" y1="315" x2="598.88" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="600.74" y1="315" x2="600.74" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="602.5999999999999" y1="315" x2="602.5999999999999" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="604.46" y1="315" x2="604.46" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="606.3199999999999" y1="315" x2="606.3199999999999" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="608.1800000000001" y1="315" x2="608.1800000000001" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="610.04" y1="315" x2="610.04" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="611.9000000000001" y1="315" x2="611.9000000000001" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="613.76" y1="315" x2="613.76" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="615.62" y1="315" x2="615.62" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="617.48" y1="315" x2="617.48" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="619.34" y1="315" x2="619.34" y2="331" stroke="#ffffff" stroke-width="2"/>
+  <line x1="509.59999999999997" y1="310" x2="509.59999999999997" y2="336" stroke="#ffffff" stroke-width="2"/>
+  <text x="150.0" y="364" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="1" font-weight="400" fill="#1e293b" text-anchor="start"></text>
+  <rect x="150" y="376" width="26" height="14" rx="3" fill="#99d5cc"/>
+  <line x1="163" y1="376" x2="163" y2="390" stroke="#ffffff" stroke-width="2"/>
+  <text x="184" y="388" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">heating; white tick = first arrival, then settle_ms</text>
+  <rect x="510" y="376" width="26" height="14" rx="3" fill="#2a9d8f"/>
+  <text x="544" y="388" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">HOT, waiting for its turn</text>
+  <rect x="760" y="376" width="26" height="14" rx="3" fill="#1e293b"/>
+  <text x="794" y="388" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">firing its pulses</text>
+  <text x="150" y="416" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">Each filament: back to IDLE once its pulses are counted. Its window (dashed) is a hard limit; a normal turn ends well inside it.</text>
+  <text x="150" y="436" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">B is raised early (preheat_ahead) so it is HOT about when A is done; C is raised when A is done.</text>
+</svg>

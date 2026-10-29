@@ -14,7 +14,6 @@ everywhere it means the same thing.
 | `settle_ms` | after a filament FIRST arrives (load voltage within ±150 mV), wait this long; then it is HOT and may fire. Not restarted by a wobble. | required | — (a wait, not a timeout) |
 | `heat_timeout_s` | **the longest a filament may stay heated in one go**: from the VOLTAGE command until it is back at IDLE. Hard: timed by the backend, never renewed. | Q4 | that filament back to IDLE; what it had not done is skipped; the run goes on (Q1) |
 | `trigger_timeout_ms` | the longest gap between two consecutive edges of the SAME filament, timed by the RP2350 from the filament's first edge | sim: 2 × `pulse_interval_ms` + 100; ext: Q7 | Q2 |
-| `max_on_ms` | firmware cap on one pulse; `width_us` above it and the ARM is refused, nothing fires | Q3 | — (checked before anything fires) |
 | `link_lost_timeout_s` | how long a link (§4) may be down before the run stops | 5 s; nobody needs to change it | the run stops |
 
 Pulse settings (not timing knobs): `num_pulses`, `width_us`, `pulse_interval_ms`
@@ -30,6 +29,7 @@ Pulse settings (not timing knobs): `num_pulses`, `width_us`, `pulse_interval_ms`
 | `no_pulse_timeout_s` | every filament ends within its window, so the run cannot stall. Fixed rule instead: 2 filaments in a row with no edge at all → STOP (the trigger source is dead) |
 | `total_ms` (parameter) | computed: number of filaments × `heat_timeout_s` + 30 s, written to the firmware as its last backstop |
 | backend timed-VOLTAGE length | = `heat_timeout_s`, no longer "predicted wait + margin, renewed" |
+| `max_on_ms` | it only restated `width_us`: the firmware's check IS "width above maxOnMs → ARM refused". `width_us` above what the firmware can hold (u16 µs, 65 535) is refused before anything is touched; the host writes maxOnMs itself. |
 
 ## 3. The workflow
 
@@ -40,7 +40,7 @@ step 6 and closes at step 13 at the latest.
 
 1. Every filament has its own voltage; none is dead; HV (emission and focus)
    is on; HV guard not tripped; vacuum within its limit.
-2. `width_us` ≤ `max_on_ms`; widths fit the firmware's u16 µs (≤ 65 535).
+2. `width_us` fits the firmware's u16 µs (1 .. 65 535), else refused.
 3. sim: `trigger_timeout_ms` > `pulse_interval_ms`.
 4. The window can hold one filament's work: `heat_timeout_s` ≥ typical heat-up
    + `settle_ms` + (`num_pulses` − 1) × spacing + margin. Otherwise refused as
@@ -96,6 +96,29 @@ sequenceDiagram
     H->>R: f to IDLE (once the next is released)
     B-->>R: window ends first - f to IDLE, the rest skipped
 ```
+
+## 3b. Timing: where each removed timeout's job went
+
+A normal run, three filaments (heat_timeout_s = 8 s in the picture). Each
+filament has ONE window (dashed): opened by its raise, a hard end. A normal
+turn ends well inside it.
+
+![scan_view timing, three filaments](img/timing_normal.svg)
+
+Every failure the old timeouts caught, and what catches it now. One filament,
+same 8 s window. The vertical bar is the moment it is caught.
+
+![what ends each failure](img/timing_failures.svg)
+
+| failure | before | now |
+|---|---|---|
+| never gets HOT | `heat_timeout_s` (wait for arrival) | the window ends: IDLE, skipped |
+| HOT, its turn comes late | the backend renewed its timed VOLTAGE (no limit) | the window ends: IDLE, re-heated at its turn (Q1) |
+| `on_armed` hangs | `on_armed_timeout_s` | the window ends with `on_armed` still running: STOP |
+| no edge ever comes | `shot_wait_timeout_s`; a dead source: `no_pulse_timeout_s` | the window ends: IDLE, skipped; 2 filaments in a row with no edge: STOP |
+| edges stop half way | `trigger_timeout_ms` | the same (kept); Q2 |
+| pulses outlast the window | `shot_wait_timeout_s` | the window ends: stop the sim train (confirmed), IDLE, rest skipped |
+| the whole run hangs | `total_ms` (parameter) | the same firmware backstop, computed: filaments × `heat_timeout_s` + 30 s |
 
 ## 4. "Link": which one
 
@@ -169,12 +192,11 @@ What follows from it:
 | longest one heating may last | `heat_timeout_s` (new meaning) | `heat_timeout_s` (changes from "wait for arrival") | `active_s` (unchanged) |
 | wait after the first arrival | `settle_ms` (from the FIRST arrival) | `settle_ms` (held continuously) — Q9 | — |
 | gap between edges | `trigger_timeout_ms` | `trigger_timeout_ms` | — |
-| firmware pulse cap | `max_on_ms` | `max_on_ms` | — |
 
 combined_backend passes today, all of which have to follow:
-- to `fire_single_pulse`: `max_on_ms`, `total_ms`, `shot_wait_timeout_s`,
+- to `fire_single_pulse`: `max_on_ms` (goes), `total_ms`, `shot_wait_timeout_s`,
   `heat_timeout_s`, `settle_ms`;
-- to `scan_view`: `trigger_timeout_ms`, `max_on_ms`, `total_ms`,
+- to `scan_view`: `trigger_timeout_ms`, `max_on_ms` (goes), `total_ms`,
   `shot_wait_timeout_s`, `heat_timeout_s`, `link_lost_timeout_s`,
   `preheat_margin_s`.
 
@@ -189,8 +211,6 @@ filament nobody renews for 4 s falls back), which a long window must not trip.
 - **Q2** `trigger_timeout_ms` runs out: today the firmware faults the WHOLE run
   (InterPulseTimeout → STOP). Keep that — or skip only the rest of that
   filament (needs a firmware change: the timeout ends the row, not the run)?
-- **Q3** `max_on_ms` default: the firmware's own 40 ms, or the user always
-  sets it?
 - **Q4** `heat_timeout_s` default (10 s fits today's 4 V test: ~3 s heat-up +
   1 s settle + 20 pulses × 26 ms, with margin)?
 - **Q5** Step 4: refuse a window that cannot hold one filament's work, or only

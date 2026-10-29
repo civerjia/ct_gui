@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="552" viewBox="0 0 1060 552" role="img" aria-label="scan_view timing: what ends each failure, now">
+  <title>scan_view timing: what ends each failure, now</title>
+  <rect width="1060" height="552" fill="#ffffff"/>
+  <line x1="300" y1="36" x2="300" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="300" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">0 s</text>
+  <line x1="352" y1="36" x2="352" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="352" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">1 s</text>
+  <line x1="404" y1="36" x2="404" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="404" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">2 s</text>
+  <line x1="456" y1="36" x2="456" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="456" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">3 s</text>
+  <line x1="508" y1="36" x2="508" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="508" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">4 s</text>
+  <line x1="560" y1="36" x2="560" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="560" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">5 s</text>
+  <line x1="612" y1="36" x2="612" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="612" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">6 s</text>
+  <line x1="664" y1="36" x2="664" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="664" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">7 s</text>
+  <line x1="716" y1="36" x2="716" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="716" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">8 s</text>
+  <line x1="768" y1="36" x2="768" y2="502" stroke="#eef2f6" stroke-width="1"/>
+  <text x="768" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle">9 s</text>
+  <text x="16" y="30" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">one filament, heat_timeout_s = 8 s</text>
+  <text x="16" y="74" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">never gets HOT</text>
+  <text x="16" y="92" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">was: heat_timeout_s (arrival)</text>
+  <rect x="300" y="57" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="300" y1="75.0" x2="778.4" y2="75.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="300" y="64" width="416.0" height="22" rx="3" fill="#99d5cc"/>
+  <line x1="716.0" y1="54" x2="716.0" y2="96" stroke="#b45309" stroke-width="3"/>
+  <text x="738.0" y="80" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b45309" text-anchor="start">back to IDLE, skipped</text>
+  <text x="16" y="146" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">HOT, its turn comes late</text>
+  <text x="16" y="164" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">was: renewed timed VOLTAGE</text>
+  <rect x="300" y="129" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="300" y1="147.0" x2="778.4" y2="147.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="300" y="136" width="156" height="22" rx="3" fill="#99d5cc"/>
+  <rect x="456" y="136" width="260.0" height="22" rx="3" fill="#2a9d8f"/>
+  <line x1="716.0" y1="126" x2="716.0" y2="168" stroke="#475569" stroke-width="3"/>
+  <text x="738.0" y="152" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#475569" text-anchor="start">back to IDLE, re-heated at its turn (Q1)</text>
+  <text x="16" y="218" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">on_armed hangs</text>
+  <text x="16" y="236" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">was: on_armed_timeout_s</text>
+  <rect x="300" y="201" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="300" y1="219.0" x2="778.4" y2="219.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="300" y="208" width="156" height="22" rx="3" fill="#99d5cc"/>
+  <rect x="456" y="208" width="260.0" height="22" rx="3" fill="#1e293b"/>
+  <text x="586.0" y="224" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#ffffff" text-anchor="middle">on_armed still running</text>
+  <line x1="716.0" y1="198" x2="716.0" y2="240" stroke="#b91c1c" stroke-width="3"/>
+  <text x="738.0" y="224" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b91c1c" text-anchor="start">STOP (your code is stuck)</text>
+  <text x="16" y="290" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">no edge ever comes</text>
+  <text x="16" y="308" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">was: shot_wait_timeout_s</text>
+  <rect x="300" y="273" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="300" y1="291.0" x2="778.4" y2="291.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="300" y="280" width="156" height="22" rx="3" fill="#99d5cc"/>
+  <rect x="456" y="280" width="260.0" height="22" rx="3" fill="#1e293b"/>
+  <text x="586.0" y="296" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#ffffff" text-anchor="middle">released, waiting for edges</text>
+  <line x1="716.0" y1="270" x2="716.0" y2="312" stroke="#b45309" stroke-width="3"/>
+  <text x="738.0" y="296" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b45309" text-anchor="start">back to IDLE, skipped; 2 in a row: STOP</text>
+  <text x="16" y="362" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">edges stop half way</text>
+  <text x="16" y="380" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">kept: trigger_timeout_ms</text>
+  <rect x="300" y="345" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="300" y1="363.0" x2="778.4" y2="363.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="300" y="352" width="156" height="22" rx="3" fill="#99d5cc"/>
+  <rect x="456" y="352" width="83.20000000000005" height="22" rx="3" fill="#1e293b"/>
+  <line x1="466.4" y1="355" x2="466.4" y2="371" stroke="#ffffff" stroke-width="2"/>
+  <line x1="474.20000000000005" y1="355" x2="474.20000000000005" y2="371" stroke="#ffffff" stroke-width="2"/>
+  <line x1="482.0" y1="355" x2="482.0" y2="371" stroke="#ffffff" stroke-width="2"/>
+  <line x1="489.8" y1="355" x2="489.8" y2="371" stroke="#ffffff" stroke-width="2"/>
+  <line x1="497.6" y1="355" x2="497.6" y2="371" stroke="#ffffff" stroke-width="2"/>
+  <line x1="505.4" y1="355" x2="505.4" y2="371" stroke="#ffffff" stroke-width="2"/>
+  <line x1="513.2" y1="355" x2="513.2" y2="371" stroke="#ffffff" stroke-width="2"/>
+  <line x1="521.0" y1="355" x2="521.0" y2="371" stroke="#ffffff" stroke-width="2"/>
+  <text x="547.2" y="368" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#b91c1c" text-anchor="start">gap &gt; trigger_timeout_ms</text>
+  <line x1="543.2" y1="342" x2="543.2" y2="384" stroke="#b91c1c" stroke-width="3"/>
+  <text x="738.0" y="368" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b91c1c" text-anchor="start">STOP (firmware) -- or skip the rest (Q2)</text>
+  <text x="16" y="434" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">pulses outlast the window</text>
+  <text x="16" y="452" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">was: shot_wait_timeout_s</text>
+  <rect x="300" y="417" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="300" y1="435.0" x2="778.4" y2="435.0" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="300" y="424" width="156" height="22" rx="3" fill="#99d5cc"/>
+  <rect x="456" y="424" width="260.0" height="22" rx="3" fill="#1e293b"/>
+  <line x1="466.4" y1="427" x2="466.4" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="476.8" y1="427" x2="476.8" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="487.20000000000005" y1="427" x2="487.20000000000005" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="497.6" y1="427" x2="497.6" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="508.0" y1="427" x2="508.0" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="518.4" y1="427" x2="518.4" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="528.8" y1="427" x2="528.8" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="539.2" y1="427" x2="539.2" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="549.6" y1="427" x2="549.6" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="560.0" y1="427" x2="560.0" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="570.4000000000001" y1="427" x2="570.4000000000001" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="580.8" y1="427" x2="580.8" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="591.2" y1="427" x2="591.2" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="601.6" y1="427" x2="601.6" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="612.0" y1="427" x2="612.0" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="622.4000000000001" y1="427" x2="622.4000000000001" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="632.8" y1="427" x2="632.8" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="643.2" y1="427" x2="643.2" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="653.6" y1="427" x2="653.6" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="664.0" y1="427" x2="664.0" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="674.4000000000001" y1="427" x2="674.4000000000001" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="684.8" y1="427" x2="684.8" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="695.2" y1="427" x2="695.2" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="705.6" y1="427" x2="705.6" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="716.0" y1="427" x2="716.0" y2="443" stroke="#ffffff" stroke-width="2"/>
+  <line x1="716.0" y1="414" x2="716.0" y2="456" stroke="#b45309" stroke-width="3"/>
+  <text x="738.0" y="440" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b45309" text-anchor="start">stop the sim train, then IDLE; rest skipped</text>
+  <text x="16" y="502" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">The window is the one per-filament limit: whatever has not happened by its end is caught there. trigger_timeout_ms stays</text>
+  <text x="16" y="520" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">because a stalled train must not keep the firmware armed; total_ms is computed (filaments x heat_timeout_s + 30 s) as the firmware's last backstop.</text>
+</svg>
