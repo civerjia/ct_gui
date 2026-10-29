@@ -361,6 +361,127 @@ def fig_timing_failures():
            "computed (filaments x heat_timeout_s + 30 s) as the firmware's last backstop.", 13, MUTED)
     s.save("timing_failures.svg")
 
+
+def fig_timing_sim():
+    """trigger="sim": where the edges come from, the request/poll delays, and
+    why a train must be stopped before the next row is released."""
+    W, L = 1080, 230
+    s = Svg(W, 740, "scan_view timing, trigger=sim")
+    PX = 0.46                                 # px per ms, panel 1
+    x = lambda t: L + t * PX                  # noqa: E731
+    top = 40
+    s.text(16, top - 14, "1. Normal: A is on C1 (the master), B on C2. 20 pulses, 26 ms apart.",
+           15, INK, weight=600)
+    for t in range(0, 1800, 200):
+        s.line(x(t), top + 4, x(t), 352, "#eef2f6", 1)
+        s.text(x(t), top + 2, f"{t} ms", 11.5, MUTED, "middle")
+    rows = {"host": 70, "flag": 130, "esp": 190, "c1": 246, "c2": 302}
+    names = {"host": ("host (scan_view)", None), "flag": ("backend sim flag", "polls the ESP32 every 300 ms"),
+             "esp": ("master ESP32 timer", "sends the edges"), "c1": ("C1 RP2350 (master)", "ReadyIn"),
+             "c2": ("C2 RP2350", "via C1 SyncOut")}
+    for k, y in rows.items():
+        a, b = names[k]
+        s.text(L - 14, y + 4, a, 13.5, INK, "end", 600)
+        if b:
+            s.text(L - 14, y + 20, b, 12, MUTED, "end")
+        s.line(x(0), y + 12, x(1700), y + 12, RULE, 1)
+    yh = rows["host"]
+    # host events
+    for t, lab in ((0, "release A"), (840, "release B")):
+        s.line(x(t), yh - 2, x(t), yh + 26, INK, 2)
+        s.text(x(t) + 5, yh - 6, lab, 12.5, INK, weight=600)
+    s.rect(x(30), yh + 4, x(280) - x(30), 16, "#cbd5e1", 3)
+    s.text((x(30) + x(280)) / 2, yh + 16, "sim request", 12, INK, "middle")
+    s.rect(x(870), yh + 4, x(940) - x(870), 16, "#fecaca", 3)
+    s.text(x(870), yh + 40, "“already running”: retried", 12, STOP)
+    s.rect(x(940), yh + 4, x(1190) - x(940), 16, "#cbd5e1", 3)
+    s.text((x(940) + x(1190)) / 2, yh + 16, "sim request", 12, INK, "middle")
+    s.text(x(30), yh + 40, "65 ms idle, 200-300 ms under load", 12, MUTED)
+    # backend flag
+    yf = rows["flag"]
+    s.rect(x(30), yf + 4, x(930) - x(30), 16, "#e2e8f0", 3)
+    s.text(x(40), yf + 16, "running", 12, INK)
+    s.rect(x(940), yf + 4, x(1700) - x(940), 16, "#e2e8f0", 3)
+    for t in (330, 630, 930, 1240, 1540):
+        s.line(x(t), yf, x(t), yf + 24, WAIT, 1.5)
+    s.text(x(930) + 4, yf + 36, "cleared only at this poll", 12, STOP)
+    # trains
+    ye = rows["esp"]
+    for t0 in (280, 1190):
+        for i in range(20):
+            xi = x(t0 + i * 26)
+            s.line(xi, ye + 3, xi, ye + 21, PULSE, 1.4)
+    s.line(x(774), ye - 4, x(774), ye + 28, WAIT, 1, "3 3")
+    s.text(x(774) + 4, ye - 6, "A's train done", 12, MUTED)
+    # RP2350 lanes: emitted (dark) vs consumed (light)
+    for lane, t0, emit in (("c1", 280, True), ("c2", 280, False), ("c1", 1190, False), ("c2", 1190, True)):
+        y = rows[lane]
+        for i in range(20):
+            xi = x(t0 + i * 26)
+            if emit:
+                s.rect(xi, y + 2, 12 * PX * 1.0 + 3, 20, FIREFILL, 1)
+            else:
+                s.line(xi, y + 6, xi, y + 18, "#94a3b8", 1.2)
+    s.text(x(280), rows["c1"] + 38, "A's pulses", 12, INK)
+    s.text(x(280), rows["c2"] + 38, "edges counted, no pulse (not its filament)", 12, MUTED)
+    s.text(x(1190), rows["c1"] + 38, "no pulse", 12, MUTED)
+    s.text(x(1190), rows["c2"] + 38, "B's pulses", 12, INK)
+    s.text(16, 372, "Both RP2350s walk the same table: each edge fires a pulse only on the board "
+           "whose filament's row is released; the other counts it.", 12.5, MUTED)
+
+    # ---- panel 2: the leftover train ---------------------------------------
+    PX2 = 0.42
+    x2 = lambda t: L + t * PX2                # noqa: E731
+    top2 = 418
+    s.text(16, top2 - 14, "2. A's window ends mid-train (edges 200 ms apart): the rest of the "
+           "train is still coming.", 15, INK, weight=600)
+    for t in range(0, 1751, 250):
+        s.line(x2(t), top2 + 4, x2(t), 690, "#eef2f6", 1)
+        s.text(x2(t), top2 + 2, f"{t} ms", 11.5, MUTED, "middle")
+    edges = [i * 200 for i in range(10)]
+    wend = 700
+    # edges row
+    ye2 = top2 + 34
+    s.text(L - 14, ye2 + 8, "ESP32 edges", 13.5, INK, "end", 600)
+    s.text(L - 14, ye2 + 24, "(if never stopped)", 12, MUTED, "end")
+    for t in edges:
+        s.line(x2(t), ye2 + 2, x2(t), ye2 + 22, PULSE, 1.6)
+    s.line(x2(wend), top2 + 10, x2(wend), 690, SKIP, 2.5)
+    s.text(x2(wend) + 5, top2 + 20, "A's window ends", 12.5, SKIP, weight=600)
+    # bad
+    yb = top2 + 100
+    s.text(16, yb + 4, "WITHOUT stopping the train", 14, STOP, weight=600)
+    s.text(16, yb + 22, "B released at once", 12, MUTED)
+    s.text(L - 14, yb - 10, "A", 13, INK, "end", 600)
+    s.text(L - 14, yb + 30, "B", 13, INK, "end", 600)
+    for t in edges:
+        if t < wend:
+            s.rect(x2(t), yb - 22, 9, 18, FIREFILL, 1)
+        else:
+            s.rect(x2(t), yb + 18, 9, 18, STOP, 1)
+    s.text(x2(1000), yb + 54, "A's leftover edges fire B: wrong count, wrong timing", 12.5, STOP)
+    # good
+    yg = top2 + 210
+    s.text(16, yg + 4, "WITH the rule", 14, INK, weight=600)
+    s.text(16, yg + 22, "stop, confirm, then release", 12, MUTED)
+    s.text(L - 14, yg - 10, "A", 13, INK, "end", 600)
+    s.text(L - 14, yg + 30, "B", 13, INK, "end", 600)
+    stop_at, conf_at = wend + 250, wend + 330
+    for t in edges:
+        if t < wend:
+            s.rect(x2(t), yg - 22, 9, 18, FIREFILL, 1)
+        elif t < stop_at:
+            s.line(x2(t), yg - 4, x2(t), yg + 12, "#94a3b8", 1.6)
+    s.rect(x2(wend), yg - 2, x2(stop_at) - x2(wend), 12, "#cbd5e1", 2)
+    s.text(x2(wend) + 2, yg + 26, "stop request", 11.5, MUTED)
+    s.line(x2(conf_at), yg - 8, x2(conf_at), yg + 16, WAIT, 2)
+    s.text(x2(conf_at) + 4, yg - 10, "ESP32: running = false", 12, WAIT)
+    s.line(x2(conf_at + 20), yg + 14, x2(conf_at + 20), yg + 40, INK, 2)
+    s.text(x2(conf_at + 20) + 5, yg + 38, "release B; its own train", 12, INK)
+    s.text(x2(wend) + 2, yg + 54, "the 1 edge before the stop lands on no released row: dropped "
+           "and counted; none after it", 12, MUTED)
+    s.save("timing_sim.svg")
+
 if __name__ == "__main__":
     fig_turn()
     fig_edges()
@@ -368,3 +489,4 @@ if __name__ == "__main__":
     fig_single()
     fig_timing_normal()
     fig_timing_failures()
+    fig_timing_sim()

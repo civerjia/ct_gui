@@ -152,6 +152,14 @@ backend --HTTP /sync/burst--> MASTER ESP32 hardware timer
         --SyncOut--> the other RP2350's SyncIn (fires its released row)
 ```
 
+![trigger=sim timing: the request and poll delays, and the leftover train](img/timing_sim.svg)
+
+Panel 1: one sim request per filament after `on_armed` (65–300 ms), the
+backend's flag clearing only on its next 300 ms poll ("already running" for
+the next filament), and both RP2350s walking the same table — the board whose
+row is released fires, the other only counts the edge. Panel 2: a filament
+that ends before its train does.
+
 What follows from it:
 
 - **Only the master can start a train.** The other controller's filaments get

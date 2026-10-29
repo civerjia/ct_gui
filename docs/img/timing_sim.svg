@@ -1,0 +1,246 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="740" viewBox="0 0 1080 740" role="img" aria-label="scan_view timing, trigger=sim">
+  <title>scan_view timing, trigger=sim</title>
+  <rect width="1080" height="740" fill="#ffffff"/>
+  <text x="16" y="26" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="15" font-weight="600" fill="#1e293b" text-anchor="start">1. Normal: A is on C1 (the master), B on C2. 20 pulses, 26 ms apart.</text>
+  <line x1="230.0" y1="44" x2="230.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="230.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">0 ms</text>
+  <line x1="322.0" y1="44" x2="322.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="322.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">200 ms</text>
+  <line x1="414.0" y1="44" x2="414.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="414.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">400 ms</text>
+  <line x1="506.0" y1="44" x2="506.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="506.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">600 ms</text>
+  <line x1="598.0" y1="44" x2="598.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="598.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">800 ms</text>
+  <line x1="690.0" y1="44" x2="690.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="690.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">1000 ms</text>
+  <line x1="782.0" y1="44" x2="782.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="782.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">1200 ms</text>
+  <line x1="874.0" y1="44" x2="874.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="874.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">1400 ms</text>
+  <line x1="966.0" y1="44" x2="966.0" y2="352" stroke="#eef2f6" stroke-width="1"/>
+  <text x="966.0" y="42" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">1600 ms</text>
+  <text x="216" y="74" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1e293b" text-anchor="end">host (scan_view)</text>
+  <line x1="230.0" y1="82" x2="1012.0" y2="82" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="216" y="134" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1e293b" text-anchor="end">backend sim flag</text>
+  <text x="216" y="150" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="end">polls the ESP32 every 300 ms</text>
+  <line x1="230.0" y1="142" x2="1012.0" y2="142" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="216" y="194" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1e293b" text-anchor="end">master ESP32 timer</text>
+  <text x="216" y="210" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="end">sends the edges</text>
+  <line x1="230.0" y1="202" x2="1012.0" y2="202" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="216" y="250" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1e293b" text-anchor="end">C1 RP2350 (master)</text>
+  <text x="216" y="266" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="end">ReadyIn</text>
+  <line x1="230.0" y1="258" x2="1012.0" y2="258" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="216" y="306" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1e293b" text-anchor="end">C2 RP2350</text>
+  <text x="216" y="322" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="end">via C1 SyncOut</text>
+  <line x1="230.0" y1="314" x2="1012.0" y2="314" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="230.0" y1="68" x2="230.0" y2="96" stroke="#1e293b" stroke-width="2"/>
+  <text x="235.0" y="64" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#1e293b" text-anchor="start">release A</text>
+  <line x1="616.4000000000001" y1="68" x2="616.4000000000001" y2="96" stroke="#1e293b" stroke-width="2"/>
+  <text x="621.4000000000001" y="64" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#1e293b" text-anchor="start">release B</text>
+  <rect x="243.8" y="74" width="115.0" height="16" rx="3" fill="#cbd5e1"/>
+  <text x="301.3" y="86" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#1e293b" text-anchor="middle">sim request</text>
+  <rect x="630.2" y="74" width="32.200000000000045" height="16" rx="3" fill="#fecaca"/>
+  <text x="630.2" y="110" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#b91c1c" text-anchor="start">“already running”: retried</text>
+  <rect x="662.4000000000001" y="74" width="114.99999999999989" height="16" rx="3" fill="#cbd5e1"/>
+  <text x="719.9000000000001" y="86" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#1e293b" text-anchor="middle">sim request</text>
+  <text x="243.8" y="110" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">65 ms idle, 200-300 ms under load</text>
+  <rect x="243.8" y="134" width="413.99999999999994" height="16" rx="3" fill="#e2e8f0"/>
+  <text x="248.4" y="146" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#1e293b" text-anchor="start">running</text>
+  <rect x="662.4000000000001" y="134" width="349.5999999999999" height="16" rx="3" fill="#e2e8f0"/>
+  <line x1="381.8" y1="130" x2="381.8" y2="154" stroke="#475569" stroke-width="1.5"/>
+  <line x1="519.8" y1="130" x2="519.8" y2="154" stroke="#475569" stroke-width="1.5"/>
+  <line x1="657.8" y1="130" x2="657.8" y2="154" stroke="#475569" stroke-width="1.5"/>
+  <line x1="800.4" y1="130" x2="800.4" y2="154" stroke="#475569" stroke-width="1.5"/>
+  <line x1="938.4" y1="130" x2="938.4" y2="154" stroke="#475569" stroke-width="1.5"/>
+  <text x="661.8" y="166" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#b91c1c" text-anchor="start">cleared only at this poll</text>
+  <line x1="358.8" y1="193" x2="358.8" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="370.76" y1="193" x2="370.76" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="382.72" y1="193" x2="382.72" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="394.68" y1="193" x2="394.68" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="406.64" y1="193" x2="406.64" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="418.6" y1="193" x2="418.6" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="430.56" y1="193" x2="430.56" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="442.52" y1="193" x2="442.52" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="454.48" y1="193" x2="454.48" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="466.44" y1="193" x2="466.44" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="478.4" y1="193" x2="478.4" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="490.36" y1="193" x2="490.36" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="502.32" y1="193" x2="502.32" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="514.28" y1="193" x2="514.28" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="526.24" y1="193" x2="526.24" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="538.2" y1="193" x2="538.2" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="550.1600000000001" y1="193" x2="550.1600000000001" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="562.12" y1="193" x2="562.12" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="574.08" y1="193" x2="574.08" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="586.04" y1="193" x2="586.04" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="777.4" y1="193" x2="777.4" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="789.36" y1="193" x2="789.36" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="801.32" y1="193" x2="801.32" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="813.28" y1="193" x2="813.28" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="825.24" y1="193" x2="825.24" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="837.2" y1="193" x2="837.2" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="849.1600000000001" y1="193" x2="849.1600000000001" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="861.12" y1="193" x2="861.12" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="873.08" y1="193" x2="873.08" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="885.0400000000001" y1="193" x2="885.0400000000001" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="897.0" y1="193" x2="897.0" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="908.96" y1="193" x2="908.96" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="920.9200000000001" y1="193" x2="920.9200000000001" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="932.88" y1="193" x2="932.88" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="944.84" y1="193" x2="944.84" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="956.8000000000001" y1="193" x2="956.8000000000001" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="968.76" y1="193" x2="968.76" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="980.72" y1="193" x2="980.72" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="992.6800000000001" y1="193" x2="992.6800000000001" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="1004.64" y1="193" x2="1004.64" y2="211" stroke="#334155" stroke-width="1.4"/>
+  <line x1="586.04" y1="186" x2="586.04" y2="218" stroke="#475569" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="590.04" y="184" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">A's train done</text>
+  <rect x="358.8" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="370.76" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="382.72" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="394.68" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="406.64" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="418.6" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="430.56" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="442.52" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="454.48" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="466.44" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="478.4" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="490.36" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="502.32" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="514.28" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="526.24" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="538.2" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="550.1600000000001" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="562.12" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="574.08" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="586.04" y="248" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <line x1="358.8" y1="308" x2="358.8" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="370.76" y1="308" x2="370.76" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="382.72" y1="308" x2="382.72" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="394.68" y1="308" x2="394.68" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="406.64" y1="308" x2="406.64" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="418.6" y1="308" x2="418.6" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="430.56" y1="308" x2="430.56" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="442.52" y1="308" x2="442.52" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="454.48" y1="308" x2="454.48" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="466.44" y1="308" x2="466.44" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="478.4" y1="308" x2="478.4" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="490.36" y1="308" x2="490.36" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="502.32" y1="308" x2="502.32" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="514.28" y1="308" x2="514.28" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="526.24" y1="308" x2="526.24" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="538.2" y1="308" x2="538.2" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="550.1600000000001" y1="308" x2="550.1600000000001" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="562.12" y1="308" x2="562.12" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="574.08" y1="308" x2="574.08" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="586.04" y1="308" x2="586.04" y2="320" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="777.4" y1="252" x2="777.4" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="789.36" y1="252" x2="789.36" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="801.32" y1="252" x2="801.32" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="813.28" y1="252" x2="813.28" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="825.24" y1="252" x2="825.24" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="837.2" y1="252" x2="837.2" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="849.1600000000001" y1="252" x2="849.1600000000001" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="861.12" y1="252" x2="861.12" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="873.08" y1="252" x2="873.08" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="885.0400000000001" y1="252" x2="885.0400000000001" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="897.0" y1="252" x2="897.0" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="908.96" y1="252" x2="908.96" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="920.9200000000001" y1="252" x2="920.9200000000001" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="932.88" y1="252" x2="932.88" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="944.84" y1="252" x2="944.84" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="956.8000000000001" y1="252" x2="956.8000000000001" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="968.76" y1="252" x2="968.76" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="980.72" y1="252" x2="980.72" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="992.6800000000001" y1="252" x2="992.6800000000001" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <line x1="1004.64" y1="252" x2="1004.64" y2="264" stroke="#94a3b8" stroke-width="1.2"/>
+  <rect x="777.4" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="789.36" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="801.32" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="813.28" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="825.24" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="837.2" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="849.1600000000001" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="861.12" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="873.08" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="885.0400000000001" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="897.0" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="908.96" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="920.9200000000001" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="932.88" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="944.84" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="956.8000000000001" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="968.76" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="980.72" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="992.6800000000001" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <rect x="1004.64" y="304" width="8.52" height="20" rx="1" fill="#1e293b"/>
+  <text x="358.8" y="284" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#1e293b" text-anchor="start">A's pulses</text>
+  <text x="358.8" y="340" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">edges counted, no pulse (not its filament)</text>
+  <text x="777.4" y="284" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">no pulse</text>
+  <text x="777.4" y="340" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#1e293b" text-anchor="start">B's pulses</text>
+  <text x="16" y="372" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#64748b" text-anchor="start">Both RP2350s walk the same table: each edge fires a pulse only on the board whose filament's row is released; the other counts it.</text>
+  <text x="16" y="404" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="15" font-weight="600" fill="#1e293b" text-anchor="start">2. A's window ends mid-train (edges 200 ms apart): the rest of the train is still coming.</text>
+  <line x1="230.0" y1="422" x2="230.0" y2="690" stroke="#eef2f6" stroke-width="1"/>
+  <text x="230.0" y="420" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">0 ms</text>
+  <line x1="335.0" y1="422" x2="335.0" y2="690" stroke="#eef2f6" stroke-width="1"/>
+  <text x="335.0" y="420" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">250 ms</text>
+  <line x1="440.0" y1="422" x2="440.0" y2="690" stroke="#eef2f6" stroke-width="1"/>
+  <text x="440.0" y="420" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">500 ms</text>
+  <line x1="545.0" y1="422" x2="545.0" y2="690" stroke="#eef2f6" stroke-width="1"/>
+  <text x="545.0" y="420" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">750 ms</text>
+  <line x1="650.0" y1="422" x2="650.0" y2="690" stroke="#eef2f6" stroke-width="1"/>
+  <text x="650.0" y="420" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">1000 ms</text>
+  <line x1="755.0" y1="422" x2="755.0" y2="690" stroke="#eef2f6" stroke-width="1"/>
+  <text x="755.0" y="420" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">1250 ms</text>
+  <line x1="860.0" y1="422" x2="860.0" y2="690" stroke="#eef2f6" stroke-width="1"/>
+  <text x="860.0" y="420" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">1500 ms</text>
+  <line x1="965.0" y1="422" x2="965.0" y2="690" stroke="#eef2f6" stroke-width="1"/>
+  <text x="965.0" y="420" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="middle">1750 ms</text>
+  <text x="216" y="460" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1e293b" text-anchor="end">ESP32 edges</text>
+  <text x="216" y="476" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="end">(if never stopped)</text>
+  <line x1="230.0" y1="454" x2="230.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="314.0" y1="454" x2="314.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="398.0" y1="454" x2="398.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="482.0" y1="454" x2="482.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="566.0" y1="454" x2="566.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="650.0" y1="454" x2="650.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="734.0" y1="454" x2="734.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="818.0" y1="454" x2="818.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="902.0" y1="454" x2="902.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="986.0" y1="454" x2="986.0" y2="474" stroke="#334155" stroke-width="1.6"/>
+  <line x1="524.0" y1="428" x2="524.0" y2="690" stroke="#b45309" stroke-width="2.5"/>
+  <text x="529.0" y="438" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#b45309" text-anchor="start">A's window ends</text>
+  <text x="16" y="522" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#b91c1c" text-anchor="start">WITHOUT stopping the train</text>
+  <text x="16" y="540" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">B released at once</text>
+  <text x="216" y="508" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="600" fill="#1e293b" text-anchor="end">A</text>
+  <text x="216" y="548" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="600" fill="#1e293b" text-anchor="end">B</text>
+  <rect x="230.0" y="496" width="9" height="18" rx="1" fill="#1e293b"/>
+  <rect x="314.0" y="496" width="9" height="18" rx="1" fill="#1e293b"/>
+  <rect x="398.0" y="496" width="9" height="18" rx="1" fill="#1e293b"/>
+  <rect x="482.0" y="496" width="9" height="18" rx="1" fill="#1e293b"/>
+  <rect x="566.0" y="536" width="9" height="18" rx="1" fill="#b91c1c"/>
+  <rect x="650.0" y="536" width="9" height="18" rx="1" fill="#b91c1c"/>
+  <rect x="734.0" y="536" width="9" height="18" rx="1" fill="#b91c1c"/>
+  <rect x="818.0" y="536" width="9" height="18" rx="1" fill="#b91c1c"/>
+  <rect x="902.0" y="536" width="9" height="18" rx="1" fill="#b91c1c"/>
+  <rect x="986.0" y="536" width="9" height="18" rx="1" fill="#b91c1c"/>
+  <text x="650.0" y="572" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#b91c1c" text-anchor="start">A's leftover edges fire B: wrong count, wrong timing</text>
+  <text x="16" y="632" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14" font-weight="600" fill="#1e293b" text-anchor="start">WITH the rule</text>
+  <text x="16" y="650" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">stop, confirm, then release</text>
+  <text x="216" y="618" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="600" fill="#1e293b" text-anchor="end">A</text>
+  <text x="216" y="658" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="600" fill="#1e293b" text-anchor="end">B</text>
+  <rect x="230.0" y="606" width="9" height="18" rx="1" fill="#1e293b"/>
+  <rect x="314.0" y="606" width="9" height="18" rx="1" fill="#1e293b"/>
+  <rect x="398.0" y="606" width="9" height="18" rx="1" fill="#1e293b"/>
+  <rect x="482.0" y="606" width="9" height="18" rx="1" fill="#1e293b"/>
+  <line x1="566.0" y1="624" x2="566.0" y2="640" stroke="#94a3b8" stroke-width="1.6"/>
+  <rect x="524.0" y="626" width="105.0" height="12" rx="2" fill="#cbd5e1"/>
+  <text x="526.0" y="654" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#64748b" text-anchor="start">stop request</text>
+  <line x1="662.5999999999999" y1="620" x2="662.5999999999999" y2="644" stroke="#475569" stroke-width="2"/>
+  <text x="666.5999999999999" y="618" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#475569" text-anchor="start">ESP32: running = false</text>
+  <line x1="671.0" y1="642" x2="671.0" y2="668" stroke="#1e293b" stroke-width="2"/>
+  <text x="676.0" y="666" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#1e293b" text-anchor="start">release B; its own train</text>
+  <text x="526.0" y="682" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start">the 1 edge before the stop lands on no released row: dropped and counted; none after it</text>
+</svg>
