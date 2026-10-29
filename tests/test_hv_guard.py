@@ -16,6 +16,7 @@ os.environ.setdefault("CT_NO_AUTO_UPDATE", "1")
 os.environ["CT_NO_AUTO_CONNECT"] = "1"
 
 import ct.server._server as S  # noqa: E402
+import ct.server._spellman_watch as SW  # noqa: E402
 
 QUIET = S._hv_guard_quiet       # the real one, before setup() replaces it
 
@@ -32,7 +33,9 @@ class Rig:
     """reading(): what the ADS says now. force_open() may fix it (a 595 that
     flipped) or not (a blown FET)."""
 
-    def __init__(self, base=12.45, focus=-204.5):
+    # 11.60 mA at -197.8 V is what the 12 channel boards' loads draw (measured
+    # 2026-10-29); one sub-board switch on adds ~1.95 mA.
+    def __init__(self, base=11.60, focus=-204.5):
         self.ma, self.focus, self.emiss_v = base, focus, -197.8
         self.fixable = True
         self.base = base
@@ -64,13 +67,18 @@ class _Link:
 def setup(rig):
     S._HVG_HIST.clear()
     S._HVG_HIGH_SINCE[0] = None
+    S._HVG_OFFSET.clear()
+    S._HVG_LOW.update(since=None, warned=False)
+    S._SPELL_WATCH = SW.SpellmanWatch()
+    S._SPELL_ACTIONS.clear()
+    S._safety_record = lambda kind, rec: rig.records.append((kind, rec))
+    rig.records = []
     S._HV_GUARD.update(enabled=True, tripped=None)
     S._hv_guard_read = rig.read
     S._hv_guard_quiet = lambda now: rig.quiet
     S.force_grid_off = rig.force
     S.stm32_hv_enable_set = rig.rail
     S._note_forced_open = lambda *a, **k: None
-    S._safety_record = lambda *a, **k: None
     S._hv_guard_read_fresh = rig.read
     S.CONTROLLERS.clear()
     S.CONTROLLERS.update({1: _Link(), 2: _Link()})
@@ -86,10 +94,11 @@ def setup(rig):
         return {"ok": True, "latched": op != "clear", "thr_counts": 36,
                 "trip_base_x16": 1049 * 16, "trip_mean_x16": 1096 * 16}
     S.stm32_hv_guard = _g
-    rig.after = [1096 * 16] * 3                       # STM32 window means once the HV is back
+    rig.after = [13.55] * 3                           # ADS mA once the HV is back (one switch on)
     rig.rail_back = -197.8
     S._hv_guard_wait_rail = lambda host, pre_v: rig.rail_back
-    S._hv_guard_verify_counts = lambda host: list(rig.after)
+    S._hv_guard_verify_ads = lambda: [S.hv_load_excess({"emiss_v": -197.8, "emiss_i_ma": m})
+                                      for m in rig.after]
     S._HVG_LAST_EMISS_V[0] = -197.8
     rig.fb = [[0] * 8, [0] * 8]                       # 165 read-back per controller (1, 2)
     S._hv_bytes = lambda link: ([0] * 8, list(rig.fb[0 if link is S.CONTROLLERS.get(1) else 1]))
@@ -113,7 +122,7 @@ def run(rig, seconds, t0, step=1.0):
 rig = Rig()
 setup(rig)
 _, t = run(rig, 15, 0.0)
-rig.ma = 16.4
+rig.ma = 13.55
 r, t = run(rig, 5, t)
 check("595 flip: forced open and cleared", r and r["action"] == "cleared" and rig.forced == 2, r)
 check("...HV left on", rig.rails == [] and S._HV_GUARD["tripped"] is None, rig.rails)
@@ -126,7 +135,7 @@ S._LAST_HOT.clear()
 S._LAST_HOT.update({3: 0.0, 20: 14.0})
 rig.fixable = False
 _, t = run(rig, 15, 0.0)
-rig.ma = 16.4
+rig.ma = 13.55
 r, t = run(rig, 5, t)
 check("blown FET: tripped", r and r["action"] == "tripped", r)
 check("...emission AND focus switched off", ("emission", False) in rig.rails and ("focus", False) in rig.rails,
@@ -149,7 +158,7 @@ S._LAST_HOT.update({7: 0.0})                 # hot 100+ s before the trip
 S.LAST_POWER_STATE[33] = (int(S.POWER_STATE_VOLTAGE), 0.0)   # hot right now
 rig.fixable = False
 _, t = run(rig, 100, 0.0)
-rig.ma = 16.4
+rig.ma = 13.55
 r, t = run(rig, 5, t)
 check("trip stops the filament hot NOW, not one hot 100 s ago", rig.stopped == [([33], int(S.POWER_STATE_STOP))]
       and r["heating_stopped"] == [33] and r["suspects"][0] == 33, (rig.stopped, r.get("suspects")))
@@ -158,7 +167,7 @@ check("trip stops the filament hot NOW, not one hot 100 s ago", rig.stopped == [
 rig = Rig()
 setup(rig)
 _, t = run(rig, 15, 0.0)
-rig.ma = 16.4
+rig.ma = 13.55
 r, t = run(rig, 2, t)
 rig.ma = rig.base
 r2, t = run(rig, 5, t)
@@ -173,13 +182,20 @@ r, t = run(rig, 10, t)
 check("pulses in progress -> ignored", r is None and rig.forced == 0, r)
 check("...and not in the baseline", max(m for _, m, _f in S._HVG_HIST) < 13, S._HVG_HIST[-3:])
 
-# 5. Focus moved (the standing current follows it) -> new baseline, no trip.
-rig = Rig(base=10.09, focus=-198.6)
+# 5. A switch already on when the rail comes up: no history needed, the model
+#    knows what the loads draw (08:31 / 08:39 on 2026-10-27 were learned as normal).
+rig = Rig()
 setup(rig)
-_, t = run(rig, 15, 0.0)
-rig.ma, rig.focus = 12.46, -206.5
-r, t = run(rig, 20, t)
-check("focus change -> baseline restarts, no action", r is None and rig.forced == 0, r)
+rig.ma, rig.fixable = 13.55, False
+r, t = run(rig, 5, 0.0)
+check("switch on from the start -> tripped, ~1 switch named", r and r["action"] == "tripped"
+      and abs(r["model"]["switches_on"] - 1.0) < 0.15, r and r.get("model"))
+rig = Rig()
+setup(rig)
+rig.ma, rig.focus = 11.60, -150.0
+r, t = run(rig, 10, 0.0)
+check("focus changed, loads unchanged -> nothing (the standing current does not follow focus)",
+      r is None and rig.forced == 0, r)
 
 # 6. Rail off -> nothing, history cleared.
 rig = Rig()
@@ -187,29 +203,28 @@ setup(rig)
 _, t = run(rig, 15, 0.0)
 rig.emiss_v, rig.ma = -1.6, 0.1
 r, t = run(rig, 10, t)
-check("emission rail off -> nothing, baseline dropped", r is None and not S._HVG_HIST and rig.forced == 0, r)
+check("emission rail off -> nothing, history dropped", r is None and not S._HVG_HIST and rig.forced == 0, r)
+check("...and the ADS zero learned for the model", S._HVG_OFFSET and abs(S.hv_load_model(-197.8)["offset_ma"] - 0.1) < 1e-9,
+      S._HVG_OFFSET)
 
-# 7. Too little quiet history -> a rise under the ceiling may not act yet ...
+# 7. Under the model by a board: warned once, nothing switched.
 rig = Rig()
 setup(rig)
-_, t = run(rig, 4, 0.0)
-rig.ma = 15.0
-r, t = run(rig, 5, t)
-check("baseline < 10 s old, 15 mA -> no action", r is None and rig.forced == 0, r)
+rig.ma = 11.60 - 0.955
+r, t = run(rig, 10, 0.0)
+lows = [k for k, _ in rig.records if k == "emission_load_low"]
+check("a board's load missing -> one warning, no action", len(lows) == 1 and rig.forced == 0
+      and rig.rails == [], (lows, rig.forced))
 
-# 7b. ... but over the ceiling it acts with no baseline at all: HV switched on
-#     with a switch already conducting would otherwise learn the fault (08:31).
+# 7b. Half a switch is the line: +0.9 mA (under 0.98) -> nothing; +1.1 -> acts.
 rig = Rig()
 setup(rig)
-rig.ma, rig.fixable = 22.6, False
-r, t = run(rig, 5, 0.0)
-check("no baseline, 22.6 mA (over the 16 mA ceiling) -> tripped", r and r["action"] == "tripped"
-      and r["baseline_ma"] is None and "ceiling" in S._HV_GUARD["tripped"]["message"], r)
-rig = Rig()
-setup(rig)
-rig.ma = 22.6
-r, t = run(rig, 5, 0.0)
-check("no baseline, 22.6 mA, forced open fixes it -> cleared", r and r["action"] == "cleared", r)
+rig.ma = 11.60 + 0.9
+r, t = run(rig, 6, 0.0)
+check("+0.9 mA (under half a switch) -> nothing", r is None and rig.forced == 0, r)
+rig.ma = 11.60 + 1.1
+r, t = run(rig, 4, t)
+check("+1.1 mA (over half a switch) -> forced open", r and r["action"] == "cleared" and rig.forced == 2, r)
 
 # 8. Disabled -> nothing.
 rig = Rig()
@@ -280,7 +295,7 @@ rig = Rig()
 setup(rig)
 S._LAST_HOT.clear()
 S._LAST_HOT.update({16: 95.0})
-rig.after = [1050 * 16, 1049 * 16, 1051 * 16]
+rig.after = [11.61, 11.60, 11.62]
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
 check("current back at baseline -> recovered, not latched", r and r["action"] == "recovered"
@@ -294,7 +309,7 @@ check("...no heating touched", rig.stopped == [], rig.stopped)
 rig = Rig()
 setup(rig)
 rig.fb[0] = [0, 0, 0, 0, 0, 1, 0, 0]
-rig.after = [1050 * 16] * 3
+rig.after = [11.60] * 3
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
 check("165 reads a switch closed, current fine -> recovered; the 165 only logged",
@@ -304,7 +319,7 @@ check("165 reads a switch closed, current fine -> recovered; the 165 only logged
 rig = Rig()
 setup(rig)
 S._HVG_RAILS.update(emission=True, focus=False)
-rig.after = [1050 * 16] * 3
+rig.after = [11.60] * 3
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
 check("...only the rails that were on come back", r and r["action"] == "recovered"
@@ -314,17 +329,32 @@ check("...only the rails that were on come back", r and r["action"] == "recovere
 rig = Rig()
 setup(rig)
 S._HVG_RECOVERIES[:] = [50.0, 60.0, 70.0]
-rig.after = [1050 * 16] * 3
+rig.after = [11.60] * 3
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
 check("4th within 10 min -> latched, HV not put back", r and r["action"] == "tripped"
       and "recoveries already" in r["message"] and ("emission", True) not in rig.rails, r and r.get("message"))
 
+# 12e. The same trip with a Spellman arc just before it: the arc's, recovered,
+#      and not counted (five arcs latched the rig 2026-10-29 11:03-11:09).
+rig = Rig()
+setup(rig)
+S._HVG_RECOVERIES[:] = [50.0, 60.0, 70.0]
+rig.after = [11.60] * 3
+S._SPELL_WATCH.feed_kv(97.0, 60.2)
+S._SPELL_WATCH.feed_kv(98.5, 4.3)
+S._SPELL_WATCH.feed_kv(98.7, 60.2)
+rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
+r = S.hv_guard_tick(100.0)
+check("trip right after an arc -> recovered despite 3 recoveries, said to be the arc", r
+      and r["action"] == "recovered" and "arc" in r["message"] and r["arc"]["min_kv"] == 4.3, r and r.get("message"))
+check("...and not counted", len(S._HVG_RECOVERIES) == 3, S._HVG_RECOVERIES)
+
 # 12d. The rail never comes back -> cannot check -> latched.
 rig = Rig()
 setup(rig)
 rig.rail_back = None
-rig.after = [1050 * 16] * 3
+rig.after = [11.60] * 3
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
 check("rail did not come back -> latched, HV off again", r and r["action"] == "tripped"
@@ -367,7 +397,7 @@ def _rail_check(host, ch, on):
 
 
 S.stm32_hv_enable_set = _rail_check
-rig.after = [1050 * 16] * 3
+rig.after = [11.60] * 3
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
 check("VOLTAGE filament sent to its IDLE (1100 mA) before the HV came back",

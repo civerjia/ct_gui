@@ -133,6 +133,7 @@ from ._reads import *  # noqa: F401,F403,E402
 from ._recording import *  # noqa: F401,F403,E402
 from ._safety import *  # noqa: F401,F403,E402
 from . import _remote  # noqa: E402  (remote CTClient sessions; not star-imported)
+from . import _spellman_watch as SW  # noqa: E402
 from ._shared import *  # noqa: F401,F403,E402
 # (RECORD_DIR: see ct/paths.py)
 
@@ -2990,10 +2991,28 @@ def grid_sweep_once() -> list[dict]:
 # does not come down with every switch confirmed open, a MOSFET is conducting
 # that nothing can turn off, and the rails go off and stay off until a person
 # clears the latch.
+#
+# The baseline is NOT learned: it is what the loads on the emission rail draw
+# (the user, 2026-10-29). Every channel board carries 4 x 51k + 1N4007 + a
+# green LED (NCD0805G1) from the rail; every sub-board whose MOSFET conducts
+# adds 100k + 1N4007 + a red LED (NCD0805R1). So at rail voltage V
+#     expected = offset + boards * (|V| - 2.9) / 204k
+#     one switch on = (|V| - 2.35) / 100k            (1.95 mA at 197.8 V)
+# Measured 2026-10-29: 197.8 V -> 11.60 mA (model 11.56), 17.2 V -> 0.88
+# (0.94), 4.8 V -> 0.23 (0.21); focus on or off makes no difference. A
+# learned baseline cannot see a switch that was already on when the rail came
+# up -- it learns the fault (08:31 / 08:39 on 2026-10-27) -- and the STM32's
+# learned baseline wandered by 115 counts (~2 switches) over the morning.
 HV_GUARD_TICK_S = 1.0
-HV_GUARD_RISE_MA = 1.5          # one sub-board's diode path alone is ~1.95 mA
+HV_LOAD_BOARDS = int(os.environ.get("CT_HV_LOAD_BOARDS", "12"))   # channel boards on the rail
+HV_BOARD_LOAD_OHM = 4 * 51e3
+HV_SWITCH_LOAD_OHM = 100e3
+HV_BOARD_DROP_V = 2.9           # 1N4007 0.6 + green LED 2.3 V (meter diode range, 2026-10-29)
+HV_SWITCH_DROP_V = 2.35         # 1N4007 0.6 + red LED 1.75 V (same)
+HV_ADS_OFFSET_MA = 0.10         # what the ADS reads with the rail off (learned while off)
+HV_GUARD_SWITCH_FRAC = 0.5      # over the model by half a switch -> a switch is on
+HV_GUARD_LOW_FRAC = 0.5         # under it by half a board -> a board load is missing (warning)
 HV_GUARD_HOLD_S = 2.0           # sustained this long between pulses -> act (3 readings at 1 Hz)
-HV_GUARD_CLEARED_MA = 1.0       # back within this of the baseline -> it was a 595
 # After every switch is confirmed open: fresh reads back to back (each is one
 # STM32 single-shot scan of the ADS1115 through the ESP32, 0.1-0.35 s measured
 # 2026-10-27). Back under -> cleared at once; HIGH_N fresh reads still over ->
@@ -3001,18 +3020,10 @@ HV_GUARD_CLEARED_MA = 1.0       # back within this of the baseline -> it was a 5
 # read once -- too slow for a switch that is conducting.
 HV_GUARD_RECHECK_MAX_S = 0.8
 HV_GUARD_RECHECK_HIGH_N = 2
-HV_GUARD_BASE_WINDOW_S = 120.0  # baseline = lowest quiet reading this far back
-HV_GUARD_MIN_BASE_S = 10.0      # quiet history needed before it may act at all
+HV_GUARD_BASE_WINDOW_S = 120.0  # quiet readings kept this long (the slow turn-off check)
 HV_GUARD_AFTER_TRAIN_S = 1.5    # a sim train's last pulse is not "between pulses"
 HV_GUARD_SIM_RECENT_S = 30.0    # a sim started this recently -> the run is sim-driven
-HV_GUARD_FOCUS_TOL_V = 1.5      # the standing current follows focus: new focus, new baseline
 HV_GUARD_RAIL_ON_V = -50.0      # emission rail below this = on
-# Above this between pulses is wrong whatever the learned baseline says. The
-# rig's standing current is 10-13.6 mA (it follows focus); a rail turned on
-# with a switch already conducting would otherwise LEARN the fault as its
-# baseline -- 08:31 and 08:39 on 2026-10-27 (+10-12 mA for 2 min) were missed
-# that way in a replay. CT_HV_GUARD_ABS_MA to change it.
-HV_GUARD_ABS_MA = float(os.environ.get("CT_HV_GUARD_ABS_MA", "16.0"))
 HV_GUARD_HOT_RECENT_S = 300.0   # suspects: filaments hot within this
 HV_GUARD_STOP_RECENT_S = 15.0   # on a latched trip, filaments hot within this go to STOP
                                 # (60 s took FID 16, a minute cold and innocent, 2026-10-27 15:21)
@@ -3021,6 +3032,30 @@ _HV_GUARD = {"enabled": os.environ.get("CT_HV_GUARD", "1") != "0", "tripped": No
 _HV_GUARD_LOCK = threading.Lock()
 _HVG_HIST: list = []            # quiet (t, mA, focus_v) samples, oldest first
 _HVG_HIGH_SINCE: list = [None]  # monotonic start of the current rise, or None
+_HVG_OFFSET: list = []          # ADS mA with the rail off (the model's offset)
+_HVG_LOW = {"since": None, "warned": False}
+_HVG_LAST_MODEL: dict = {}      # the last rail-on comparison, for the snapshot
+
+
+def hv_load_model(emiss_v: float) -> dict:
+    """What the rail's loads draw at emiss_v (see the block comment above)."""
+    av = abs(float(emiss_v))
+    off = (sorted(_HVG_OFFSET)[len(_HVG_OFFSET) // 2] if _HVG_OFFSET else HV_ADS_OFFSET_MA)
+    board = max(0.0, av - HV_BOARD_DROP_V) / HV_BOARD_LOAD_OHM * 1000.0
+    switch = max(0.0, av - HV_SWITCH_DROP_V) / HV_SWITCH_LOAD_OHM * 1000.0
+    return {"expected_ma": off + HV_LOAD_BOARDS * board, "switch_ma": switch,
+            "board_ma": board, "offset_ma": off, "boards": HV_LOAD_BOARDS}
+
+
+def hv_load_excess(r: dict) -> dict:
+    """An ADS read against the model: excess mA and how many switches it is."""
+    m = hv_load_model(r["emiss_v"])
+    ex = float(r["emiss_i_ma"]) - m["expected_ma"]
+    return {**{k: round(x, 3) if isinstance(x, float) else x for k, x in m.items()},
+            "measured_ma": round(float(r["emiss_i_ma"]), 3), "emiss_v": r["emiss_v"],
+            "excess_ma": round(ex, 3),
+            "switches_on": round(ex / m["switch_ma"], 1) if m["switch_ma"] > 0 else None,
+            "limit_ma": round(m["expected_ma"] + HV_GUARD_SWITCH_FRAC * m["switch_ma"], 3)}
 
 
 def _hv_guard_quiet(now: float) -> bool:
@@ -3183,19 +3218,16 @@ def _hv_guard_wait_rail(host: str, pre_v: float | None) -> float | None:
     return None
 
 
-def _hv_guard_verify_counts(host: str) -> list:
-    """The STM32's own last window means (counts x 16), fresh: the same signal
-    and units as its trip baseline. last_x16 is updated every window, also
-    while it relearns after the rail came back."""
+def _hv_guard_verify_ads() -> list:
+    """Fresh ADS reads once the rail is back, each against the load model.
+    Not the STM32's window means: its learned baseline wandered by ~2
+    switches over a morning (2026-10-29)."""
     out = []
     for _ in range(HV_GUARD_VERIFY_READS):
         time.sleep(HV_GUARD_VERIFY_GAP_S)
-        try:
-            g = stm32_hv_guard(host)
-        except Exception:
-            g = {}
-        if g.get("ok") and g.get("last_x16"):
-            out.append(int(g["last_x16"]))
+        r = _hv_guard_read_fresh()
+        if r is not None and (r.get("emiss_v") or 0.0) <= HV_GUARD_RAIL_ON_V:
+            out.append(hv_load_excess(r))
     return out
 
 
@@ -3217,14 +3249,17 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
     1. every grid switch forced open (zeros + /SRCLR: works on a flipped 595
        whatever the 165 says);
     2. the STM32 latch cleared, the rails put back as they were (preflight);
-    3. once the emission rail is back, the STM32's window means (same signal,
-       same units as its trip baseline) within thr/2 of that baseline -> it
-       was a flip and it is fixed: WARNING, no heat touched, no latch;
+    3. once the emission rail is back, fresh ADS reads within half a switch
+       of what the loads draw (hv_load_model) -> it was a flip, or an arc,
+       and it is fixed: WARNING, no heat touched, no latch;
        still over -> a MOSFET is conducting that nothing can open: HV off
        again, filaments hot within 15 s to STOP, latched.
     More than HV_GUARD_RECOVER_MAX recoveries in HV_GUARD_RECOVER_WINDOW_S,
-    or the check cannot be made (rail does not come back, STM32 unreadable):
-    latched, no second HV ON."""
+    or the check cannot be made (rail does not come back, ADS unreadable):
+    latched, no second HV ON. A trip that came with a Spellman arc is the
+    arc's: an ordinary arc recovers by itself (the user, 2026-10-29), so it
+    is not counted against that limit -- on 2026-10-29 11:03-11:09 five
+    arcs tripped the STM32 and the third latched the rig."""
     suspects = _hv_guard_suspects(now)
     rails_before = dict(_HVG_RAILS)
     pre_v = _HVG_LAST_EMISS_V[0]
@@ -3236,7 +3271,6 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
     except Exception as exc:
         g = {"ok": False, "error": str(exc)}
     base_x16 = int(g.get("trip_base_x16") or 0)
-    thr_x16 = int(g.get("thr_counts") or 36) * 16
     rise_ma = ((int(g.get("trip_mean_x16") or 0) - base_x16) / 16.0 * STM32_MA_PER_COUNT
                if g.get("ok") and base_x16 else None)
     strays = _hv_guard_strays()                     # logged only (the 165 is not trusted)
@@ -3247,13 +3281,14 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
            "suspects": suspects, "forced_open": opened, "read_back_165": stray_txt or "all open",
            "rails_before": rails_before}
 
+    arc_from = now - HV_GUARD_TICK_S - STM32_TRIP_ARC_WINDOW_S
+    arc = _SPELL_WATCH.arc_near(arc_from, now)
+    rec["arc"] = arc
     _HVG_RECOVERIES[:] = [t for t in _HVG_RECOVERIES if now - t <= HV_GUARD_RECOVER_WINDOW_S]
     why_not = None
-    if len(_HVG_RECOVERIES) >= HV_GUARD_RECOVER_MAX:
+    if arc is None and len(_HVG_RECOVERIES) >= HV_GUARD_RECOVER_MAX:
         why_not = (f"{len(_HVG_RECOVERIES)} recoveries already in the last "
                    f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min")
-    elif not base_x16:
-        why_not = "no STM32 trip baseline to compare with"
     elif not rails_before.get("emission"):
         why_not = "the emission rail was not on before the trip"
     elif not all(opened.values()):
@@ -3293,28 +3328,39 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
         if restored.get("emission") is True:
             v_back = _hv_guard_wait_rail(host, pre_v)
             rec["rail_back_v"] = v_back
-            counts = _hv_guard_verify_counts(host) if v_back is not None else []
-            rec["after_counts"] = [round(c / 16.0, 1) for c in counts]
-            if counts:
-                over = sorted(counts)[len(counts) // 2] - base_x16
-                rec["after_over_baseline_ma"] = round(over / 16.0 * STM32_MA_PER_COUNT, 2)
-                verdict = "fixed" if over <= thr_x16 // 2 else "stuck"
+            xs = _hv_guard_verify_ads() if v_back is not None else []
+            if xs:
+                x = sorted(xs, key=lambda e: e["excess_ma"])[len(xs) // 2]
+                rec["after_model"] = x
+                rec["after_over_baseline_ma"] = x["excess_ma"]
+                verdict = "fixed" if x["excess_ma"] <= HV_GUARD_SWITCH_FRAC * x["switch_ma"] else "stuck"
             else:
                 why_not = ("the emission rail did not come back to "
                            f"{HV_GUARD_RAIL_BACK_FRAC:.0%} of {pre_v} V" if v_back is None
-                           else "the STM32 window means could not be read")
+                           else "the ADS could not be read")
         else:
             why_not = f"the HV could not be put back ({restored or clr.get('error')})"
 
     _HVG_CHECKING[0] = False
     if verdict == "fixed":
-        _HVG_RECOVERIES.append(now)
-        rec["message"] = (f"HV guard: the current was over its baseline with no pulse; every switch "
-                          f"was forced open and, with the HV back, the current is back at its "
-                          f"baseline ({rec['after_over_baseline_ma']:+.2f} mA) -- a 595 that flipped "
-                          f"by itself (165 read-back at the trip: {rec['read_back_165']}). No heating "
-                          f"touched. {len(_HVG_RECOVERIES)} such recovery(ies) in "
-                          f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min (latches after {HV_GUARD_RECOVER_MAX}).")
+        arc = arc or _SPELL_WATCH.arc_near(arc_from, time.monotonic())   # its reading may come late
+        rec["arc"] = arc
+        x = rec["after_model"]
+        back = (f"with the HV back the current is what the loads draw ({x['measured_ma']:.2f} mA, "
+                f"{x['excess_ma']:+.2f} mA against the model)")
+        if arc:
+            rec["message"] = (f"HV guard: the STM32 tripped on a Spellman arc ({arc['kv_before']:.1f} -> "
+                              f"{arc['min_kv']:.1f} kV, peak {arc['peak_ma']:.3f} mA); every switch was "
+                              f"forced open and {back}. Recovered by itself; not counted as a switch "
+                              f"fault (165 read-back at the trip: {rec['read_back_165']}). Heating that "
+                              f"was hot went to IDLE for the check.")
+        else:
+            _HVG_RECOVERIES.append(now)
+            rec["message"] = (f"HV guard: the current was over its baseline with no pulse; every switch "
+                              f"was forced open and {back} -- a 595 that flipped "
+                              f"by itself (165 read-back at the trip: {rec['read_back_165']}). No heating "
+                              f"touched. {len(_HVG_RECOVERIES)} such recovery(ies) in "
+                              f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min (latches after {HV_GUARD_RECOVER_MAX}).")
         _HVG_HIST.clear()
         log.warning("%s", rec["message"])
         _safety_record("hv_guard_recovered", rec)
@@ -3333,7 +3379,8 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
         stop, rec["stop_error"] = [], str(exc)
     rec.update(hv_off=off, heating_stopped=stop)
     cause = (f"with every switch forced open and the HV back, the current stayed "
-             f"{rec.get('after_over_baseline_ma', 0):+.2f} mA over its baseline -- a grid switch is "
+             f"{rec.get('after_over_baseline_ma', 0):+.2f} mA over what the loads draw (~"
+             f"{(rec.get('after_model') or {}).get('switches_on')} switch(es)) -- a grid switch is "
              f"conducting that cannot be turned off" if verdict == "stuck"
              else f"and it could not be checked ({why_not})")
     rec["message"] = (f"HV OFF by the HV guard: the emission current between pulses stayed "
@@ -3362,9 +3409,13 @@ def _hv_guard_suspects(now: float) -> list[int]:
 
 
 def hv_guard_tick(now: float | None = None) -> dict | None:
-    """One look at the emission current. Returns what it did (cleared / tripped)
-    or None. See the block comment above."""
+    """One look at the emission current (and the Spellman's verdicts). Returns
+    what it did (cleared / tripped / recovered / warning) or None. See the
+    block comment above."""
     now = time.monotonic() if now is None else now
+    sp = _spellman_tick(now)
+    if sp:
+        return sp
     if _HV_GUARD["tripped"]:
         return None
     vt = _vacuum_tick(now)
@@ -3379,8 +3430,12 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
         return None
     r = _hv_guard_read()
     if r is None or (r.get("emiss_v") or 0.0) > HV_GUARD_RAIL_ON_V:
-        _HVG_HIST.clear()               # rail off / unreadable: the baseline starts over
+        if r is not None and abs(r.get("emiss_v") or 0.0) < 5.0 and -0.5 < r["emiss_i_ma"] < 0.5:
+            _HVG_OFFSET.append(float(r["emiss_i_ma"]))     # rail off: the ADS's zero
+            del _HVG_OFFSET[:-31]
+        _HVG_HIST.clear()               # rail off / unreadable
         _HVG_HIGH_SINCE[0] = None
+        _HVG_LOW.update(since=None, warned=False)
         _TAIL["armed"] = False
         return None
     _HVG_LAST_EMISS_V[0] = float(r["emiss_v"])   # what "the rail is back" means after a trip
@@ -3388,19 +3443,20 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
     if tw:
         return tw
     if not _hv_guard_quiet(now):
-        _HVG_HIGH_SINCE[0] = None       # a pulse is not a rise; not baseline either
+        _HVG_HIGH_SINCE[0] = None       # a pulse is not a switch left on
+        _HVG_LOW["since"] = None
         return None
     ma, focus = float(r["emiss_i_ma"]), float(r.get("focus_v") or 0.0)
-    if _HVG_HIST and abs(focus - _HVG_HIST[-1][2]) > HV_GUARD_FOCUS_TOL_V:
-        _HVG_HIST.clear()
-        _HVG_HIGH_SINCE[0] = None
     _HVG_HIST.append((now, ma, focus))
     while _HVG_HIST and now - _HVG_HIST[0][0] > HV_GUARD_BASE_WINDOW_S:
         _HVG_HIST.pop(0)
-    base = (min(m for _, m, _f in _HVG_HIST)
-            if now - _HVG_HIST[0][0] >= HV_GUARD_MIN_BASE_S else None)
-    high = ma >= HV_GUARD_ABS_MA or (base is not None and ma >= base + HV_GUARD_RISE_MA)
-    if not high:
+    x = hv_load_excess(r)
+    _HVG_LAST_MODEL.clear()
+    _HVG_LAST_MODEL.update(x, at=now)
+    lw = _hv_guard_low_check(x, now)
+    if lw:
+        return lw
+    if x["excess_ma"] <= HV_GUARD_SWITCH_FRAC * x["switch_ma"]:
         _HVG_HIGH_SINCE[0] = None
         return None
     if _HVG_HIGH_SINCE[0] is None:
@@ -3408,43 +3464,87 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
     if now - _HVG_HIGH_SINCE[0] < HV_GUARD_HOLD_S:
         return None
     _HVG_HIGH_SINCE[0] = None
-    return _hv_guard_act(base, ma, focus, now)
+    return _hv_guard_act(x, focus, now)
 
 
-def _hv_guard_act(base: float | None, ma: float, focus: float, now: float) -> dict:
-    """base None: no baseline learned yet (tripped on HV_GUARD_ABS_MA); the
-    switches then count as fixed once the current is back under that ceiling
-    less one diode path."""
+def _hv_guard_low_check(x: dict, now: float) -> dict | None:
+    """Under the model by half a board for HOLD_S: a board's load is missing
+    (unplugged, open) or the model is off. Warned once per rail-on: it is
+    not dangerous, but it eats into the margin a stuck switch is seen by."""
+    if x["excess_ma"] >= -HV_GUARD_LOW_FRAC * x["board_ma"]:
+        _HVG_LOW["since"] = None
+        return None
+    if _HVG_LOW["since"] is None:
+        _HVG_LOW["since"] = now
+    if _HVG_LOW["warned"] or now - _HVG_LOW["since"] < HV_GUARD_HOLD_S:
+        return None
+    _HVG_LOW["warned"] = True
+    boards = round(-x["excess_ma"] / x["board_ma"], 1) if x["board_ma"] else None
+    rec = {**x, "message": (f"emission load low: {x['measured_ma']:.2f} mA at {x['emiss_v']} V, the "
+                            f"{x['boards']} channel boards should draw {x['expected_ma']:.2f} mA -- about "
+                            f"{boards} board load(s) missing (unplugged board / open load), or "
+                            f"CT_HV_LOAD_BOARDS is wrong. A stuck switch is still seen, with less margin.")}
+    log.warning("HV guard: %s", rec["message"])
+    _safety_record("emission_load_low", rec)
+    return {"action": "warning", **rec}
+
+
+def _hv_guard_act(x: dict, focus: float, now: float) -> dict:
+    """The current is over what the loads draw by half a switch or more:
+    force every switch open, re-read, and judge against the same model."""
     suspects = _hv_guard_suspects(now)
-    ok_below = (base + HV_GUARD_CLEARED_MA) if base is not None else (HV_GUARD_ABS_MA - HV_GUARD_RISE_MA)
-    log.warning("HV guard: emission %.2f mA between pulses (baseline %s, ceiling %.1f mA) -- "
-                "forcing every grid switch open (recently hot: %s)", ma,
-                "unknown" if base is None else f"{base:.2f} mA", HV_GUARD_ABS_MA, suspects)
+    log.warning("HV guard: emission %.2f mA between pulses, the loads draw %.2f mA at %s V "
+                "(+%.2f mA = ~%s switch(es) on) -- forcing every grid switch open (recently hot: %s)",
+                x["measured_ma"], x["expected_ma"], x["emiss_v"], x["excess_ma"], x["switches_on"], suspects)
     opened = _hv_guard_force_open_all()
     t0 = time.monotonic()
-    reads, highs, ma2 = [], 0, None
+    reads, highs, x2 = [], 0, None
     while True:
         r2 = _hv_guard_read_fresh()
-        if r2 is not None:
-            ma2 = float(r2["emiss_i_ma"])
-            reads.append(round(ma2, 2))
-            if ma2 < ok_below:
+        if r2 is not None and (r2.get("emiss_v") or 0.0) <= HV_GUARD_RAIL_ON_V:
+            x2 = hv_load_excess(r2)
+            reads.append(x2["measured_ma"])
+            if x2["excess_ma"] <= HV_GUARD_SWITCH_FRAC * x2["switch_ma"]:
                 break
             highs += 1
             if highs >= HV_GUARD_RECHECK_HIGH_N:
                 break
         if time.monotonic() - t0 >= HV_GUARD_RECHECK_MAX_S:
             break
-    rec = {"baseline_ma": None if base is None else round(base, 2), "emission_ma": round(ma, 2),
-           "after_force_open_ma": None if ma2 is None else round(ma2, 2),
-           "after_force_open_reads": reads,
+    rec = {"model": x, "emission_ma": x["measured_ma"], "expected_ma": x["expected_ma"],
+           "after_force_open_ma": None if x2 is None else x2["measured_ma"],
+           "after_force_open_reads": reads, "after_model": x2,
            "recheck_ms": round((time.monotonic() - t0) * 1000.0),
            "focus_v": focus, "suspects": suspects, "forced_open": opened}
-    if ma2 is not None and ma2 < ok_below:
+    if x2 is not None and x2["excess_ma"] <= HV_GUARD_SWITCH_FRAC * x2["switch_ma"]:
         _safety_record("hv_guard_cleared_by_force_open", rec)
         return {"action": "cleared", **rec}
-    # Still high (or unreadable) with every switch forced open: something is
+    # Still over (or unreadable) with every switch forced open: something is
     # conducting that the 595s cannot turn off. Rails off, latched.
+    off = _hv_rails_off()
+    rec["hv_off"] = off
+    try:
+        stop = _hv_guard_stop_hot(now)
+    except Exception as exc:
+        stop, rec["stop_error"] = [], str(exc)
+    rec["heating_stopped"] = stop
+    was = ("unreadable" if x2 is None else
+           f"{x2['measured_ma']:.2f} mA against the {x2['expected_ma']:.2f} mA the loads draw at "
+           f"{x2['emiss_v']} V (~{x2['switches_on']} switch(es) on)")
+    rec["message"] = (f"HV OFF: emission was still {was} with every grid switch "
+                      f"forced open -- a grid MOSFET is "
+                      f"conducting that cannot be turned off (recently hot filaments, most recent "
+                      f"first: {suspects}). Emission and focus switched off; heating set to STOP "
+                      f"for {stop or 'none (no filament was hot)'}; turning HV on is "
+                      f"refused until the latch is cleared (POST /api/hv-guard {{\"clear\": true}}).")
+    _hv_guard_latch(rec)
+    log.error("HV guard TRIPPED: %s", rec["message"])
+    _safety_record("hv_guard_tripped", rec)
+    return {"action": "tripped", **rec}
+
+
+def _hv_rails_off() -> dict:
+    """Emission and focus off at the STM32, 3 tries each."""
     link = CONTROLLERS.get(MASTER)
     host = link.host if link else None
     off = {}
@@ -3458,43 +3558,150 @@ def _hv_guard_act(base: float | None, ma: float, focus: float, now: float) -> di
             if res.get("ok"):
                 break
         off[ch] = bool(res and res.get("ok"))
-    rec["hv_off"] = off
-    try:
-        stop = _hv_guard_stop_hot(now)
-    except Exception as exc:
-        stop, rec["stop_error"] = [], str(exc)
-    rec["heating_stopped"] = stop
-    was = ("unreadable" if ma2 is None else f"{ma2:.2f} mA")
-    ref = (f"its {base:.2f} mA baseline" if base is not None else
-           f"the {HV_GUARD_ABS_MA:.1f} mA ceiling (no baseline yet)")
-    rec["message"] = (f"HV OFF: emission was still {was} against {ref} with every grid switch "
-                      f"forced open -- a grid MOSFET is "
-                      f"conducting that cannot be turned off (recently hot filaments, most recent "
-                      f"first: {suspects}). Emission and focus switched off; heating set to STOP "
-                      f"for {stop or 'none (no filament was hot)'}; turning HV on is "
-                      f"refused until the latch is cleared (POST /api/hv-guard {{\"clear\": true}}).")
+    return off
+
+
+def _hv_guard_latch(rec: dict) -> None:
     with _HV_GUARD_LOCK:
         _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                                 **rec}
     _HVG_HIST.clear()
-    log.error("HV guard TRIPPED: %s", rec["message"])
+
+
+# ── Spellman: arcs and over-current (see _spellman_watch) ────────────────────
+# The watch sees every reading as it arrives (the WebSocket thread); what it
+# decides is acted on here, in the guard loop, which it wakes at once.
+SPELLMAN_GUARD_STATE_PATH = STATE_DIR / "hv_guard.json"
+ARC_LOG_PATH = LOG_DIR / "arcs.jsonl"
+STM32_TRIP_ARC_WINDOW_S = 3.0   # an STM32 trip this close after an arc is the arc's
+
+
+def _spellman_trip_ma_load() -> float:
+    try:
+        v = float(json.loads(SPELLMAN_GUARD_STATE_PATH.read_text()).get("spellman_trip_ma"))
+        if SW.TRIP_MA_RANGE[0] <= v <= SW.TRIP_MA_RANGE[1]:
+            return v
+    except Exception:
+        pass
+    return float(os.environ.get("CT_SPELLMAN_TRIP_MA", SW.TRIP_MA_DEFAULT))
+
+
+_SPELL_WATCH = SW.SpellmanWatch(trip_ma=_spellman_trip_ma_load())
+_SPELL_ACTIONS: collections.deque = collections.deque()   # big_arc / over_current, for the loop
+_HVG_WAKE = threading.Event()
+
+
+def spellman_set_trip_ma(value, who: str = "?") -> dict:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"spellman_trip_ma must be a number in mA, got {value!r}"}
+    lo, hi = SW.TRIP_MA_RANGE
+    if not (lo <= v <= hi):
+        return {"ok": False, "error": f"spellman_trip_ma {v} out of range {lo}..{hi} mA -- nothing changed"}
+    old, _SPELL_WATCH.trip_ma = _SPELL_WATCH.trip_ma, v
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        SPELLMAN_GUARD_STATE_PATH.write_text(json.dumps({"spellman_trip_ma": v, "set_by": who}))
+    except OSError as exc:
+        log.warning("spellman_trip_ma not saved (%s)", exc)
+    log.warning("Spellman over-current threshold %.3f -> %.3f mA over baseline (by %s)", old, v, who)
+    return {"ok": True, "spellman_trip_ma": v, "was": old}
+
+
+def _spellman_events(events: list, now: float) -> None:
+    """From the WebSocket thread: record arcs; queue what must be acted on."""
+    for ev in events:
+        ev = dict(ev, at=datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                  age_s=round(now - ev["t"], 2))
+        if ev["kind"] in ("arc", "big_arc"):
+            with _SAFETY_LOCK:
+                ev["hot"] = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
+                                   if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+            with _SIM_LOCK:
+                ev["sim_running"] = bool(_SIM_STATE.get("running"))
+            try:
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                with open(ARC_LOG_PATH, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({k: v for k, v in ev.items() if k != "t"}) + "\n")
+            except OSError:
+                pass
+            if ev["kind"] == "arc":
+                log.info("Spellman arc: %.1f kV -> %.1f kV, peak %.3f mA, back in %s s%s (via %s)",
+                         ev["kv_before"], ev["min_kv"], ev["peak_ma"], ev.get("recovered_s"),
+                         f", settled at {ev['settled_kv']} kV" if "settled_kv" in ev else "", ev["via"])
+        if ev["kind"] in ("big_arc", "over_current"):
+            _SPELL_ACTIONS.append(ev)
+            _HVG_WAKE.set()
+
+
+def _spellman_tick(now: float) -> dict | None:
+    """Act on what the watch decided (a big arc / over-current): HV off,
+    every switch open, heating down, latched."""
+    _spellman_events(_SPELL_WATCH.poll(now), now)
+    out = None
+    while _SPELL_ACTIONS:
+        ev = _SPELL_ACTIONS.popleft()
+        if _HV_GUARD["tripped"] or not _HV_GUARD["enabled"]:
+            _safety_record("spellman_" + ev["kind"], {**ev, "acted": False,
+                                                      "why_not": "already tripped" if _HV_GUARD["tripped"]
+                                                      else "HV guard disabled"})
+            continue
+        out = _spellman_trip(ev, now)
+    return out
+
+
+def _spellman_trip(ev: dict, now: float) -> dict:
+    opened = _hv_guard_force_open_all()
+    off = _hv_rails_off()
+    rec = {"source": "spellman_" + ev["kind"], "spellman": ev, "forced_open": opened, "hv_off": off,
+           "suspects": _hv_guard_suspects(now)}
+    if ev["kind"] == "big_arc":
+        # IDLE, not STOP: IDLE keeps the vacuum (the rig's rule).
+        to_idle, no_idle = drop_hot_to_idle(now)
+        rec.update(to_idle=to_idle, to_sleep_no_idle_known=no_idle)
+        rec["message"] = (f"HV OFF: big arc on the Spellman -- {ev['kv_before']:.1f} kV fell to "
+                          f"{ev['min_kv']:.1f} kV and is still at {ev.get('kv_now')} kV after "
+                          f"{ev.get('down_s')} s (peak {ev['peak_ma']:.3f} mA"
+                          f"{', status ' + '/'.join(ev['status']) if ev['status'] else ''}). Every grid "
+                          f"switch opened, emission and focus off, heating back to IDLE for "
+                          f"{to_idle or 'none'}{f', SLEEP for {no_idle}' if no_idle else ''}. Check the "
+                          f"tube and the supply; HV ON is refused until the latch is cleared "
+                          f"(POST /api/hv-guard {{\"clear\": true}}).")
+    else:
+        try:
+            stop = _hv_guard_stop_hot(now)
+        except Exception as exc:
+            stop, rec["stop_error"] = [], str(exc)
+        rec["heating_stopped"] = stop
+        rec["message"] = (f"HV OFF: Spellman current {ev['ma']:.3f} mA stayed over its "
+                          f"{ev['baseline_ma']:.3f} mA baseline by more than {ev['trip_ma']} mA for "
+                          f"{ev['over_s']} s with no pulse -- something is emitting (a grid switch on, "
+                          f"recently hot filaments, most recent first: {rec['suspects']}). Every grid "
+                          f"switch opened, emission and focus off, heating set to STOP for "
+                          f"{stop or 'none (no filament was hot)'}; HV ON is refused until the latch is "
+                          f"cleared (POST /api/hv-guard {{\"clear\": true}}).")
+    _hv_guard_latch(rec)
+    log.error("HV guard TRIPPED (Spellman %s): %s", ev["kind"], rec["message"])
     _safety_record("hv_guard_tripped", rec)
     return {"action": "tripped", **rec}
 
 
 def hv_guard_snapshot() -> dict:
     now = time.monotonic()
-    base = min((m for _, m, _f in _HVG_HIST), default=None)
+    m = dict(_HVG_LAST_MODEL)
+    if m:
+        m["age_s"] = round(now - m.pop("at"), 1)
     return {"ok": True, "enabled": _HV_GUARD["enabled"], "tripped": _HV_GUARD["tripped"],
             "vacuum": vacuum_snapshot(), "hv_supply": hv_supply_snapshot(),
-            "baseline_ma": None if base is None else round(base, 2),
-            "baseline_span_s": round(now - _HVG_HIST[0][0], 1) if _HVG_HIST else 0.0,
-            "rise_ma": HV_GUARD_RISE_MA, "hold_s": HV_GUARD_HOLD_S, "ceiling_ma": HV_GUARD_ABS_MA}
+            "load_model": m or None, "spellman": _SPELL_WATCH.snapshot(now),
+            "switch_frac": HV_GUARD_SWITCH_FRAC, "hold_s": HV_GUARD_HOLD_S}
 
 
 def _hv_guard_loop() -> None:
     while not _STOPPING.is_set():          # see _safety_loop
-        time.sleep(HV_GUARD_TICK_S)
+        _HVG_WAKE.wait(HV_GUARD_TICK_S)    # a Spellman verdict wakes it at once
+        _HVG_WAKE.clear()
         try:
             hv_guard_tick()
         except Exception as exc:          # never let the guard die
@@ -3672,6 +3879,31 @@ def _spellman_on_message(m: dict, now: float) -> None:
                 series_add("vac", float(p))
         elif t == "lesker_status":
             _SPELL["lesker"] = m.get("data")
+    _spellman_watch_feed(m, now)
+
+
+def _spellman_watch_feed(m: dict, now: float) -> None:
+    """Every reading to the arc / over-current watch, outside _SPELL_LOCK."""
+    t, evs = m.get("type"), []
+    if t == "spellman_response":
+        cmd, data = m.get("cmd"), m.get("data")
+        v = _spellman_number(data)
+        if cmd == "GetkVMonitor" and v is not None:
+            evs = _SPELL_WATCH.feed_kv(now, v)
+        elif cmd == "GetmAMonitor" and v is not None:
+            evs = _SPELL_WATCH.feed_ma(now, v, _hv_guard_quiet(now))
+        elif cmd == "GetStatus" and isinstance(data, list):
+            evs = _SPELL_WATCH.feed_status(now, data)
+    elif t == "conditioning_point" and isinstance(m.get("data"), dict):
+        d = m["data"]
+        if d.get("arc"):
+            evs += _SPELL_WATCH.feed_status(now, [0, 0, 1])
+        if isinstance(d.get("measured_kv"), (int, float)):
+            evs += _SPELL_WATCH.feed_kv(now, float(d["measured_kv"]))
+        if isinstance(d.get("measured_mA"), (int, float)):
+            evs += _SPELL_WATCH.feed_ma(now, float(d["measured_mA"]), _hv_guard_quiet(now))
+    if evs:
+        _spellman_events(evs, now)
 
 
 def _spellman_loop() -> None:
@@ -5715,6 +5947,12 @@ class CtHandler(BaseHTTPRequestHandler):
                 # {"clear": true}: a person has dealt with the switch that would
                 # not turn off -- HV may come on again. {"enabled": bool}: switch
                 # the guard (it starts enabled; CT_HV_GUARD=0 at start-up).
+                # {"spellman_trip_ma": x}: the Spellman over-current threshold
+                # (mA over its quiet baseline, held > 1 s), kept across restarts.
+                if "spellman_trip_ma" in body:
+                    r = spellman_set_trip_ma(body["spellman_trip_ma"], self._client(body))
+                    if not r.get("ok"):
+                        return self._json(r, HTTPStatus.OK)
                 stm32_clear = None
                 if body.get("clear"):
                     link = CONTROLLERS.get(MASTER)
@@ -5736,6 +5974,7 @@ class CtHandler(BaseHTTPRequestHandler):
                                     else "DISABLED", self._client(body))
                 _HVG_HIST.clear()
                 _HVG_HIGH_SINCE[0] = None
+                _SPELL_WATCH.reset_over()
                 snap = hv_guard_snapshot()
                 if stm32_clear is not None:
                     snap["stm32_clear"] = stm32_clear

@@ -1,0 +1,225 @@
+"""backend: the Spellman 60 kV supply's arcs and over-current, from its
+read-only stream. Pure logic -- no I/O, no hardware; the HV guard acts on
+what it returns.
+
+control2's spellman_backend broadcasts GetStatus / GetkVMonitor /
+GetmAMonitor about 4 times a second (measured 2026-10-29: 0.22 s median).
+Nothing is ever sent to the supply: other programs drive it.
+
+What it looks like (2026-10-29 11:01-11:12, 60-65 kV, 22 arcs in 11 min):
+  ordinary arc   ONE reading with the kV at 2-40 kV and/or the mA at
+                 0.5-2.4 mA, the next reading back at the set voltage. The
+                 supply recovers by itself, so does this: it is recorded,
+                 nothing is switched.
+  big arc        the kV falls in one step and does NOT come back within
+                 BIG_ARC_S: HV guard trip, latched, a person clears it (the
+                 user, 2026-10-29).
+  over-current   the mA over its baseline by trip_ma for more than HOLD_S
+                 while nothing is pulsing: something is emitting that should
+                 not be (a grid switch on, a hot filament) -- HV guard trip.
+A ramp-down is not an arc: an arc opens only on a drop of more than 10 %
+AND ARC_KV_MIN_DROP kV between two consecutive readings.
+
+The mA baseline is learned all the time from quiet readings (no pulse, no
+arc) over BASE_WINDOW_S, never above BASE_CAP_MA: a fault present from the
+start may not be learned as normal.
+"""
+from __future__ import annotations
+
+import collections
+import statistics
+import threading
+
+ARC_KV_FRAC = 0.90       # a reading under this fraction of the one before = an arc starts ...
+ARC_KV_MIN_DROP = 3.0    # ... and at least this many kV under it (a ramp near 0 kV
+                         # falls 10 % per step; the 10-29 arcs fell 20-63 kV)
+ARC_BACK_FRAC = 0.95     # back to this fraction of the kV before it = recovered
+BIG_ARC_KV_FRAC = 0.50   # still under this fraction after BIG_ARC_S = big arc
+BIG_ARC_S = 5.0
+ARC_MA = 1.0             # one quiet reading this far over the baseline = an arc (kV dip missed)
+KV_ON = 5.0              # under this the supply is off: no arcs to see
+HOLD_S = 1.0             # over-current: over the threshold this long
+GAP_S = 2.0              # readings further apart than this are not "continuous"
+BASE_WINDOW_S = 60.0
+BASE_CAP_MA = 0.2        # the learned baseline is never taken above this
+TRIP_MA_DEFAULT = 0.3
+TRIP_MA_RANGE = (0.05, 10.0)
+ARCS_KEPT = 500
+
+# GetStatus bit positions, as spellman_backend reads them (_status_*_active).
+STATUS_BITS = {2: "arc", 4: "over_current", 8: "system_fault"}
+
+
+def status_flags(bits) -> list[str]:
+    """Names of the alarm bits set in a GetStatus list."""
+    if not isinstance(bits, (list, tuple)):
+        return []
+    return [name for i, name in sorted(STATUS_BITS.items()) if i < len(bits) and bits[i]]
+
+
+class SpellmanWatch:
+    """Feed it readings in arrival order (monotonic seconds); each feed
+    returns the events it closed: dicts with "kind" "arc" | "big_arc" |
+    "over_current". Thread-safe."""
+
+    def __init__(self, trip_ma: float = TRIP_MA_DEFAULT):
+        self.trip_ma = float(trip_ma)
+        self._lock = threading.Lock()
+        self._base = collections.deque()          # (t, mA) quiet, no arc
+        self._arcs = collections.deque(maxlen=ARCS_KEPT)
+        self._arc = None                          # the open arc, or None
+        self._kv = None                           # (t, kV) last reading
+        self._ma = None                           # (t, mA) last reading
+        self._over_since = None
+        self._over_fired = False
+        self._last_ma_t = None
+
+    # ── readings ────────────────────────────────────────────────────────────
+    def feed_kv(self, t: float, kv: float) -> list[dict]:
+        with self._lock:
+            prev = self._kv
+            self._kv = (t, kv)
+            out = self._advance(t)
+            if self._arc is not None:
+                a = self._arc
+                a["min_kv"] = min(a["min_kv"], kv)
+                if kv >= ARC_BACK_FRAC * a["kv_before"]:
+                    out.append(self._close(t, "arc"))
+                return out
+            if prev is not None and prev[1] >= KV_ON and kv < ARC_KV_FRAC * prev[1] \
+                    and prev[1] - kv >= ARC_KV_MIN_DROP and t - prev[0] <= GAP_S:
+                self._open(t, "kv", kv_before=prev[1], min_kv=kv)
+            if kv < KV_ON:
+                self._base.clear()                # off: a new baseline when it is back
+            return out
+
+    def feed_ma(self, t: float, ma: float, quiet: bool) -> list[dict]:
+        with self._lock:
+            gap = self._last_ma_t is not None and t - self._last_ma_t > GAP_S
+            self._last_ma_t = t
+            self._ma = (t, ma)                    # first: it is what closes an mA spike
+            out = self._advance(t)
+            base = self._baseline(t)
+            if self._arc is not None:
+                self._arc["peak_ma"] = max(self._arc["peak_ma"], ma)
+                self._over_since, self._over_fired = None, False   # an arc's mA is the arc's
+                return out
+            if not quiet or gap:
+                self._over_since, self._over_fired = None, False   # a pulse is not over-current
+                if not quiet:
+                    return out
+            if ma - base >= ARC_MA and self._over_since is None and self._kv is not None \
+                    and self._kv[1] >= KV_ON:
+                # One spike: an arc whose kV dip fell between readings. If it
+                # stays up it is over-current instead (the next reading
+                # closes the arc only once the mA is back).
+                self._open(t, "ma", kv_before=self._kv[1], min_kv=self._kv[1], peak_ma=ma)
+                return out
+            if ma > base + self.trip_ma:
+                if self._over_since is None:
+                    self._over_since = t
+                if t - self._over_since >= HOLD_S and not self._over_fired:
+                    self._over_fired = True
+                    out.append({"kind": "over_current", "t": t, "ma": round(ma, 4),
+                                "baseline_ma": round(base, 4), "trip_ma": self.trip_ma,
+                                "over_s": round(t - self._over_since, 2),
+                                "kv": None if self._kv is None else round(self._kv[1], 2)})
+                return out
+            self._over_since, self._over_fired = None, False
+            self._base.append((t, ma))
+            while self._base and t - self._base[0][0] > BASE_WINDOW_S:
+                self._base.popleft()
+            return out
+
+    def feed_status(self, t: float, bits) -> list[dict]:
+        flags = status_flags(bits)
+        with self._lock:
+            out = self._advance(t)
+            if self._arc is not None:
+                for f in flags:
+                    if f not in self._arc["status"]:
+                        self._arc["status"].append(f)
+            elif "arc" in flags and self._kv is not None and self._kv[1] >= KV_ON:
+                self._open(t, "status", kv_before=self._kv[1], min_kv=self._kv[1])
+                self._arc["status"] = flags
+            return out
+
+    def poll(self, now: float) -> list[dict]:
+        """Close what time alone closes (a big arc with the readings stopped)."""
+        with self._lock:
+            return self._advance(now)
+
+    # ── internals (lock held) ───────────────────────────────────────────────
+    def _open(self, t, via, kv_before, min_kv, peak_ma=None):
+        self._arc = {"t0": t, "via": via, "kv_before": kv_before, "min_kv": min_kv,
+                     "peak_ma": peak_ma if peak_ma is not None else (self._ma[1] if self._ma else 0.0),
+                     "status": []}
+
+    def _close(self, t, kind):
+        a, self._arc = self._arc, None
+        ev = {"kind": kind, "t": a["t0"], "via": a["via"], "kv_before": round(a["kv_before"], 2),
+              "min_kv": round(a["min_kv"], 2), "peak_ma": round(a["peak_ma"], 4),
+              "status": a["status"]}
+        if kind == "arc":
+            ev["recovered_s"] = round(t - a["t0"], 2)
+            kv_now = self._kv[1] if self._kv else None
+            if kv_now is not None and kv_now < ARC_BACK_FRAC * a["kv_before"]:
+                ev["settled_kv"] = round(kv_now, 2)
+        else:
+            ev["down_s"] = round(t - a["t0"], 2)
+            ev["kv_now"] = None if self._kv is None else round(self._kv[1], 2)
+        self._arcs.append(ev)
+        return ev
+
+    def _advance(self, t):
+        a = self._arc
+        if a is None:
+            return []
+        if a["via"] == "ma" and self._ma is not None and self._ma[0] > a["t0"]:
+            # The reading after the spike: back under -> it was an arc.
+            if self._ma[1] - self._baseline(t) < ARC_MA:
+                return [self._close(t, "arc")]
+            # Still up: not a spike. Hand it to the over-current check.
+            self._arc = None
+            self._over_since = a["t0"]
+            return []
+        if a["via"] == "status" and self._kv is not None and self._kv[0] > a["t0"] \
+                and self._kv[1] >= ARC_BACK_FRAC * a["kv_before"]:
+            return [self._close(t, "arc")]
+        if t - a["t0"] < BIG_ARC_S:
+            return []
+        kv_now = self._kv[1] if self._kv else 0.0
+        if kv_now < BIG_ARC_KV_FRAC * a["kv_before"]:
+            return [self._close(t, "big_arc")]
+        return [self._close(t, "arc")]            # came part way back and stayed: recorded, settled_kv
+
+    def _baseline(self, t):
+        vals = [m for tt, m in self._base if t - tt <= BASE_WINDOW_S]
+        return min(statistics.median(vals), BASE_CAP_MA) if vals else 0.0
+
+    # ── queries ─────────────────────────────────────────────────────────────
+    def arc_near(self, t_from: float, t_to: float):
+        """The first arc that started in [t_from, t_to] (open or closed), or None."""
+        with self._lock:
+            if self._arc is not None and t_from <= self._arc["t0"] <= t_to:
+                return dict(self._arc, kind="arc (open)")
+            for ev in self._arcs:
+                if t_from <= ev["t"] <= t_to:
+                    return dict(ev)
+        return None
+
+    def reset_over(self):
+        with self._lock:
+            self._over_since, self._over_fired = None, False
+
+    def snapshot(self, now: float) -> dict:
+        with self._lock:
+            arcs = [ev for ev in self._arcs if now - ev["t"] <= 600.0]
+            return {"baseline_ma": round(self._baseline(now), 4), "trip_ma": self.trip_ma,
+                    "hold_s": HOLD_S, "over_s": None if self._over_since is None
+                    else round(now - self._over_since, 2),
+                    "arc_open": self._arc is not None,
+                    "arcs_10min": sum(1 for ev in arcs if ev["kind"] == "arc"),
+                    "big_arcs_10min": sum(1 for ev in arcs if ev["kind"] == "big_arc"),
+                    "last_arc": dict(self._arcs[-1], age_s=round(now - self._arcs[-1]["t"], 1))
+                    if self._arcs else None}

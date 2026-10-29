@@ -2384,7 +2384,7 @@ function wireSupplyMonitor() {
   const set = (ids, text, cls, title) => {
     for (const id of ids) forMirrored(id, (e) => {
       e.textContent = text;
-      e.classList.remove('bad', 'stale');
+      e.classList.remove('bad', 'stale', 'warn');
       if (cls) e.classList.add(cls);
       if (title !== undefined) e.title = title;
     });
@@ -2415,7 +2415,15 @@ function wireSupplyMonitor() {
       forMirrored('hvGuardMsg', (e) => { e.hidden = false; e.textContent = (t.at ? t.at + ' — ' : '') + (t.message || 'HV guard tripped'); });
       forMirrored('hvGuardClear', (e) => { e.hidden = false; });
     } else {
-      set(['hvGuardState'], g.enabled === false ? 'off' : 'armed', g.enabled === false ? 'stale' : null);
+      const sp = g.spellman || {}, lm = g.load_model;
+      const arcs = (sp.arcs_10min || 0) + (sp.big_arcs_10min || 0);
+      const tip = [lm ? `emission ${(+lm.measured_ma).toFixed(2)} mA, loads draw ${(+lm.expected_ma).toFixed(2)} mA ` +
+                        `at ${lm.emiss_v} V (${lm.excess_ma >= 0 ? '+' : ''}${(+lm.excess_ma).toFixed(2)} mA; one switch = ` +
+                        `${(+lm.switch_ma).toFixed(2)} mA)` : 'emission rail off',
+                   `Spellman baseline ${sp.baseline_ma ?? '?'} mA, trips at +${sp.trip_ma ?? '?'} mA held ${sp.hold_s ?? 1} s`,
+                   arcs ? `${arcs} arc(s) in 10 min; last ${sp.last_arc ? sp.last_arc.kv_before + ' → ' + sp.last_arc.min_kv + ' kV, ' + sp.last_arc.age_s + ' s ago' : ''}` : 'no arc in 10 min'].join('\n');
+      set(['hvGuardState'], g.enabled === false ? 'off' : ('armed' + (arcs ? ` · ${arcs} arc${arcs > 1 ? 's' : ''}/10 min` : '')),
+          g.enabled === false ? 'stale' : (arcs ? 'warn' : null), tip);
       forMirrored('hvGuardMsg', (e) => { e.hidden = true; });
       forMirrored('hvGuardClear', (e) => { e.hidden = true; });
     }
