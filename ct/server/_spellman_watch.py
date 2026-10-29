@@ -14,7 +14,7 @@ What it looks like (2026-10-29 11:01-11:12, 60-65 kV, 22 arcs in 11 min):
   big arc        the kV falls in one step and does NOT come back within
                  BIG_ARC_S: HV guard trip, latched, a person clears it (the
                  user, 2026-10-29).
-  over-current   the mA over its baseline by trip_ma for more than HOLD_S
+  over-current   the mA over mean + k sigma of its quiet readings for more than HOLD_S
                  while nothing is pulsing: something is emitting that should
                  not be (a grid switch on, a hot filament) -- HV guard trip.
 A ramp-down is not an arc: an arc opens only on a drop of more than 10 %
@@ -45,8 +45,15 @@ HOLD_S = 1.0             # over-current: over the threshold this long
 GAP_S = 2.0              # readings further apart than this are not "continuous"
 BASE_WINDOW_S = 60.0
 BASE_CAP_MA = 0.2        # the learned baseline is never taken above this
-TRIP_MA_DEFAULT = 0.3
-TRIP_MA_RANGE = (0.05, 10.0)
+# Over-current threshold = mean + k * sigma of the quiet readings over
+# BASE_WINDOW_S. Measured 2026-10-29 at 60-65 kV: mean 0.034-0.037 mA, sigma
+# 0.036-0.043 mA in every 60 s window (readings in 0.0098 mA steps, skewed:
+# median 0.02, p99 0.13 -- 3 sigma is about the 1 % point, hence k = 5).
+TRIP_SIGMA_DEFAULT = 5.0
+TRIP_SIGMA_RANGE = (2.0, 20.0)
+SIGMA_FLOOR_MA = 0.02    # ~2 steps: all-zero readings (low kV) must not make sigma 0
+SIGMA_CAP_MA = 0.1       # a noisy fault may not widen the threshold past this
+MIN_BASE_N = 20          # fewer quiet readings: the floor sigma, baseline 0
 ARCS_KEPT = 500
 
 # GetStatus: 17 bits, in the order control2's spellman.html labels them.
@@ -80,8 +87,8 @@ class SpellmanWatch:
     returns the events it closed: dicts with "kind" "arc" | "big_arc" |
     "over_current". Thread-safe."""
 
-    def __init__(self, trip_ma: float = TRIP_MA_DEFAULT):
-        self.trip_ma = float(trip_ma)
+    def __init__(self, trip_sigma: float = TRIP_SIGMA_DEFAULT):
+        self.trip_sigma = float(trip_sigma)
         self._lock = threading.Lock()
         self._base = collections.deque()          # (t, mA) quiet, no arc
         self._arcs = collections.deque(maxlen=ARCS_KEPT)
@@ -124,7 +131,8 @@ class SpellmanWatch:
             self._last_ma_t = t
             self._ma = (t, ma)                    # first: it is what closes an mA spike
             out = self._advance(t)
-            base = self._baseline(t)
+            base, sigma = self._stats(t)
+            thr = base + self.trip_sigma * sigma
             if self._arc is not None:
                 self._arc["peak_ma"] = max(self._arc["peak_ma"], ma)
                 self._over_since, self._over_fired = None, False   # an arc's mA is the arc's
@@ -140,13 +148,14 @@ class SpellmanWatch:
                 # closes the arc only once the mA is back).
                 self._open(t, "ma", kv_before=self._kv[1], min_kv=self._kv[1], peak_ma=ma)
                 return out
-            if ma > base + self.trip_ma:
+            if ma > thr:
                 if self._over_since is None:
                     self._over_since = t
                 if t - self._over_since >= HOLD_S and not self._over_fired:
                     self._over_fired = True
                     out.append({"kind": "over_current", "t": t, "ma": round(ma, 4),
-                                "baseline_ma": round(base, 4), "trip_ma": self.trip_ma,
+                                "baseline_ma": round(base, 4), "sigma_ma": round(sigma, 4),
+                                "k": self.trip_sigma, "threshold_ma": round(thr, 4),
                                 "over_s": round(t - self._over_since, 2),
                                 "kv": None if self._kv is None else round(self._kv[1], 2)})
                 return out
@@ -254,9 +263,16 @@ class SpellmanWatch:
             return [self._close(t, "big_arc")]
         return [self._close(t, "arc")]            # came part way back and stayed: recorded, settled_kv
 
-    def _baseline(self, t):
+    def _stats(self, t):
+        """(baseline mean, sigma) of the quiet readings, both bounded."""
         vals = [m for tt, m in self._base if t - tt <= BASE_WINDOW_S]
-        return min(statistics.median(vals), BASE_CAP_MA) if vals else 0.0
+        if len(vals) < MIN_BASE_N:
+            return (min(statistics.mean(vals), BASE_CAP_MA) if vals else 0.0), SIGMA_FLOOR_MA
+        return (min(statistics.mean(vals), BASE_CAP_MA),
+                min(max(statistics.pstdev(vals), SIGMA_FLOOR_MA), SIGMA_CAP_MA))
+
+    def _baseline(self, t):
+        return self._stats(t)[0]
 
     # ── queries ─────────────────────────────────────────────────────────────
     def arc_near(self, t_from: float, t_to: float):
@@ -303,7 +319,9 @@ class SpellmanWatch:
     def snapshot(self, now: float) -> dict:
         with self._lock:
             arcs = [ev for ev in self._arcs if now - ev["t"] <= 600.0]
-            return {"baseline_ma": round(self._baseline(now), 4), "trip_ma": self.trip_ma,
+            base, sigma = self._stats(now)
+            return {"baseline_ma": round(base, 4), "sigma_ma": round(sigma, 4), "k": self.trip_sigma,
+                    "threshold_ma": round(base + self.trip_sigma * sigma, 4),
                     "hold_s": HOLD_S, "over_s": None if self._over_since is None
                     else round(now - self._over_since, 2),
                     "arc_open": self._arc is not None, "alarms": list(self._status_flags),

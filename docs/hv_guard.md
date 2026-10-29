@@ -81,7 +81,7 @@ control2's `spellman_backend` broadcasts kV, mA and GetStatus about 4 times a se
 |---|---|---|
 | ordinary arc | one reading (sometimes two) with the kV down by more than 10 % and 3 kV and/or an mA spike, then back to 95 % | Recorded in `logs/arcs.jsonl` and in the backend log. The supply recovers by itself, so nothing is switched. |
 | big arc (auto-recovers) | the kV falls in one step, and a reading taken at least 5 s later is still under 50 % (a stale reading never counts: `spellman_backend` pauses its monitor while its conditioning handles an arc, which caused a false trip at 11:36 on 2026-10-29; with no reading for 30 s the event is recorded as unknown) | Trip: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Back on by itself once the Spellman has been stable for 10 s. Heating stays at IDLE. |
-| over-current | between pulses, the mA is over its baseline by `spellman_trip_ma` for more than 1 s | Trip, latched: switches open, HV off, filaments hot within 15 s to STOP. |
+| over-current | between pulses, the mA is over mean + 5σ of its quiet readings for more than 1 s | Trip, latched: switches open, HV off, filaments hot within 15 s to STOP. |
 
 ### GetStatus
 
@@ -108,7 +108,15 @@ A ramp-down (about 1 kV per reading) is never an arc. The GetStatus arc bit coun
 
 The mA baseline is the median of quiet readings over the last 60 s, with arcs and pulses left out. It is capped at 0.2 mA, so a fault present from the start is not learned as normal.
 
-`spellman_trip_ma` defaults to 0.3 mA (`CT_SPELLMAN_TRIP_MA`). It can be set with `POST /api/hv-guard {"spellman_trip_ma": x}`, and it is kept across restarts.
+The over-current threshold is statistical: **mean + k·σ** of the quiet readings over the last 60 s. Quiet means no arc and no pulse.
+
+- k defaults to 5. Set it with `CT_SPELLMAN_TRIP_SIGMA` or `POST /api/hv-guard {"spellman_trip_sigma": k}` (range 2–20); it is kept across restarts.
+- Measured 2026-10-29 at 60–65 kV: mean 0.034–0.037 mA, σ 0.036–0.043 mA in every 60 s window, so the threshold is about 0.24 mA.
+- The readings come in 0.0098 mA steps and are skewed (median 0.02 mA, p99 0.13 mA). 3σ is about the 1 % point, so k = 3 would be too tight.
+- σ has a floor of 0.02 mA, so all-zero readings at low kV cannot make the threshold zero, and a cap of 0.1 mA. The mean is capped at 0.2 mA.
+- Over readings are never learned. A current already high when the watch starts trips after 1 s.
+
+Replayed on 1 h 20 min of real readings: no false over-current.
 
 Replay of 2026-10-29 11:01–11:12 (60–65 kV): 22 arcs, all ordinary, no over-current.
 

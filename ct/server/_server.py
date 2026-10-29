@@ -3580,37 +3580,37 @@ ARC_LOG_PATH = LOG_DIR / "arcs.jsonl"
 STM32_TRIP_ARC_WINDOW_S = 3.0   # an STM32 trip this close after an arc is the arc's
 
 
-def _spellman_trip_ma_load() -> float:
+def _spellman_trip_sigma_load() -> float:
     try:
-        v = float(json.loads(SPELLMAN_GUARD_STATE_PATH.read_text()).get("spellman_trip_ma"))
-        if SW.TRIP_MA_RANGE[0] <= v <= SW.TRIP_MA_RANGE[1]:
+        v = float(json.loads(SPELLMAN_GUARD_STATE_PATH.read_text()).get("spellman_trip_sigma"))
+        if SW.TRIP_SIGMA_RANGE[0] <= v <= SW.TRIP_SIGMA_RANGE[1]:
             return v
     except Exception:
         pass
-    return float(os.environ.get("CT_SPELLMAN_TRIP_MA", SW.TRIP_MA_DEFAULT))
+    return float(os.environ.get("CT_SPELLMAN_TRIP_SIGMA", SW.TRIP_SIGMA_DEFAULT))
 
 
-_SPELL_WATCH = SW.SpellmanWatch(trip_ma=_spellman_trip_ma_load())
+_SPELL_WATCH = SW.SpellmanWatch(trip_sigma=_spellman_trip_sigma_load())
 _SPELL_ACTIONS: collections.deque = collections.deque()   # big_arc / over_current, for the loop
 _HVG_WAKE = threading.Event()
 
 
-def spellman_set_trip_ma(value, who: str = "?") -> dict:
+def spellman_set_trip_sigma(value, who: str = "?") -> dict:
     try:
         v = float(value)
     except (TypeError, ValueError):
-        return {"ok": False, "error": f"spellman_trip_ma must be a number in mA, got {value!r}"}
-    lo, hi = SW.TRIP_MA_RANGE
+        return {"ok": False, "error": f"spellman_trip_sigma must be a number (k in mean + k sigma), got {value!r}"}
+    lo, hi = SW.TRIP_SIGMA_RANGE
     if not (lo <= v <= hi):
-        return {"ok": False, "error": f"spellman_trip_ma {v} out of range {lo}..{hi} mA -- nothing changed"}
-    old, _SPELL_WATCH.trip_ma = _SPELL_WATCH.trip_ma, v
+        return {"ok": False, "error": f"spellman_trip_sigma {v} out of range {lo:g}..{hi:g} -- nothing changed"}
+    old, _SPELL_WATCH.trip_sigma = _SPELL_WATCH.trip_sigma, v
     try:
         STATE_DIR.mkdir(exist_ok=True)
-        SPELLMAN_GUARD_STATE_PATH.write_text(json.dumps({"spellman_trip_ma": v, "set_by": who}))
+        SPELLMAN_GUARD_STATE_PATH.write_text(json.dumps({"spellman_trip_sigma": v, "set_by": who}))
     except OSError as exc:
-        log.warning("spellman_trip_ma not saved (%s)", exc)
-    log.warning("Spellman over-current threshold %.3f -> %.3f mA over baseline (by %s)", old, v, who)
-    return {"ok": True, "spellman_trip_ma": v, "was": old}
+        log.warning("spellman_trip_sigma not saved (%s)", exc)
+    log.warning("Spellman over-current threshold mean + %g sigma -> + %g sigma (by %s)", old, v, who)
+    return {"ok": True, "spellman_trip_sigma": v, "was": old}
 
 
 def _spellman_events(events: list, now: float) -> None:
@@ -3701,7 +3701,8 @@ def _spellman_trip(ev: dict, now: float) -> dict:
             stop, rec["stop_error"] = [], str(exc)
         rec["heating_stopped"] = stop
         rec["message"] = (f"HV OFF: Spellman current {ev['ma']:.3f} mA stayed over its "
-                          f"{ev['baseline_ma']:.3f} mA baseline by more than {ev['trip_ma']} mA for "
+                          f"{ev['baseline_ma']:.3f} mA baseline past {ev['threshold_ma']:.3f} mA (+{ev['k']:g} sigma, "
+                          f"sigma {ev['sigma_ma']:.3f} mA) for "
                           f"{ev['over_s']} s with no pulse -- something is emitting (a grid switch on, "
                           f"recently hot filaments, most recent first: {rec['suspects']}). Every grid "
                           f"switch opened, emission and focus off, heating set to STOP for "
@@ -6139,10 +6140,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 # {"clear": true}: a person has dealt with the switch that would
                 # not turn off -- HV may come on again. {"enabled": bool}: switch
                 # the guard (it starts enabled; CT_HV_GUARD=0 at start-up).
-                # {"spellman_trip_ma": x}: the Spellman over-current threshold
-                # (mA over its quiet baseline, held > 1 s), kept across restarts.
-                if "spellman_trip_ma" in body:
-                    r = spellman_set_trip_ma(body["spellman_trip_ma"], self._client(body))
+                # {"spellman_trip_sigma": k}: the Spellman over-current threshold
+                # (mean + k sigma of its quiet readings, held > 1 s), kept across restarts.
+                if "spellman_trip_sigma" in body:
+                    r = spellman_set_trip_sigma(body["spellman_trip_sigma"], self._client(body))
                     if not r.get("ok"):
                         return self._json(r, HTTPStatus.OK)
                 stm32_clear = None

@@ -156,8 +156,8 @@ ev = w.feed_arc_flag(t + 0.1) + feed(w, t + 0.2, [65.5])[0]
 check("conditioning arc flag -> one arc, HV On untouched", [e["kind"] for e in ev] == ["arc"]
       and w.snapshot(t + 1)["hv_on"] is True, (ev, w.snapshot(t + 1)))
 
-# Over-current: quiet, over baseline by trip_ma for > 1 s.
-w = SW.SpellmanWatch(trip_ma=0.3)
+# Over-current: quiet, over mean + 5 sigma for > 1 s (flat 0.02 mA: sigma at its floor).
+w = SW.SpellmanWatch()
 ev, t = feed(w, 0.0, [60.2] * 100)
 ev, t = feed(w, t, [60.2] * 4, [0.5] * 4)
 check("0.5 mA for 0.7 s -> not yet", ev == [], ev)
@@ -169,18 +169,18 @@ check("...not repeated while it stays over", ev == [], ev)
 check("...and the over readings were not learned", w.snapshot(t)["baseline_ma"] < 0.05, w.snapshot(t))
 
 # Pulses (not quiet): never over-current, never baseline.
-w = SW.SpellmanWatch(trip_ma=0.3)
+w = SW.SpellmanWatch()
 ev, t = feed(w, 0.0, [60.2] * 100)
 ev, t = feed(w, t, [60.2] * 20, [0.8] * 20, quiet=False)
 check("a pulse train's mA -> nothing", ev == [] and w.snapshot(t)["baseline_ma"] < 0.05, ev)
 
-# A fault there from the start may not become the baseline.
-w = SW.SpellmanWatch(trip_ma=0.3)
-ev, t = feed(w, 0.0, [60.2] * 6, [0.25] * 6)
-check("baseline capped at %.1f mA" % SW.BASE_CAP_MA, w.snapshot(t)["baseline_ma"] == SW.BASE_CAP_MA,
-      w.snapshot(t))
-ev, t = feed(w, t, [60.2] * 6, [0.6] * 6)
-check("...so 0.6 mA still trips", [e["kind"] for e in ev] == ["over_current"], ev)
+# A fault there from the start may not become the baseline: with no quiet
+# history the threshold is 0 + 5 x the sigma floor, and over readings are
+# never learned.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [60.2] * 8, [0.25] * 8)
+check("0.25 mA from the very start -> over_current, not learned", [e["kind"] for e in ev] == ["over_current"]
+      and w.snapshot(t)["baseline_ma"] == 0.0, (ev, w.snapshot(t)))
 
 # ── the server acts on it ───────────────────────────────────────────────────
 
@@ -197,7 +197,7 @@ class _Link:
 def setup():
     rig = {"forced": 0, "rails": [], "fallback": [], "records": []}
     S._HV_GUARD.update(enabled=True, tripped=None)
-    S._SPELL_WATCH = SW.SpellmanWatch(trip_ma=0.3)
+    S._SPELL_WATCH = SW.SpellmanWatch()
     S._SPELL_ACTIONS.clear()
     S.CONTROLLERS.clear()
     S.CONTROLLERS.update({1: _Link(), 2: _Link()})
@@ -354,11 +354,31 @@ check("over-current -> stays latched however stable (a person handles it)", r is
       and S._HV_GUARD["tripped"] and not S._HV_GUARD["tripped"]["auto_recover"], S._HV_GUARD["tripped"])
 
 # The threshold is settable and kept.
-r = S.spellman_set_trip_ma(0.5, "test")
-check("spellman_trip_ma set -> used, saved", r["ok"] and S._SPELL_WATCH.trip_ma == 0.5
-      and S._spellman_trip_ma_load() == 0.5, r)
-check("...nonsense refused, nothing changed", not S.spellman_set_trip_ma(-1, "t")["ok"]
-      and not S.spellman_set_trip_ma("x", "t")["ok"] and S._SPELL_WATCH.trip_ma == 0.5)
+r = S.spellman_set_trip_sigma(4, "test")
+check("spellman_trip_sigma set -> used, saved", r["ok"] and S._SPELL_WATCH.trip_sigma == 4
+      and S._spellman_trip_sigma_load() == 4, r)
+check("...nonsense refused, nothing changed", not S.spellman_set_trip_sigma(0.5, "t")["ok"]
+      and not S.spellman_set_trip_sigma("x", "t")["ok"] and S._SPELL_WATCH.trip_sigma == 4)
+
+# Noise as measured 2026-10-29 (60-65 kV, 0.0098 mA steps, mean ~0.035,
+# sigma ~0.04): never trips; a sustained +0.3 mA does, +0.1 does not.
+NOISE = [0, 0, 0.0098, 0.0195, 0.0195, 0, 0.0293, 0.0488, 0.0098, 0.0684, 0.0195,
+         0.0977, 0, 0.1172, 0.0098, 0.0293, 0.0781, 0.0195, 0.1074, 0, 0.0391, 0.1270]
+w = SW.SpellmanWatch()
+mas = NOISE * 30
+ev, t = feed(w, 0.0, [65.5] * len(mas), mas)
+snap = w.snapshot(t)
+check("measured noise for 2.5 min -> nothing; sigma learned ~0.04", ev == [] and 0.03 < snap["sigma_ma"] < 0.05
+      and 0.18 < snap["threshold_ma"] - snap["baseline_ma"] < 0.25, (ev, snap))
+ev, t = feed(w, t, [65.5] * 20, [m + 0.1 for m in NOISE[:20]])
+check("...+0.1 mA for 4.6 s (under 5 sigma) -> nothing", ev == [], ev)
+ev, t = feed(w, t, [65.5] * 8, [0.35] * 8)
+check("...0.35 mA held > 1 s (over mean + 5 sigma) -> over_current", [e["kind"] for e in ev] == ["over_current"]
+      and ev[0]["k"] == 5.0, ev)
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [8.0] * 100, [0.0] * 100)
+check("all-zero readings (low kV) -> sigma at its floor, not 0", w.snapshot(t)["sigma_ma"] == SW.SIGMA_FLOOR_MA,
+      w.snapshot(t))
 
 # The real 2026-10-29 11:01-11:12 stream (22 arcs, every one back next
 # reading) is replayed in the commit that added this; as a spot check, the
