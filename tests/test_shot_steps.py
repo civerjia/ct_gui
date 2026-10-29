@@ -30,6 +30,7 @@ def check(name, cond, detail=""):
 
 def make(arm_ok=True, end_state=SHV_COMPLETE, on_mismatch=False, master=None):
     ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
+    ct._hv_ready_for_shot = lambda: {"ok": True, "trips": None}   # HV on, guard quiet
     calls = []
     ct._is_dead = lambda f: False
     ct.filament_to_board = lambda f: {"controller": 1, "slot": 2}

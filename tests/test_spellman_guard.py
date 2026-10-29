@@ -425,6 +425,23 @@ t = msgs(t + 0.6, [65.5, 65.5], [0.02, 0.02])  # back: ordinary arc, closed
 r = S.hv_guard_tick(t)
 check("...arc closed -> the STM32 check runs", called and r["action"] == "recovered", r)
 
+# While the guard is tripped (HV off) no heating to ACTIVE/VOLTAGE: a shot
+# would measure 0 mA and a tuner reads that as "heat more" (#86, 2026-10-29).
+rig = setup()
+S.vacuum_refusal = lambda action: None
+S._HV_GUARD["tripped"] = {"source": "spellman_big_arc", "auto_recover": True, "at": "now"}
+why = S.heat_refusal("heating filament 86 to VOLTAGE(6)")
+check("guard tripped -> heating refused, says it comes back by itself", why and "HV is off" in why
+      and "by itself" in why, why)
+S._HV_GUARD["tripped"] = None
+check("...not tripped -> allowed", S.heat_refusal("heating filament 86 to VOLTAGE(6)") is None)
+n0 = S._HV_GUARD["trips"]
+t = stable_feed(0.0, 3.0)
+t = msgs(t, [0.3] * 12, [0.0] * 12)
+S._spellman_tick(t)
+check("a trip bumps the trips counter (fire_single_pulse compares it)", S._HV_GUARD["trips"] == n0 + 1
+      and S.hv_guard_snapshot()["trips"] == n0 + 1, (n0, S._HV_GUARD["trips"]))
+
 # The threshold is settable and kept.
 r = S.spellman_set_trip_sigma(4, "test")
 check("spellman_trip_sigma set -> used, saved", r["ok"] and S._SPELL_WATCH.trip_sigma == 4

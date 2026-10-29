@@ -140,3 +140,18 @@ Every plotted reading goes to disk: Spellman kV and mA, vacuum, emission V and I
 | `logs/series/summary_<date>.csv` | `minute,name,n,min,max,mean` | for good |
 
 When a raw hour falls outside the kept window, it is compacted into the summary and deleted. A restart reads the last hour back into the plot.
+
+## 5. Shots while the HV is off
+
+While the guard has the HV down, it **refuses to heat any filament to ACTIVE or VOLTAGE**.
+
+- A shot then would measure 0 mA, and a tuner reads that as "heat more". This happened on 2026-10-29 between 13:17 and 14:51: `liuxing_api.py` raised ten filaments, and #86 reached 9563 mV, past the 9.5 V cap. From then on every #86 shot was refused.
+- The refusal names the trip, and says whether the HV comes back by itself or needs a person.
+
+`fire_single_pulse(measure=True)` handles the HV-off case on the client side:
+
+| situation | what happens |
+|---|---|
+| guard tripped, HV coming back by itself | waits up to 30 s for it |
+| guard tripped and needs a person, or HV switched off | refuses at once (`hv_off: True`) |
+| guard acted during the shot (counted by `trips` in `GET /api/hv-guard`) | returns `ok=False`, `hv_off: True` |

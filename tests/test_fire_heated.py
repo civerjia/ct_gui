@@ -29,6 +29,7 @@ def check(name, cond, detail=""):
 
 def make(active_ok=True, run="complete", idle_ok=True, heat_ok=True, heating=None):
     ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
+    ct._hv_ready_for_shot = lambda: {"ok": True, "trips": None}   # HV on, guard quiet
     calls = []
     seen = {}
 

@@ -2629,6 +2629,16 @@ class _ScheduleMixin:
         it lives on the master controller. If it cannot be armed, nothing is
         fired at all and the error says so, so measure=True never leaves you
         guessing whether HV went out.
+
+        HV OFF. With measure=True a shot is only fired with the HV on: while
+        the HV guard has the HV down for a Spellman arc it waits (up to
+        HV_WAIT_FOR_RECOVERY_S, 30 s) for the HV to come back by itself; a
+        latch that needs a person, or HV switched off, is refused at once
+        ("hv_off": True, nothing heated or fired). If the guard acts DURING
+        the shot, the result is ok=False with "hv_off": True -- what was
+        measured is not this filament's emission. (2026-10-29: shots fired
+        into an HV that an arc had switched off read ~0 mA, and a tuner raised
+        ten filaments for it.)
         """
         if timeout_s is not None:        # the old name wins if a script passes it
             shot_wait_timeout_s = timeout_s
@@ -2677,6 +2687,16 @@ class _ScheduleMixin:
                         "error": f"settle_ms={settle}: could not set the firmware's arrival "
                                  f"settle time: {r.get('error')} -- not fired"}
             heat_timeout_s = float(heat_timeout_s) + settle / 1000.0
+        trips0 = None
+        if measure:
+            ready = self._hv_ready_for_shot()
+            if not ready.get("ok"):
+                if settle:
+                    self.set_arrival_settle(0)
+                return {"ok": False, "fired": 0, "records": [], "status": {},
+                        "measured": [], "ref_mv": None, "hv_off": True,
+                        "error": ready["error"]}
+            trips0 = ready.get("trips")
         try:
             res = self._fire_single_pulse_run(
                 filament, num_pulses, width_us, interval, tmo, max_on_ms, total_ms,
@@ -2692,7 +2712,53 @@ class _ScheduleMixin:
                         "fire_single_pulse: arrival settle not set back to 0: %s", exc)
         if settle is not None and isinstance(res, dict):
             res["settle_ms"] = settle
+        if trips0 is not None and isinstance(res, dict):
+            g = self._get("/api/hv-guard") or {}
+            if g.get("trips") is not None and g["trips"] != trips0:
+                # The HV went down (or the grid was forced open) at some point in
+                # this shot: whatever was measured is not this filament's
+                # emission. A failure, never a reading a tuner could act on.
+                t = g.get("tripped") or {}
+                res["ok"] = False
+                res["hv_off"] = True
+                res["error"] = ("the HV guard acted during this shot (the HV went off or the "
+                                "grid was forced open"
+                                + (f": {t.get('source')}" if t.get("source") else "")
+                                + ") -- its measurement is not this filament's emission"
+                                + (f"; also: {res.get('error')}" if res.get("error") else ""))
         return res
+
+    # A big arc takes the HV down for ~15 s and the guard puts it back itself
+    # (2026-10-29). A measured shot waits that out instead of firing into an
+    # HV that is off -- which measured 0 mA, and a tuner read that as "heat
+    # more" (#86 went to 9563 mV, past the 9.5 V cap).
+    HV_WAIT_FOR_RECOVERY_S = 30.0
+
+    def _hv_ready_for_shot(self) -> dict:
+        """{"ok": True, "trips": n} once the HV guard is not tripped and both
+        rails are on; waits up to HV_WAIT_FOR_RECOVERY_S for a trip that
+        recovers by itself. Otherwise {"ok": False, "error"}."""
+        deadline = time.monotonic() + self.HV_WAIT_FOR_RECOVERY_S
+        while True:
+            g = self._get("/api/hv-guard") or {}
+            t = g.get("tripped")
+            if not t:
+                hv = self.hv_status() or {}
+                if hv.get("emission_on") and hv.get("focus_on"):
+                    return {"ok": True, "trips": g.get("trips")}
+                why = (f"the HV is off (emission_on={hv.get('emission_on')}, "
+                       f"focus_on={hv.get('focus_on')}) -- a measured shot would read nothing")
+                if time.monotonic() >= deadline:
+                    return {"ok": False, "error": why + " -- not fired"}
+            elif not t.get("auto_recover"):
+                return {"ok": False, "error": f"the HV guard is tripped and needs a person: "
+                                              f"{t.get('message') or t.get('source')} -- not fired"}
+            elif time.monotonic() >= deadline:
+                return {"ok": False, "error": (f"the HV guard tripped ({t.get('source')}) and "
+                                               f"the Spellman was not stable again within "
+                                               f"{self.HV_WAIT_FOR_RECOVERY_S:g} s "
+                                               f"(waiting for: {t.get('waiting_for')}) -- not fired")}
+            time.sleep(0.5)
 
     def _fire_single_pulse_run(self, filament, num_pulses, width_us, interval, tmo,
                                max_on_ms, total_ms, controller, trigger,

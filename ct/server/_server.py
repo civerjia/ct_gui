@@ -3028,7 +3028,14 @@ HV_GUARD_HOT_RECENT_S = 300.0   # suspects: filaments hot within this
 HV_GUARD_STOP_RECENT_S = 15.0   # on a latched trip, filaments hot within this go to STOP
                                 # (60 s took FID 16, a minute cold and innocent, 2026-10-27 15:21)
 
-_HV_GUARD = {"enabled": os.environ.get("CT_HV_GUARD", "1") != "0", "tripped": None}
+_HV_GUARD = {"enabled": os.environ.get("CT_HV_GUARD", "1") != "0", "tripped": None,
+             "trips": 0}   # every time the guard takes the HV down, opens the grid or checks;
+                           # a client compares it before/after a shot (fire_single_pulse)
+
+
+def _hvg_count() -> None:
+    with _HV_GUARD_LOCK:
+        _HV_GUARD["trips"] += 1
 _HV_GUARD_LOCK = threading.Lock()
 _HVG_HIST: list = []            # quiet (t, mA, focus_v) samples, oldest first
 _HVG_HIGH_SINCE: list = [None]  # monotonic start of the current rise, or None
@@ -3234,6 +3241,7 @@ def _hv_guard_verify_ads() -> list:
 def _hv_guard_after_stm32_trip(now: float) -> dict:
     """See _hv_guard_after_stm32_trip_. The heat block is always lifted, also
     if that raises: a stuck _HVG_CHECKING would refuse every ACTIVE forever."""
+    _hvg_count()
     try:
         return _hv_guard_after_stm32_trip_(now)
     finally:
@@ -3520,6 +3528,7 @@ def _hv_guard_act(x: dict, focus: float, now: float) -> dict:
     """The current is over what the loads draw by half a switch or more:
     force every switch open, re-read, and judge against the same model."""
     suspects = _hv_guard_suspects(now)
+    _hvg_count()
     log.warning("HV guard: emission %.2f mA between pulses, the loads draw %.2f mA at %s V "
                 "(+%.2f mA = ~%s switch(es) on) -- forcing every grid switch open (recently hot: %s)",
                 x["measured_ma"], x["expected_ma"], x["emiss_v"], x["excess_ma"], x["switches_on"], suspects)
@@ -3589,6 +3598,7 @@ def _hv_rails_off() -> dict:
 
 
 def _hv_guard_latch(rec: dict) -> None:
+    _hvg_count()
     with _HV_GUARD_LOCK:
         _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                                 **rec}
@@ -3792,6 +3802,7 @@ def hv_guard_snapshot() -> dict:
     if m:
         m["age_s"] = round(now - m.pop("at"), 1)
     return {"ok": True, "enabled": _HV_GUARD["enabled"], "tripped": _HV_GUARD["tripped"],
+            "trips": _HV_GUARD["trips"],
             "vacuum": vacuum_snapshot(), "hv_supply": hv_supply_snapshot(),
             "load_model": m or None, "spellman": _SPELL_WATCH.snapshot(now),
             "switch_frac": HV_GUARD_SWITCH_FRAC, "hold_s": HV_GUARD_HOLD_S}
@@ -4258,6 +4269,15 @@ def heat_refusal(action: str) -> str | None:
     if _HVG_CHECKING[0]:
         return (f"HV guard check in progress (the HV is back on for 1-3 s to measure whether "
                 f"a grid switch still conducts) -- refusing {action}; try again in a few seconds")
+    t = _HV_GUARD["tripped"]
+    if t:
+        # The HV is off: a shot now measures nothing, and a tuner reads that
+        # 0 mA as "heat more" (2026-10-29: 13:17-14:51, ten filaments raised,
+        # #86 to 9563 mV, past the 9.5 V cap).
+        how = ("it comes back by itself once the Spellman is stable" if t.get("auto_recover")
+               else "a person must clear the latch (POST /api/hv-guard {\"clear\": true})")
+        return (f"HV guard tripped ({t.get('source')}, {t.get('at')}) -- the HV is off, so "
+                f"refusing {action}; {how}")
     return vacuum_refusal(action)
 
 
@@ -4273,6 +4293,7 @@ def _vacuum_trip(p: float, now: float) -> dict:
         except Exception:
             off[ch] = False
     to_idle, no_idle = drop_hot_to_idle(now)
+    _hvg_count()
     rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": vacuum_limit(), "hv_off": off,
            "to_idle": to_idle, "to_sleep_no_idle_known": no_idle,
            "message": (f"HV OFF: vacuum {p:.2e} Torr over the {vacuum_limit():.1e} Torr limit -- "
