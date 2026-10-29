@@ -191,6 +191,16 @@ ev = w.feed_arc_flag(t + 0.1) + feed(w, t + 0.2, [65.5])[0]
 check("conditioning arc flag -> one arc, HV On untouched", [e["kind"] for e in ev] == ["arc"]
       and w.snapshot(t + 1)["hv_on"] is True, (ev, w.snapshot(t + 1)))
 
+# Conditioning re-reports the arc 1.7 s after the GetStatus bit: one arc, not two.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [61.2] * 20)
+w.feed_status(t, OK)
+ev = w.feed_status(t + 0.05, st(arc=1, hv_inhibit=1))
+ev += feed(w, t + 0.1, [7.1, 61.2])[0]
+ev += w.feed_status(t + 0.6, OK)
+ev += w.feed_arc_flag(t + 1.8) + feed(w, t + 1.9, [61.2, 61.2])[0]
+check("conditioning's late arc flag -> still one arc", [e["kind"] for e in ev if e["kind"] != "status"] == ["arc"], ev)
+
 # Over-current: quiet, over mean + 5 sigma for > 1 s (flat 0.02 mA: sigma at its floor).
 w = SW.SpellmanWatch()
 ev, t = feed(w, 0.0, [60.2] * 100)

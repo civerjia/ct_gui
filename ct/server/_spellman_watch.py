@@ -42,6 +42,7 @@ BIG_ARC_S = 5.0          # judged on a kV reading taken at least this long after
                          # never on a stale one: spellman_backend's monitor pauses while
                          # its conditioning handles an arc (2026-10-29 11:36, a false trip)
 NO_READING_S = 30.0      # no kV reading this long after the drop: closed as unknown, no trip
+ARC_SAME_S = 3.0         # conditioning's arc flag this soon after an arc is that arc
 KV_ON = 5.0              # under this the supply is off: no arcs to see
 HOLD_S = 1.0             # over-current: over the threshold this long
 GAP_S = 2.0              # readings further apart than this are not "continuous"
@@ -198,7 +199,10 @@ class SpellmanWatch:
         an arc, nothing more -- not a GetStatus, so no HV On / alarm change."""
         with self._lock:
             out = self._advance(t)
-            if self._arc is None and self._kv is not None and self._kv[1] >= KV_ON:
+            # Conditioning re-reports an arc the GetStatus bit already showed,
+            # 1-2 s later (12:22:02 / 12:22:03.8 on 2026-10-29): the same arc.
+            recent = self._arcs and t - self._arcs[-1]["t"] <= ARC_SAME_S
+            if self._arc is None and not recent and self._kv is not None and self._kv[1] >= KV_ON:
                 self._open(t, "status", kv_before=self._kv[1], min_kv=self._kv[1])
                 self._arc["status"] = ["arc"]
             return out
