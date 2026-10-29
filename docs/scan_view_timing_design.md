@@ -1,7 +1,6 @@
 # Firing filaments: scan_view and fire_single_pulse — design
 
-**Status: proposal, nothing built.** The last section lists what must be
-decided before code changes.
+**Status: design agreed 2026-10-28 (§9), nothing built yet.**
 
 ## 1. Goal
 
@@ -158,7 +157,7 @@ happening at scan scale.
 | pitfall | cause | status | this design |
 |---|---|---|---|
 | The trigger delay is board state set by a separate call; an RP2350 restart zeroes it, and the shot fires 3 ms early with nobody told | `set_trigger_delay()` is not part of the shot | today | `trigger_delay_us` is a **required argument**, written to every controller at set-up and read back; the ARM is refused while they differ |
-| An edge during the delay of the previous one loses that pulse while both are counted | one hardware alarm serves every edge; a new edge re-aims it | firmware, unchecked | spacing must be > `trigger_delay_us` + `width_us`: sim refused before starting; ext Q4 |
+| An edge during the delay of the previous one loses that pulse while both are counted | one hardware alarm serves every edge; a new edge re-aims it | firmware, unchecked | sim: spacing must be > `trigger_delay_us` + `width_us`, refused before starting. ext: your source's spacing; a pulse lost this way shows as a missing read-back and a missing measurement on that pulse |
 | `trigger_timeout_ms` counted the host's own work between release and the first edge; 60 ms stopped the run at the second filament | the firmware timed it from the release | fixed: from the first edge, 766874d | `trigger_timeout_ms` = the gap between edges only |
 | A gap limit equal to the spacing faulted after one pulse | every edge raced its own deadline | refused today | `trigger_timeout_ms` > spacing, refused otherwise |
 | sim: "already running" right after a filament; the next one was skipped | the backend sees a train's end only on its 300 ms poll | host retries 2 s, cb70fa6 | the backend asks the ESP32 directly (Q6) |
@@ -257,7 +256,7 @@ byte once while ON and once after OFF, into that pulse's record.
 |---|---|---|
 | edges from | the master ESP32's hardware timer, one train per filament | your hardware, into the master's SyncIn |
 | `on_armed` | optional `on_armed(f)`; the train starts after it returns | required `on_armed(f)`: start your source and return |
-| `pulse_interval_ms` | the train's spacing; > (`trigger_delay_us` + `width_us`)/1000, ≥ 0.5 ms; default 500 | — (Q4) |
+| `pulse_interval_ms` | the train's spacing; > (`trigger_delay_us` + `width_us`)/1000, ≥ 0.5 ms; default 500 | — (your source sets it) |
 | `trigger_timeout_ms` | the longest wait for the NEXT edge. The first one is counted from the moment the train has started (the ESP32 accepted it); every later one from the previous edge. Runs out → **STOP the run**. Default 2 × spacing + 100 | the same: the first edge counted from `on_armed` returning (your source started), the later ones from the previous edge. Runs out → **STOP the run**. Required (only you know how long your source takes) |
 
 ## 6. Timing
@@ -361,18 +360,19 @@ Callers that change with it: the auto test program, combined_backend (its
 `CT_PULSE_*` / `CT_SCAN_*` whitelists, its delay box), the emission tests and
 `measure_pulse_current` (`heating=None`, `on_armed(f)`).
 
-## 9. To decide
+## 9. Decisions (2026-10-28)
 
-| | question | proposal |
+| | question | decided |
 |---|---|---|
-| Q1 | the run's own filaments: their heating window ends while the schedule is armed. Today the backend defers it until the run ends | the window is never deferred for the run's own filaments |
-| Q2 | RP2350 drops a heated filament by itself after `heat_timeout_s` if no IDLE comes (L2/L3 down) | yes; firmware change, test board first |
+| Q1 | the run's own filaments, when their heating window ends while the schedule is armed | the window is never deferred for them: dropped to IDLE on time |
+| Q2 | the link to a controller is down: who drops a heated filament | the RP2350 itself, after `heat_timeout_s` (firmware change; test board first) |
 | Q3 | a filament HOT but still waiting when its window ends | back to IDLE, re-heated at its turn |
-| Q4 | ext: spacing > delay + width and ≥ 0.5 ms need your spacing | `ct.Ext(expected_interval_ms=...)`, optional, used only for these checks |
+| Q4 | ext: checking your edge spacing beforehand | not done: no extra argument. Your source's spacing is yours; a pulse lost to it shows as missing read-back and measurement |
 | Q5 | extra keys in the heating dict | refused; scan_views passes each view only its own |
 | Q6 | sim "already running" right after a filament | the backend asks the ESP32 directly |
-| Q7 | `trigger_timeout_ms` runs out | decided: STOP the run. It is the safety backstop; a dead trigger must stop the run at the first filament |
-| Q8 | ON read-back mismatch | record and go on; the measured current is the truth |
+| Q7 | `trigger_timeout_ms` runs out | STOP the run, the first edge included |
+| Q8 | ON read-back mismatch | recorded, the run goes on; the measured current decides |
 | Q9 | `heat_timeout_s` default | none: required |
-| Q10 | `heat_timeout_s` counted from | decided: the raise → back at IDLE, all heating |
-| Q11 | `settle_ms` with current heating | decided: from the first arrival, like VOLTAGE |
+| Q10 | `heat_timeout_s` counted from | the heating command → back at IDLE: all heating |
+| Q11 | `settle_ms` with current heating | from the first arrival, like VOLTAGE |
+| Q12 | sim: a filament ends before its train | stop the train and confirm it before the next row; every STOP stops it |
