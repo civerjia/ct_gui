@@ -55,7 +55,7 @@ What is done TODAY differs in one place:
 |---|---|---|
 | fire_single_pulse | waits for "settled": the heating must hold arrival for `settle_ms` CONTINUOUSLY, and every exit restarts the clock (VOLTAGE and current alike) | HOT, as above |
 | scan_view | HOT, as above (VOLTAGE) | HOT, as above |
-| current heating | restarts on every exit (fire_single_pulse) | Q11 |
+| current heating | restarts on every exit (fire_single_pulse) | HOT, as above: from the first arrival, like VOLTAGE (decided, Q11) |
 
 ## 3. The calls
 
@@ -246,9 +246,9 @@ byte once while ON and once after OFF, into that pulse's record.
 | value | `active_mv`: scan_view `{filament: mV}`, exactly the listed filaments; fire_single_pulse one number; ≤ the voltage cap read from the controllers (9.5 V on the rig) | `active_ma` | — |
 | "arrived" | §2a | §2a | — |
 | `idle_ma` | back to this when done | same | — |
-| `settle_ms` | §2a: from the FIRST arrival | §2a: Q11 | — |
+| `settle_ms` | §2a: from the FIRST arrival | the same (Q11) | — |
 | `max_voltage_drop_mv` | a drop this far below `active_mv` on 3 reads = interrupted. Default 500 | — | — |
-| `heat_timeout_s` | the longest it may stay heated in one go; backend-timed, never renewed, **not deferred by the run**. Counted from the raise or from the first arrival: Q10 | same | — |
+| `heat_timeout_s` | the longest it may stay heated in one go; backend-timed, never renewed, **not deferred by the run**. Counted from the heating command (the raise) until it is back at IDLE: ALL heating, including a filament that never arrives (decided, Q10) | same | — |
 | interrupted by | output fault (OCP, open, short), board lost, the drop above | output fault, board lost | — |
 
 ### 5.3 `trigger=`
@@ -374,5 +374,5 @@ Callers that change with it: the auto test program, combined_backend (its
 | Q7 | `trigger_timeout_ms` runs out | decided: STOP the run. It is the safety backstop; a dead trigger must stop the run at the first filament |
 | Q8 | ON read-back mismatch | record and go on; the measured current is the truth |
 | Q9 | `heat_timeout_s` default | none: required |
-| Q10 | `heat_timeout_s` counted from | (a) the raise: bounds ALL heating, including a filament that never arrives; or (b) the first arrival: bounds the time held hot, and a filament that never arrives needs another limit |
-| Q11 | `settle_ms` with current heating | (a) from the first arrival, like VOLTAGE; or (b) restart on every exit, like fire_single_pulse today |
+| Q10 | `heat_timeout_s` counted from | decided: the raise → back at IDLE, all heating |
+| Q11 | `settle_ms` with current heating | decided: from the first arrival, like VOLTAGE |
