@@ -351,6 +351,17 @@ check("trip right after an arc -> recovered despite 3 recoveries, said to be the
       and r["action"] == "recovered" and "arc" in r["message"] and r["arc"]["min_kv"] == 4.3, r and r.get("message"))
 check("...and not counted", len(S._HVG_RECOVERIES) == 3, S._HVG_RECOVERIES)
 
+# 12f. STM32 latch with the emission rail already off (left from before a
+#      restart, 12:54:06): cleared, HV stays off, no latch here.
+rig = Rig()
+setup(rig)
+S._HVG_RAILS.update(emission=False, focus=False)
+rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
+r = S.hv_guard_tick(100.0)
+check("STM32 trip with the rail off -> STM32 latch cleared, HV not turned on, not latched",
+      r and r["action"] == "cleared" and "clear" in rig.guard_ops and S._HV_GUARD["tripped"] is None
+      and ("emission", True) not in rig.rails, (r, rig.rails))
+
 # 12d. The rail never comes back -> cannot check -> latched.
 rig = Rig()
 setup(rig)

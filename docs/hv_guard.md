@@ -71,7 +71,7 @@ The backend then:
 
 Back within half a switch means recovered. Still over means latched.
 
-There is **no latch by count**: every trip is checked by current, and only "still over with every switch forced open" (a MOSFET that stays on) latches. More than 3 flips in 10 min adds a warning about the 595s. This changed on 2026-10-29: at 12:51:12 a 4th trip in 10 min latched unchecked. A trip that comes within about 4 s after a Spellman arc is the arc's, and is not counted as a flip.
+There is **no latch by count**: every trip is checked by current, and only "still over with every switch forced open" (a MOSFET that stays on) latches. More than 3 flips in 10 min adds a warning about the 595s. This changed on 2026-10-29: at 12:51:12 a 4th trip in 10 min latched unchecked. A trip that comes within about 4 s after a Spellman arc is the arc's, and is not counted as a flip. An STM32 trip while the emission rail is already off (for example a latch left over from before a restart) is not checked and does not latch: nothing can conduct, so the STM32 latch is cleared and the HV stays off. Whoever turns it on next is watched by the load model.
 
 ## 2. The Spellman (read-only)
 

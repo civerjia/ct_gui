@@ -3292,8 +3292,21 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
     # and only "still over with every switch open" latches. Frequent flips
     # are a warning about the 595s, not a latch.
     if not rails_before.get("emission"):
-        why_not = "the emission rail was not on before the trip"
-    elif not all(opened.values()):
+        # HV already off (a latch left over from before a restart, 12:54:06
+        # 2026-10-29): nothing conducts, nothing to check, nothing to latch.
+        # The STM32 latch is cleared and the HV stays OFF; whoever turns it
+        # on next is watched by the load model like any other time.
+        try:
+            rec["stm32_clear"] = stm32_hv_guard(host, "clear") if host else {"ok": False}
+        except Exception as exc:
+            rec["stm32_clear"] = {"ok": False, "error": str(exc)}
+        rec["message"] = ("HV guard: an STM32 trip with the emission rail already off -- nothing to "
+                          "check; the STM32 latch is cleared, the HV stays off (turn it on as usual; the "
+                          "load model watches it from then on).")
+        log.warning("%s", rec["message"])
+        _safety_record("hv_guard_cleared_rail_off", rec)
+        return {"action": "cleared", **rec}
+    if not all(opened.values()):
         why_not = "a force-open was not confirmed"
 
     verdict = None
