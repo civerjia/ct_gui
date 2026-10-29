@@ -3727,6 +3727,123 @@ def series_add(name: str, value: float, t: float | None = None) -> None:
         d.append((t, value))
         while d and t - d[0][0] > SERIES_KEEP_S:
             d.popleft()
+        _SERIES_PENDING.append((t, name, value))
+
+
+# Every reading also goes to disk (the user, 2026-10-29: a restart lost the
+# plot, and nothing was on disk at all). Full rate only for a few hours, older
+# hours as a per-minute summary (the user: keep a few hours, only a summary of
+# the old):
+#   logs/series/raw_<YYYY-MM-DD>T<HH>.csv     unix_t,name,value   (~13 rows/s)
+#   logs/series/summary_<YYYY-MM-DD>.csv      minute,name,n,min,max,mean
+# The last SERIES_KEEP_S is read back at start-up.
+SERIES_DIR = LOG_DIR / "series"
+SERIES_FLUSH_S = 2.0
+SERIES_RAW_KEEP_H = float(os.environ.get("CT_SERIES_RAW_HOURS", "6"))
+SERIES_COMPACT_S = 600.0
+_SERIES_PENDING: list = []
+
+
+def _series_path(t: float) -> Path:
+    return SERIES_DIR / f"raw_{datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%dT%H')}.csv"
+
+
+def series_flush() -> int:
+    with _SERIES_LOCK:
+        rows, _SERIES_PENDING[:] = list(_SERIES_PENDING), []
+    if not rows:
+        return 0
+    try:
+        SERIES_DIR.mkdir(parents=True, exist_ok=True)
+        by_file: dict = {}
+        for t, n, v in rows:
+            by_file.setdefault(_series_path(t), []).append(f"{t:.3f},{n},{v:.6g}\n")
+        for path, lines in by_file.items():
+            with open(path, "a", encoding="ascii") as fh:
+                fh.writelines(lines)
+    except OSError as exc:
+        log.warning("series not written (%s) -- the plot still has them in memory", exc)
+    return len(rows)
+
+
+def _series_rows(path: Path):
+    try:
+        fh = open(path, encoding="ascii", errors="ignore")
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            parts = line.rstrip("\n").split(",")
+            if len(parts) != 3 or parts[1] not in _SERIES:
+                continue
+            try:
+                yield float(parts[0]), parts[1], float(parts[2])
+            except ValueError:
+                continue
+
+
+def series_load(now: float | None = None) -> int:
+    """The last SERIES_KEEP_S from disk into the plot (start-up)."""
+    now = time.time() if now is None else now
+    since, n = now - SERIES_KEEP_S, 0
+    paths = sorted({_series_path(since + k * 3600.0) for k in range(int(SERIES_KEEP_S // 3600) + 1)}
+                   | {_series_path(now)})
+    for path in paths:
+        rows = [(t, nm, v) for t, nm, v in _series_rows(path) if since <= t <= now]
+        with _SERIES_LOCK:
+            for t, nm, v in rows:
+                _SERIES[nm].append((t, v))
+        n += len(rows)
+    return n
+
+
+def series_compact(now: float | None = None) -> list:
+    """Raw hours older than SERIES_RAW_KEEP_H -> per-minute summary rows, then
+    deleted. Returns the files it compacted."""
+    now = time.time() if now is None else now
+    done = []
+    if not SERIES_DIR.is_dir():
+        return done
+    cut = now - SERIES_RAW_KEEP_H * 3600.0
+    for path in sorted(SERIES_DIR.glob("raw_*.csv")):
+        try:
+            hour = datetime.datetime.strptime(path.stem[4:], "%Y-%m-%dT%H").timestamp()
+        except ValueError:
+            continue
+        if hour + 3600.0 > cut:
+            continue
+        agg: dict = {}
+        for t, nm, v in _series_rows(path):
+            m = int(t // 60) * 60
+            a = agg.get((m, nm))
+            agg[(m, nm)] = [1, v, v, v] if a is None else [a[0] + 1, min(a[1], v), max(a[2], v), a[3] + v]
+        try:
+            out = SERIES_DIR / f"summary_{path.stem[4:14]}.csv"
+            new = not out.exists()
+            with open(out, "a", encoding="ascii") as fh:
+                if new:
+                    fh.write("minute,name,n,min,max,mean\n")
+                for (m, nm), (k, lo, hi, tot) in sorted(agg.items()):
+                    stamp = datetime.datetime.fromtimestamp(m).strftime("%Y-%m-%dT%H:%M")
+                    fh.write(f"{stamp},{nm},{k},{lo:.6g},{hi:.6g},{tot / k:.6g}\n")
+            path.unlink()
+            done.append(path.name)
+        except OSError as exc:
+            log.warning("series %s not compacted: %s", path.name, exc)
+    return done
+
+
+def _series_flush_loop() -> None:
+    last_compact = 0.0
+    while not _STOPPING.wait(SERIES_FLUSH_S):
+        series_flush()
+        if time.monotonic() - last_compact >= SERIES_COMPACT_S:
+            last_compact = time.monotonic()
+            try:
+                series_compact()
+            except Exception as exc:
+                log.warning("series compaction failed: %s", exc)
+    series_flush()
 
 
 def series_from_ads(r) -> None:
@@ -7513,6 +7630,7 @@ def _do_restart(keep: dict, server) -> None:
     # back (on Windows it stays alive, waiting for the new one). The lock waits
     # out an auto-connect scan already in flight.
     _STOPPING.set()
+    series_flush()                      # the plot's last seconds, for the new process
     if _AUTO_LOCK.acquire(timeout=30.0):
         _AUTO_LOCK.release()
     for link in CONTROLLERS.values():
@@ -8025,6 +8143,12 @@ def main() -> None:
     # A grid switch that will not turn off at all (see hv_guard_tick).
     threading.Thread(target=_hv_guard_loop, name="hv_guard", daemon=True).start()
     # Spellman V/I + vacuum from control2, read-only (see _spellman_loop).
+    try:
+        log.info("trend plot: %d points of the last %.0f min read back from %s",
+                 series_load(), SERIES_KEEP_S / 60, SERIES_DIR)
+    except Exception as exc:
+        log.warning("trend plot history not read back: %s", exc)
+    threading.Thread(target=_series_flush_loop, name="series_writer", daemon=True).start()
     threading.Thread(target=_spellman_loop, name="spellman_reader", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()

@@ -71,10 +71,10 @@ control2's `spellman_backend` broadcasts kV, mA and GetStatus about 4 times a se
 | event | what it looks like | action |
 |---|---|---|
 | ordinary arc | one reading (sometimes two) with the kV down by more than 10 % and 3 kV and/or an mA spike, then back to 95 % | Recorded in `logs/arcs.jsonl` and in the backend log. The supply recovers by itself, so nothing is switched. |
-| big arc | the kV falls in one step and is still under 50 % after 5 s | Trip, latched: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Cleared by hand. |
+| big arc | the kV falls in one step, and a reading taken at least 5 s later is still under 50 % (a stale reading never counts: `spellman_backend` pauses its monitor while its conditioning handles an arc, which caused a false trip at 11:36 on 2026-10-29; with no reading for 30 s the event is recorded as unknown) | Trip, latched: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Cleared by hand. |
 | over-current | between pulses, the mA is over its baseline by `spellman_trip_ma` for more than 1 s | Trip, latched: switches open, HV off, filaments hot within 15 s to STOP. |
 
-A ramp-down (about 1 kV per reading) is never an arc.
+A ramp-down (about 1 kV per reading) is never an arc. The GetStatus arc bit counts on its rising edge only.
 
 The mA baseline is the median of quiet readings over the last 60 s, with arcs and pulses left out. It is capped at 0.2 mA, so a fault present from the start is not learned as normal.
 
@@ -91,3 +91,14 @@ Replay of 2026-10-29 11:01–11:12 (60–65 kV): 22 arcs, all ordinary, no over-
 - `tripped`: the full record and the message.
 
 The GUI's HV guard tile shows the arc count. Its tooltip shows the model and the Spellman baseline.
+
+## 4. Trend data on disk
+
+Every plotted reading goes to disk: Spellman kV and mA, vacuum, emission V and I.
+
+| file | content | kept |
+|---|---|---|
+| `logs/series/raw_<date>T<hour>.csv` | `unix_t,name,value`, full rate, about 13 rows/s | `CT_SERIES_RAW_HOURS`, default 6 h |
+| `logs/series/summary_<date>.csv` | `minute,name,n,min,max,mean` | for good |
+
+When a raw hour falls outside the kept window, it is compacted into the summary and deleted. A restart reads the last hour back into the plot.

@@ -74,6 +74,29 @@ ev, t = feed(w, t, [3.0] * 30, [2.0] + [0.0] * 29)
 check("collapse that stays down 5 s -> big_arc", [e["kind"] for e in ev] == ["big_arc"]
       and ev[0]["kv_before"] == 60.2 and ev[0]["down_s"] >= SW.BIG_ARC_S, ev)
 
+# The 11:36 false trip: the kV dips, then the readings STOP (spellman_backend's
+# conditioning pauses its monitor) and come back at the set voltage. Time
+# alone (poll) with a stale low reading is not a big arc.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [65.5] * 50 + [24.3])
+ev += w.poll(t + 6.0) + w.poll(t + 9.0)
+check("dip, then no readings for 9 s -> not decided yet", ev == [], ev)
+ev, t = feed(w, t + 9.2, [65.5] * 3)
+check("...readings back at 65 kV -> one ordinary arc, no big arc", [e["kind"] for e in ev] == ["arc"], ev)
+ev, t = feed(w, 0.0, [65.5] * 50 + [24.3])
+ev += w.poll(t + 31.0)
+check("no reading at all for 30 s -> closed as unknown, not big", [e["kind"] for e in ev] == ["arc"]
+      and "unknown" in ev[0], ev)
+
+# A latched status arc bit: one arc on its rising edge, not one per GetStatus.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [60.2] * 20)
+for k in range(10):
+    ev += w.feed_status(t, [1, 1, 1, 1])
+    ev += feed(w, t + 0.05, [60.2])[0]
+    t += 0.3
+check("arc bit held for 10 GetStatus -> one arc", [e["kind"] for e in ev] == ["arc"], ev)
+
 # Over-current: quiet, over baseline by trip_ma for > 1 s.
 w = SW.SpellmanWatch(trip_ma=0.3)
 ev, t = feed(w, 0.0, [60.2] * 100)

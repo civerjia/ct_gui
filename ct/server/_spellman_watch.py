@@ -35,7 +35,10 @@ ARC_KV_MIN_DROP = 3.0    # ... and at least this many kV under it (a ramp near 0
                          # falls 10 % per step; the 10-29 arcs fell 20-63 kV)
 ARC_BACK_FRAC = 0.95     # back to this fraction of the kV before it = recovered
 BIG_ARC_KV_FRAC = 0.50   # still under this fraction after BIG_ARC_S = big arc
-BIG_ARC_S = 5.0
+BIG_ARC_S = 5.0          # judged on a kV reading taken at least this long after the drop --
+                         # never on a stale one: spellman_backend's monitor pauses while
+                         # its conditioning handles an arc (2026-10-29 11:36, a false trip)
+NO_READING_S = 30.0      # no kV reading this long after the drop: closed as unknown, no trip
 ARC_MA = 1.0             # one quiet reading this far over the baseline = an arc (kV dip missed)
 KV_ON = 5.0              # under this the supply is off: no arcs to see
 HOLD_S = 1.0             # over-current: over the threshold this long
@@ -73,6 +76,7 @@ class SpellmanWatch:
         self._over_since = None
         self._over_fired = False
         self._last_ma_t = None
+        self._status_flags = []
 
     # ── readings ────────────────────────────────────────────────────────────
     def feed_kv(self, t: float, kv: float) -> list[dict]:
@@ -135,11 +139,13 @@ class SpellmanWatch:
         flags = status_flags(bits)
         with self._lock:
             out = self._advance(t)
+            rose = "arc" in flags and "arc" not in self._status_flags   # an edge, not a level
+            self._status_flags = flags
             if self._arc is not None:
                 for f in flags:
                     if f not in self._arc["status"]:
                         self._arc["status"].append(f)
-            elif "arc" in flags and self._kv is not None and self._kv[1] >= KV_ON:
+            elif rose and self._kv is not None and self._kv[1] >= KV_ON:
                 self._open(t, "status", kv_before=self._kv[1], min_kv=self._kv[1])
                 self._arc["status"] = flags
             return out
@@ -155,11 +161,13 @@ class SpellmanWatch:
                      "peak_ma": peak_ma if peak_ma is not None else (self._ma[1] if self._ma else 0.0),
                      "status": []}
 
-    def _close(self, t, kind):
+    def _close(self, t, kind, unknown=None):
         a, self._arc = self._arc, None
         ev = {"kind": kind, "t": a["t0"], "via": a["via"], "kv_before": round(a["kv_before"], 2),
               "min_kv": round(a["min_kv"], 2), "peak_ma": round(a["peak_ma"], 4),
               "status": a["status"]}
+        if unknown:
+            ev["unknown"] = unknown
         if kind == "arc":
             ev["recovered_s"] = round(t - a["t0"], 2)
             kv_now = self._kv[1] if self._kv else None
@@ -186,10 +194,11 @@ class SpellmanWatch:
         if a["via"] == "status" and self._kv is not None and self._kv[0] > a["t0"] \
                 and self._kv[1] >= ARC_BACK_FRAC * a["kv_before"]:
             return [self._close(t, "arc")]
-        if t - a["t0"] < BIG_ARC_S:
+        if self._kv is None or self._kv[0] - a["t0"] < BIG_ARC_S:
+            if t - a["t0"] >= NO_READING_S:      # the readings stopped: cannot tell
+                return [self._close(t, "arc", unknown="no kV reading after the drop")]
             return []
-        kv_now = self._kv[1] if self._kv else 0.0
-        if kv_now < BIG_ARC_KV_FRAC * a["kv_before"]:
+        if self._kv[1] < BIG_ARC_KV_FRAC * a["kv_before"]:
             return [self._close(t, "big_arc")]
         return [self._close(t, "arc")]            # came part way back and stayed: recorded, settled_kv
 

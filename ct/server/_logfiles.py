@@ -75,7 +75,7 @@ from ._common import *  # noqa: F401,F403
 # let any client on the LAN read what is under LOG_DIR -- backend.log (and its
 # dated roll-overs) and the call records of scripts that ran ON THIS MACHINE
 # (logs/client/*.jsonl). READ-ONLY, no lease: they touch no hardware.
-# Confined to LOG_DIR and to .log / .log.<date> / .jsonl files; a path that
+# Confined to LOG_DIR and to .log / .log.<date> / .jsonl / .csv files; a path that
 # resolves outside it is refused. A read is capped at LOG_READ_MAX_BYTES from
 # the END of the file (tail semantics), so a huge file cannot tie up the server.
 LOG_READ_MAX_BYTES = 8 * 1024 * 1024
@@ -89,7 +89,8 @@ LOG_READ_MAX_TAIL = 20000
 
 def _log_file_ok(p: Path) -> bool:
     name = p.name
-    return p.is_file() and (name.endswith(".jsonl") or name.endswith(".log") or ".log." in name)
+    return p.is_file() and (name.endswith(".jsonl") or name.endswith(".log") or ".log." in name
+                            or name.endswith(".csv"))
 
 
 def list_log_files() -> list[dict]:
