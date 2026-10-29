@@ -58,6 +58,8 @@ STATUS_NAMES = ("power_on", "hv_on", "arc", "interlock_closed", "over_current", 
 ALARMS = ("arc", "over_current", "over_power", "over_voltage", "system_fault",
           "regulation_error", "over_temperature", "ac_fault", "lvps_fault", "hv_inhibit")
 STATUS_FRESH_S = 3.0     # a GetStatus older than this says nothing about now
+STABLE_S = 10.0          # "stable again": this long with no arc, no alarm, HV on, kV steady
+STABLE_KV_SPREAD = 0.02  # ... kV within this fraction over that time
 
 
 def status_flags(bits, names=ALARMS) -> list[str]:
@@ -91,12 +93,17 @@ class SpellmanWatch:
         self._last_ma_t = None
         self._status_flags = []
         self._hv_on = None                        # (t, bool) the supply's HV Ray On bit
+        self._kv_hist = collections.deque()       # (t, kV), the last STABLE_S * 2
+        self._last_bad_status_t = None            # last GetStatus with an alarm or HV off
 
     # ── readings ────────────────────────────────────────────────────────────
     def feed_kv(self, t: float, kv: float) -> list[dict]:
         with self._lock:
             prev = self._kv
             self._kv = (t, kv)
+            self._kv_hist.append((t, kv))
+            while self._kv_hist and t - self._kv_hist[0][0] > 2 * STABLE_S:
+                self._kv_hist.popleft()
             out = self._advance(t)
             if self._arc is not None:
                 a = self._arc
@@ -160,6 +167,8 @@ class SpellmanWatch:
             hv_was = None if self._hv_on is None else self._hv_on[1]
             if hv is not None:
                 self._hv_on = (t, hv)
+            if flags or hv is False:
+                self._last_bad_status_t = t
             kv = None if self._kv is None else round(self._kv[1], 2)
             if flags != was or (hv is not None and hv_was is not None and hv != hv_was):
                 out.append({"kind": "status", "t": t, "set": [f for f in flags if f not in was],
@@ -259,6 +268,33 @@ class SpellmanWatch:
                 if t_from <= ev["t"] <= t_to:
                     return dict(ev)
         return None
+
+    def stable(self, now: float, hold_s: float = STABLE_S):
+        """None if the supply has been stable for hold_s (no arc open or within
+        hold_s, no alarm bit, HV Ray On, kV readings covering the whole time
+        within STABLE_KV_SPREAD), else why not (a short text)."""
+        with self._lock:
+            if self._arc is not None:
+                return "an arc is still open"
+            if self._status_flags:
+                return "alarm bit(s) set: " + ", ".join(self._status_flags)
+            if self._hv_on is None or now - self._hv_on[0] > STATUS_FRESH_S:
+                return "no fresh GetStatus"
+            if not self._hv_on[1]:
+                return "the Spellman HV is off"
+            if self._last_bad_status_t is not None and now - self._last_bad_status_t < hold_s:
+                return f"alarm / HV off {now - self._last_bad_status_t:.1f} s ago"
+            if self._arcs and now - self._arcs[-1]["t"] < hold_s:
+                return f"an arc {now - self._arcs[-1]['t']:.1f} s ago"
+            kvs = [(t, kv) for t, kv in self._kv_hist if now - t <= hold_s]
+            if not kvs or kvs[0][0] > now - hold_s + 1.0 or now - kvs[-1][0] > GAP_S:
+                return f"kV readings do not cover the last {hold_s:g} s"
+            lo, hi = min(kv for _, kv in kvs), max(kv for _, kv in kvs)
+            if lo < KV_ON:
+                return f"kV {lo:.1f} (supply not up)"
+            if hi - lo > STABLE_KV_SPREAD * hi:
+                return f"kV not steady ({lo:.1f}-{hi:.1f})"
+            return None
 
     def reset_over(self):
         with self._lock:

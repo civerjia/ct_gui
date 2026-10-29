@@ -3282,7 +3282,8 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
            "rails_before": rails_before}
 
     arc_from = now - HV_GUARD_TICK_S - STM32_TRIP_ARC_WINDOW_S
-    arc = _SPELL_WATCH.arc_near(arc_from, now)
+    arc = _SPELL_WATCH.arc_near(arc_from, now) or _HVG_SPELL_ARC[0]
+    _HVG_SPELL_ARC[0] = None
     rec["arc"] = arc
     _HVG_RECOVERIES[:] = [t for t in _HVG_RECOVERIES if now - t <= HV_GUARD_RECOVER_WINDOW_S]
     why_not = None
@@ -3349,8 +3350,9 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
         back = (f"with the HV back the current is what the loads draw ({x['measured_ma']:.2f} mA, "
                 f"{x['excess_ma']:+.2f} mA against the model)")
         if arc:
-            rec["message"] = (f"HV guard: the STM32 tripped on a Spellman arc ({arc['kv_before']:.1f} -> "
-                              f"{arc['min_kv']:.1f} kV, peak {arc['peak_ma']:.3f} mA); every switch was "
+            what = (f"{arc.get('kv_before')} -> {arc.get('min_kv')} kV, peak {arc.get('peak_ma')} mA"
+                    if arc.get("min_kv") is not None else f"{arc.get('kind')}: {arc.get('alarms')}")
+            rec["message"] = (f"HV guard: the STM32 tripped on a Spellman arc ({what}); every switch was "
                               f"forced open and {back}. Recovered by itself; not counted as a switch "
                               f"fault (165 read-back at the trip: {rec['read_back_165']}). Heating that "
                               f"was hot went to IDLE for the check.")
@@ -3417,6 +3419,8 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
     if sp:
         return sp
     if _HV_GUARD["tripped"]:
+        if _HV_GUARD["tripped"].get("auto_recover"):
+            return _spellman_try_recover(now)
         return None
     vt = _vacuum_tick(now)
     if vt:
@@ -3657,20 +3661,29 @@ def _spellman_tick(now: float) -> dict | None:
     return out
 
 
+# What needs a person (the user, 2026-10-29): a MOSFET that stays on, and
+# Spellman current high for a long time. Arcs -- big ones and a System
+# Fault included -- are normal transients: the HV comes down, and goes back
+# on by itself once the Spellman has been stable for SW.STABLE_S.
+SPELLMAN_AUTO_RECOVER = ("big_arc", "system_fault")
+
+
 def _spellman_trip(ev: dict, now: float) -> dict:
+    rails_before = dict(_HVG_RAILS)
     opened = _hv_guard_force_open_all()
     off = _hv_rails_off()
     rec = {"source": "spellman_" + ev["kind"], "spellman": ev, "forced_open": opened, "hv_off": off,
-           "suspects": _hv_guard_suspects(now)}
+           "suspects": _hv_guard_suspects(now), "rails_before": rails_before,
+           "auto_recover": ev["kind"] in SPELLMAN_AUTO_RECOVER}
+    back = (f"Emission and focus go back on by themselves once the Spellman is stable "
+            f"{SW.STABLE_S:g} s (no arc, no alarm, HV on, kV steady); heating stays at IDLE.")
     if ev["kind"] == "system_fault":
         to_idle, no_idle = drop_hot_to_idle(now)
         rec.update(to_idle=to_idle, to_sleep_no_idle_known=no_idle)
         rec["message"] = (f"HV OFF: the Spellman reports SYSTEM FAULT (alarms: {', '.join(ev['alarms'])}; "
                           f"HV On bit {ev['hv_on']}, {ev['kv']} kV). Every grid switch opened, emission and "
                           f"focus off, heating back to IDLE for {to_idle or 'none'}"
-                          f"{f', SLEEP for {no_idle}' if no_idle else ''}. Check the tube and the supply "
-                          f"(reset its fault there); HV ON is refused until the latch is cleared "
-                          f"(POST /api/hv-guard {{\"clear\": true}}).")
+                          f"{f', SLEEP for {no_idle}' if no_idle else ''}. {back}")
     elif ev["kind"] == "big_arc":
         # IDLE, not STOP: IDLE keeps the vacuum (the rig's rule).
         to_idle, no_idle = drop_hot_to_idle(now)
@@ -3680,9 +3693,7 @@ def _spellman_trip(ev: dict, now: float) -> dict:
                           f"{ev.get('down_s')} s (peak {ev['peak_ma']:.3f} mA"
                           f"{', status ' + '/'.join(ev['status']) if ev['status'] else ''}). Every grid "
                           f"switch opened, emission and focus off, heating back to IDLE for "
-                          f"{to_idle or 'none'}{f', SLEEP for {no_idle}' if no_idle else ''}. Check the "
-                          f"tube and the supply; HV ON is refused until the latch is cleared "
-                          f"(POST /api/hv-guard {{\"clear\": true}}).")
+                          f"{to_idle or 'none'}{f', SLEEP for {no_idle}' if no_idle else ''}. {back}")
     else:
         try:
             stop = _hv_guard_stop_hot(now)
@@ -3697,9 +3708,58 @@ def _spellman_trip(ev: dict, now: float) -> dict:
                           f"{stop or 'none (no filament was hot)'}; HV ON is refused until the latch is "
                           f"cleared (POST /api/hv-guard {{\"clear\": true}}).")
     _hv_guard_latch(rec)
-    log.error("HV guard TRIPPED (Spellman %s): %s", ev["kind"], rec["message"])
+    (log.warning if rec["auto_recover"] else log.error)("HV guard TRIPPED (Spellman %s): %s",
+                                                       ev["kind"], rec["message"])
     _safety_record("hv_guard_tripped", rec)
     return {"action": "tripped", **rec}
+
+
+_HVG_SPELL_ARC = [None]         # the arc a Spellman auto-recovery was for (the STM32 check uses it)
+
+
+def _spellman_try_recover(now: float) -> dict | None:
+    """Tripped by a big arc / System Fault: once the Spellman is stable, the
+    rails that were on go back on (preflight first), latch cleared."""
+    t = _HV_GUARD["tripped"] or {}
+    why = _SPELL_WATCH.stable(now)
+    if why is None:
+        why = vacuum_refusal("HV ON after a Spellman arc")
+    t["waiting_for"] = why
+    if why is not None:
+        return None
+    rails = t.get("rails_before") or {}
+    st = _hv_guard_stm32_flags()
+    rec = {"source": t.get("source"), "tripped_at": t.get("at"), "rails_before": rails}
+    with _HV_GUARD_LOCK:
+        _HV_GUARD["tripped"] = None
+    if st is not None and st.get("flags", 0) & STM32_FLAG_HV_GUARD:
+        # The STM32 tripped on the same arc: its own check puts the rails back
+        # and judges by current (next tick); it must know this was an arc.
+        _HVG_RAILS.update(emission=bool(rails.get("emission")), focus=bool(rails.get("focus")))
+        _HVG_SPELL_ARC[0] = t.get("spellman")
+        rec["restored"] = "by the STM32 guard check (it tripped too)"
+    else:
+        link = CONTROLLERS.get(MASTER)
+        host = link.host if link else None
+        restored = {}
+        for ch in ("emission", "focus"):
+            if not rails.get(ch):
+                continue
+            pre = hv_preflight_switches(f"before {ch} ON (Spellman recovered)")
+            if not pre.get("ok"):
+                restored[ch] = f"not restored: {pre.get('error')}"
+                continue
+            try:
+                restored[ch] = bool(stm32_hv_enable_set(host, ch, True).get("ok")) if host else False
+            except Exception as exc:
+                restored[ch] = f"not restored: {exc}"
+        rec["restored"] = restored
+    rec["message"] = (f"HV guard: the Spellman is stable again ({SW.STABLE_S:g} s, no arc / alarm) after "
+                      f"the {t.get('source')} trip at {t.get('at')} -- latch cleared, rails put back "
+                      f"as they were: {rec['restored']}. Heating was left at IDLE.")
+    log.warning("%s", rec["message"])
+    _safety_record("hv_guard_auto_recovered", rec)
+    return {"action": "recovered", **rec}
 
 
 def hv_guard_snapshot() -> dict:

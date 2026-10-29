@@ -1,6 +1,15 @@
 # HV guard
 
-The HV guard takes the HV down when current flows that should not: a grid switch that will not turn off, or a Spellman arc or over-current. Current flowing *during* a pulse is not judged.
+The HV guard takes the HV down when current flows that should not: a grid switch that will not turn off, or a Spellman arc or over-current.
+
+Only two things need a person, and they stay latched until one clears them:
+
+- a MOSFET that stays on;
+- Spellman current high for a long time.
+
+Arcs are normal transients, including big ones and a System Fault. The HV comes down, then goes back on by itself once the Spellman has been stable for 10 s. Stable means no arc, no alarm bit and no HV-off read in that time, HV Ray On, and the kV steady within 2 %.
+
+The vacuum interlock is unchanged: it stays latched. Current flowing *during* a pulse is not judged.
 
 When the guard trips:
 
@@ -71,7 +80,7 @@ control2's `spellman_backend` broadcasts kV, mA and GetStatus about 4 times a se
 | event | what it looks like | action |
 |---|---|---|
 | ordinary arc | one reading (sometimes two) with the kV down by more than 10 % and 3 kV and/or an mA spike, then back to 95 % | Recorded in `logs/arcs.jsonl` and in the backend log. The supply recovers by itself, so nothing is switched. |
-| big arc | the kV falls in one step, and a reading taken at least 5 s later is still under 50 % (a stale reading never counts: `spellman_backend` pauses its monitor while its conditioning handles an arc, which caused a false trip at 11:36 on 2026-10-29; with no reading for 30 s the event is recorded as unknown) | Trip, latched: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Cleared by hand. |
+| big arc (auto-recovers) | the kV falls in one step, and a reading taken at least 5 s later is still under 50 % (a stale reading never counts: `spellman_backend` pauses its monitor while its conditioning handles an arc, which caused a false trip at 11:36 on 2026-10-29; with no reading for 30 s the event is recorded as unknown) | Trip: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Back on by itself once the Spellman has been stable for 10 s. Heating stays at IDLE. |
 | over-current | between pulses, the mA is over its baseline by `spellman_trip_ma` for more than 1 s | Trip, latched: switches open, HV off, filaments hot within 15 s to STOP. |
 
 ### GetStatus
@@ -90,7 +99,7 @@ Its 17 bits, in the order of control2's `spellman.html`:
 | 7 | Voltage Control Mode | 16 | HV Inhibit |
 | **8** | **System Fault** | | |
 
-- **System Fault** rising: trip, latched, at once, whatever the kV reads. Switches are opened, HV goes off, hot filaments go to IDLE. The fault is reset on the supply, then the latch is cleared here.
+- **System Fault** rising: trip at once, whatever the kV reads. Switches are opened, HV goes off, hot filaments go to IDLE. Once the supply is stable again for 10 s, the rails that were on come back by themselves. Heating stays at IDLE. If the STM32 tripped on the same arc, its own current check restores the rails instead.
 - **Arc** rising: an arc. Only the edge counts; the bit can stay set across several reads.
 - **HV Ray On**: the kV down for 5 s with this bit 0 (read within 3 s) and no fault means somebody switched the supply off. That is recorded as `hv_off`, with no trip.
 - Every change of an alarm bit or of HV Ray On is written to `logs/arcs.jsonl` as `kind: status`. The alarm bits are Arc, Over Current/Power/Voltage, System Fault, Regulation Error, Over Temperature, AC/LVPS Fault and HV Inhibit.

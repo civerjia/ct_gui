@@ -246,7 +246,8 @@ check("...every switch forced open, emission and focus off", rig["forced"] == 2
       and ("emission", False) in rig["rails"] and ("focus", False) in rig["rails"], rig)
 check("...the hot filament back to its IDLE (not STOP)", S.ACTIVE_DEADLINES[20][1] == 1200
       and S.ACTIVE_DEADLINES[20][0] < 1e11 and r["to_idle"] == [20], r and r.get("to_idle"))
-check("...message says how to clear", "/api/hv-guard" in r["message"] and "big arc" in r["message"])
+check("...message says it comes back by itself", "by themselves" in r["message"] and "big arc" in r["message"]
+      and r["auto_recover"], r["message"])
 n = len(rig["rails"])
 t = msgs(t, [2.0] * 30, [0.0] * 30)
 S._spellman_tick(t)
@@ -279,6 +280,78 @@ check("...switches open, rails off, the hot filament to IDLE", rig["forced"] == 
 lines = S.ARC_LOG_PATH.read_text().splitlines()
 check("...the status change is in arcs.jsonl", any('"kind": "status"' in ln and "system_fault" in ln for ln in lines),
       lines)
+
+# ── auto-recovery: arcs (big ones, System Fault) are transients ─────────────
+def stable_feed(t0, seconds, status=None):
+    """Steady 65.5 kV, 0.02 mA, GetStatus each cycle, for `seconds`."""
+    t = t0
+    while t < t0 + seconds:
+        S._spellman_on_message({"type": "spellman_response", "cmd": "GetStatus",
+                                "data": status or OK}, t)
+        S._spellman_on_message({"type": "spellman_response", "cmd": "GetkVMonitor", "data": 65.5}, t + 0.05)
+        S._spellman_on_message({"type": "spellman_response", "cmd": "GetmAMonitor", "data": [0.02]}, t + 0.1)
+        t += DT
+    return t
+
+
+def recover_setup():
+    rig = setup()
+    S._HVG_RAILS.update(emission=True, focus=True)
+    S._hv_guard_stm32_flags = lambda: {"ok": True, "flags": 0}
+    S.hv_preflight_switches = lambda reason: {"ok": True}
+    S.vacuum_refusal = lambda action: None
+    return rig
+
+
+rig = recover_setup()
+t = stable_feed(0.0, 3.0)
+S._spellman_on_message({"type": "spellman_response", "cmd": "GetStatus", "data": st(system_fault=1, hv_on=0)}, t)
+r = S._spellman_tick(t + 0.1)
+check("system fault -> tripped, marked auto_recover", r and r["auto_recover"] and S._HV_GUARD["tripped"], r)
+t = stable_feed(t + 0.2, 4.0, st(system_fault=1, hv_on=0))
+r = S.hv_guard_tick(t)
+check("...fault still set -> stays tripped, says why", r is None and S._HV_GUARD["tripped"]
+      and "system_fault" in (S._HV_GUARD["tripped"].get("waiting_for") or ""), S._HV_GUARD["tripped"].get("waiting_for"))
+t = stable_feed(t, 5.0)
+r = S.hv_guard_tick(t)
+check("...cleared but only 5 s steady -> still waiting", r is None and S._HV_GUARD["tripped"], r)
+n_rails = len(rig["rails"])
+t = stable_feed(t, 6.0)
+r = S.hv_guard_tick(t)
+check("...stable 10 s -> recovered, latch cleared", r and r["action"] == "recovered" and S._HV_GUARD["tripped"] is None, r)
+check("...emission and focus back on", rig["rails"][n_rails:] == [("emission", True), ("focus", True)], rig["rails"])
+
+rig = recover_setup()
+S._HVG_RAILS.update(emission=True, focus=False)
+t = stable_feed(0.0, 3.0)
+t = msgs(t, [3.0] * 30, [0.0] * 30)              # big arc (HV On still 1 in the last status)
+S._spellman_tick(t)
+check("big arc -> tripped, auto_recover", S._HV_GUARD["tripped"] and S._HV_GUARD["tripped"]["auto_recover"],
+      S._HV_GUARD["tripped"])
+t = stable_feed(t, 11.0)
+r = S.hv_guard_tick(t)
+check("...stable again -> recovered; only the rail that was on comes back", r and r["action"] == "recovered"
+      and ("emission", True) in rig["rails"] and ("focus", True) not in rig["rails"], rig["rails"])
+
+rig = recover_setup()
+S._hv_guard_stm32_flags = lambda: {"ok": True, "flags": 32}
+t = stable_feed(0.0, 3.0)
+S._spellman_on_message({"type": "spellman_response", "cmd": "GetStatus", "data": st(system_fault=1)}, t)
+S._spellman_tick(t + 0.1)
+n_rails = len(rig["rails"])
+t = stable_feed(t + 0.2, 11.0)
+r = S.hv_guard_tick(t)
+check("STM32 tripped on it too -> its own check restores (rails not touched here)", r and r["action"] == "recovered"
+      and rig["rails"][n_rails:] == [] and S._HVG_SPELL_ARC[0] is not None, (r, rig["rails"][n_rails:]))
+
+rig = recover_setup()
+t = stable_feed(0.0, 3.0)
+t = msgs(t, [65.5] * 8, [0.6] * 8)
+S._spellman_tick(t)
+t = stable_feed(t, 20.0)
+r = S.hv_guard_tick(t)
+check("over-current -> stays latched however stable (a person handles it)", r is None
+      and S._HV_GUARD["tripped"] and not S._HV_GUARD["tripped"]["auto_recover"], S._HV_GUARD["tripped"])
 
 # The threshold is settable and kept.
 r = S.spellman_set_trip_ma(0.5, "test")

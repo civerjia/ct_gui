@@ -2411,8 +2411,13 @@ function wireSupplyMonitor() {
     // HV guard
     const t = g.tripped;
     if (t) {
-      set(['hvGuardState'], 'TRIPPED · ' + (t.source || 'host'), 'bad');
-      forMirrored('hvGuardMsg', (e) => { e.hidden = false; e.textContent = (t.at ? t.at + ' — ' : '') + (t.message || 'HV guard tripped'); });
+      const auto = !!t.auto_recover;
+      set(['hvGuardState'], (auto ? 'HV off · waiting for Spellman · ' : 'TRIPPED · ') + (t.source || 'host'), auto ? 'warn' : 'bad');
+      forMirrored('hvGuardMsg', (e) => {
+        e.hidden = false;
+        e.textContent = (t.at ? t.at + ' — ' : '') + (t.message || 'HV guard tripped') +
+          (auto && t.waiting_for ? ` (waiting: ${t.waiting_for})` : '');
+      });
       forMirrored('hvGuardClear', (e) => { e.hidden = false; });
     } else {
       const sp = g.spellman || {}, lm = g.load_model;
