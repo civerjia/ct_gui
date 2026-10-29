@@ -325,15 +325,16 @@ r = S.hv_guard_tick(100.0)
 check("...only the rails that were on come back", r and r["action"] == "recovered"
       and rig.rails == [("emission", True)], rig.rails)
 
-# 12c. Too many recoveries -> the next one latches without a second HV ON.
+# 12c. Many recoveries -> no latch by count (2026-10-29): still checked by current.
 rig = Rig()
 setup(rig)
 S._HVG_RECOVERIES[:] = [50.0, 60.0, 70.0]
 rig.after = [11.60] * 3
 rig.stm32 = {"ok": True, "flags": 24 | 32, "reason": 8}
 r = S.hv_guard_tick(100.0)
-check("4th within 10 min -> latched, HV not put back", r and r["action"] == "tripped"
-      and "recoveries already" in r["message"] and ("emission", True) not in rig.rails, r and r.get("message"))
+check("4th within 10 min -> still checked by current, recovered, warns about the 595s",
+      r and r["action"] == "recovered" and "flip often" in r["message"] and ("emission", True) in rig.rails,
+      r and r.get("message"))
 
 # 12e. The same trip with a Spellman arc just before it: the arc's, recovered,
 #      and not counted (five arcs latched the rig 2026-10-29 11:03-11:09).

@@ -71,7 +71,7 @@ The backend then:
 
 Back within half a switch means recovered. Still over means latched.
 
-More than 3 recoveries in 10 min latches. **A trip that comes within about 4 s after a Spellman arc is the arc's.** It recovers and does not count toward that limit. On 2026-10-29 between 11:03 and 11:09, five arcs tripped the STM32 and the third one latched the rig.
+There is **no latch by count**: every trip is checked by current, and only "still over with every switch forced open" (a MOSFET that stays on) latches. More than 3 flips in 10 min adds a warning about the 595s. This changed on 2026-10-29: at 12:51:12 a 4th trip in 10 min latched unchecked. A trip that comes within about 4 s after a Spellman arc is the arc's, and is not counted as a flip.
 
 ## 2. The Spellman (read-only)
 

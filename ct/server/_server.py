@@ -3254,12 +3254,11 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
        and it is fixed: WARNING, no heat touched, no latch;
        still over -> a MOSFET is conducting that nothing can open: HV off
        again, filaments hot within 15 s to STOP, latched.
-    More than HV_GUARD_RECOVER_MAX recoveries in HV_GUARD_RECOVER_WINDOW_S,
-    or the check cannot be made (rail does not come back, ADS unreadable):
-    latched, no second HV ON. A trip that came with a Spellman arc is the
-    arc's: an ordinary arc recovers by itself (the user, 2026-10-29), so it
-    is not counted against that limit -- on 2026-10-29 11:03-11:09 five
-    arcs tripped the STM32 and the third latched the rig."""
+    The check cannot be made (rail does not come back, ADS unreadable):
+    latched. There is no latch by count: every trip is checked by current;
+    more than HV_GUARD_RECOVER_MAX flips in HV_GUARD_RECOVER_WINDOW_S only
+    adds a warning about the 595s. A trip that came with a Spellman arc is
+    the arc's and is not counted as a flip."""
     suspects = _hv_guard_suspects(now)
     rails_before = dict(_HVG_RAILS)
     pre_v = _HVG_LAST_EMISS_V[0]
@@ -3287,10 +3286,12 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
     rec["arc"] = arc
     _HVG_RECOVERIES[:] = [t for t in _HVG_RECOVERIES if now - t <= HV_GUARD_RECOVER_WINDOW_S]
     why_not = None
-    if arc is None and len(_HVG_RECOVERIES) >= HV_GUARD_RECOVER_MAX:
-        why_not = (f"{len(_HVG_RECOVERIES)} recoveries already in the last "
-                   f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min")
-    elif not rails_before.get("emission"):
+    # No latch by COUNT (the user, 2026-10-29: only a MOSFET that stays on,
+    # and Spellman current high for long, need a person). 12:51:12 latched
+    # unchecked on a 4th trip in 10 min; every trip is now checked by current
+    # and only "still over with every switch open" latches. Frequent flips
+    # are a warning about the 595s, not a latch.
+    if not rails_before.get("emission"):
         why_not = "the emission rail was not on before the trip"
     elif not all(opened.values()):
         why_not = "a force-open was not confirmed"
@@ -3358,11 +3359,15 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
                               f"was hot went to IDLE for the check.")
         else:
             _HVG_RECOVERIES.append(now)
+            n = len(_HVG_RECOVERIES)
+            rec["flips_10min"] = n
             rec["message"] = (f"HV guard: the current was over its baseline with no pulse; every switch "
                               f"was forced open and {back} -- a 595 that flipped "
-                              f"by itself (165 read-back at the trip: {rec['read_back_165']}). No heating "
-                              f"touched. {len(_HVG_RECOVERIES)} such recovery(ies) in "
-                              f"{HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min (latches after {HV_GUARD_RECOVER_MAX}).")
+                              f"by itself (165 read-back at the trip: {rec['read_back_165']}). "
+                              f"{n} such recovery(ies) in {HV_GUARD_RECOVER_WINDOW_S / 60:.0f} min"
+                              + (f" -- the 595s flip often: check the channel boards / their supply "
+                                 f"(filaments that were hot went to IDLE each time)." if n >= HV_GUARD_RECOVER_MAX
+                                 else "."))
         _HVG_HIST.clear()
         log.warning("%s", rec["message"])
         _safety_record("hv_guard_recovered", rec)
