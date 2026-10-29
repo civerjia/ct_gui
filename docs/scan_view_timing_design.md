@@ -26,9 +26,10 @@ covers the names they share.
 ## 2. The call
 
 Every argument is written with its name: the function takes no positional
-arguments, so a call without names is a TypeError. What only one trigger
-mode uses lives in that mode's own group. Give `sim=` OR `ext=`, never
-both and never neither.
+arguments, so a call without names is a TypeError. The trigger mode is ONE
+argument, `trigger=`, whose value is `ct.Sim(...)` or `ct.Ext(...)`. What
+only one mode uses lives inside it, so the other mode cannot be given it, and
+"both" cannot even be written.
 
 ```python
 # trigger = sim: the library makes the edges
@@ -40,7 +41,7 @@ r = ct.scan_view(
     heat_timeout_s=10,                       # longest one filament may stay heated
     num_pulses=20,                           # pulses per filament
     width_us=12000,                          # HV pulse width
-    sim=ct.Sim(
+    trigger=ct.Sim(
         pulse_interval_ms=26,                # the train's edge spacing
         trigger_timeout_ms=None,             # gap limit; None = 2 x 26 + 100 = 152
         on_armed=None,                       # optional: called before each train
@@ -67,7 +68,7 @@ r = ct.scan_view(
     heat_timeout_s=10,
     num_pulses=20,
     width_us=12000,
-    ext=ct.Ext(
+    trigger=ct.Ext(
         on_armed=on_armed,                   # required: start your edges in it
         trigger_timeout_ms=60,               # required: gap limit for YOUR spacing
     ),
@@ -82,9 +83,11 @@ r = ct.scan_view(
 ```
 
 `ct.Sim`, `ct.Ext` and `ct.Measure` take named arguments only and return a
-plain dict. A misspelt name fails at once, and the dict passes through the
-remote proxy unchanged (`on_armed` inside it is still called back). A
-hand-written dict is checked the same way: an unknown key is refused.
+plain dict; `ct.Sim` / `ct.Ext` put the mode in it (`{"mode": "sim", ...}`).
+A misspelt name fails at once, and the dict passes through the remote proxy
+unchanged (`on_armed` inside it is still called back). A hand-written dict is
+checked the same way: a missing or unknown `mode`, or an unknown key, is
+refused.
 
 ## 3. Who does what
 
@@ -118,7 +121,7 @@ hand-written dict is checked the same way: an unknown key is refused.
 | `num_pulses` | pulses per filament = edges per filament | RP2350 (row length) | 1..255 |
 | `width_us` | the HV pulse width. The edge that triggers it does not set it: a sim edge is a fixed 5 µs ESP32 pulse, and an ext edge may be any width | RP2350 PIO | 1..65 535 µs (firmware u16) |
 
-### `sim=ct.Sim(...)` — the library makes the edges
+### `trigger=ct.Sim(...)` — the library makes the edges
 
 | parameter | meaning | enforced by | default / range |
 |---|---|---|---|
@@ -129,7 +132,7 @@ hand-written dict is checked the same way: an unknown key is refused.
 The host sends one request per filament: `num_pulses` edges,
 `pulse_interval_ms` apart (§5).
 
-### `ext=ct.Ext(...)` — your hardware makes the edges
+### `trigger=ct.Ext(...)` — your hardware makes the edges
 
 | parameter | meaning | enforced by | default / range |
 |---|---|---|---|
@@ -202,7 +205,7 @@ Specific to `sim`:
 1. Every filament has its own `active_mv`, and none is dead.
 2. HV (emission and focus) is on, the HV guard is not tripped, and the vacuum
    is within its limit.
-3. Exactly one of `sim=` / `ext=`, every key known. `width_us` is 1..65 535.
+3. `trigger` is a `ct.Sim` or `ct.Ext`, every key known. `width_us` is 1..65 535.
    sim: `pulse_interval_ms` × 1000 > `width_us`, `trigger_timeout_ms` >
    `pulse_interval_ms`, and with `measure` the spacing is ≥ 0.5 ms. ext:
    `on_armed` and `trigger_timeout_ms` given.
@@ -309,7 +312,7 @@ heated filament: the backend's window ends, but its IDLE cannot arrive (Q7).
 | `max_on_ms` | removed; the host writes the firmware's maxOnMs itself | the firmware check is "width above maxOnMs" — it only restated `width_us` |
 | backend timed-VOLTAGE length | = `heat_timeout_s`, never renewed | one hard limit |
 | positional `filaments, active_mv, idle_ma, settle_ms` | named only | a call reads the same everywhere; no positional arguments at all |
-| `trigger=`, `on_armed=`, `pulse_interval_ms=`, `trigger_timeout_ms=` | inside `sim=ct.Sim(...)` or `ext=ct.Ext(...)` | what one mode uses is written in that mode's group; the other mode cannot be given it by mistake |
+| `trigger="sim"/"ext"`, `on_armed=`, `pulse_interval_ms=`, `trigger_timeout_ms=` | `trigger=ct.Sim(...)` or `trigger=ct.Ext(...)` | one argument picks the mode, and what that mode uses is inside it; the other mode cannot be given it by mistake |
 | `measure=`, `rate_hz=`, `bg_gap_us=`, `bg_window_us=` | `measure=ct.Measure(...)` or `None` | the sampling settings exist only when measuring |
 
 `fire_single_pulse` takes the same names with the same meanings:
@@ -343,4 +346,4 @@ during a window.
 | Q10 | `settle_ms` in fire_single_pulse is "held continuously"; in scan_view "from the first arrival" | one rule for both: from the first arrival |
 | Q11 | `link_lost_timeout_s` watches L2 only | watch L2 and L3 |
 | Q12 | ext: the measurement spacing check (≥ 0.5 ms) needs the edge spacing, which only you know | give `ct.Ext` an optional `expected_interval_ms` used ONLY for that check — or drop the check for ext and flag a pulse whose background was not clean |
-| Q13 | same call shape for `fire_single_pulse` (`filament=`, `sim=`/`ext=`, `measure=`) | yes |
+| Q13 | same call shape for `fire_single_pulse` (`filament=`, `trigger=ct.Sim/ct.Ext`, `measure=`) | yes |
