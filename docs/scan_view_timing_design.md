@@ -25,26 +25,66 @@ covers the names they share.
 
 ## 2. The call
 
+Every argument is written with its name: the function takes no positional
+arguments, so a call without names is a TypeError. What only one trigger
+mode uses lives in that mode's own group. Give `sim=` OR `ext=`, never
+both and never neither.
+
 ```python
+# trigger = sim: the library makes the edges
 r = ct.scan_view(
-    [0, 1, 95],                       # filaments, fired in this order
-    {0: 7000, 1: 7050, 95: 6950},     # active_mv: each filament's heating voltage
-    1200,                             # idle_ma: back to this after its pulses
-    settle_ms=1000,                   # HOT = this long after the FIRST arrival
-    heat_timeout_s=10,                # longest one filament may stay heated
-    trigger="sim",                    # "sim" or "ext"
-    on_armed=on_armed,                # your function, called at each filament's turn
+    filaments=[0, 1, 95],                    # fired in this order
+    active_mv={0: 7000, 1: 7050, 95: 6950},  # each filament's heating voltage
+    idle_ma=1200,                            # back to this after its pulses
+    settle_ms=1000,                          # HOT = this long after the FIRST arrival
+    heat_timeout_s=10,                       # longest one filament may stay heated
+    num_pulses=20,                           # pulses per filament
+    width_us=12000,                          # HV pulse width
+    sim=ct.Sim(
+        pulse_interval_ms=26,                # the train's edge spacing
+        trigger_timeout_ms=None,             # gap limit; None = 2 x 26 + 100 = 152
+        on_armed=None,                       # optional: called before each train
+    ),
+    measure=ct.Measure(                      # or measure=None: no measurement
+        rate_hz=1_000_000,
+        bg_gap_us=100.0,
+        bg_window_us=50.0,
+    ),
+    preheat_ahead="auto",                    # rarely changed from here on
+    preheat_margin_s=0.3,
+    max_hot=6,
+    max_voltage_drop_mv=500,
+    link_lost_timeout_s=5.0,
+    verify=True,
+)
+
+# trigger = ext: your hardware makes the edges
+r = ct.scan_view(
+    filaments=[0, 1, 95],
+    active_mv={0: 7000, 1: 7050, 95: 6950},
+    idle_ma=1200,
+    settle_ms=1000,
+    heat_timeout_s=10,
     num_pulses=20,
     width_us=12000,
-    pulse_interval_ms=26,             # sim: edge spacing. ext: optional, see 4
-    trigger_timeout_ms=None,          # longest gap between two edges (None = default)
-    measure=True,                     # STM32 measures every pulse
-    # rarely changed:
-    preheat_ahead="auto", preheat_margin_s=0.3, max_hot=6, max_voltage_drop_mv=500,
-    link_lost_timeout_s=5.0, verify=True, rate_hz=1_000_000,
-    bg_gap_us=100.0, bg_window_us=50.0,
+    ext=ct.Ext(
+        on_armed=on_armed,                   # required: start your edges in it
+        trigger_timeout_ms=60,               # required: gap limit for YOUR spacing
+    ),
+    measure=ct.Measure(rate_hz=1_000_000, bg_gap_us=100.0, bg_window_us=50.0),
+    preheat_ahead="auto",
+    preheat_margin_s=0.3,
+    max_hot=6,
+    max_voltage_drop_mv=500,
+    link_lost_timeout_s=5.0,
+    verify=True,
 )
 ```
+
+`ct.Sim`, `ct.Ext` and `ct.Measure` take named arguments only and return a
+plain dict. A misspelt name fails at once, and the dict passes through the
+remote proxy unchanged (`on_armed` inside it is still called back). A
+hand-written dict is checked the same way: an unknown key is refused.
 
 ## 3. Who does what
 
@@ -59,35 +99,62 @@ r = ct.scan_view(
 
 ## 4. Every parameter: what it does in `sim` and in `ext`
 
-### Heating
+### Heating — the same in both modes
 
-| parameter | meaning | enforced by | sim | ext | default / range |
-|---|---|---|---|---|---|
-| `active_mv` | each filament's heating voltage (VOLTAGE mode) | RP2350 voltage loop | same | same | required, one per filament |
-| `idle_ma` | the IDLE current each filament returns to | RP2350 current loop | same | same | required |
-| `settle_ms` | after the FIRST arrival (load V within ±150 mV), wait this long; then it is HOT. A wobble does not restart it; a drop of more than `max_voltage_drop_mv` (3 reads) or an output fault "interrupts" it | RP2350 (CH_ARRIVAL_SETTLE, CH_GET_HOT) | same | same | required, 0..60 000 ms |
-| `heat_timeout_s` | **the longest one filament may stay heated in one go**: from its VOLTAGE command until it is back at IDLE. A hard limit, never renewed | backend timer | same | same | Q3 (10 s proposed) |
-| `preheat_ahead`, `preheat_margin_s`, `max_hot` | when to raise each filament so it is HOT about when its turn comes; at most `max_hot` heating at once | host | same | same | `"auto"`, 0.3 s, 6 |
-| `max_voltage_drop_mv` | a drop larger than this below `active_mv` (3 reads) = heating interrupted | RP2350 | same | same | 500 mV |
+| parameter | meaning | enforced by | default / range |
+|---|---|---|---|
+| `filaments` | the filaments, fired strictly in this order | host | required; no repeats, none dead |
+| `active_mv` | each filament's heating voltage (VOLTAGE mode) | RP2350 voltage loop | required, one per filament |
+| `idle_ma` | the IDLE current each filament returns to | RP2350 current loop | required |
+| `settle_ms` | after the FIRST arrival (load V within ±150 mV), wait this long; then it is HOT. A wobble does not restart it; a drop of more than `max_voltage_drop_mv` (3 reads) or an output fault "interrupts" it | RP2350 (CH_ARRIVAL_SETTLE, CH_GET_HOT) | required, 0..60 000 ms |
+| `heat_timeout_s` | **the longest one filament may stay heated in one go**: from its VOLTAGE command until it is back at IDLE. A hard limit, never renewed | backend timer | Q3 (10 s proposed) |
+| `preheat_ahead`, `preheat_margin_s`, `max_hot` | when to raise each filament so it is HOT about when its turn comes; at most `max_hot` heating at once | host | `"auto"`, 0.3 s, 6 |
+| `max_voltage_drop_mv` | a drop larger than this below `active_mv` (3 reads) = heating interrupted | RP2350 | 500 mV |
 
-### Firing
+### Firing — both modes
 
-| parameter | meaning | enforced by | **sim** | **ext** | default / range |
-|---|---|---|---|---|---|
-| `trigger` | where the edges come from | — | the library starts a train on the master ESP32 after `on_armed` returns | your hardware drives the master's SyncIn | `"sim"` |
-| `on_armed(f)` | your function, called when it is f's turn and f is HOT | host | optional; the train starts only after it RETURNS | required: start your edges here (or start the thing that sends them) and return | — |
-| `num_pulses` | pulses per filament | RP2350 (row length) | the train sends exactly this many edges | your hardware must send exactly this many | 1..255 |
-| `width_us` | the HV pulse width | RP2350 PIO | the edge is a fixed 5 µs ESP32 pulse; the pulse it fires is `width_us` | your edge's own width does not matter; the pulse is `width_us` | 1..65 535 µs (firmware u16) |
-| `pulse_interval_ms` | the spacing of the edges | **sim: master ESP32 timer** (period = `pulse_interval_ms` × 1000 µs, hardware-timed) | used: the train's spacing | **not sent anywhere**; give it only if `measure=True`, so the host can check the spacing against the measurement limit | sim: default 500 ms, must be > `width_us`; ext: optional |
-| `trigger_timeout_ms` | the longest gap between two consecutive edges of the SAME filament, from its FIRST edge (release → first edge is not timed) | RP2350 | catches a lost edge or a dead train; spacing is hardware-timed | catches your source stopping mid-filament | sim: 2 × `pulse_interval_ms` + 100; ext: Q6 |
+| parameter | meaning | enforced by | default / range |
+|---|---|---|---|
+| `num_pulses` | pulses per filament = edges per filament | RP2350 (row length) | 1..255 |
+| `width_us` | the HV pulse width. The edge that triggers it does not set it: a sim edge is a fixed 5 µs ESP32 pulse, and an ext edge may be any width | RP2350 PIO | 1..65 535 µs (firmware u16) |
 
-### Measuring and housekeeping
+### `sim=ct.Sim(...)` — the library makes the edges
 
-| parameter | meaning | sim / ext |
+| parameter | meaning | enforced by | default / range |
+|---|---|---|---|
+| `pulse_interval_ms` | the spacing of the train: the master ESP32's timer period is `pulse_interval_ms` × 1000 µs, hardware-timed | master ESP32 | 500; must be > `width_us`; ≥ 0.5 with `measure` |
+| `trigger_timeout_ms` | the longest gap between two consecutive edges of the same filament, from its first edge. With a hardware-timed train it only catches a lost edge or a dead train | RP2350 | 2 × `pulse_interval_ms` + 100; must be > `pulse_interval_ms` |
+| `on_armed` | optional `on_armed(f)`, called at f's turn; the train starts after it RETURNS | host | None |
+
+The host sends one request per filament: `num_pulses` edges,
+`pulse_interval_ms` apart (§5).
+
+### `ext=ct.Ext(...)` — your hardware makes the edges
+
+| parameter | meaning | enforced by | default / range |
+|---|---|---|---|
+| `on_armed` | `on_armed(f)`, called at f's turn: start your `num_pulses` edges here (or start what sends them) and return | host | **required** |
+| `trigger_timeout_ms` | the longest gap between two consecutive edges of the same filament, from its first edge: a little over YOUR spacing | RP2350 | **required** (only you know your spacing; Q6) |
+
+Your edges go into the master's SyncIn (§5). The host does not know their
+spacing, so it cannot check it against the measurement minimum before
+starting (Q12).
+
+### `measure=ct.Measure(...)` — or `measure=None`
+
+| parameter | meaning | default |
 |---|---|---|
-| `measure`, `rate_hz`, `bg_gap_us`, `bg_window_us` | the STM32 measures each pulse (mA, mAms) inside the master's envelope, sampling at `rate_hz`. Its background is averaged over `bg_window_us`, taken `bg_gap_us` before the pulse's rise and again after it | same. Edges closer than 0.5 ms (`MIN_INTER_PULSE_US`) leave no clean background: refused |
-| `verify` | read the schedule back before arming | same |
-| `link_lost_timeout_s` | a command link (L2/L3, section 9) down this long → the run stops. Leave it at 5 s | same |
+| `rate_hz` | STM32 sample rate | 1 000 000 |
+| `bg_gap_us`, `bg_window_us` | the background is averaged over `bg_window_us`, taken `bg_gap_us` before the pulse's rise and again after it | 100, 50 |
+
+Pulses closer than 0.5 ms (`MIN_INTER_PULSE_US`) leave no clean background.
+
+### Housekeeping
+
+| parameter | meaning | default |
+|---|---|---|
+| `verify` | read the schedule back before arming | True |
+| `link_lost_timeout_s` | a command link (L2/L3, §9) down this long → the run stops. Leave it at 5 s | 5.0 |
 
 ## 5. The two trigger paths
 
@@ -135,9 +202,10 @@ Specific to `sim`:
 1. Every filament has its own `active_mv`, and none is dead.
 2. HV (emission and focus) is on, the HV guard is not tripped, and the vacuum
    is within its limit.
-3. `width_us` is 1..65 535. sim: `pulse_interval_ms` × 1000 > `width_us`, and
-   `trigger_timeout_ms` > `pulse_interval_ms`. With `measure`: the spacing is
-   at least 0.5 ms (§4).
+3. Exactly one of `sim=` / `ext=`, every key known. `width_us` is 1..65 535.
+   sim: `pulse_interval_ms` × 1000 > `width_us`, `trigger_timeout_ms` >
+   `pulse_interval_ms`, and with `measure` the spacing is ≥ 0.5 ms. ext:
+   `on_armed` and `trigger_timeout_ms` given.
 4. The window holds one filament's work (§7). If not: Q4.
 
 **Setup.** All filaments are at IDLE.
@@ -240,6 +308,9 @@ heated filament: the backend's window ends, but its IDLE cannot arrive (Q7).
 | `total_ms` | removed as a parameter; computed | firmware backstop only |
 | `max_on_ms` | removed; the host writes the firmware's maxOnMs itself | the firmware check is "width above maxOnMs" — it only restated `width_us` |
 | backend timed-VOLTAGE length | = `heat_timeout_s`, never renewed | one hard limit |
+| positional `filaments, active_mv, idle_ma, settle_ms` | named only | a call reads the same everywhere; no positional arguments at all |
+| `trigger=`, `on_armed=`, `pulse_interval_ms=`, `trigger_timeout_ms=` | inside `sim=ct.Sim(...)` or `ext=ct.Ext(...)` | what one mode uses is written in that mode's group; the other mode cannot be given it by mistake |
+| `measure=`, `rate_hz=`, `bg_gap_us=`, `bg_window_us=` | `measure=ct.Measure(...)` or `None` | the sampling settings exist only when measuring |
 
 `fire_single_pulse` takes the same names with the same meanings:
 `heat_timeout_s`, `settle_ms`, `trigger_timeout_ms`, `pulse_interval_ms`,
@@ -265,9 +336,11 @@ during a window.
 | Q3 | `heat_timeout_s` default | 10 s |
 | Q4 | the window cannot hold one filament's work (§7) | refuse before starting |
 | Q5 | ext, your script disconnects mid-run | STOP |
-| Q6 | ext default for `trigger_timeout_ms` | required with ext (only you know your spacing) |
+| Q6 | ext `trigger_timeout_ms` | required in `ct.Ext` (only you know your spacing) |
 | Q7 | RP2350 drops a heated filament by itself after `heat_timeout_s` if no IDLE comes | yes; firmware change, test board first |
 | Q8 | sim: stop and confirm the train before the next row when a filament ends early, and on every STOP | yes |
 | Q9 | sim "already running" right after a filament | the backend asks the ESP32 directly; drop the host's 2 s retry |
 | Q10 | `settle_ms` in fire_single_pulse is "held continuously"; in scan_view "from the first arrival" | one rule for both: from the first arrival |
 | Q11 | `link_lost_timeout_s` watches L2 only | watch L2 and L3 |
+| Q12 | ext: the measurement spacing check (≥ 0.5 ms) needs the edge spacing, which only you know | give `ct.Ext` an optional `expected_interval_ms` used ONLY for that check — or drop the check for ext and flag a pulse whose background was not clean |
+| Q13 | same call shape for `fire_single_pulse` (`filament=`, `sim=`/`ext=`, `measure=`) | yes |
