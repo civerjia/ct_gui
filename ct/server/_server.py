@@ -3614,7 +3614,7 @@ def _spellman_events(events: list, now: float) -> None:
     for ev in events:
         ev = dict(ev, at=datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
                   age_s=round(now - ev["t"], 2))
-        if ev["kind"] in ("arc", "big_arc"):
+        if ev["kind"] in ("arc", "big_arc", "hv_off", "status", "system_fault"):
             with _SAFETY_LOCK:
                 ev["hot"] = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
                                    if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
@@ -3626,11 +3626,17 @@ def _spellman_events(events: list, now: float) -> None:
                     fh.write(json.dumps({k: v for k, v in ev.items() if k != "t"}) + "\n")
             except OSError:
                 pass
-            if ev["kind"] == "arc":
+            if ev["kind"] == "status":
+                log.info("Spellman status: set %s, cleared %s (HV on %s, %s kV)", ev["set"], ev["cleared"],
+                         ev["hv_on"], ev["kv"])
+            elif ev["kind"] == "hv_off":
+                log.warning("Spellman HV switched off (HV On bit 0, no fault): %.1f -> %.1f kV -- no trip",
+                            ev["kv_before"], ev["min_kv"])
+            elif ev["kind"] == "arc":
                 log.info("Spellman arc: %.1f kV -> %.1f kV, peak %.3f mA, back in %s s%s (via %s)",
                          ev["kv_before"], ev["min_kv"], ev["peak_ma"], ev.get("recovered_s"),
                          f", settled at {ev['settled_kv']} kV" if "settled_kv" in ev else "", ev["via"])
-        if ev["kind"] in ("big_arc", "over_current"):
+        if ev["kind"] in ("big_arc", "over_current", "system_fault"):
             _SPELL_ACTIONS.append(ev)
             _HVG_WAKE.set()
 
@@ -3656,7 +3662,16 @@ def _spellman_trip(ev: dict, now: float) -> dict:
     off = _hv_rails_off()
     rec = {"source": "spellman_" + ev["kind"], "spellman": ev, "forced_open": opened, "hv_off": off,
            "suspects": _hv_guard_suspects(now)}
-    if ev["kind"] == "big_arc":
+    if ev["kind"] == "system_fault":
+        to_idle, no_idle = drop_hot_to_idle(now)
+        rec.update(to_idle=to_idle, to_sleep_no_idle_known=no_idle)
+        rec["message"] = (f"HV OFF: the Spellman reports SYSTEM FAULT (alarms: {', '.join(ev['alarms'])}; "
+                          f"HV On bit {ev['hv_on']}, {ev['kv']} kV). Every grid switch opened, emission and "
+                          f"focus off, heating back to IDLE for {to_idle or 'none'}"
+                          f"{f', SLEEP for {no_idle}' if no_idle else ''}. Check the tube and the supply "
+                          f"(reset its fault there); HV ON is refused until the latch is cleared "
+                          f"(POST /api/hv-guard {{\"clear\": true}}).")
+    elif ev["kind"] == "big_arc":
         # IDLE, not STOP: IDLE keeps the vacuum (the rig's rule).
         to_idle, no_idle = drop_hot_to_idle(now)
         rec.update(to_idle=to_idle, to_sleep_no_idle_known=no_idle)
@@ -4014,7 +4029,7 @@ def _spellman_watch_feed(m: dict, now: float) -> None:
     elif t == "conditioning_point" and isinstance(m.get("data"), dict):
         d = m["data"]
         if d.get("arc"):
-            evs += _SPELL_WATCH.feed_status(now, [0, 0, 1])
+            evs += _SPELL_WATCH.feed_arc_flag(now)
         if isinstance(d.get("measured_kv"), (int, float)):
             evs += _SPELL_WATCH.feed_kv(now, float(d["measured_kv"]))
         if isinstance(d.get("measured_mA"), (int, float)):

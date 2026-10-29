@@ -74,6 +74,27 @@ control2's `spellman_backend` broadcasts kV, mA and GetStatus about 4 times a se
 | big arc | the kV falls in one step, and a reading taken at least 5 s later is still under 50 % (a stale reading never counts: `spellman_backend` pauses its monitor while its conditioning handles an arc, which caused a false trip at 11:36 on 2026-10-29; with no reading for 30 s the event is recorded as unknown) | Trip, latched: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Cleared by hand. |
 | over-current | between pulses, the mA is over its baseline by `spellman_trip_ma` for more than 1 s | Trip, latched: switches open, HV off, filaments hot within 15 s to STOP. |
 
+### GetStatus
+
+Its 17 bits, in the order of control2's `spellman.html`:
+
+| bit | meaning | bit | meaning |
+|---|---|---|---|
+| 0 | Power On | 9 | Regulation Error |
+| **1** | **HV Ray On** | 10 | Current Control Mode |
+| **2** | **Arc** | 11 | Over Temperature |
+| 3 | Interlock Closed | 12 | Power Control Mode |
+| 4 | Over Current | 13 | AC Fault |
+| 5 | Over Power | 14 | Local/Remote Mode |
+| 6 | Over Voltage | 15 | LVPS Fault |
+| 7 | Voltage Control Mode | 16 | HV Inhibit |
+| **8** | **System Fault** | | |
+
+- **System Fault** rising: trip, latched, at once, whatever the kV reads. Switches are opened, HV goes off, hot filaments go to IDLE. The fault is reset on the supply, then the latch is cleared here.
+- **Arc** rising: an arc. Only the edge counts; the bit can stay set across several reads.
+- **HV Ray On**: the kV down for 5 s with this bit 0 (read within 3 s) and no fault means somebody switched the supply off. That is recorded as `hv_off`, with no trip.
+- Every change of an alarm bit or of HV Ray On is written to `logs/arcs.jsonl` as `kind: status`. The alarm bits are Arc, Over Current/Power/Voltage, System Fault, Regulation Error, Over Temperature, AC/LVPS Fault and HV Inhibit.
+
 A ramp-down (about 1 kV per reading) is never an arc. The GetStatus arc bit counts on its rising edge only.
 
 The mA baseline is the median of quiet readings over the last 60 s, with arcs and pulses left out. It is capped at 0.2 mA, so a fault present from the start is not learned as normal.

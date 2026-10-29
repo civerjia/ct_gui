@@ -49,15 +49,28 @@ TRIP_MA_DEFAULT = 0.3
 TRIP_MA_RANGE = (0.05, 10.0)
 ARCS_KEPT = 500
 
-# GetStatus bit positions, as spellman_backend reads them (_status_*_active).
-STATUS_BITS = {2: "arc", 4: "over_current", 8: "system_fault"}
+# GetStatus: 17 bits, in the order control2's spellman.html labels them.
+STATUS_NAMES = ("power_on", "hv_on", "arc", "interlock_closed", "over_current", "over_power",
+                "over_voltage", "voltage_control", "system_fault", "regulation_error",
+                "current_control", "over_temperature", "power_control", "ac_fault",
+                "remote_mode", "lvps_fault", "hv_inhibit")
+# The ones that mean something went wrong (recorded on every change).
+ALARMS = ("arc", "over_current", "over_power", "over_voltage", "system_fault",
+          "regulation_error", "over_temperature", "ac_fault", "lvps_fault", "hv_inhibit")
+STATUS_FRESH_S = 3.0     # a GetStatus older than this says nothing about now
 
 
-def status_flags(bits) -> list[str]:
-    """Names of the alarm bits set in a GetStatus list."""
+def status_flags(bits, names=ALARMS) -> list[str]:
+    """Names of the bits set in a GetStatus list (alarms only by default)."""
     if not isinstance(bits, (list, tuple)):
         return []
-    return [name for i, name in sorted(STATUS_BITS.items()) if i < len(bits) and bits[i]]
+    return [n for i, n in enumerate(STATUS_NAMES) if n in names and i < len(bits) and bits[i]]
+
+
+def status_bit(bits, name):
+    """True / False, or None when the list is too short to say."""
+    i = STATUS_NAMES.index(name)
+    return bool(bits[i]) if isinstance(bits, (list, tuple)) and i < len(bits) else None
 
 
 class SpellmanWatch:
@@ -77,6 +90,7 @@ class SpellmanWatch:
         self._over_fired = False
         self._last_ma_t = None
         self._status_flags = []
+        self._hv_on = None                        # (t, bool) the supply's HV Ray On bit
 
     # ── readings ────────────────────────────────────────────────────────────
     def feed_kv(self, t: float, kv: float) -> list[dict]:
@@ -139,8 +153,22 @@ class SpellmanWatch:
         flags = status_flags(bits)
         with self._lock:
             out = self._advance(t)
-            rose = "arc" in flags and "arc" not in self._status_flags   # an edge, not a level
+            was = self._status_flags
+            rose = "arc" in flags and "arc" not in was    # an edge, not a level
             self._status_flags = flags
+            hv = status_bit(bits, "hv_on")
+            hv_was = None if self._hv_on is None else self._hv_on[1]
+            if hv is not None:
+                self._hv_on = (t, hv)
+            kv = None if self._kv is None else round(self._kv[1], 2)
+            if flags != was or (hv is not None and hv_was is not None and hv != hv_was):
+                out.append({"kind": "status", "t": t, "set": [f for f in flags if f not in was],
+                            "cleared": [f for f in was if f not in flags], "alarms": flags,
+                            "hv_on": hv, "kv": kv})
+            if "system_fault" in flags and "system_fault" not in was:
+                # The supply says it faulted: act now, whatever the kV says.
+                out.append({"kind": "system_fault", "t": t, "alarms": flags, "hv_on": hv, "kv": kv,
+                            "kv_before": None if self._arc is None else round(self._arc["kv_before"], 2)})
             if self._arc is not None:
                 for f in flags:
                     if f not in self._arc["status"]:
@@ -148,6 +176,16 @@ class SpellmanWatch:
             elif rose and self._kv is not None and self._kv[1] >= KV_ON:
                 self._open(t, "status", kv_before=self._kv[1], min_kv=self._kv[1])
                 self._arc["status"] = flags
+            return out
+
+    def feed_arc_flag(self, t: float) -> list[dict]:
+        """spellman_backend's conditioning says "arc" (its own status read):
+        an arc, nothing more -- not a GetStatus, so no HV On / alarm change."""
+        with self._lock:
+            out = self._advance(t)
+            if self._arc is None and self._kv is not None and self._kv[1] >= KV_ON:
+                self._open(t, "status", kv_before=self._kv[1], min_kv=self._kv[1])
+                self._arc["status"] = ["arc"]
             return out
 
     def poll(self, now: float) -> list[dict]:
@@ -199,6 +237,11 @@ class SpellmanWatch:
                 return [self._close(t, "arc", unknown="no kV reading after the drop")]
             return []
         if self._kv[1] < BIG_ARC_KV_FRAC * a["kv_before"]:
+            # Down and staying down. The supply's own HV Ray On bit, fresh,
+            # off and no fault: someone switched it off -- not an arc.
+            if (self._hv_on is not None and self._hv_on[1] is False and t - self._hv_on[0] <= STATUS_FRESH_S
+                    and "system_fault" not in a["status"] and "arc" not in a["status"]):
+                return [self._close(t, "hv_off")]
             return [self._close(t, "big_arc")]
         return [self._close(t, "arc")]            # came part way back and stayed: recorded, settled_kv
 
@@ -227,7 +270,8 @@ class SpellmanWatch:
             return {"baseline_ma": round(self._baseline(now), 4), "trip_ma": self.trip_ma,
                     "hold_s": HOLD_S, "over_s": None if self._over_since is None
                     else round(now - self._over_since, 2),
-                    "arc_open": self._arc is not None,
+                    "arc_open": self._arc is not None, "alarms": list(self._status_flags),
+                    "hv_on": None if self._hv_on is None else self._hv_on[1],
                     "arcs_10min": sum(1 for ev in arcs if ev["kind"] == "arc"),
                     "big_arcs_10min": sum(1 for ev in arcs if ev["kind"] == "big_arc"),
                     "last_arc": dict(self._arcs[-1], age_s=round(now - self._arcs[-1]["t"], 1))

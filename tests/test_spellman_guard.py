@@ -58,6 +58,7 @@ check("mA spike alone (quiet) -> arc, via mA", [e["kind"] for e in ev] == ["arc"
 # The supply's own arc bit.
 ev = w.feed_status(t, [1, 1, 1, 1] + [0] * 13)
 ev += feed(w, t + 0.05, [60.2, 60.2])[0]
+ev = [e for e in ev if e["kind"] != "status"]          # the bit change itself is recorded too
 check("GetStatus arc bit -> arc, status named", [e["kind"] for e in ev] == ["arc"] and ev[0]["status"] == ["arc"], ev)
 t += 1.0
 
@@ -95,7 +96,65 @@ for k in range(10):
     ev += w.feed_status(t, [1, 1, 1, 1])
     ev += feed(w, t + 0.05, [60.2])[0]
     t += 0.3
-check("arc bit held for 10 GetStatus -> one arc", [e["kind"] for e in ev] == ["arc"], ev)
+check("arc bit held for 10 GetStatus -> one arc (and one status change)",
+      [e["kind"] for e in ev] == ["status", "arc"], ev)
+
+# GetStatus as the supply sends it (17 bits, spellman.html's order).
+OK = [1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0]          # read 2026-10-29, 65 kV
+
+
+def st(**on):
+    b = list(OK)
+    for name, v in on.items():
+        b[SW.STATUS_NAMES.index(name)] = int(v)
+    return b
+
+
+check("the bit map: normal status has no alarm, HV on", SW.status_flags(OK) == []
+      and SW.status_bit(OK, "hv_on") is True)
+check("...the arc read 11:35 (arc + HV inhibit)", SW.status_flags(st(arc=1, hv_inhibit=1)) == ["arc", "hv_inhibit"])
+
+# System fault: an event at once, whatever the kV.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [65.5] * 20)
+ev = w.feed_status(t, OK)
+ev += w.feed_status(t + 0.3, st(system_fault=1, hv_on=0))
+kinds = [e["kind"] for e in ev]
+check("system fault bit rises -> system_fault event (and the change recorded)", "system_fault" in kinds
+      and "status" in kinds and [e for e in ev if e["kind"] == "system_fault"][0]["alarms"] == ["system_fault"], ev)
+ev = w.feed_status(t + 0.6, st(system_fault=1, hv_on=0))
+check("...held -> not repeated", [e["kind"] for e in ev] == [], ev)
+
+# Somebody switches the Spellman off: kV down, HV On bit 0, no fault -> hv_off, not big arc.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [65.5] * 20)
+w.feed_status(t, OK)
+ev, t = feed(w, t, [20.0])
+for k in range(26):                                   # GetStatus every cycle, as the supply is polled
+    ev += w.feed_status(t, st(hv_on=0))
+    ev += feed(w, t + 0.05, [0.5])[0]
+    t += DT
+check("switched off (HV On 0, no fault) -> hv_off, no big arc", "hv_off" in [e["kind"] for e in ev]
+      and "big_arc" not in [e["kind"] for e in ev], [e["kind"] for e in ev])
+
+# The same drop with HV On still 1 -> big arc.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [65.5] * 20)
+w.feed_status(t, OK)
+ev = []
+for k in range(26):
+    ev += w.feed_status(t, OK)
+    ev += feed(w, t + 0.05, [3.0])[0]
+    t += DT
+check("collapse with HV On still 1 -> big_arc", "big_arc" in [e["kind"] for e in ev], [e["kind"] for e in ev])
+
+# Conditioning's own arc flag: an arc, no status change invented.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [65.5] * 20)
+w.feed_status(t, OK)
+ev = w.feed_arc_flag(t + 0.1) + feed(w, t + 0.2, [65.5])[0]
+check("conditioning arc flag -> one arc, HV On untouched", [e["kind"] for e in ev] == ["arc"]
+      and w.snapshot(t + 1)["hv_on"] is True, (ev, w.snapshot(t + 1)))
 
 # Over-current: quiet, over baseline by trip_ma for > 1 s.
 w = SW.SpellmanWatch(trip_ma=0.3)
@@ -203,6 +262,23 @@ r = S._spellman_tick(t)
 check("server: 0.6 mA held > 1 s with no pulse -> tripped", r and r["action"] == "tripped"
       and S._HV_GUARD["tripped"]["source"] == "spellman_over_current", r and r.get("message"))
 check("...recently hot filament to STOP", rig["fallback"] == [([33], int(S.POWER_STATE_STOP))], rig["fallback"])
+
+# System fault: tripped at once, latched, hot filaments to IDLE.
+rig = setup()
+S.LAST_POWER_STATE[20] = (int(S.POWER_STATE_VOLTAGE), 0.0)
+S.ACTIVE_DEADLINES[20] = (1e12, 1200)
+t = msgs(0.0, [65.5] * 10, [0.02] * 10)
+S._spellman_on_message({"type": "spellman_response", "cmd": "GetStatus", "data": OK}, t)
+S._spellman_on_message({"type": "spellman_response", "cmd": "GetStatus", "data": st(system_fault=1)}, t + 0.3)
+r = S._spellman_tick(t + 0.4)
+check("server: system fault -> tripped, latched, says SYSTEM FAULT", r and r["action"] == "tripped"
+      and S._HV_GUARD["tripped"]["source"] == "spellman_system_fault" and "SYSTEM FAULT" in r["message"],
+      r and r.get("message"))
+check("...switches open, rails off, the hot filament to IDLE", rig["forced"] == 2 and ("emission", False) in rig["rails"]
+      and r["to_idle"] == [20], rig)
+lines = S.ARC_LOG_PATH.read_text().splitlines()
+check("...the status change is in arcs.jsonl", any('"kind": "status"' in ln and "system_fault" in ln for ln in lines),
+      lines)
 
 # The threshold is settable and kept.
 r = S.spellman_set_trip_ma(0.5, "test")

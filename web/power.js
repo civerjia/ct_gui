@@ -2421,6 +2421,7 @@ function wireSupplyMonitor() {
                         `at ${lm.emiss_v} V (${lm.excess_ma >= 0 ? '+' : ''}${(+lm.excess_ma).toFixed(2)} mA; one switch = ` +
                         `${(+lm.switch_ma).toFixed(2)} mA)` : 'emission rail off',
                    `Spellman baseline ${sp.baseline_ma ?? '?'} mA, trips at +${sp.trip_ma ?? '?'} mA held ${sp.hold_s ?? 1} s`,
+                   `Spellman HV ${sp.hv_on == null ? '?' : (sp.hv_on ? 'on' : 'off')}, alarms: ${(sp.alarms || []).join(', ') || 'none'}`,
                    arcs ? `${arcs} arc(s) in 10 min; last ${sp.last_arc ? sp.last_arc.kv_before + ' → ' + sp.last_arc.min_kv + ' kV, ' + sp.last_arc.age_s + ' s ago' : ''}` : 'no arc in 10 min'].join('\n');
       set(['hvGuardState'], g.enabled === false ? 'off' : ('armed' + (arcs ? ` · ${arcs} arc${arcs > 1 ? 's' : ''}/10 min` : '')),
           g.enabled === false ? 'stale' : (arcs ? 'warn' : null), tip);
