@@ -1,392 +1,358 @@
-# Firing filaments: fire_single_pulse and scan_view — design
+# Firing filaments: scan_view and fire_single_pulse — design
 
 **Status: proposal, nothing built.** The last section lists what must be
-decided before code changes. The next step after this design is running
-`scan_view` at scale. Today it is a concept that has only run in tests.
+decided before code changes.
 
-## 1. How it is used today (from the logs)
+## 1. Goal
 
-Source: the ct_gui client logs on the rig PC (2026-09-24 .. 10-28, about 380 MB)
-and on control2, plus combined_backend's code.
-
-`fire_single_pulse` is the tool that runs every day; `scan_view` has only run
-in tests. Two programs call it:
-
-| | **"auto test"** (client `ct_simple_control`) | **combined page** (client `combined_backend`) |
-|---|---|---|
-| shots | 12 013 | 4 537 |
-| sequence per filament | `idle_one(1200)` → `fire_single_pulse(...)` → `idle_one(1200)` | `fire_single_pulse(...)` → `idle_one(1200)`, then the detector and gantry, about 4–5 s |
-| heating | ACTIVE at a **per-filament calibrated current**, e.g. 2379, 2435, 2389 mA (`active_ma`) | ACTIVE at 2600 mA (also 2700, 2680) |
-| `heat_timeout_s` / `idle_ma` | 6 s / 1200 mA | 6 s / 1200 mA |
-| trigger | sim (11 992 of 12 013) | **ext** (3 758 of 4 537): the page's `on_armed` tells the page to start the detector, whose hardware sends the edge |
-| pulses | 1 (8 340), 10 (1 566), 20 (1 359) | 1 (2 530), 20 (1 056), 10 (887) |
-| width | 7 ms mostly; also 22, 6, 2, 12, 40 ms | 22, 30, 12, 5, 9 ms |
-| spacing / gap limit | `inter_pulse_ms=100` (sim spacing) | `inter_pulse_ms=3000` (ext: the wait for the edge) |
-| **trigger delay** | `set_trigger_delay(3000)` before every run: each pulse fires **3 ms after its edge** | 3000 µs set from the page's box (30 times); the box is now 0 |
-| measurement | always (`measure=True`, 1 MSPS, bg 100/50 µs) | always |
-| one shot takes | 8–14 s (once 37 s): heating + 10 pulses | 3.2–4.1 s: heating + 1 pulse |
-
-The "auto test" set-up before its filaments:
-1. `safety_config(active_timeout_s=6)`, `set_dead`, `set_filament_order`, the
-   lease;
-2. STOP → SLEEP → STANDBY → IDLE 1200 mA;
-3. emission 200 V / 45 mA, focus 210 V, emission on;
-4. `set_trigger_delay(3000)`.
-
-What goes wrong, most frequent first. Each needs a defined outcome:
-
-| failure | count | what it is |
-|---|---|---|
-| filament in the dead mask | ~250 | refused before anything is touched (correct) |
-| HV did not turn on (ON read-back ≠ commanded) | ~200 | the grid switch read-back after the pulse |
-| ext: no edge in time ("timed out after 6.0 s", "shot_wait timed out 9 s") | 133 | the detector never sent its edge |
-| arm rejected, NotReady | 73 | a channel/expander unreadable |
-| download failed | 44 | link |
-| measurement incomplete (0 of 1) | 13 | the STM32 sent no event for the pulse |
-| spacing shorter than width | 12 | refused before anything is touched (correct) |
+- **Run `scan_view` at scale.** Fire a list of filaments in order, the next
+  ones already heating while one fires, every filament measured, every
+  filament back at IDLE. `fire_single_pulse` is the same thing for one
+  filament.
+- **VOLTAGE mode is the main heating mode, for speed.** A voltage step
+  arrives faster than the current loop converges.
+- **Avoid every pitfall already hit on this rig.** Section 4 lists each one
+  and what in this design prevents it. That section is the point of this
+  document; the rest follows from it.
 
 ## 2. Design rules
 
 1. **Every argument is named.** No positional arguments.
 2. **One choice = one argument whose value says which.** For example,
-   `trigger=ct.Sim(...)` or `ct.Ext(...)`, and `heating=ct.Current(...)` or
-   `ct.Voltage(...)`. "Both" cannot be written.
-3. **What only one choice uses lives inside it.** For example, the sim spacing
-   lives in `ct.Sim`, the IDLE current and the window live in the heating, and
-   the sampling lives in `ct.Measure`.
+   `heating=ct.Voltage(...)` or `ct.Current(...)`, and `trigger=ct.Sim(...)`
+   or `ct.Ext(...)`. "Both" cannot be written.
+3. **What only one choice uses lives inside it.** For example,
+   `max_voltage_drop_mv` lives in `ct.Voltage`, the sim spacing in `ct.Sim`,
+   and the sampling in `ct.Measure`.
 4. **One name, one meaning**, in both functions.
-5. **Nothing hidden.** Everything that changes how a shot fires is an argument
-   of that shot. The trigger delay is set today by a separate call, kept by
-   the board, and lost when a board restarts; it becomes an argument (§3).
+5. **Nothing hidden.** Everything that decides how a shot fires is an argument
+   of the shot, written and read back by the shot. Board state set earlier by
+   another call does not count.
 6. **Every shot is measured.**
+7. **Physical things are named physically.** Safety state (dead filaments,
+   stuck switches) is kept in FIDs. The user numbering is translated ONCE,
+   at the start of the call, with one mapping snapshot used for everything
+   in that call.
 
-`ct.Sim`, `ct.Ext`, `ct.Current`, `ct.Voltage` and `ct.Measure` take named
+`ct.Sim`, `ct.Ext`, `ct.Voltage`, `ct.Current` and `ct.Measure` take named
 arguments only and return a plain dict that carries its kind. A misspelt name
-fails at once. The dict passes the remote proxy unchanged, and `on_armed`
-inside it is still called back.
+fails at once, and the dict passes the remote proxy (`on_armed` inside it is
+still called back).
 
-## 3. The two calls
-
-### 3.1 fire_single_pulse: one filament
+## 3. The calls
 
 ```python
-r = ct.fire_single_pulse(
-    filament=16,
-    heating=ct.Current(
-        active_ma=2600,                # ACTIVE at this current for the shot
-        idle_ma=1200,                  # back to this right after
-        settle_ms=0,                   # HOT = this long after the FIRST arrival
-        heat_timeout_s=10,             # longest it may stay heated, raise -> back at IDLE
-    ),
-    num_pulses=1,
-    width_us=30000,
-    trigger_delay_us=3000,             # each pulse fires this long after its edge
-    trigger=ct.Ext(
-        on_armed=on_armed,             # on_armed(f): start the detector; it sends the edge
-        trigger_timeout_ms=None,       # gap between edges; not used with num_pulses=1
-    ),
-    measure=ct.Measure(rate_hz=1_000_000, bg_gap_us=100.0, bg_window_us=50.0),
-    controller=None,                   # None = the filament's own board
-    reuse=True,                        # skip the download when unchanged
-    link_lost_timeout_s=5.0,
-    verify=True,
-)
-```
-
-### 3.2 scan_view: a list of filaments, in order
-
-The same arguments, for a list. The heating takes one value per filament.
-
-```python
+# scan_view, VOLTAGE heating, sim trigger
 r = ct.scan_view(
     filaments=[0, 1, 2],
-    heating=ct.Current(
-        active_ma={0: 2379, 1: 2435, 2: 2389},   # exactly one per listed filament
-        idle_ma=1200,
-        settle_ms=0,
-        heat_timeout_s=10,
+    heating=ct.Voltage(
+        active_mv={0: 7688, 1: 7698, 2: 8228},  # each filament's calibrated voltage
+        idle_ma=1200,                           # back to this when it is done
+        settle_ms=1000,                         # HOT = this long after the FIRST arrival
+        heat_timeout_s=10,                      # longest it may stay heated, raise -> IDLE
+        max_voltage_drop_mv=500,                # a drop this big (3 reads) = interrupted
     ),
     num_pulses=10,
     width_us=7000,
-    trigger_delay_us=3000,
+    trigger_delay_us=3000,                      # each pulse fires this long after its edge
     trigger=ct.Sim(
-        pulse_interval_ms=100,         # the train's edge spacing
-        trigger_timeout_ms=None,       # None = 2 x 100 + 100 = 300
+        pulse_interval_ms=100,                  # the train's edge spacing
+        trigger_timeout_ms=None,                # None = 2 x 100 + 100 = 300
         on_armed=None,
     ),
     measure=ct.Measure(rate_hz=1_000_000, bg_gap_us=100.0, bg_window_us=50.0),
-    preheat_ahead="auto",              # raise the next ones early enough to be HOT
+    preheat_ahead="auto",
     preheat_margin_s=0.3,
     max_hot=6,
     link_lost_timeout_s=5.0,
     verify=True,
 )
+
+# scan_view, VOLTAGE heating, ext trigger (the detector sends one edge per filament)
+r = ct.scan_view(
+    filaments=[0, 1, 2],
+    heating=ct.Voltage(active_mv={0: 7688, 1: 7698, 2: 8228}, idle_ma=1200,
+                       settle_ms=1000, heat_timeout_s=10, max_voltage_drop_mv=500),
+    num_pulses=1,
+    width_us=30000,
+    trigger_delay_us=3000,
+    trigger=ct.Ext(
+        on_armed=on_armed,                      # on_armed(f): start the detector
+        trigger_timeout_ms=None,                # gap between edges: none with 1 pulse
+    ),
+    measure=ct.Measure(rate_hz=1_000_000, bg_gap_us=100.0, bg_window_us=50.0),
+    preheat_ahead="auto",
+    preheat_margin_s=0.3,
+    max_hot=6,
+    link_lost_timeout_s=5.0,
+    verify=True,
+)
+
+# fire_single_pulse: the same arguments for one filament
+r = ct.fire_single_pulse(
+    filament=16,
+    heating=ct.Voltage(active_mv=7688, idle_ma=1200, settle_ms=1000, heat_timeout_s=10,
+                       max_voltage_drop_mv=500),
+    num_pulses=1,
+    width_us=30000,
+    trigger_delay_us=3000,
+    trigger=ct.Ext(on_armed=on_armed, trigger_timeout_ms=None),
+    measure=ct.Measure(rate_hz=1_000_000, bg_gap_us=100.0, bg_window_us=50.0),
+    controller=None,
+    reuse=True,
+    link_lost_timeout_s=5.0,
+    verify=True,
+)
 ```
 
-`fire_single_pulse` with a heating IS `scan_view` with one filament: the same
-steps, gating, window and failures (§5–§7). Its own arguments are `filament`
-(singular), `controller`, `reuse`, and `heating=None` (§4.2).
+`fire_single_pulse` with a heating is `scan_view` with one filament: the same
+steps, gating, window and failures. It also takes `ct.Current(active_ma=...)`
+(ACTIVE through the current loop), and `heating=None` for tests that set the
+filament's state themselves: then the schedule is not gated and there is no
+window.
 
-### 3.3 Today's calls, rewritten
+## 4. Pitfalls already hit, and what prevents each
 
-| today | becomes |
-|---|---|
-| "auto test": `set_trigger_delay(3000)` once; per filament `idle_one(f, 1200)`, `fire_single_pulse(filament=f, num_pulses=10, width_us=7000, inter_pulse_ms=100, max_on_ms=165, total_ms=6000, trigger="sim", timeout_s=6.0, active_ma=cal[f], idle_ma=1200, heat_timeout_s=6, measure=True, ...)`, `idle_one(f, 1200)` | one `scan_view(filaments=order, heating=ct.Current(active_ma=cal, idle_ma=1200, settle_ms=0, heat_timeout_s=10), num_pulses=10, width_us=7000, trigger_delay_us=3000, trigger=ct.Sim(pulse_interval_ms=100), measure=ct.Measure(...))`. The idle_one calls disappear: every filament ends at IDLE |
-| combined: `fire_single_pulse(filament=f, num_pulses=1, width_us=30000, inter_pulse_ms=3000, max_on_ms=66, total_ms=12000, trigger="ext", shot_wait_timeout_s=9, active_ma=2600, idle_ma=1200, heat_timeout_s=6, measure=True, ...)`, then `idle_one` | `fire_single_pulse(filament=f, heating=ct.Current(active_ma=2600, idle_ma=1200, settle_ms=0, heat_timeout_s=10), num_pulses=1, width_us=30000, trigger_delay_us=3000, trigger=ct.Ext(on_armed=...), measure=ct.Measure(...))`. A whole view: `scan_view` with the same arguments and `active_ma={f: 2600 ...}` |
+Each row is something that went wrong on this rig. "Status" says whether it
+is fixed today; "this design" says what keeps it from coming back, or from
+happening at scan scale.
 
-## 4. Every parameter
+### 4.1 Heating in VOLTAGE mode
 
-### 4.1 Top level
+| pitfall | cause | status | this design |
+|---|---|---|---|
+| Re-setting a voltage dropped the output to 0.8 V, then ramped back up (2026-07) | the OFF→ON test did not count VOLTAGE as on, so it re-seeded | fixed (firmware) | a filament is raised ONCE per turn; nothing re-sets its voltage mid-turn |
+| Load voltage below target by the cable drop | VOLTAGE was open loop on the converter | fixed: closed loop on the measured load voltage, c9bb6df | "arrived" = load voltage within ±150 mV |
+| One wild INA reading moved the voltage loop (a 500 mV jump; a voltage change whose current did not follow) | corrupted reads; P2 CH1/CH2 have 10–25× the other channels' bad reads | fixed: held until the next read agrees, 3386f0f / 5553c9a | HOT is interrupted only by a drop on **3** reads; one bad read never interrupts, and never resets `settle_ms` |
+| VOLTAGE → IDLE overshot to ~0.45 A, then climbed back slowly; the filament cooled under IDLE | the current loop restarted unseeded and cold | fixed: seeded from the measured filament, warm restart, cc9e776 | — |
+| …but on P2 CH1/CH2 a filament was still at 424–883 mA after 37–40 s at IDLE, so the next view refused it "not warm yet" | bad INA reads on those channels (suspected) | open (hardware) | a "not warm yet" refusal skips that filament for THIS view only; the next view tries it again (done, 4b0c0d9) |
+| A voltage above the cap is never reached | the rig's cap is **9.5 V** (the user's setting, 2026-10-27), kept by the backend | by design | the cap is READ from every controller at set-up; `active_mv` above it is refused before anything is heated |
+| After an RP2350 restart its cap is the firmware default, 11 V, until the backend's keeper writes 9.5 V back — and the keeper skips controllers that are armed or running | the cap is board state; the keeper waits for the end of a run | **open** | the run compares each controller's cap (with its heartbeat) during the run; a cap different from the one read at set-up → STOP |
+| Over-current trips the converter OFF (IOUT_LIMIT is a cut-out, not a limiter) | VOLTAGE mode has no current loop: a low-resistance filament or too high a voltage → over 3.4 A (3.7 A at turn-on) | by design of the part | an OCP trip = "interrupted" (output fault): that filament → SLEEP, skipped, the run goes on. Its calibrated `active_mv` is what keeps it under the limit |
+| A VOLTAGE row in the firmware heating table spun forever | the firmware table cannot run VOLTAGE | fixed: skipped, 3cbf555 | all heating is commanded by the host (backend), never by the firmware table |
+
+### 4.2 Holding the heat: the backend's own timers
+
+| pitfall | cause | status | this design |
+|---|---|---|---|
+| **During an armed or running schedule, the backend renews the dead-man for every filament and DEFERS every timed-heating deadline** ("held_for_run", "timed_active_deferred") | written so a run is never interrupted by a stale timer | **open — found 2026-10-28** | the heating window is NOT deferred for the run's own filaments: when `heat_timeout_s` is up, the backend drops that filament to IDLE even while the schedule is armed (Q1). Without this, a pre-heated filament can stay at VOLTAGE until `total_ms`, i.e. minutes |
+| The timed VOLTAGE of a waiting filament was renewed as its wait grew, with no upper limit | "predicted wait + margin, renewed" | today | one hard window per raise, never renewed (§6) |
+| combined_backend sets `active_timeout_s=4.0` (the auto test 6): a heated filament nobody commands for 4 s falls back | the dead-man | today | inside a run the window is the limit; outside a run the dead-man still applies |
+
+### 4.3 Firing: edges, delay, timing
+
+| pitfall | cause | status | this design |
+|---|---|---|---|
+| The trigger delay is board state set by a separate call; an RP2350 restart zeroes it, and the shot fires 3 ms early with nobody told | `set_trigger_delay()` is not part of the shot | today | `trigger_delay_us` is a **required argument**, written to every controller at set-up and read back; the ARM is refused while they differ |
+| An edge during the delay of the previous one loses that pulse while both are counted | one hardware alarm serves every edge; a new edge re-aims it | firmware, unchecked | spacing must be > `trigger_delay_us` + `width_us`: sim refused before starting; ext Q4 |
+| `trigger_timeout_ms` counted the host's own work between release and the first edge; 60 ms stopped the run at the second filament | the firmware timed it from the release | fixed: from the first edge, 766874d | `trigger_timeout_ms` = the gap between edges only |
+| A gap limit equal to the spacing faulted after one pulse | every edge raced its own deadline | refused today | `trigger_timeout_ms` > spacing, refused otherwise |
+| sim: "already running" right after a filament; the next one was skipped | the backend sees a train's end only on its 300 ms poll | host retries 2 s, cb70fa6 | the backend asks the ESP32 directly (Q6) |
+| sim: a train runs on its own; if a filament ends early, the rest of its train fires the NEXT filament | nothing stops the train | **open** | a filament that ends before its train: stop the train and confirm it stopped before the next row is released; every STOP stops it too |
+| ext: an edge before the filament is hot fired a cold filament | fire_single_pulse's schedule is not gated | today | gated schedule in both functions: a pulse fires only on a released row whose filament is HOT |
+| First pulse after ARM latched 0 (2.3% of pulse 1) | unknown; the byte waits in the 595 for the whole ARM→trigger wait (~3 s) | open | the gated run stages a filament's first pulse at its RELEASE, after HOT, so the wait shrinks to `on_armed` + the first edge |
+
+### 4.4 Two controllers
+
+| pitfall | cause | status | this design |
+|---|---|---|---|
+| sim edges skipped the trigger delay on C1 while C2 applied it; C2's pulses fell outside the window | the sim path bypassed the delay | fixed (G6) | the delay is applied by each board on both paths |
+| C2 missed sim edges | C1 forwarded the live level of a 5 µs pulse that was already over | fixed (G7): forwards latched edges | — |
+| An edge between the two ARMs counted on one board only: the boards an entry apart for the whole run | arm order | fixed: C2 armed first, C1 (forwards) last | kept |
+| The two boards' trigger delays differ after one restarts | board state | ARM refused on mismatch | the shot writes the delay to both (§4.3) |
+
+### 4.5 Measurement
+
+| pitfall | cause | status | this design |
+|---|---|---|---|
+| A 660-pulse view got the LAST 128 events and gave them to the FIRST filaments | the ESP32 keeps 128 events; read once at the end | fixed: read during the run, 0768ab2 | a missing event is "missing", never another pulse's |
+| "Measured 0 of 1" | the STM32 sent no event | open | reported per pulse; the run goes on |
+| A shot with measurement off is useless | — | — | `measure=` is required; a measurement that cannot be armed refuses the shot before anything is heated |
+| Absolute mA is suspect on the current board (VREF+ floating, front end saturating ~842 counts) | hardware | new board coming | the per-pulse event is kept raw too |
+
+### 4.6 HV switch read-back and switches
+
+| pitfall | cause | status | this design |
+|---|---|---|---|
+| "HV did not turn on": the ON read-back ≠ commanded; the 165 often reads the neighbour bit | the 165 is flaky and reads upstream of the gate resistor | hardware | judge by the measured current: a read-back mismatch is recorded on the pulse, the run goes on (Q8) |
+| Switch read-back OK but no current | cold-soldered 33 Ω gate resistors | hardware | a pulse with no current is flagged on that filament |
+| OFF frames lost on a slow link left 4 switches closed for 3 h | an unconfirmed OFF was ignored | fixed: `force_grid_off` | every STOP and every end of run: disarm, then all grids forced open and confirmed |
+| A MOS stuck on after a pulse | hardware | checked every 0.5 s | STOP |
+
+### 4.7 Numbering
+
+| pitfall | cause | status | this design |
+|---|---|---|---|
+| One filament heated, the next fired (27 shots, 10-08) | the call that heated and the call that fired used two different filament orders | fixed: one mapping, `X-CT-Order` | heat and fire happen in ONE call that takes ONE mapping snapshot |
+| `set_dead` after `set_filament_order` freed broken boards | the dead mask was translated through the order | fixed: dead mask is physical | rule 7 |
+| The GUI sent ring positions as FIDs and addressed the wrong board | two numberings | fixed (GUI) | the call takes the user's numbering only; the result reports user number, FID and board for every row |
+| An extra key in `active_mv` was silently ignored (a typo like 95 for 59) | scan_views passes one dict for every view | today | refused; scan_views gives each view only its own (Q5) |
+
+### 4.8 Links, backend, other programs
+
+| pitfall | cause | status | this design |
+|---|---|---|---|
+| WiFi TCP stalls of 1–2.5 s on both ESP32s | the link | 64 KB ring on P1 | `link_lost_timeout_s` default 5 s rides them out |
+| The ESP32's web server is single-threaded; 200–300 ms a request under load | its design | — | during a run: one sim request per filament, no other ESP32 web traffic from the run |
+| Looping single-board reads starved the current loop and gave false "stuck" results | one shared link | rule | during a run: bulk / cached reads only (CH_GET_HOT, cached currents, pushed telemetry) |
+| Only the backend→ESP32 socket is watched; an RP2350 behind it can be silent while it looks connected | `connected` = socket open | **open** | watch the RP2350 heartbeat too (L3) |
+| With the link down, nothing drops a heated filament: the RP2350 has no fallback | firmware | **open** | firmware: a timed VOLTAGE of its own (Q2) |
+| A second open copy of the combined page sent `idle_one` and cancelled the first page's next fire | broadcast results acted on by every page | fixed in the page (ownership flags) | the run lives in the backend under one lease; nothing outside it may change its filaments (only de-energising requests pass the lease) |
+| A client NEWER than the backend was told to restart itself | the version check compared only "different" | fixed, 61672eb | — |
+| The backend updated itself mid-session | auto-update when quiet | waits for no lease, no run | the run holds the lease for its whole length |
+
+## 5. Every parameter
+
+### 5.1 Top level
 
 | parameter | function | meaning | default / range |
 |---|---|---|---|
 | `filaments` / `filament` | scan_view / fire_single_pulse | fired strictly in this order / the one filament | required; no repeats, none dead |
-| `heating` | both | §4.2 | required |
+| `heating` | both | §5.2 | required |
 | `num_pulses` | both | pulses per filament = edges per filament | 1..255 |
-| `width_us` | both | the HV pulse width (RP2350 PIO). The edge does not set it | 1..65 535 µs |
-| `trigger_delay_us` | both | **each pulse fires this long after its edge** (RP2350 hardware alarm; sim and ext alike; the measurement window moves with it). Written to every controller at set-up and read back; the ARM is refused if they disagree | **required**, 0..65 535 µs |
-| `trigger` | both | §4.3 | required |
-| `measure` | both | §4.4: every pulse is measured | required |
+| `width_us` | both | the HV pulse width (RP2350 PIO) | 1..65 535 µs |
+| `trigger_delay_us` | both | each pulse fires this long after its edge (both paths, both boards); written and read back by the shot | required, 0..65 535 µs |
+| `trigger` | both | §5.3 | required |
+| `measure` | both | `ct.Measure(rate_hz, bg_gap_us, bg_window_us)`: background averaged over `bg_window_us`, taken `bg_gap_us` before and after each pulse | required |
 | `preheat_ahead`, `preheat_margin_s`, `max_hot` | scan_view | when to raise each filament so it is HOT about when its turn comes; at most `max_hot` heating at once | `"auto"`, 0.3 s, 6 |
-| `controller` | fire_single_pulse | which controller fires; `None` = the filament's own board | `None` |
-| `reuse` | fire_single_pulse | skip the download when unchanged since the last shot | `False` |
+| `controller`, `reuse` | fire_single_pulse | the firing controller (`None` = its own); skip an unchanged download | `None`, `False` |
 | `verify` | both | read the schedule back before arming | `True` |
-| `link_lost_timeout_s` | both | a command link (L2/L3, §8) down this long → STOP. Leave it at 5 s | 5.0 |
+| `link_lost_timeout_s` | both | a command link (L2 or L3) down this long → STOP | 5.0 |
 
-### 4.2 `heating=`
+### 5.2 `heating=`
 
-| | `ct.Current(...)` — what runs every day | `ct.Voltage(...)` | `None` |
+| | `ct.Voltage(...)` — main | `ct.Current(...)` | `None` |
 |---|---|---|---|
-| for | both | both | fire_single_pulse only |
-| heats with | ACTIVE at `active_ma` (current loop) | VOLTAGE mode at `active_mv` | nothing: fired in the state the caller left it in |
-| `active_ma` / `active_mv` | scan_view: `{filament: value}`, exactly the listed filaments (Q12); fire_single_pulse: one number | same | — |
-| "arrived" | the current loop converged at `active_ma`, not capped | load voltage within ±150 mV | — |
-| `idle_ma` | back to this when the filament is done | same | — |
-| `settle_ms` | after the FIRST arrival wait this long; then HOT. An output fault interrupts it | same; a drop of more than `max_voltage_drop_mv` (3 reads) also interrupts it | — |
-| `max_voltage_drop_mv` | — | default 500 | — |
-| `heat_timeout_s` | the longest the filament may stay heated in one go: from its heating command until it is back at IDLE. Backend-timed, never renewed | same | — (Q13) |
-| schedule | gated: a pulse fires only on a released row whose filament is HOT | gated | not gated: any edge after ARM fires; the caller owns the state |
+| for | both | fire_single_pulse | fire_single_pulse |
+| heats with | VOLTAGE, closed loop on the load voltage | ACTIVE, current loop | nothing |
+| value | `active_mv`: scan_view `{filament: mV}`, exactly the listed filaments; fire_single_pulse one number; ≤ the voltage cap read from the controllers (9.5 V on the rig) | `active_ma` | — |
+| "arrived" | load voltage within ±150 mV | current loop converged, not capped | — |
+| `idle_ma` | back to this when done | same | — |
+| `settle_ms` | after the FIRST arrival, wait this long → HOT; a wobble does not restart it | same | — |
+| `max_voltage_drop_mv` | a drop this far below `active_mv` on 3 reads = interrupted. Default 500 | — | — |
+| `heat_timeout_s` | the longest it may stay heated in one go, raise → back at IDLE; backend-timed, never renewed, **not deferred by the run** | same | — |
+| interrupted by | output fault (OCP, open, short), board lost, the drop above | output fault, board lost | — |
 
-### 4.3 `trigger=`
+### 5.3 `trigger=`
 
-| | `ct.Sim(...)` — the library makes the edges | `ct.Ext(...)` — your hardware makes them |
+| | `ct.Sim(...)` | `ct.Ext(...)` |
 |---|---|---|
-| `on_armed` | optional `on_armed(f)`, called at f's turn; the train starts after it RETURNS | **required** `on_armed(f)`: start your source (e.g. the detector) and return |
-| `pulse_interval_ms` | the train's spacing: the master ESP32 timer's period, hardware-timed. Must be > (`trigger_delay_us` + `width_us`) / 1000 (§6) and ≥ 0.5 (measurement). Default 500 | — (Q11) |
-| `trigger_timeout_ms` | the longest gap between two edges of the same filament, from its first edge. Default 2 × `pulse_interval_ms` + 100 | the same, a little over YOUR spacing. Required when `num_pulses` > 1; unused with 1 pulse |
-| where edges enter | master ESP32 → master RP2350 (ReadyIn) | the master's SyncIn |
-| the first edge | one request after `on_armed` returns (65–300 ms) | whenever your source sends it; bounded by the window (§7) |
+| edges from | the master ESP32's hardware timer, one train per filament | your hardware, into the master's SyncIn |
+| `on_armed` | optional `on_armed(f)`; the train starts after it returns | required `on_armed(f)`: start your source and return |
+| `pulse_interval_ms` | the train's spacing; > (`trigger_delay_us` + `width_us`)/1000, ≥ 0.5 ms; default 500 | — (Q4) |
+| `trigger_timeout_ms` | gap limit between edges of one filament, from its first edge; default 2 × spacing + 100 | required when `num_pulses` > 1; unused with 1 pulse |
 
-### 4.4 `measure=ct.Measure(...)` — required
-
-| parameter | meaning | default |
-|---|---|---|
-| `rate_hz` | STM32 sample rate | 1 000 000 |
-| `bg_gap_us`, `bg_window_us` | background averaged over `bg_window_us`, taken `bg_gap_us` before the pulse's rise and again after it | 100, 50 |
-
-If the measurement cannot be armed, the call is refused before anything is
-heated. A pulse whose event does not come is reported as missing, never as
-another pulse's.
-
-## 5. The trigger paths and the trigger delay
-
-```mermaid
-flowchart LR
-    subgraph sim
-      H[host] -- "HTTP /sync/burst<br/>count, period" --> E[master ESP32 timer]
-      E -- "ReadyIn, 5 us edge" --> C1s[C1 RP2350]
-    end
-    subgraph ext
-      Y[your hardware] -- "SyncIn" --> C1e[C1 RP2350]
-    end
-    C1s -- "SyncOut, only while C1 is armed" --> C2[C2 RP2350]
-    C1e -- "SyncOut, only while C1 is armed" --> C2
-```
-
-- C1 (the master) is the head of the chain. It forwards each edge to C2
-  at once, only while its own schedule is armed.
-- **Each board applies `trigger_delay_us` itself.** On an edge it starts a
-  hardware alarm; the pulse fires when the alarm runs out. Both boards must
-  hold the same delay, or the master's measurement window misses the other
-  board's pulse. That is why the ARM is refused when they differ.
-- Both RP2350s walk the same table. The board whose filament's row is
-  released fires; the other only counts the edge.
-- With a gated schedule, an edge with no released row fires nothing: it is
-  dropped and counted.
-
-Specific to `sim`:
-- Only the master ESP32 makes trains; one request per filament, one train at
-  a time. The backend sees a train's end only on its 300 ms poll (Q8).
-- **A train runs on its own once started.** If a filament ends early, the
-  rest of the train would fire the next filament. The train must be stopped
-  and confirmed stopped before the next row is released (Q7).
+## 6. Timing
 
 ![sim timing: the parameters on the timeline, the request and poll delays, the leftover train](img/timing_sim.svg)
 
-## 6. Timing of one pulse
+One pulse:
 
 ```
-edge ──(trigger_delay_us)──> pulse ON ──(width_us)──> OFF ──(gap)──> next edge
+edge ──(trigger_delay_us)──> pulse ON ──(width_us)──> OFF ──> next edge, after (delay + width)
 ```
 
-- **The next edge must come after the pulse is over:** spacing >
-  `trigger_delay_us` + `width_us`. All edges share one alarm on the RP2350. An
-  edge during the delay re-aims the alarm, so the earlier pulse never fires,
-  while both edges are counted. The firmware does not check this. sim:
-  refused before starting. ext: Q11.
-- The measurement window opens with the pulse (after the delay), not with the
-  edge.
-- `trigger_timeout_ms` is timed edge to edge: the delay does not change it.
-- Today's values: 3 ms delay + 7 ms width + 100 ms spacing ("auto test") fits;
-  3 ms + 30 ms with one pulse (combined) has no next edge.
+The workflow. Each step happens once, in order.
 
-## 7. The workflow
-
-**Checks.** Nothing is touched; on failure the call is refused with a reason.
-
-1. The filaments are given, none is repeated, none is dead, and the heating
-   has exactly one value per listed filament.
-2. HV (emission and focus) is on, the HV guard is not tripped, and the vacuum
-   is within its limit.
-3. `trigger` and `heating` are of a known kind, every key is known, and
-   `width_us` and `trigger_delay_us` are in range.
-   - `ct.Sim`: spacing > delay + width, spacing ≥ 0.5 ms, and
-     `trigger_timeout_ms` > spacing.
-   - `ct.Ext`: `on_armed` is given, and `trigger_timeout_ms` too when
-     `num_pulses` > 1.
-4. The window holds one filament's work (§7.1). If not: Q4.
-
-**Setup.** All filaments are at IDLE.
-
-5. Write `trigger_delay_us` to every controller and read it back.
-6. Download ONE gated schedule (all filaments, in order) to every controller
-   that fires or frames a pulse, and read it back.
-7. Write `settle_ms` (and `max_voltage_drop_mv` for `ct.Voltage`). Arm the
-   STM32 measurement; if it cannot be armed, refuse here. Then ARM.
-
-**Per filament f, in order:**
-
-8. **Raise** f to ACTIVE `active_ma[f]` (or VOLTAGE). f's window opens; the
-   backend timer is set to `heat_timeout_s`.
-9. **HOT:** the RP2350 reports first arrival + `settle_ms`, not interrupted.
-10. **Its turn:** the previous filament's pulses are all counted. Release f's
-    row on every armed controller.
-11. **`on_armed(f)`** is called.
-12. **Edges.**
-    - sim: one request starts a train of `num_pulses` edges,
-      `pulse_interval_ms` apart.
-    - ext: your source sends `num_pulses` edges.
-13. **Pulses:** each one `trigger_delay_us` after its edge, `width_us` long.
-    From the first edge, every gap is shorter than `trigger_timeout_ms`.
-14. **Measurement:** the host reads the STM32 events while they arrive.
-15. **Done:** all pulses are counted. f goes back to IDLE `idle_ma` once the
-    next filament is released, and its window closes.
-
-**End.** This runs whatever ended the run.
-
-16. Stop any sim train and disarm. Every heated filament goes to IDLE (a
-    faulted one to SLEEP). Set `settle_ms` back to 0, read the pulse logs, and
-    match the measurements to filaments.
+1. **Checks.** Nothing is touched; on failure the call is refused with a
+   reason.
+   - Arguments: every name, every kind, every key; the heating dict
+     matches `filaments` exactly; none dead; `active_mv` ≤ the cap read from
+     every controller (9.5 V on the rig); the spacing
+     rules in §5.3.
+   - HV (emission and focus) is on, the HV guard is not tripped, and the
+     vacuum is within its limit.
+   - The window holds one filament's work (below).
+2. **Set-up.** All filaments are at IDLE.
+   - One mapping snapshot for the whole call.
+   - Write `trigger_delay_us` to every controller and read it back.
+   - Download ONE gated schedule and read it back.
+   - Write `settle_ms` and `max_voltage_drop_mv`.
+   - Arm the STM32 measurement (or refuse), then ARM: C2 first, C1 last.
+3. **Per filament f, in order:**
+   1. **Raise** f to VOLTAGE `active_mv[f]`, early enough to be HOT by its
+      turn. The window opens: the backend drops f to IDLE at
+      `heat_timeout_s`, armed or not.
+   2. **HOT:** first arrival + `settle_ms`, not interrupted.
+   3. **Its turn:** release f's row on every controller.
+   4. **`on_armed(f)`** is called.
+   5. **Edges:** sim, one train request; ext, your source.
+   6. **Pulses**, `trigger_delay_us` after each edge. The host reads the
+      measurement events as they arrive.
+   7. **Done:** all pulses counted. f goes to IDLE once the next filament is
+      released.
+   - **Ended early** (window, skip): stop the sim train and confirm it, then
+     f goes to IDLE, then the next row is released.
+4. **End**, whatever ended it.
+   - Stop any sim train and disarm.
+   - Force every grid open and confirm.
+   - Every heated filament goes to IDLE (a faulted one to SLEEP).
+   - Set `settle_ms` back to 0.
+   - Read the pulse logs and match the measurements by event id.
 
 ![three filaments, normal run](img/timing_normal.svg)
 
-`fire_single_pulse(heating=None)` skips steps 8, 9 and 15. The schedule is not
-gated, `on_armed(f)` is called right after ARM, and there is no window (Q13).
-
-### 7.1 What has to fit in the window
+What has to fit in the window, from the raise:
 
 ```
-heat-up (raise -> first arrival)     from its history; ACTIVE 1200 -> 2600 mA ~2-3 s
-+ settle_ms / 1000
-+ wait for its turn                  ~0 with preheat_ahead="auto" (scan_view)
-+ on_armed                           your code (ext: until the detector is ready)
-+ sim only: start request            0.07-0.3 s
+VOLTAGE heat-up to first arrival   from the filament's history (filament_perf)
++ settle_ms
++ wait for its turn                ~0 with preheat_ahead="auto"
++ on_armed                         ext: until the detector is ready
++ sim: train request               0.07-0.3 s
 + (num_pulses - 1) x spacing + trigger_delay_us + width_us
 ```
 
-- "auto test" today: 2.5 + 0 + 0.3 + 9 × 0.1 + 0.003 + 0.007 ≈ 3.7 s.
-- combined today: 2.5 + 0 + (detector start) + 0.003 + 0.030 ≈ 3 s, matching
-  the 3.2–4.1 s shots in the logs.
-- `heat_timeout_s` = 10 s covers both, with margin.
-
-## 8. When something goes wrong
-
-The window is each heated filament's one limit. Anything not done by its end
-is caught there.
+## 7. When something goes wrong
 
 ![what ends each failure](img/timing_failures.svg)
 
-| failure (today's count) | caught by | result |
+| failure | caught by | result |
 |---|---|---|
-| never gets HOT | window end | IDLE, skipped, the run goes on |
-| HOT, its turn comes late | window end | IDLE, re-heated at its turn (Q1) |
-| `on_armed` hangs | window end, `on_armed` still running | STOP |
-| ext: no edge comes (133) | window end | IDLE, skipped; 2 filaments in a row: STOP |
-| edges stop half way | `trigger_timeout_ms` | STOP (firmware), or skip the rest (Q2) |
-| pulses outlast the window | window end | sim: stop the train and confirm; IDLE; the rest skipped |
-| HV did not turn on: ON read-back mismatch (~200) | the pulse log | that filament marked `on_mismatch`; the run goes on (Q14) |
-| measurement missing (13) | event ids | that pulse has no measurement; never another's |
-| arm NotReady (73), download failed (44) | set-up | refused before anything is heated |
+| never gets HOT | the window | IDLE, skipped, the run goes on |
+| interrupted (OCP, open, short, board lost, voltage drop) | the RP2350 HOT flags | a faulted output → SLEEP, otherwise IDLE; skipped; the run goes on |
+| "not warm yet" when raised | the backend's ladder guard | skipped in this view only |
+| HOT, its turn comes late | the window | IDLE, re-heated at its turn (Q3) |
+| `on_armed` hangs | the window, with `on_armed` still running | STOP |
+| ext: no edge comes | the window | IDLE, skipped; 2 filaments in a row: STOP |
+| edges stop half way | `trigger_timeout_ms` | STOP (firmware), or skip the rest (Q7) |
+| ON read-back mismatch, a pulse with no current | the pulse log, the measurement | recorded on that filament; the run goes on |
+| measurement event missing | event ids | "missing" on that pulse |
 | SHV fault, MOS stuck on, HV guard, vacuum, HV off | checked every 0.5 s | STOP |
-| a command link down > `link_lost_timeout_s` | §9 | STOP |
+| link L2 or L3 down > `link_lost_timeout_s` | the host | STOP |
 
-STOP means: stop any sim train, disarm, every heated filament to IDLE (a
-faulted one to SLEEP), and `stopped` says why.
+STOP = stop the sim train, disarm, force the grids open, every heated filament
+to IDLE (a faulted one to SLEEP), `stopped` says why.
 
-## 9. Links
+## 8. Removed and renamed
 
-| | link | carries | lost: consequence | watched by |
-|---|---|---|---|---|
-| L1 | your script ↔ backend | the `on_armed` call | `on_armed` cannot be called (Q5) | session ping 3 s, reaper 15 s |
-| L2 | backend ↔ ESP32, each controller (WiFi TCP) | release, heating/IDLE, sim start | **no IDLE can be sent: a heated filament stays heated** | `link_lost_timeout_s` (today) |
-| L3 | ESP32 ↔ RP2350, each controller (UART) | the same, one hop further | same, while L2 still looks connected | RP2350 heartbeat age — **not watched today** (Q10) |
-| L4 | ESP32 ↔ STM32, master | measurements | measurements missing; firing unaffected | event ids |
-| L5 | RP2350 ↔ boards (I²C) | heating, arrival, HOT | that filament interrupted → skipped | HOT/interrupted flags |
-| L6 | SyncIn/SyncOut wires, envelope | the edges | edges missing | `trigger_timeout_ms`, envelope count |
+| today | becomes |
+|---|---|
+| positional arguments | all named |
+| `set_trigger_delay()` before the shot | `trigger_delay_us=` in the shot |
+| `trigger="sim"/"ext"`, `on_armed`, `inter_pulse_ms` / `pulse_interval_ms`, `trigger_timeout_ms` | `trigger=ct.Sim(...)` / `ct.Ext(...)` |
+| `active_mv` / `active_ma`, `idle_ma`, `settle_ms`, `heat_timeout_s`, `max_voltage_drop_mv` | `heating=ct.Voltage(...)` / `ct.Current(...)` / `None` |
+| `measure=True`, `rate_hz`, `bg_gap_us`, `bg_window_us` | `measure=ct.Measure(...)`, required |
+| `heat_timeout_s` = the wait for the first arrival | the longest heating, raise → IDLE |
+| `settle_ms` "held continuously" (fire_single_pulse) | from the first arrival, in both |
+| `on_armed()` (fire_single_pulse) | `on_armed(f)` in both |
+| `shot_wait_timeout_s`, `timeout_s`, `on_armed_timeout_s`, `no_pulse_timeout_s`, `total_ms`, `max_on_ms` | removed: the window, or computed |
+| `idle_one` around each shot | not needed: every filament starts and ends at IDLE |
 
-The RP2350 has no fallback of its own: with L2 or L3 down, nothing drops a
-heated filament (Q6).
+Callers that change with it: the auto test program, combined_backend (its
+`CT_PULSE_*` / `CT_SCAN_*` whitelists, its delay box), the emission tests and
+`measure_pulse_current` (`heating=None`, `on_armed(f)`).
 
-## 10. Removed and renamed
-
-| today | becomes | why |
-|---|---|---|
-| positional arguments | all named | rule 1 |
-| `set_trigger_delay()` beforehand (board state) | `trigger_delay_us=` in every call | rule 5: today a board restart silently zeroes it |
-| `trigger="sim"/"ext"`, `on_armed`, `inter_pulse_ms` / `pulse_interval_ms`, `trigger_timeout_ms` | `trigger=ct.Sim(...)` / `ct.Ext(...)` | rules 2, 3 |
-| `active_ma` / `active_mv`, `idle_ma`, `settle_ms`, `heat_timeout_s` | `heating=ct.Current(...)` / `ct.Voltage(...)` / `None` | rules 2, 3 |
-| `measure=True`, `rate_hz`, `bg_gap_us`, `bg_window_us` | `measure=ct.Measure(...)`, required | rule 6 |
-| `heat_timeout_s` = wait for the first arrival (6 s today) | longest heating, raise → back at IDLE | one limit per filament |
-| `settle_ms` "held continuously" (fire_single_pulse) | from the first arrival, in both (Q9) | rule 4 |
-| `on_armed()` without argument (fire_single_pulse) | `on_armed(f)` in both | rule 4 |
-| `shot_wait_timeout_s`, `timeout_s`, `on_armed_timeout_s`, `no_pulse_timeout_s` | removed | inside the window |
-| `total_ms` | computed (filaments × `heat_timeout_s` + 30 s) | firmware backstop |
-| `max_on_ms` (165 / 66 / 40 today) | removed; the host writes it | it only restated `width_us` |
-| `idle_one` before and after each shot | not needed | every filament starts and ends at IDLE |
-| fire_single_pulse ungated (heated) | gated | an early ext edge cannot fire a cold filament |
-
-Callers to change in the same step:
-- the "auto test" program;
-- combined_backend (its whitelists `CT_PULSE_*` / `CT_SCAN_*` and the page's
-  delay box);
-- the emission tests and `measure_pulse_current` (`heating=None`, `on_armed(f)`).
-
-## 11. To decide
+## 9. To decide
 
 | | question | proposal |
 |---|---|---|
-| Q1 | a filament HOT but still waiting when its window ends | back to IDLE, re-heated at its turn |
-| Q2 | `trigger_timeout_ms` runs out | today the firmware stops the whole run; alternative: skip the rest of that filament (firmware change) |
-| Q3 | `heat_timeout_s` default | none: required, like today's calls always pass it |
-| Q4 | the window cannot hold one filament's work (§7.1) | refuse before starting |
-| Q5 | ext: your script disconnects mid-run | STOP |
-| Q6 | RP2350 drops a heated filament by itself after `heat_timeout_s` if no IDLE comes | yes; firmware change, test board first |
-| Q7 | sim: stop and confirm the train before the next row when a filament ends early, and on every STOP | yes |
-| Q8 | sim "already running" right after a filament | the backend asks the ESP32 directly |
-| Q9 | one `settle_ms` rule for both | from the first arrival |
-| Q10 | `link_lost_timeout_s` watches L2 only | L2 and L3 |
-| Q11 | ext: spacing > delay + width and ≥ 0.5 ms cannot be checked without your spacing | `ct.Ext(expected_interval_ms=...)`, optional, used only for these checks |
-| Q12 | the heating dict vs `filaments`: today an extra key is silently ignored | refuse extra keys; scan_views passes each view only its own |
-| Q13 | `fire_single_pulse(heating=None)`: what bounds it without a window | `trigger_timeout_ms` between edges; computed `total_ms` for the first edge |
-| Q14 | HV ON read-back mismatch (~200 in the logs): mark and go on, or skip that filament's remaining pulses | mark and go on (the measured current says whether it fired) |
-| Q15 | scan_view with `ct.Current`: scan_view was designed on `ct.Voltage` (10-27), but every daily shot heats by current | both kinds in scan_view |
+| Q1 | the run's own filaments: their heating window ends while the schedule is armed. Today the backend defers it until the run ends | the window is never deferred for the run's own filaments |
+| Q2 | RP2350 drops a heated filament by itself after `heat_timeout_s` if no IDLE comes (L2/L3 down) | yes; firmware change, test board first |
+| Q3 | a filament HOT but still waiting when its window ends | back to IDLE, re-heated at its turn |
+| Q4 | ext: spacing > delay + width and ≥ 0.5 ms need your spacing | `ct.Ext(expected_interval_ms=...)`, optional, used only for these checks |
+| Q5 | extra keys in the heating dict | refused; scan_views passes each view only its own |
+| Q6 | sim "already running" right after a filament | the backend asks the ESP32 directly |
+| Q7 | `trigger_timeout_ms` runs out | today the firmware stops the whole run; alternative: skip the rest of that filament (firmware change) |
+| Q8 | ON read-back mismatch | record and go on; the measured current is the truth |
+| Q9 | `heat_timeout_s` default | none: required |
