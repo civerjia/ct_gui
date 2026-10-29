@@ -39,6 +39,24 @@ arguments only and return a plain dict that carries its kind. A misspelt name
 fails at once, and the dict passes the remote proxy (`on_armed` inside it is
 still called back).
 
+## 2a. Words (agreed 2026-10-27)
+
+| word | means |
+|---|---|
+| **arrived** | VOLTAGE: the LOAD voltage is within ±150 mV of `active_mv`. Current: the current loop has converged at `active_ma` (not capped). |
+| **`settle_ms`** | a wait counted from the FIRST arrival. It is never restarted while the setpoint is unchanged. |
+| **HOT** | can emit: `settle_ms` has passed since the first arrival, and the heating has not been interrupted since. Only a HOT filament fires. |
+| **interrupted** | an output fault (OCP = short, open), the board lost, the filament left its heating state, or (VOLTAGE) more than `max_voltage_drop_mv` below target on 3 reads in a row. Wobble is not an interruption. |
+| **settled** | stable. Feedback only, never a gate. |
+
+What is done TODAY differs in one place:
+
+| | today | this design |
+|---|---|---|
+| fire_single_pulse | waits for "settled": the heating must hold arrival for `settle_ms` CONTINUOUSLY, and every exit restarts the clock (VOLTAGE and current alike) | HOT, as above |
+| scan_view | HOT, as above (VOLTAGE) | HOT, as above |
+| current heating | restarts on every exit (fire_single_pulse) | Q11 |
+
 ## 3. The calls
 
 ```python
@@ -65,7 +83,6 @@ r = ct.scan_view(
     preheat_margin_s=0.3,
     max_hot=6,
     link_lost_timeout_s=5.0,
-    verify=True,
 )
 
 # scan_view, VOLTAGE heating, ext trigger (the detector sends one edge per filament)
@@ -85,7 +102,6 @@ r = ct.scan_view(
     preheat_margin_s=0.3,
     max_hot=6,
     link_lost_timeout_s=5.0,
-    verify=True,
 )
 
 # fire_single_pulse: the same arguments for one filament
@@ -99,9 +115,7 @@ r = ct.fire_single_pulse(
     trigger=ct.Ext(on_armed=on_armed, trigger_timeout_ms=None),
     measure=ct.Measure(rate_hz=1_000_000, bg_gap_us=100.0, bg_window_us=50.0),
     controller=None,
-    reuse=True,
     link_lost_timeout_s=5.0,
-    verify=True,
 )
 ```
 
@@ -128,7 +142,7 @@ happening at scan scale.
 | …but on P2 CH1/CH2 a filament was still at 424–883 mA after 37–40 s at IDLE, so the next view refused it "not warm yet" | bad INA reads on those channels (suspected) | open (hardware) | a "not warm yet" refusal skips that filament for THIS view only; the next view tries it again (done, 4b0c0d9) |
 | A voltage above the cap is never reached | the rig's cap is **9.5 V** (the user's setting, 2026-10-27), kept by the backend | by design | the cap is READ from every controller at set-up; `active_mv` above it is refused before anything is heated |
 | After an RP2350 restart its cap is the firmware default, 11 V, until the backend's keeper writes 9.5 V back — and the keeper skips controllers that are armed or running | the cap is board state; the keeper waits for the end of a run | **open** | the run compares each controller's cap (with its heartbeat) during the run; a cap different from the one read at set-up → STOP |
-| Over-current trips the converter OFF (IOUT_LIMIT is a cut-out, not a limiter) | VOLTAGE mode has no current loop: a low-resistance filament or too high a voltage → over 3.4 A (3.7 A at turn-on) | by design of the part | an OCP trip = "interrupted" (output fault): that filament → SLEEP, skipped, the run goes on. Its calibrated `active_mv` is what keeps it under the limit |
+| Over-current cuts the converter OFF (IOUT_LIMIT is a cut-out, not a limiter) | with the cap at 9.5 V a normal filament cannot draw that much: an OCP trip means a short or a fault | by design of the part | an OCP trip = "interrupted" (output fault): that filament → SLEEP, skipped, the run goes on |
 | A VOLTAGE row in the firmware heating table spun forever | the firmware table cannot run VOLTAGE | fixed: skipped, 3cbf555 | all heating is commanded by the host (backend), never by the firmware table |
 
 ### 4.2 Holding the heat: the backend's own timers
@@ -170,14 +184,19 @@ happening at scan scale.
 | A shot with measurement off is useless | — | — | `measure=` is required; a measurement that cannot be armed refuses the shot before anything is heated |
 | Absolute mA is suspect on the current board (VREF+ floating, front end saturating ~842 counts) | hardware | new board coming | the per-pulse event is kept raw too |
 
-### 4.6 HV switch read-back and switches
+### 4.6 HV switch read-back (165) and switches
+
+The 165 read-back is ALWAYS taken (PIO firing): every pulse reads the switch
+byte once while ON and once after OFF, into that pulse's record.
 
 | pitfall | cause | status | this design |
 |---|---|---|---|
-| "HV did not turn on": the ON read-back ≠ commanded; the 165 often reads the neighbour bit | the 165 is flaky and reads upstream of the gate resistor | hardware | judge by the measured current: a read-back mismatch is recorded on the pulse, the run goes on (Q8) |
-| Switch read-back OK but no current | cold-soldered 33 Ω gate resistors | hardware | a pulse with no current is flagged on that filament |
+| "HV did not turn on": the ON read-back ≠ commanded; it often reads the neighbour bit | the 165 is flaky and reads upstream of the gate resistor | hardware | ON mismatch is recorded on the pulse (`on_mismatch`), the run goes on; whether it fired is judged by the measured current (Q8) |
+| A switch did not open after a pulse | MOS stuck, or the OFF frame lost | the OFF read-back ≠ 0 is counted per pulse | STOP at once |
+| A pulse whose read-back sample was dropped | the read-back FIFO | flagged "unverified" | recorded; the run goes on |
+| Read-back OK but no current | cold-soldered 33 Ω gate resistors | hardware | a pulse with no current is flagged on that filament |
 | OFF frames lost on a slow link left 4 switches closed for 3 h | an unconfirmed OFF was ignored | fixed: `force_grid_off` | every STOP and every end of run: disarm, then all grids forced open and confirmed |
-| A MOS stuck on after a pulse | hardware | checked every 0.5 s | STOP |
+| The firmware `fault_policy` (on a board fault: stop the run / continue; on a read-back mismatch: stop / continue) is board state, set by a separate call and kept until changed | hidden state, like the trigger delay. Its mismatch switch only acts on the old bit-bang path, not PIO | today | the run writes the policy it needs at set-up and reads it back (rule 5): a board fault = that filament interrupted and skipped, never the whole run; a read-back mismatch = recorded |
 
 ### 4.7 Numbering
 
@@ -215,8 +234,7 @@ happening at scan scale.
 | `trigger` | both | §5.3 | required |
 | `measure` | both | `ct.Measure(rate_hz, bg_gap_us, bg_window_us)`: background averaged over `bg_window_us`, taken `bg_gap_us` before and after each pulse | required |
 | `preheat_ahead`, `preheat_margin_s`, `max_hot` | scan_view | when to raise each filament so it is HOT about when its turn comes; at most `max_hot` heating at once | `"auto"`, 0.3 s, 6 |
-| `controller`, `reuse` | fire_single_pulse | the firing controller (`None` = its own); skip an unchanged download | `None`, `False` |
-| `verify` | both | read the schedule back before arming | `True` |
+| `controller` | fire_single_pulse | the firing controller (`None` = the filament's own board) | `None` |
 | `link_lost_timeout_s` | both | a command link (L2 or L3) down this long → STOP | 5.0 |
 
 ### 5.2 `heating=`
@@ -224,13 +242,13 @@ happening at scan scale.
 | | `ct.Voltage(...)` — main | `ct.Current(...)` | `None` |
 |---|---|---|---|
 | for | both | fire_single_pulse | fire_single_pulse |
-| heats with | VOLTAGE, closed loop on the load voltage | ACTIVE, current loop | nothing |
+| heats with | VOLTAGE, closed loop on the load voltage | ACTIVE, current loop | the state as is: whatever the caller set before the call |
 | value | `active_mv`: scan_view `{filament: mV}`, exactly the listed filaments; fire_single_pulse one number; ≤ the voltage cap read from the controllers (9.5 V on the rig) | `active_ma` | — |
-| "arrived" | load voltage within ±150 mV | current loop converged, not capped | — |
+| "arrived" | §2a | §2a | — |
 | `idle_ma` | back to this when done | same | — |
-| `settle_ms` | after the FIRST arrival, wait this long → HOT; a wobble does not restart it | same | — |
+| `settle_ms` | §2a: from the FIRST arrival | §2a: Q11 | — |
 | `max_voltage_drop_mv` | a drop this far below `active_mv` on 3 reads = interrupted. Default 500 | — | — |
-| `heat_timeout_s` | the longest it may stay heated in one go, raise → back at IDLE; backend-timed, never renewed, **not deferred by the run** | same | — |
+| `heat_timeout_s` | the longest it may stay heated in one go; backend-timed, never renewed, **not deferred by the run**. Counted from the raise or from the first arrival: Q10 | same | — |
 | interrupted by | output fault (OCP, open, short), board lost, the drop above | output fault, board lost | — |
 
 ### 5.3 `trigger=`
@@ -240,7 +258,7 @@ happening at scan scale.
 | edges from | the master ESP32's hardware timer, one train per filament | your hardware, into the master's SyncIn |
 | `on_armed` | optional `on_armed(f)`; the train starts after it returns | required `on_armed(f)`: start your source and return |
 | `pulse_interval_ms` | the train's spacing; > (`trigger_delay_us` + `width_us`)/1000, ≥ 0.5 ms; default 500 | — (Q4) |
-| `trigger_timeout_ms` | gap limit between edges of one filament, from its first edge; default 2 × spacing + 100 | required when `num_pulses` > 1; unused with 1 pulse |
+| `trigger_timeout_ms` | the longest wait for the NEXT edge. The first one is counted from the moment the train has started (the ESP32 accepted it); every later one from the previous edge. Runs out → **STOP the run**. Default 2 × spacing + 100 | the same: the first edge counted from `on_armed` returning (your source started), the later ones from the previous edge. Runs out → **STOP the run**. Required (only you know how long your source takes) |
 
 ## 6. Timing
 
@@ -314,8 +332,8 @@ VOLTAGE heat-up to first arrival   from the filament's history (filament_perf)
 | "not warm yet" when raised | the backend's ladder guard | skipped in this view only |
 | HOT, its turn comes late | the window | IDLE, re-heated at its turn (Q3) |
 | `on_armed` hangs | the window, with `on_armed` still running | STOP |
-| ext: no edge comes | the window | IDLE, skipped; 2 filaments in a row: STOP |
-| edges stop half way | `trigger_timeout_ms` | STOP (firmware), or skip the rest (Q7) |
+| no edge comes (ext source dead, sim train never started) | `trigger_timeout_ms` from when edges should start (host) | STOP — at the first filament, not after heating the rest |
+| edges stop half way | `trigger_timeout_ms` between edges (firmware) | STOP |
 | ON read-back mismatch, a pulse with no current | the pulse log, the measurement | recorded on that filament; the run goes on |
 | measurement event missing | event ids | "missing" on that pulse |
 | SHV fault, MOS stuck on, HV guard, vacuum, HV off | checked every 0.5 s | STOP |
@@ -353,6 +371,8 @@ Callers that change with it: the auto test program, combined_backend (its
 | Q4 | ext: spacing > delay + width and ≥ 0.5 ms need your spacing | `ct.Ext(expected_interval_ms=...)`, optional, used only for these checks |
 | Q5 | extra keys in the heating dict | refused; scan_views passes each view only its own |
 | Q6 | sim "already running" right after a filament | the backend asks the ESP32 directly |
-| Q7 | `trigger_timeout_ms` runs out | today the firmware stops the whole run; alternative: skip the rest of that filament (firmware change) |
+| Q7 | `trigger_timeout_ms` runs out | decided: STOP the run. It is the safety backstop; a dead trigger must stop the run at the first filament |
 | Q8 | ON read-back mismatch | record and go on; the measured current is the truth |
 | Q9 | `heat_timeout_s` default | none: required |
+| Q10 | `heat_timeout_s` counted from | (a) the raise: bounds ALL heating, including a filament that never arrives; or (b) the first arrival: bounds the time held hot, and a filament that never arrives needs another limit |
+| Q11 | `settle_ms` with current heating | (a) from the first arrival, like VOLTAGE; or (b) restart on every exit, like fire_single_pulse today |

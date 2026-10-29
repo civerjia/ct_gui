@@ -46,17 +46,17 @@
   <text x="586.0" y="224" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#ffffff" text-anchor="middle">on_armed still running</text>
   <line x1="716.0" y1="198" x2="716.0" y2="240" stroke="#b91c1c" stroke-width="3"/>
   <text x="738.0" y="224" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b91c1c" text-anchor="start">STOP (your code is stuck)</text>
-  <text x="16" y="290" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">no edge ever comes</text>
-  <text x="16" y="308" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">was: shot_wait_timeout_s</text>
+  <text x="16" y="290" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">no edge comes</text>
+  <text x="16" y="308" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">was: shot_wait / no_pulse timeouts</text>
   <rect x="300" y="273" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
   <line x1="300" y1="291.0" x2="778.4" y2="291.0" stroke="#cbd5e1" stroke-width="1.5"/>
   <rect x="300" y="280" width="156" height="22" rx="3" fill="#99d5cc"/>
-  <rect x="456" y="280" width="260.0" height="22" rx="3" fill="#1e293b"/>
-  <text x="586.0" y="296" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#ffffff" text-anchor="middle">released, waiting for edges</text>
-  <line x1="716.0" y1="270" x2="716.0" y2="312" stroke="#b45309" stroke-width="3"/>
-  <text x="738.0" y="296" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b45309" text-anchor="start">back to IDLE, skipped; 2 in a row: STOP</text>
+  <rect x="456" y="280" width="31.200000000000045" height="22" rx="3" fill="#1e293b"/>
+  <text x="495.20000000000005" y="296" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#b91c1c" text-anchor="start">none within trigger_timeout_ms</text>
+  <line x1="491.20000000000005" y1="270" x2="491.20000000000005" y2="312" stroke="#b91c1c" stroke-width="3"/>
+  <text x="738.0" y="296" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b91c1c" text-anchor="start">STOP at the first filament</text>
   <text x="16" y="362" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">edges stop half way</text>
-  <text x="16" y="380" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">kept: trigger_timeout_ms</text>
+  <text x="16" y="380" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">trigger_timeout_ms</text>
   <rect x="300" y="345" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
   <line x1="300" y1="363.0" x2="778.4" y2="363.0" stroke="#cbd5e1" stroke-width="1.5"/>
   <rect x="300" y="352" width="156" height="22" rx="3" fill="#99d5cc"/>
@@ -71,7 +71,7 @@
   <line x1="521.0" y1="355" x2="521.0" y2="371" stroke="#ffffff" stroke-width="2"/>
   <text x="547.2" y="368" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="12.5" font-weight="400" fill="#b91c1c" text-anchor="start">gap &gt; trigger_timeout_ms</text>
   <line x1="543.2" y1="342" x2="543.2" y2="384" stroke="#b91c1c" stroke-width="3"/>
-  <text x="738.0" y="368" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b91c1c" text-anchor="start">STOP (firmware) -- or skip the rest (Q2)</text>
+  <text x="738.0" y="368" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b91c1c" text-anchor="start">STOP (firmware)</text>
   <text x="16" y="434" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="14.5" font-weight="600" fill="#1e293b" text-anchor="start">pulses outlast the window</text>
   <text x="16" y="452" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">was: shot_wait_timeout_s</text>
   <rect x="300" y="417" width="416.0" height="36" rx="5" fill="none" stroke="#b45309" stroke-width="1.5" stroke-dasharray="5 4"/>
@@ -105,6 +105,6 @@
   <line x1="716.0" y1="427" x2="716.0" y2="443" stroke="#ffffff" stroke-width="2"/>
   <line x1="716.0" y1="414" x2="716.0" y2="456" stroke="#b45309" stroke-width="3"/>
   <text x="738.0" y="440" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#b45309" text-anchor="start">stop the sim train, then IDLE; rest skipped</text>
-  <text x="16" y="502" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">The window is the one per-filament limit: whatever has not happened by its end is caught there. trigger_timeout_ms stays</text>
-  <text x="16" y="520" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">because a stalled train must not keep the firmware armed; total_ms is computed (filaments x heat_timeout_s + 30 s) as the firmware's last backstop.</text>
+  <text x="16" y="502" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">The window limits each filament's heating. trigger_timeout_ms is the safety backstop for the trigger: a dead source stops the run</text>
+  <text x="16" y="520" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Helvetica Neue&quot;,Arial,sans-serif" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">at the first filament. total_ms is computed (filaments x heat_timeout_s + 30 s) as the firmware's last backstop.</text>
 </svg>

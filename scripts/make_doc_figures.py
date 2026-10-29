@@ -318,10 +318,10 @@ def fig_timing_failures():
          [(0, 3, "heat"), (3, WEND, "hot")], None, "back to IDLE, re-heated at its turn (Q1)", WAIT),
         ("on_armed hangs", "was: on_armed_timeout_s",
          [(0, 3, "heat"), (3, WEND, "fire")], "onarmed", "STOP (your code is stuck)", STOP),
-        ("no edge ever comes", "was: shot_wait_timeout_s",
-         [(0, 3, "heat"), (3, WEND, "fire")], None, "back to IDLE, skipped; 2 in a row: STOP", SKIP),
-        ("edges stop half way", "kept: trigger_timeout_ms",
-         [(0, 3, "heat"), (3, 4.6, "fire")], "gap", "STOP (firmware) -- or skip the rest (Q2)", STOP),
+        ("no edge comes", "was: shot_wait / no_pulse timeouts",
+         [(0, 3, "heat"), (3, 3.6, "fire")], "noedge", "STOP at the first filament", STOP),
+        ("edges stop half way", "trigger_timeout_ms",
+         [(0, 3, "heat"), (3, 4.6, "fire")], "gap", "STOP (firmware)", STOP),
         ("pulses outlast the window", "was: shot_wait_timeout_s",
          [(0, 3, "heat"), (3, WEND, "fire")], "slow", "stop the sim train, then IDLE; rest skipped", SKIP),
     ]
@@ -345,20 +345,22 @@ def fig_timing_failures():
                 _pulses(s, x, 3.2, 25, 0.2, y)
         if extra == "onarmed":
             s.text(x(5.5), y + 16, "on_armed still running", 12.5, "#ffffff", "middle")
-        if extra is None and segs[-1][2] == "fire":
-            s.text(x(5.5), y + 16, "released, waiting for edges", 12.5, "#ffffff", "middle")
+        if extra == "noedge":
+            s.text(x(3.6) + 8, y + 16, "none within trigger_timeout_ms", 12.5, STOP)
         if extra == "gap":
             s.text(x(4.6) + 8, y + 16, "gap > trigger_timeout_ms", 12.5, STOP)
             end_x = x(4.6) + 4
+        elif extra == "noedge":
+            end_x = x(3.6) + 4
         else:
             end_x = x(WEND)
         s.line(end_x, y - 10, end_x, y + 32, color, 3)
         s.text(x(WEND) + 22, y + 16, outcome, 13.5, color, weight=600)
         y += 72
-    s.text(16, y + 6, "The window is the one per-filament limit: whatever has not happened "
-           "by its end is caught there. trigger_timeout_ms stays", 13, MUTED)
-    s.text(16, y + 24, "because a stalled train must not keep the firmware armed; total_ms is "
-           "computed (filaments x heat_timeout_s + 30 s) as the firmware's last backstop.", 13, MUTED)
+    s.text(16, y + 6, "The window limits each filament's heating. trigger_timeout_ms is the safety "
+           "backstop for the trigger: a dead source stops the run", 13, MUTED)
+    s.text(16, y + 24, "at the first filament. total_ms is computed (filaments x heat_timeout_s + 30 s) "
+           "as the firmware's last backstop.", 13, MUTED)
     s.save("timing_failures.svg")
 
 
