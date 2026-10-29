@@ -44,6 +44,9 @@ unknown key, is refused.
 
 ## 3. The calls
 
+Every pulse is measured: `measure=ct.Measure(...)` is required in every call
+(§5.4).
+
 ```python
 # scan_view, sim trigger
 r = ct.scan_view(
@@ -53,6 +56,7 @@ r = ct.scan_view(
         idle_ma=1200,                           # back to this after its pulses
         settle_ms=1000,                         # HOT = this long after the FIRST arrival
         heat_timeout_s=10,                      # longest one filament may stay heated
+        max_voltage_drop_mv=500,                # a drop this big (3 reads) = interrupted
     ),
     num_pulses=20,
     width_us=12000,
@@ -65,7 +69,6 @@ r = ct.scan_view(
     preheat_ahead="auto",                       # rarely changed from here on
     preheat_margin_s=0.3,
     max_hot=6,
-    max_voltage_drop_mv=500,
     link_lost_timeout_s=5.0,
     verify=True,
 )
@@ -74,7 +77,7 @@ r = ct.scan_view(
 r = ct.scan_view(
     filaments=[0, 1, 95],
     heating=ct.Voltage(active_mv={0: 7000, 1: 7050, 95: 6950}, idle_ma=1200,
-                       settle_ms=1000, heat_timeout_s=10),
+                       settle_ms=1000, heat_timeout_s=10, max_voltage_drop_mv=500),
     num_pulses=20,
     width_us=12000,
     trigger=ct.Ext(
@@ -85,7 +88,6 @@ r = ct.scan_view(
     preheat_ahead="auto",
     preheat_margin_s=0.3,
     max_hot=6,
-    max_voltage_drop_mv=500,
     link_lost_timeout_s=5.0,
     verify=True,
 )
@@ -93,14 +95,14 @@ r = ct.scan_view(
 # fire_single_pulse: one filament, heated by voltage, sim trigger
 r = ct.fire_single_pulse(
     filament=16,
-    heating=ct.Voltage(active_mv=7000, idle_ma=1200, settle_ms=1000, heat_timeout_s=10),
+    heating=ct.Voltage(active_mv=7000, idle_ma=1200, settle_ms=1000, heat_timeout_s=10,
+                       max_voltage_drop_mv=500),
     num_pulses=20,
     width_us=12000,
     trigger=ct.Sim(pulse_interval_ms=26, trigger_timeout_ms=None, on_armed=None),
     measure=ct.Measure(rate_hz=1_000_000, bg_gap_us=100.0, bg_window_us=50.0),
     controller=None,                            # None = from the filament's board
     reuse=False,                                # True: skip re-download if unchanged
-    max_voltage_drop_mv=500,
     link_lost_timeout_s=5.0,
     verify=True,
 )
@@ -109,13 +111,12 @@ r = ct.fire_single_pulse(
 r = ct.fire_single_pulse(
     filament=16,
     heating=ct.Current(active_ma=2900, idle_ma=1200, settle_ms=1000, heat_timeout_s=10),
-    num_pulses=1,
+    num_pulses=20,
     width_us=15000,
-    trigger=ct.Ext(on_armed=on_armed, trigger_timeout_ms=3000),
-    measure=None,
+    trigger=ct.Ext(on_armed=on_armed, trigger_timeout_ms=60),
+    measure=ct.Measure(rate_hz=1_000_000, bg_gap_us=100.0, bg_window_us=50.0),
     controller=None,
     reuse=False,
-    max_voltage_drop_mv=500,
     link_lost_timeout_s=5.0,
     verify=True,
 )
@@ -158,9 +159,8 @@ r = ct.fire_single_pulse(
 | `num_pulses` | both | pulses per filament = edges per filament (the RP2350 row length) | 1..255 |
 | `width_us` | both | the HV pulse width, fired by the RP2350's PIO. The triggering edge does not set it: a sim edge is a fixed 5 µs ESP32 pulse, and an ext edge may be any width | 1..65 535 µs (firmware u16) |
 | `trigger` | both | §5.3 | required |
-| `measure` | both | §5.4, or `None` | `None` |
+| `measure` | both | `ct.Measure(...)`: every pulse is measured, always (§5.4) | required |
 | `preheat_ahead`, `preheat_margin_s`, `max_hot` | scan_view | when to raise each filament so it is HOT about when its turn comes; at most `max_hot` heating at once | `"auto"`, 0.3 s, 6 |
-| `max_voltage_drop_mv` | both (heated) | a drop larger than this below the target (3 reads) = heating interrupted | 500 mV |
 | `controller` | fire_single_pulse | which controller fires; `None` = the filament's own board | `None` |
 | `reuse` | fire_single_pulse | skip the download when the schedule is unchanged since your last shot | `False` |
 | `verify` | both | read the schedule back before arming | `True` |
@@ -176,6 +176,7 @@ r = ct.fire_single_pulse(
 | "arrived" means | load voltage within ±150 mV of `active_mv` | the current loop converged at `active_ma`, not capped | — |
 | `idle_ma` | the IDLE current it returns to | same | — |
 | `settle_ms` | after the FIRST arrival, wait this long; then it is HOT. A wobble does not restart it; a drop of more than `max_voltage_drop_mv` (3 reads) or an output fault interrupts it. RP2350-timed. 0..60 000 ms | same; interrupted by an output fault | — |
+| `max_voltage_drop_mv` | a drop larger than this below `active_mv` (3 reads) = heating interrupted. Default 500 | — (a voltage check; a current heating has none) | — |
 | `heat_timeout_s` | the longest one filament may stay heated in one go, from its heating command until it is back at IDLE. Backend-timed, never renewed | same | — (Q14) |
 | schedule | gated: a pulse fires only on a released row whose filament is HOT | gated | NOT gated: any edge after ARM fires; the caller is responsible |
 
@@ -184,11 +185,11 @@ r = ct.fire_single_pulse(
 | | `ct.Sim(...)` — the library makes the edges | `ct.Ext(...)` — your hardware makes the edges |
 |---|---|---|
 | `on_armed` | optional `on_armed(f)`, called at f's turn; the train starts after it RETURNS | **required** `on_armed(f)`: start your `num_pulses` edges in it (or start what sends them) and return |
-| `pulse_interval_ms` | the train's spacing: the master ESP32's timer period is `pulse_interval_ms` × 1000 µs, hardware-timed. Default 500; must be > `width_us`; ≥ 0.5 with `measure` | — (your source sets the spacing; Q12) |
+| `pulse_interval_ms` | the train's spacing: the master ESP32's timer period is `pulse_interval_ms` × 1000 µs, hardware-timed. Default 500; must be > `width_us` and ≥ 0.5 (measurement) | — (your source sets the spacing; Q12) |
 | `trigger_timeout_ms` | the longest gap between two consecutive edges of the same filament, from its first edge. It only catches a lost edge or a dead train. Default 2 × `pulse_interval_ms` + 100; must be > `pulse_interval_ms` | **required**: a little over YOUR spacing. Catches your source stopping mid-filament |
 | where edges enter | the master ESP32 → master RP2350 (ReadyIn) | the master's SyncIn |
 
-### 5.4 `measure=ct.Measure(...)` or `None`
+### 5.4 `measure=ct.Measure(...)` — required, always on
 
 | parameter | meaning | default |
 |---|---|---|
@@ -196,6 +197,11 @@ r = ct.fire_single_pulse(
 | `bg_gap_us`, `bg_window_us` | the background is averaged over `bg_window_us`, taken `bg_gap_us` before the pulse's rise and again after it | 100, 50 |
 
 Pulses closer than 0.5 ms (`MIN_INTER_PULSE_US`) leave no clean background.
+
+Every pulse is measured; there is no unmeasured shot. If the measurement
+cannot be armed (master STM32 not connected, arm refused), the call is
+refused before anything is heated or fired. A pulse whose measurement does
+not arrive is reported as missing, never as another pulse's.
 
 ## 6. The two trigger paths
 
@@ -250,7 +256,7 @@ the same steps, with the same gating, the same window and the same failures.
 3. `trigger` and `heating` are of a known kind, and every key is known.
    `width_us` is 1..65 535.
    - `ct.Sim`: `pulse_interval_ms` × 1000 > `width_us`; `trigger_timeout_ms`
-     > `pulse_interval_ms`; with `measure`, the spacing is ≥ 0.5 ms.
+     > `pulse_interval_ms`; the spacing is ≥ 0.5 ms (measurement).
    - `ct.Ext`: `on_armed` and `trigger_timeout_ms` are given.
 4. The window holds one filament's work (§8). If not: Q4.
 
@@ -258,8 +264,9 @@ the same steps, with the same gating, the same window and the same failures.
 
 5. Download ONE gated schedule (all filaments, in order) to every controller
    that fires or frames a pulse, and read it back.
-6. Write `settle_ms` and `max_voltage_drop_mv` to the RP2350s, arm the STM32
-   measurement, then ARM.
+6. Write `settle_ms` (and, for `ct.Voltage`, `max_voltage_drop_mv`) to the
+   RP2350s. Arm the STM32 measurement; if it cannot be armed, refuse here,
+   before anything is heated. Then ARM.
 
 **Per filament f, in order:**
 
@@ -361,7 +368,8 @@ heated filament: the backend's window ends, but its IDLE cannot arrive (Q7).
 | `trigger="sim"/"ext"`, `on_armed`, `pulse_interval_ms`, `trigger_timeout_ms` | `trigger=ct.Sim(...)` / `ct.Ext(...)` | rules 2, 3 |
 | scan_view `active_mv`, `idle_ma`, `settle_ms`, `heat_timeout_s` | `heating=ct.Voltage(...)` | rule 3: they exist only when heating |
 | fire_single_pulse `active_mv` / `active_ma`, `idle_ma`, `settle_ms`, `heat_timeout_s` | `heating=ct.Voltage(...)` / `ct.Current(...)` / `None` | rules 2, 3 |
-| `measure=True`, `rate_hz`, `bg_gap_us`, `bg_window_us` | `measure=ct.Measure(...)` / `None` | rule 3 |
+| `measure=True/False`, `rate_hz`, `bg_gap_us`, `bg_window_us` | `measure=ct.Measure(...)`, required: every shot is measured | an unmeasured shot has no use |
+| `max_voltage_drop_mv` (top level) | inside `ct.Voltage` | rule 3: only a voltage heating has a voltage to drop |
 | `heat_timeout_s` = "wait for first arrival" | `heat_timeout_s` = longest heating | the window covers the arrival too |
 | `settle_ms` "held continuously" (fire_single_pulse) | "from the first arrival" in both (Q10) | rule 4 |
 | `on_armed()` (fire_single_pulse, no argument) | `on_armed(f)` in both | rule 4 |
