@@ -366,7 +366,7 @@ def fig_timing_sim():
     """trigger="sim": where the edges come from, the request/poll delays, and
     why a train must be stopped before the next row is released."""
     W, L = 1080, 230
-    s = Svg(W, 740, "scan_view timing, trigger=sim")
+    s = Svg(W, 760, "scan_view timing, trigger=sim")
     PX = 0.46                                 # px per ms, panel 1
     x = lambda t: L + t * PX                  # noqa: E731
     top = 40
@@ -412,7 +412,8 @@ def fig_timing_sim():
             xi = x(t0 + i * 26)
             s.line(xi, ye + 3, xi, ye + 21, PULSE, 1.4)
     s.line(x(774), ye - 4, x(774), ye + 28, WAIT, 1, "3 3")
-    s.text(x(774) + 4, ye - 6, "A's train done", 12, MUTED)
+    s.text(x(280), ye - 6, "num_pulses = 20 edges, pulse_interval_ms = 26 apart "
+           "(each edge: a fixed 5 us ESP32 pulse)", 12, INK)
     # RP2350 lanes: emitted (dark) vs consumed (light)
     for lane, t0, emit in (("c1", 280, True), ("c2", 280, False), ("c1", 1190, False), ("c2", 1190, True)):
         y = rows[lane]
@@ -422,21 +423,23 @@ def fig_timing_sim():
                 s.rect(xi, y + 2, 12 * PX * 1.0 + 3, 20, FIREFILL, 1)
             else:
                 s.line(xi, y + 6, xi, y + 18, "#94a3b8", 1.2)
-    s.text(x(280), rows["c1"] + 38, "A's pulses", 12, INK)
+    s.text(x(280), rows["c1"] + 38, "A's pulses: width_us = 12 ms each (RP2350 PIO)", 12, INK)
     s.text(x(280), rows["c2"] + 38, "edges counted, no pulse (not its filament)", 12, MUTED)
     s.text(x(1190), rows["c1"] + 38, "no pulse", 12, MUTED)
     s.text(x(1190), rows["c2"] + 38, "B's pulses", 12, INK)
     s.text(16, 372, "Both RP2350s walk the same table: each edge fires a pulse only on the board "
            "whose filament's row is released; the other counts it.", 12.5, MUTED)
+    s.text(16, 390, "From A's first edge, the RP2350s time every gap against trigger_timeout_ms "
+           "(sim default 2 x 26 + 100 = 152 ms).", 12.5, MUTED)
 
     # ---- panel 2: the leftover train ---------------------------------------
     PX2 = 0.42
     x2 = lambda t: L + t * PX2                # noqa: E731
-    top2 = 418
+    top2 = 438
     s.text(16, top2 - 14, "2. A's window ends mid-train (edges 200 ms apart): the rest of the "
            "train is still coming.", 15, INK, weight=600)
     for t in range(0, 1751, 250):
-        s.line(x2(t), top2 + 4, x2(t), 690, "#eef2f6", 1)
+        s.line(x2(t), top2 + 4, x2(t), 710, "#eef2f6", 1)
         s.text(x2(t), top2 + 2, f"{t} ms", 11.5, MUTED, "middle")
     edges = [i * 200 for i in range(10)]
     wend = 700
@@ -446,7 +449,7 @@ def fig_timing_sim():
     s.text(L - 14, ye2 + 24, "(if never stopped)", 12, MUTED, "end")
     for t in edges:
         s.line(x2(t), ye2 + 2, x2(t), ye2 + 22, PULSE, 1.6)
-    s.line(x2(wend), top2 + 10, x2(wend), 690, SKIP, 2.5)
+    s.line(x2(wend), top2 + 10, x2(wend), 710, SKIP, 2.5)
     s.text(x2(wend) + 5, top2 + 20, "A's window ends", 12.5, SKIP, weight=600)
     # bad
     yb = top2 + 100
