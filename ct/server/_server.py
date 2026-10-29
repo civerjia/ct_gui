@@ -3429,6 +3429,11 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
     # The flag, not the reason: the reason is first-wins until the STM32 resets,
     # so after a cleared latch it still says 8 and would re-trip at once.
     if st is not None and st.get("flags", 0) & STM32_FLAG_HV_GUARD:
+        if _SPELL_WATCH.snapshot(now)["arc_open"]:
+            # A Spellman arc is still open (< SW.BIG_ARC_S): its outcome first.
+            # 12:24:22 2026-10-29 the HV was put back 1 s after an arc, and a
+            # big arc followed 1 s later. Big -> the Spellman trip takes it.
+            return None
         return _hv_guard_after_stm32_trip(now)
     if not _HV_GUARD["enabled"]:
         return None

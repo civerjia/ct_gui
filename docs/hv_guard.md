@@ -79,8 +79,8 @@ control2's `spellman_backend` broadcasts kV, mA and GetStatus about 4 times a se
 
 | event | what it looks like | action |
 |---|---|---|
-| ordinary arc | the GetStatus Arc bit rises; as a fallback, a kV drop of more than 10 % and 3 kV between two readings. HV Ray On stays 1 and no System Fault, even if the kV is low and climbing (the supply's own recovery, often back to a lower safe voltage: 65 → 13.8 → 55 kV at 11:55). A single mA spike alone is not an arc, since a normal pulse makes one too. | Recorded in `logs/arcs.jsonl` and in the backend log, with the kV it settled at. Nothing is switched. |
-| big arc (auto-recovers) | judged by GetStatus: on the arc the supply cuts its HV (HV Ray On 0 at 5 s, read within 3 s), or System Fault. With no fresh GetStatus only, the fallback is a kV reading at least 5 s after the drop still under 50 % (never a stale reading). | Trip: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Back on by itself once the Spellman has been stable for 10 s. Heating stays at IDLE. |
+| ordinary arc | the GetStatus Arc bit rises (fallback: a kV drop of more than 10 % and 3 kV between two readings) and the kV is back to 95 % within 2 s. Every ordinary arc on 2026-10-29 was back in 0.2–0.65 s. A single mA spike alone is not an arc, since a normal pulse makes one too. | Recorded in `logs/arcs.jsonl` and in the backend log. Nothing is switched. |
+| big arc (auto-recovers) | the kV is **not back within 2 s**: low, climbing, or no readings at all (`spellman_backend` pauses its monitor while its conditioning handles an arc, about 7.8 s), or System Fault. HV Ray On stays 1 through these, so GetStatus cannot tell one. 12:24:24: 61.5 → 0.3 kV, 7.8 s without readings, ramp back by 12:24:41; a shot fired at 38 kV during the ramp. | Trip: switches open, HV off, hot filaments to IDLE. Back on by itself once the Spellman has been stable for 10 s. Heating stays at IDLE. If the STM32 tripped on the arc, its check waits until the arc is decided. |
 | over-current | between pulses, the mA is over mean + 5σ of its quiet readings for more than 1 s | Trip, latched: switches open, HV off, filaments hot within 15 s to STOP. |
 
 ### GetStatus
@@ -101,7 +101,7 @@ Its 17 bits, in the order of control2's `spellman.html`:
 
 - **System Fault** rising: trip at once, whatever the kV reads. Switches are opened, HV goes off, hot filaments go to IDLE. Once the supply is stable again for 10 s, the rails that were on come back by themselves. Heating stays at IDLE. If the STM32 tripped on the same arc, its own current check restores the rails instead.
 - **Arc** rising: an arc. Only the edge counts; the bit can stay set across several reads.
-- **HV Ray On**: the kV down for 5 s with this bit 0 (read within 3 s) and no fault means somebody switched the supply off. That is recorded as `hv_off`, with no trip.
+- **HV Ray On**: the kV not back within 2 s, with this bit 0 (read within 3 s) and neither Arc nor System Fault, means somebody switched the supply off. That is recorded as `hv_off`, with no trip. During an arc, even a big one, the bit stays 1.
 - Every change of an alarm bit or of HV Ray On is written to `logs/arcs.jsonl` as `kind: status`. The alarm bits are Arc, Over Current/Power/Voltage, System Fault, Regulation Error, Over Temperature, AC/LVPS Fault and HV Inhibit.
 
 A ramp-down (about 1 kV per reading) is never an arc. The GetStatus arc bit counts on its rising edge only.

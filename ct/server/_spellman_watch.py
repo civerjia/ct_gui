@@ -11,12 +11,10 @@ What it looks like (2026-10-29 11:01-11:12, 60-65 kV, 22 arcs in 11 min):
                  0.5-2.4 mA, the next reading back at the set voltage. The
                  supply recovers by itself, so does this: it is recorded,
                  nothing is switched.
-  big arc        judged by the supply's GetStatus, not the kV: it cut its
-                 HV (HV Ray On 0) on an arc, or System Fault. HV guard trip;
-                 our HV comes back once it is stable. A kV that is low but
-                 climbing with HV Ray On 1 and no fault is the supply
-                 recovering from an ordinary arc. Only with no fresh status
-                 is a kV still under half after BIG_ARC_S taken as big.
+  big arc        the kV NOT back within BIG_ARC_S (low, climbing, or no
+                 readings at all), or System Fault. HV Ray On stays 1 through
+                 those, so the status cannot tell one. HV guard trip; our HV
+                 comes back once the Spellman is stable.
   over-current   the mA over mean + k sigma of its quiet readings for more than HOLD_S
                  while nothing is pulsing: something is emitting that should
                  not be (a grid switch on, a hot filament) -- HV guard trip.
@@ -38,10 +36,12 @@ ARC_KV_MIN_DROP = 3.0    # ... and at least this many kV under it (a ramp near 0
                          # falls 10 % per step; the 10-29 arcs fell 20-63 kV)
 ARC_BACK_FRAC = 0.95     # back to this fraction of the kV before it = recovered
 BIG_ARC_KV_FRAC = 0.50   # still under this fraction after BIG_ARC_S = big arc
-BIG_ARC_S = 5.0          # judged on a kV reading taken at least this long after the drop --
-                         # never on a stale one: spellman_backend's monitor pauses while
-                         # its conditioning handles an arc (2026-10-29 11:36, a false trip)
-NO_READING_S = 30.0      # no kV reading this long after the drop: closed as unknown, no trip
+BIG_ARC_S = 2.0          # kV not back to ARC_BACK_FRAC this long after the drop = a big arc.
+                         # Every ordinary arc on 2026-10-29 was back in 0.2-0.65 s. The
+                         # 12:24:24 big one: 61.5 -> 0.3 kV, NO reading for 7.8 s (the
+                         # monitor pauses while conditioning handles an arc), 13 kV
+                         # decaying to 7.9, ramp back, 61.5 at 12:24:41 -- HV Ray On 1
+                         # throughout, so the status cannot tell it; a shot fired at 38 kV.
 ARC_SAME_S = 3.0         # conditioning's arc flag this soon after an arc is that arc
 KV_ON = 5.0              # under this the supply is off: no arcs to see
 HOLD_S = 1.0             # over-current: over the threshold this long
@@ -243,25 +243,17 @@ class SpellmanWatch:
         if a["via"] == "status" and self._kv is not None and self._kv[0] > a["t0"] \
                 and self._kv[1] >= ARC_BACK_FRAC * a["kv_before"]:
             return [self._close(t, "arc")]
-        if self._kv is None or self._kv[0] - a["t0"] < BIG_ARC_S:
-            if t - a["t0"] >= NO_READING_S:      # the readings stopped: cannot tell
-                return [self._close(t, "arc", unknown="no kV reading after the drop")]
+        if t - a["t0"] < BIG_ARC_S:
             return []
-        fresh = self._hv_on is not None and t - self._hv_on[0] <= STATUS_FRESH_S
-        if fresh:
-            # The supply's own status decides (the user, 2026-10-29), not the
-            # kV: after an arc the Spellman (or its conditioning) drops the
-            # voltage and ramps back, often to a lower safe level, with HV Ray
-            # On 1 and no fault -- 11:55 went 65 -> 13.8 -> 55 kV like that.
-            if self._hv_on[1]:
-                return [self._close(t, "arc")]    # HV still on: recovering, settled_kv recorded
-            if "arc" in a["status"] or "system_fault" in a["status"]:
-                return [self._close(t, "big_arc")]   # it cut its HV on the arc
-            return [self._close(t, "hv_off")]        # switched off, no arc, no fault
-        # No fresh GetStatus: the kV is all there is.
-        if self._kv[1] < BIG_ARC_KV_FRAC * a["kv_before"]:
-            return [self._close(t, "big_arc", unknown="no fresh GetStatus: judged by kV")]
-        return [self._close(t, "arc")]            # came part way back and stayed: recorded, settled_kv
+        # Not back within BIG_ARC_S -- low readings, or none at all (the
+        # monitor pausing is itself the conditioning handling an arc). The
+        # one exception: the supply says its HV is OFF with no arc and no
+        # fault -- somebody switched it off.
+        if (self._hv_on is not None and self._hv_on[1] is False and t - self._hv_on[0] <= STATUS_FRESH_S
+                and "arc" not in a["status"] and "system_fault" not in a["status"]):
+            return [self._close(t, "hv_off")]
+        stale = self._kv is None or self._kv[0] <= a["t0"]
+        return [self._close(t, "big_arc", unknown="no kV reading since the drop" if stale else None)]
 
     def _stats(self, t):
         """(baseline mean, sigma) of the quiet readings, both bounded."""

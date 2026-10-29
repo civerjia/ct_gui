@@ -72,22 +72,21 @@ check("ramp-up -> nothing", ev == [], ev)
 
 # A big arc: falls in one step and stays down.
 ev, t = feed(w, t, [3.0] * 30, [2.0] + [0.0] * 29)
-check("collapse that stays down 5 s -> big_arc", [e["kind"] for e in ev] == ["big_arc"]
+check("collapse that stays down -> big_arc after 2 s", [e["kind"] for e in ev] == ["big_arc"]
       and ev[0]["kv_before"] == 60.2 and ev[0]["down_s"] >= SW.BIG_ARC_S, ev)
 
-# The 11:36 false trip: the kV dips, then the readings STOP (spellman_backend's
-# conditioning pauses its monitor) and come back at the set voltage. Time
-# alone (poll) with a stale low reading is not a big arc.
+# 12:24:24 2026-10-29: 61.5 -> 0.3 kV, then NO reading for 7.8 s (the monitor
+# pauses while conditioning handles the arc), 13 kV decaying, ramp back. Not
+# back within 2 s -> big arc, whether the readings are low or missing.
 w = SW.SpellmanWatch()
-ev, t = feed(w, 0.0, [65.5] * 50 + [24.3])
-ev += w.poll(t + 6.0) + w.poll(t + 9.0)
-check("dip, then no readings for 9 s -> not decided yet", ev == [], ev)
-ev, t = feed(w, t + 9.2, [65.5] * 3)
-check("...readings back at 65 kV -> one ordinary arc, no big arc", [e["kind"] for e in ev] == ["arc"], ev)
-ev, t = feed(w, 0.0, [65.5] * 50 + [24.3])
-ev += w.poll(t + 31.0)
-check("no reading at all for 30 s -> closed as unknown, not big", [e["kind"] for e in ev] == ["arc"]
+ev, t = feed(w, 0.0, [61.5] * 50 + [0.3])
+ev += w.poll(t + 1.0)
+check("dip, no readings for 1 s -> not decided yet", ev == [], ev)
+ev += w.poll(t + 2.1)
+check("...still no reading at 2 s -> big_arc (no reading since the drop)", [e["kind"] for e in ev] == ["big_arc"]
       and "unknown" in ev[0], ev)
+ev, t = feed(w, t + 7.8, [13.0, 11.0, 9.0, 7.9] + [7.9 + 2.5 * k for k in range(22)] + [61.5] * 3)
+check("...the ramp back -> no further arc", [e["kind"] for e in ev] == [], ev)
 
 # A latched status arc bit: one arc on its rising edge, not one per GetStatus.
 w = SW.SpellmanWatch()
@@ -150,9 +149,8 @@ for k in range(40):
     ev += feed(w, t + 0.05, [13.8 + k])[0]
     t += DT
 kinds = [e["kind"] for e in ev if e["kind"] != "status"]
-arcs = [e for e in ev if e["kind"] == "arc"]
-check("arc with HV On kept at 1, kV low then climbing -> ordinary arc, not big", kinds == ["arc"]
-      and "settled_kv" in arcs[0], kinds)
+check("11:55: arc, HV Ray On kept at 1, kV low then climbing -> big arc (the status cannot tell)",
+      kinds == ["big_arc"], kinds)
 
 # HV Ray On drops to 0 on an arc -> big arc.
 w = SW.SpellmanWatch()
@@ -168,8 +166,7 @@ check("arc with HV Ray On -> 0 -> big_arc", "big_arc" in [e["kind"] for e in ev]
 # No GetStatus at all: the kV is the fallback.
 w = SW.SpellmanWatch()
 ev, t = feed(w, 0.0, [65.5] * 20 + [3.0] * 26)
-check("no status, kV under half for 5 s -> big_arc (marked judged by kV)", [e["kind"] for e in ev] == ["big_arc"]
-      and "unknown" in ev[0], ev)
+check("no status, kV under half for 2 s -> big_arc", [e["kind"] for e in ev] == ["big_arc"], ev)
 
 # The same drop with HV On still 1 -> no longer a big arc (it was, by kV).
 w = SW.SpellmanWatch()
@@ -180,8 +177,8 @@ for k in range(26):
     ev += w.feed_status(t, OK)
     ev += feed(w, t + 0.05, [3.0])[0]
     t += DT
-check("collapse with HV On still 1, no fault -> ordinary arc (the supply says it is fine)",
-      "big_arc" not in [e["kind"] for e in ev] and "arc" in [e["kind"] for e in ev], [e["kind"] for e in ev])
+check("collapse with HV On still 1, no fault -> big_arc", "big_arc" in [e["kind"] for e in ev],
+      [e["kind"] for e in ev])
 
 # Conditioning's own arc flag: an arc, no status change invented.
 w = SW.SpellmanWatch()
@@ -397,6 +394,19 @@ t = stable_feed(t, 20.0)
 r = S.hv_guard_tick(t)
 check("over-current -> stays latched however stable (a person handles it)", r is None
       and S._HV_GUARD["tripped"] and not S._HV_GUARD["tripped"]["auto_recover"], S._HV_GUARD["tripped"])
+
+# STM32 tripped while a Spellman arc is still open: wait for the arc's outcome.
+rig = recover_setup()
+S._hv_guard_stm32_flags = lambda: {"ok": True, "flags": 32}
+called = []
+S._hv_guard_after_stm32_trip = lambda now: called.append(now) or {"action": "recovered"}
+t = stable_feed(0.0, 3.0)
+t = msgs(t, [0.3], [0.0])                      # the drop: arc open
+r = S.hv_guard_tick(t + 0.5)
+check("STM32 trip during an open arc -> not handled yet", r is None and called == [], r)
+t = msgs(t + 0.6, [65.5, 65.5], [0.02, 0.02])  # back: ordinary arc, closed
+r = S.hv_guard_tick(t)
+check("...arc closed -> the STM32 check runs", called and r["action"] == "recovered", r)
 
 # The threshold is settable and kept.
 r = S.spellman_set_trip_sigma(4, "test")
