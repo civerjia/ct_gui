@@ -1277,6 +1277,34 @@ async function applyUpdate() {
   b.disabled = false; setStatus('Backend did not come back within 3 min — check its window/log.');
 }
 
+// "Check for updates": ask GitHub now instead of waiting for the backend's
+// next periodic check. A newer version shows the update badge as usual.
+async function checkUpdateNow() {
+  const b = $('updateCheckBtn');
+  b.disabled = true; b.textContent = 'Checking…';
+  let j;
+  try {
+    j = await (await fetch('/api/update-check', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client: 'gui' }) })).json();
+  } catch (e) { j = { ok: false, update: { error: String((e && e.message) || e) } }; }
+  b.disabled = false; b.textContent = 'Check for updates';
+  const u = (j && j.update) || {};
+  if (u.error && !u.latest) {
+    setStatus(`Update check failed: ${u.error}`);
+  } else if (u.dev_copy) {
+    setStatus('Update check: this backend runs the development copy -- nothing to compare with GitHub.');
+  } else if (u.available) {
+    const wait = !u.auto ? ' Auto-update is off on this backend --'
+      : (j.busy || []).length ? ` It is applied automatically once the rig is quiet (now: ${j.busy.join('; ')}),`
+      : ' The rig is quiet: it is applied automatically within ~20 s,';
+    setStatus(`Update available: ${u.latest} (running ${u.current || '?'}).${wait} or click the badge to restart now.`);
+  } else {
+    setStatus(`Up to date: running ${u.current || j.commit || '?'}, GitHub has ${u.latest || '?'} (checked ${u.checked_at || 'now'}).`
+      + (u.error ? ` Last check error: ${u.error}` : ''));
+  }
+  pollUpdateStatus();
+}
+
 function toggleDead(i) {
   if (filaments[i].dead && refuseHwDead(i)) return;
   filaments[i].dead = !filaments[i].dead;
@@ -2501,6 +2529,7 @@ function init() {
   syncBackendOrder(); setInterval(syncBackendOrder, 10000);   // ring <-> FID (file read, no hardware)
   syncBackendDead(); setInterval(syncBackendDead, 10000);   // file read on the backend, no hardware
   $('updateBadge').addEventListener('click', applyUpdate);
+  $('updateCheckBtn').addEventListener('click', checkUpdateNow);
   pollUpdateStatus(); setInterval(pollUpdateStatus, 60000);   // the backend does the GitHub check
   // On load, detect a firmware that's already armed/running/faulted (e.g. after a
   // page reload mid-run) and start the run monitor, so the GUI reflects it — Arm

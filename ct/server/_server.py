@@ -5690,6 +5690,16 @@ class CtHandler(BaseHTTPRequestHandler):
                            if busy else "bridge accepted then closed the connection")
                     return self._json({"ok": False, "error": err, "status": link.status()}, HTTPStatus.OK)
                 self._json({"ok": True, "status": link.status()})
+            elif path == "/api/update-check":
+                # The GUI's "Check for updates": ask GitHub now (not in up to
+                # UPDATE_CHECK_S), and wake the auto-update loop so a newer
+                # version waits for a quiet rig from now on.
+                st = update_check_now()
+                _UPDATE_WAKE.set()
+                with _UPDATE_LOCK:
+                    waiting = _UPDATE_STATUS.get("auto_waiting")
+                self._json({"ok": bool(st.get("ok")), **_BACKEND_VERSION, "update": st,
+                            "busy": _rig_busy(), "auto_waiting": waiting})
             elif path == "/api/restart":
                 # Restart this backend in place (and, on the way up, the same
                 # GitHub update check a manual start does). The controller
@@ -8022,6 +8032,32 @@ UPDATE_CHECK_S = float(os.environ.get("CT_UPDATE_CHECK_S", "420"))
 UPDATE_FIRST_CHECK_S = 60.0
 _UPDATE_LOCK = threading.Lock()
 _UPDATE_STATUS: dict = {"checked": False}
+_UPDATE_WAKE = threading.Event()        # "check now" from the GUI: the loop acts on it at once
+_UPDATE_CHECKED_AT = [0.0]              # monotonic time of the last check (any source)
+
+
+def update_check_now() -> dict:
+    """One GitHub check, stored in _UPDATE_STATUS; returns it. Used by the
+    periodic loop and by the GUI's "Check for updates" (POST /api/update-check)."""
+    from ct import update as ct_update
+    try:
+        st = ct_update.remote_check(_BACKEND_VERSION.get("commit"))
+        st["error"] = None
+    except Exception as exc:          # offline, rate-limited, GitHub down
+        st = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    st["checked"] = True
+    st["auto"] = AUTO_UPDATE
+    st["checked_at"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    with _UPDATE_LOCK:
+        prev = dict(_UPDATE_STATUS)
+        # A failed check keeps the last answer (an update seen an hour ago
+        # is still there) and only adds the error.
+        if not st.get("ok") and prev.get("ok"):
+            st = {**prev, "error": st["error"], "checked_at": st["checked_at"]}
+        _UPDATE_STATUS.clear()
+        _UPDATE_STATUS.update(st)
+    _UPDATE_CHECKED_AT[0] = time.monotonic()
+    return dict(st)
 
 
 # Auto-update: an update found on GitHub is APPLIED (restart in place, which
@@ -8075,27 +8111,16 @@ def _auto_update_restart(latest: str) -> None:
 
 
 def _update_watch_loop() -> None:
-    from ct import update as ct_update
-    time.sleep(UPDATE_FIRST_CHECK_S)
+    _UPDATE_WAKE.wait(UPDATE_FIRST_CHECK_S)
     announced = None
     gave_up = None
     while not _STOPPING.is_set():
-        try:
-            st = ct_update.remote_check(_BACKEND_VERSION.get("commit"))
-            st["error"] = None
-        except Exception as exc:          # offline, rate-limited, GitHub down
-            st = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        st["checked"] = True
-        st["auto"] = AUTO_UPDATE
-        st["checked_at"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-        with _UPDATE_LOCK:
-            prev = dict(_UPDATE_STATUS)
-            # A failed check keeps the last answer (an update seen an hour ago
-            # is still there) and only adds the error.
-            if not st.get("ok") and prev.get("ok"):
-                st = {**prev, "error": st["error"], "checked_at": st["checked_at"]}
-            _UPDATE_STATUS.clear()
-            _UPDATE_STATUS.update(st)
+        _UPDATE_WAKE.clear()
+        if time.monotonic() - _UPDATE_CHECKED_AT[0] < 15.0:      # the GUI just checked
+            with _UPDATE_LOCK:
+                st = dict(_UPDATE_STATUS)
+        else:
+            st = update_check_now()
         latest = st.get("latest")
         if st.get("available") and latest != announced:
             announced = latest
@@ -8125,7 +8150,8 @@ def _update_watch_loop() -> None:
                     log.info("auto-update to %s waiting: %s", latest, "; ".join(why))
                 time.sleep(AUTO_UPDATE_POLL_S)
         while not _STOPPING.is_set() and time.monotonic() < deadline:
-            time.sleep(5.0)
+            if _UPDATE_WAKE.wait(5.0):
+                break
 
 
 class _CtHTTPServer(ThreadingHTTPServer):

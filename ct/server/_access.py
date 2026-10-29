@@ -87,6 +87,7 @@ _UNGATED_POSTS = {
     "/api/master",            # which controller is master: host-side routing only
     "/api/schedule",          # stages the plan in this process
     "/api/poll-pause",        # heartbeat hint, self-expiring, no hardware write
+    "/api/update-check",      # asks GitHub; restarting is still /api/restart's guards
     "/api/safety",            # dead-man watchdog: read it, renew it, configure
                                # it. Ungated on purpose -- a keepalive from a
                                # client that does NOT hold the lease is still
