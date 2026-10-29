@@ -11,9 +11,12 @@ What it looks like (2026-10-29 11:01-11:12, 60-65 kV, 22 arcs in 11 min):
                  0.5-2.4 mA, the next reading back at the set voltage. The
                  supply recovers by itself, so does this: it is recorded,
                  nothing is switched.
-  big arc        the kV falls in one step and does NOT come back within
-                 BIG_ARC_S: HV guard trip, latched, a person clears it (the
-                 user, 2026-10-29).
+  big arc        judged by the supply's GetStatus, not the kV: it cut its
+                 HV (HV Ray On 0) on an arc, or System Fault. HV guard trip;
+                 our HV comes back once it is stable. A kV that is low but
+                 climbing with HV Ray On 1 and no fault is the supply
+                 recovering from an ordinary arc. Only with no fresh status
+                 is a kV still under half after BIG_ARC_S taken as big.
   over-current   the mA over mean + k sigma of its quiet readings for more than HOLD_S
                  while nothing is pulsing: something is emitting that should
                  not be (a grid switch on, a hot filament) -- HV guard trip.
@@ -39,7 +42,6 @@ BIG_ARC_S = 5.0          # judged on a kV reading taken at least this long after
                          # never on a stale one: spellman_backend's monitor pauses while
                          # its conditioning handles an arc (2026-10-29 11:36, a false trip)
 NO_READING_S = 30.0      # no kV reading this long after the drop: closed as unknown, no trip
-ARC_MA = 1.0             # one quiet reading this far over the baseline = an arc (kV dip missed)
 KV_ON = 5.0              # under this the supply is off: no arcs to see
 HOLD_S = 1.0             # over-current: over the threshold this long
 GAP_S = 2.0              # readings further apart than this are not "continuous"
@@ -141,13 +143,8 @@ class SpellmanWatch:
                 self._over_since, self._over_fired = None, False   # a pulse is not over-current
                 if not quiet:
                     return out
-            if ma - base >= ARC_MA and self._over_since is None and self._kv is not None \
-                    and self._kv[1] >= KV_ON:
-                # One spike: an arc whose kV dip fell between readings. If it
-                # stays up it is over-current instead (the next reading
-                # closes the arc only once the mA is back).
-                self._open(t, "ma", kv_before=self._kv[1], min_kv=self._kv[1], peak_ma=ma)
-                return out
+            # A single mA spike is NOT an arc: a normal pulse makes one too
+            # (the user, 2026-10-29). Arcs come from the Arc bit, or a kV dip.
             if ma > thr:
                 if self._over_since is None:
                     self._over_since = t
@@ -239,14 +236,6 @@ class SpellmanWatch:
         a = self._arc
         if a is None:
             return []
-        if a["via"] == "ma" and self._ma is not None and self._ma[0] > a["t0"]:
-            # The reading after the spike: back under -> it was an arc.
-            if self._ma[1] - self._baseline(t) < ARC_MA:
-                return [self._close(t, "arc")]
-            # Still up: not a spike. Hand it to the over-current check.
-            self._arc = None
-            self._over_since = a["t0"]
-            return []
         if a["via"] == "status" and self._kv is not None and self._kv[0] > a["t0"] \
                 and self._kv[1] >= ARC_BACK_FRAC * a["kv_before"]:
             return [self._close(t, "arc")]
@@ -254,13 +243,20 @@ class SpellmanWatch:
             if t - a["t0"] >= NO_READING_S:      # the readings stopped: cannot tell
                 return [self._close(t, "arc", unknown="no kV reading after the drop")]
             return []
+        fresh = self._hv_on is not None and t - self._hv_on[0] <= STATUS_FRESH_S
+        if fresh:
+            # The supply's own status decides (the user, 2026-10-29), not the
+            # kV: after an arc the Spellman (or its conditioning) drops the
+            # voltage and ramps back, often to a lower safe level, with HV Ray
+            # On 1 and no fault -- 11:55 went 65 -> 13.8 -> 55 kV like that.
+            if self._hv_on[1]:
+                return [self._close(t, "arc")]    # HV still on: recovering, settled_kv recorded
+            if "arc" in a["status"] or "system_fault" in a["status"]:
+                return [self._close(t, "big_arc")]   # it cut its HV on the arc
+            return [self._close(t, "hv_off")]        # switched off, no arc, no fault
+        # No fresh GetStatus: the kV is all there is.
         if self._kv[1] < BIG_ARC_KV_FRAC * a["kv_before"]:
-            # Down and staying down. The supply's own HV Ray On bit, fresh,
-            # off and no fault: someone switched it off -- not an arc.
-            if (self._hv_on is not None and self._hv_on[1] is False and t - self._hv_on[0] <= STATUS_FRESH_S
-                    and "system_fault" not in a["status"] and "arc" not in a["status"]):
-                return [self._close(t, "hv_off")]
-            return [self._close(t, "big_arc")]
+            return [self._close(t, "big_arc", unknown="no fresh GetStatus: judged by kV")]
         return [self._close(t, "arc")]            # came part way back and stayed: recorded, settled_kv
 
     def _stats(self, t):

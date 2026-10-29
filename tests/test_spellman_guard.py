@@ -51,9 +51,9 @@ ev, t = feed(w, t, [6.85, 60.2, 60.2], [2.33, 0.1, 0.02])
 check("one-reading kV dip with an mA spike -> one ordinary arc", [e["kind"] for e in ev] == ["arc"]
       and ev[0]["min_kv"] == 6.85 and ev[0]["peak_ma"] == 2.33 and ev[0]["recovered_s"] < 0.5, ev)
 
-# An arc whose kV dip fell between readings: only the mA spike is seen.
+# A single mA spike is what a normal pulse looks like too: not an arc.
 ev, t = feed(w, t, [60.2, 60.2, 60.2], [0.02, 1.7, 0.02])
-check("mA spike alone (quiet) -> arc, via mA", [e["kind"] for e in ev] == ["arc"] and ev[0]["via"] == "ma", ev)
+check("mA spike alone -> nothing (a pulse does that)", ev == [], ev)
 
 # The supply's own arc bit.
 ev = w.feed_status(t, [1, 1, 1, 1] + [0] * 13)
@@ -137,7 +137,41 @@ for k in range(26):                                   # GetStatus every cycle, a
 check("switched off (HV On 0, no fault) -> hv_off, no big arc", "hv_off" in [e["kind"] for e in ev]
       and "big_arc" not in [e["kind"] for e in ev], [e["kind"] for e in ev])
 
-# The same drop with HV On still 1 -> big arc.
+# 11:55 2026-10-29: arc, HV Ray On stays 1, kV 65 -> 13.8 -> climbing to 55:
+# the supply recovering -- an ordinary arc, no trip.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [65.5] * 20)
+w.feed_status(t, OK)
+ev = w.feed_status(t + 0.05, st(arc=1, hv_inhibit=1))
+ev2, t = feed(w, t + 0.1, [42.0])
+ev += ev2
+for k in range(40):
+    ev += w.feed_status(t, OK)
+    ev += feed(w, t + 0.05, [13.8 + k])[0]
+    t += DT
+kinds = [e["kind"] for e in ev if e["kind"] != "status"]
+arcs = [e for e in ev if e["kind"] == "arc"]
+check("arc with HV On kept at 1, kV low then climbing -> ordinary arc, not big", kinds == ["arc"]
+      and "settled_kv" in arcs[0], kinds)
+
+# HV Ray On drops to 0 on an arc -> big arc.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [65.5] * 20)
+w.feed_status(t, OK)
+ev = w.feed_status(t + 0.05, st(arc=1, hv_on=0))
+for k in range(26):
+    ev += w.feed_status(t, st(hv_on=0))
+    ev += feed(w, t + 0.05, [0.5])[0]
+    t += DT
+check("arc with HV Ray On -> 0 -> big_arc", "big_arc" in [e["kind"] for e in ev], [e["kind"] for e in ev])
+
+# No GetStatus at all: the kV is the fallback.
+w = SW.SpellmanWatch()
+ev, t = feed(w, 0.0, [65.5] * 20 + [3.0] * 26)
+check("no status, kV under half for 5 s -> big_arc (marked judged by kV)", [e["kind"] for e in ev] == ["big_arc"]
+      and "unknown" in ev[0], ev)
+
+# The same drop with HV On still 1 -> no longer a big arc (it was, by kV).
 w = SW.SpellmanWatch()
 ev, t = feed(w, 0.0, [65.5] * 20)
 w.feed_status(t, OK)
@@ -146,7 +180,8 @@ for k in range(26):
     ev += w.feed_status(t, OK)
     ev += feed(w, t + 0.05, [3.0])[0]
     t += DT
-check("collapse with HV On still 1 -> big_arc", "big_arc" in [e["kind"] for e in ev], [e["kind"] for e in ev])
+check("collapse with HV On still 1, no fault -> ordinary arc (the supply says it is fine)",
+      "big_arc" not in [e["kind"] for e in ev] and "arc" in [e["kind"] for e in ev], [e["kind"] for e in ev])
 
 # Conditioning's own arc flag: an arc, no status change invented.
 w = SW.SpellmanWatch()

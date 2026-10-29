@@ -79,8 +79,8 @@ control2's `spellman_backend` broadcasts kV, mA and GetStatus about 4 times a se
 
 | event | what it looks like | action |
 |---|---|---|
-| ordinary arc | one reading (sometimes two) with the kV down by more than 10 % and 3 kV and/or an mA spike, then back to 95 % | Recorded in `logs/arcs.jsonl` and in the backend log. The supply recovers by itself, so nothing is switched. |
-| big arc (auto-recovers) | the kV falls in one step, and a reading taken at least 5 s later is still under 50 % (a stale reading never counts: `spellman_backend` pauses its monitor while its conditioning handles an arc, which caused a false trip at 11:36 on 2026-10-29; with no reading for 30 s the event is recorded as unknown) | Trip: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Back on by itself once the Spellman has been stable for 10 s. Heating stays at IDLE. |
+| ordinary arc | the GetStatus Arc bit rises; as a fallback, a kV drop of more than 10 % and 3 kV between two readings. HV Ray On stays 1 and no System Fault, even if the kV is low and climbing (the supply's own recovery, often back to a lower safe voltage: 65 → 13.8 → 55 kV at 11:55). A single mA spike alone is not an arc, since a normal pulse makes one too. | Recorded in `logs/arcs.jsonl` and in the backend log, with the kV it settled at. Nothing is switched. |
+| big arc (auto-recovers) | judged by GetStatus: on the arc the supply cuts its HV (HV Ray On 0 at 5 s, read within 3 s), or System Fault. With no fresh GetStatus only, the fallback is a kV reading at least 5 s after the drop still under 50 % (never a stale reading). | Trip: switches open, HV off, hot filaments to IDLE (IDLE keeps the vacuum). Back on by itself once the Spellman has been stable for 10 s. Heating stays at IDLE. |
 | over-current | between pulses, the mA is over mean + 5σ of its quiet readings for more than 1 s | Trip, latched: switches open, HV off, filaments hot within 15 s to STOP. |
 
 ### GetStatus
