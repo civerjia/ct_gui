@@ -354,13 +354,13 @@ t = stable_feed(t + 0.2, 4.0, st(system_fault=1, hv_on=0))
 r = S.hv_guard_tick(t)
 check("...fault still set -> stays tripped, says why", r is None and S._HV_GUARD["tripped"]
       and "system_fault" in (S._HV_GUARD["tripped"].get("waiting_for") or ""), S._HV_GUARD["tripped"].get("waiting_for"))
-t = stable_feed(t, 5.0)
+t = stable_feed(t, 0.5)
 r = S.hv_guard_tick(t)
-check("...cleared but only 5 s steady -> still waiting", r is None and S._HV_GUARD["tripped"], r)
+check("...cleared 0.5 s ago -> still waiting", r is None and S._HV_GUARD["tripped"], r)
 n_rails = len(rig["rails"])
-t = stable_feed(t, 6.0)
+t = stable_feed(t, 0.8)
 r = S.hv_guard_tick(t)
-check("...stable 10 s -> recovered, latch cleared", r and r["action"] == "recovered" and S._HV_GUARD["tripped"] is None, r)
+check("...stable 1 s -> recovered at once, latch cleared", r and r["action"] == "recovered" and S._HV_GUARD["tripped"] is None, r)
 check("...emission and focus back on", rig["rails"][n_rails:] == [("emission", True), ("focus", True)], rig["rails"])
 
 rig = recover_setup()
@@ -370,10 +370,27 @@ t = msgs(t, [3.0] * 30, [0.0] * 30)              # big arc (HV On still 1 in the
 S._spellman_tick(t)
 check("big arc -> tripped, auto_recover", S._HV_GUARD["tripped"] and S._HV_GUARD["tripped"]["auto_recover"],
       S._HV_GUARD["tripped"])
-t = stable_feed(t, 11.0)
+t = stable_feed(t, 1.2)
 r = S.hv_guard_tick(t)
-check("...stable again -> recovered; only the rail that was on comes back", r and r["action"] == "recovered"
+check("...stable 1 s -> recovered; only the rail that was on comes back", r and r["action"] == "recovered"
       and ("emission", True) in rig["rails"] and ("focus", True) not in rig["rails"], rig["rails"])
+
+# The 12:24:24 ramp: still climbing -> waits; on the plateau -> back within ~1 s.
+rig = recover_setup()
+t = stable_feed(0.0, 3.0)
+t = msgs(t, [0.3] + [13.0 + 2.5 * k for k in range(19)], [0.0] * 20)   # drop, ramp (big arc at 2 s)
+S._spellman_tick(t)
+r = S.hv_guard_tick(t)
+check("big arc during the ramp -> still waiting while it climbs", S._HV_GUARD["tripped"] and r is None,
+      S._HV_GUARD["tripped"] and S._HV_GUARD["tripped"].get("waiting_for"))
+t0 = t
+recovered_at = None
+while t < t0 + 3.0 and recovered_at is None:
+    t = stable_feed(t, DT)
+    r = S.hv_guard_tick(t)
+    if r and r.get("action") == "recovered":
+        recovered_at = t - t0
+check("...on the plateau -> HV back within ~1.3 s", recovered_at is not None and recovered_at <= 1.5, recovered_at)
 
 rig = recover_setup()
 S._hv_guard_stm32_flags = lambda: {"ok": True, "flags": 32}
@@ -381,7 +398,7 @@ t = stable_feed(0.0, 3.0)
 S._spellman_on_message({"type": "spellman_response", "cmd": "GetStatus", "data": st(system_fault=1)}, t)
 S._spellman_tick(t + 0.1)
 n_rails = len(rig["rails"])
-t = stable_feed(t + 0.2, 11.0)
+t = stable_feed(t + 0.2, 1.5)
 r = S.hv_guard_tick(t)
 check("STM32 tripped on it too -> its own check restores (rails not touched here)", r and r["action"] == "recovered"
       and rig["rails"][n_rails:] == [] and S._HVG_SPELL_ARC[0] is not None, (r, rig["rails"][n_rails:]))

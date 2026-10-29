@@ -4102,6 +4102,8 @@ def _spellman_watch_feed(m: dict, now: float) -> None:
             evs += _SPELL_WATCH.feed_ma(now, float(d["measured_mA"]), _hv_guard_quiet(now))
     if evs:
         _spellman_events(evs, now)
+    if (_HV_GUARD["tripped"] or {}).get("auto_recover"):
+        _HVG_WAKE.set()             # waiting to come back: judge every reading, not once a second
 
 
 def _spellman_loop() -> None:

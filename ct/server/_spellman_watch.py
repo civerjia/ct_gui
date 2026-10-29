@@ -68,7 +68,9 @@ STATUS_NAMES = ("power_on", "hv_on", "arc", "interlock_closed", "over_current", 
 ALARMS = ("arc", "over_current", "over_power", "over_voltage", "system_fault",
           "regulation_error", "over_temperature", "ac_fault", "lvps_fault", "hv_inhibit")
 STATUS_FRESH_S = 3.0     # a GetStatus older than this says nothing about now
-STABLE_S = 10.0          # "stable again": this long with no arc, no alarm, HV on, kV steady
+STABLE_S = 1.0           # "stable again": this long with no arc, no alarm, HV on, kV steady --
+                         # back as soon as the arc is over (the user, 2026-10-29)
+STABLE_MIN_READINGS = 3
 STABLE_KV_SPREAD = 0.02  # ... kV within this fraction over that time
 
 
@@ -295,8 +297,8 @@ class SpellmanWatch:
             if self._arcs and now - self._arcs[-1]["t"] < hold_s:
                 return f"an arc {now - self._arcs[-1]['t']:.1f} s ago"
             kvs = [(t, kv) for t, kv in self._kv_hist if now - t <= hold_s]
-            if not kvs or kvs[0][0] > now - hold_s + 1.0 or now - kvs[-1][0] > GAP_S:
-                return f"kV readings do not cover the last {hold_s:g} s"
+            if len(kvs) < STABLE_MIN_READINGS or now - kvs[-1][0] > GAP_S:
+                return f"too few kV readings in the last {hold_s:g} s"
             lo, hi = min(kv for _, kv in kvs), max(kv for _, kv in kvs)
             if lo < KV_ON:
                 return f"kV {lo:.1f} (supply not up)"
