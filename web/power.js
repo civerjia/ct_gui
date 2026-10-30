@@ -892,6 +892,7 @@ const HV_HTML = `
     </div>
     <div id="hvGuardMsg" class="hw-status bad" hidden></div>
     <button id="hvGuardClear" class="xs" hidden title="The switch / vacuum was dealt with: clear the latch (HV stays off; turn it on again yourself)">Clear HV guard latch</button>
+    <button id="vacBypass" class="xs" hidden></button>
     <div id="adsStatus" class="summary"></div>
   </div>
 
@@ -2400,9 +2401,20 @@ function wireSupplyMonitor() {
     if (h.ma == null) set(['spMa'], 'no data', 'stale', why(h) || 'no mA reading from control2 (its reply was empty)');
     else set(['spMa'], (+h.ma).toFixed(3) + ' mA', null, `${h.ma_age_s ?? '?'} s old`);
     // Vacuum
+    const byp = v.bypass_missing_s;
+    forMirrored('vacBypass', (b) => {
+      b.hidden = !(byp || (v.pressure_torr == null && v.interlock));
+      b.dataset.on = byp ? '1' : '';
+      b.textContent = byp ? `End vacuum debug (${Math.ceil(byp / 60)} min left)`
+                          : 'Debug: allow without a vacuum reading (1 h)';
+      b.title = byp ? `No reading is let through (by ${v.bypass_by || '?'}); a reading over the limit still refuses`
+                    : 'For debugging while the gauge relay is down: HV ON / ACTIVE / VOLTAGE are allowed with NO reading for 1 h. A reading over the limit still refuses.';
+    });
     if (v.pressure_torr == null) {
-      set(['vacP'], 'no data', 'bad', (why(v) || `no reading for ${v.age_s ?? 'ever'} s`) +
-          (v.interlock ? ' -- the interlock refuses HV ON / ACTIVE until it reads' : ''));
+      set(['vacP'], byp ? 'no data · DEBUG' : 'no data', byp ? 'warn' : 'bad',
+          (why(v) || `no reading for ${v.age_s ?? 'ever'} s`) +
+          (byp ? ' -- debug bypass: NOT refused' :
+           (v.interlock ? ' -- the interlock refuses HV ON / ACTIVE until it reads' : '')));
     } else {
       const over = v.within_limit === false;
       set(['vacP'], (+v.pressure_torr).toExponential(2) + ' Torr', over ? 'bad' : null,
@@ -2442,6 +2454,16 @@ function wireSupplyMonitor() {
         forMirrored('hvGuardMsg', (e) => { e.hidden = false; e.textContent = 'Clear failed: ' + (r.error || 'unknown error'); });
         return;
       }
+      tick();
+    };
+  });
+  forMirrored('vacBypass', (b) => {
+    b.onclick = async () => {
+      const on = b.dataset.on === '1';
+      if (!on && !confirm('Allow HV ON and ACTIVE / VOLTAGE heating WITHOUT a vacuum reading for 1 hour?\n\n' +
+                          'Only while you know the vacuum is good. A reading over the limit still refuses.')) return;
+      const r = await postJ('/api/vacuum', { bypass_missing_s: on ? 0 : 3600 });
+      if (!r.ok) forMirrored('hvGuardMsg', (e) => { e.hidden = false; e.textContent = 'Vacuum debug: ' + (r.error || 'failed'); });
       tick();
     };
   });

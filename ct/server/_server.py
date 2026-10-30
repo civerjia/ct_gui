@@ -4045,6 +4045,42 @@ def vacuum_set_limit(value, who: str = "?") -> dict:
     return {"ok": True, "limit_torr": v, "was": old, "saved": saved}
 VACUUM_INTERLOCK = os.environ.get("CT_VACUUM_INTERLOCK", "1") != "0"
 VACUUM_TRIP_READINGS = 2        # consecutive fresh readings over the limit -> trip
+# DEBUG: while the gauge relay is down for work (2026-10-30, raspberrypi5 being
+# debugged), a person may let "no reading" pass for a while -- from the GUI or
+# POST /api/vacuum {"bypass_missing_s": s}, no restart. Never a reading OVER the
+# limit: only the missing one. Ends by itself; 0 ends it now. Not saved.
+VACUUM_BYPASS_MAX_S = 4 * 3600.0
+_VAC_BYPASS: dict = {"until": None, "by": None}
+
+
+def vacuum_bypass_left() -> float | None:
+    """Seconds the missing-reading bypass still runs, or None."""
+    u = _VAC_BYPASS["until"]
+    if u is None:
+        return None
+    left = u - time.monotonic()
+    if left <= 0:
+        _VAC_BYPASS.update(until=None)
+        log.warning("vacuum debug bypass ended (time up) -- no reading refuses again")
+        return None
+    return left
+
+
+def vacuum_set_bypass(seconds, who: str) -> dict:
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bypass_missing_s must be a number of seconds"}
+    if not 0 <= s <= VACUUM_BYPASS_MAX_S:
+        return {"ok": False, "error": f"bypass_missing_s must be 0..{VACUUM_BYPASS_MAX_S:.0f}"}
+    if s == 0:
+        _VAC_BYPASS.update(until=None, by=None)
+        log.warning("vacuum debug bypass ended by %s", who)
+    else:
+        _VAC_BYPASS.update(until=time.monotonic() + s, by=who)
+        log.warning("vacuum debug bypass ON for %.0f s by %s: no reading no longer refuses "
+                    "HV ON / ACTIVE / VOLTAGE (a reading over the limit still does)", s, who)
+    return {"ok": True, "bypass_missing_s": vacuum_bypass_left(), "by": _VAC_BYPASS["by"]}
 
 _SPELL_LOCK = threading.Lock()
 _SPELL: dict = {"connected": False, "error": None, "last_msg": None,
@@ -4202,7 +4238,8 @@ def vacuum_snapshot() -> dict:
     return {"ok": True, "source": SPELLMAN_WS_URL, "connected": conn, "error": err,
             "pressure_torr": p if fresh else None, "age_s": _age(at, now), "raw": raw if fresh else None,
             "limit_torr": vacuum_limit(), "interlock": VACUUM_INTERLOCK,
-            "within_limit": (p <= vacuum_limit()) if fresh else None, "lesker": les}
+            "within_limit": (p <= vacuum_limit()) if fresh else None, "lesker": les,
+            "bypass_missing_s": vacuum_bypass_left(), "bypass_by": _VAC_BYPASS["by"]}
 
 
 def vacuum_refusal(action: str) -> str | None:
@@ -4212,13 +4249,16 @@ def vacuum_refusal(action: str) -> str | None:
     if not VACUUM_INTERLOCK:
         return None
     v = vacuum_snapshot()
+    if v["pressure_torr"] is None and v["bypass_missing_s"]:
+        return None          # debug bypass: a person let "no reading" pass for now
     if v["pressure_torr"] is None:
         since = "ever" if v["age_s"] is None else "%.0f s" % v["age_s"]
         why = " (%s)" % v["error"] if v["error"] else ""
         return (f"vacuum interlock: no pressure reading for {since} from {SPELLMAN_WS_URL}{why} "
                 f"-- refusing {action}. "
-                f"Start control2's spellman_backend (it relays the Lesker gauge), or set "
-                f"CT_VACUUM_INTERLOCK=0 to run without the interlock")
+                f"Start control2's spellman_backend (it relays the Lesker gauge), or, to "
+                f"debug without it, let a missing reading pass for a while: the GUI's "
+                f"vacuum 'Debug' button / POST /api/vacuum {{\"bypass_missing_s\": 3600}}")
     if v["pressure_torr"] > vacuum_limit():
         return (f"vacuum interlock: {v['pressure_torr']:.2e} Torr is over the {vacuum_limit():.1e} "
                 f"Torr limit -- refusing {action}")
@@ -6187,9 +6227,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 self._json(out)
             elif path == "/api/vacuum":
                 # {"limit_torr": x}: the interlock's limit, saved (survives a
-                # restart). Other fields: none -- the reading is control2's.
+                # restart). {"bypass_missing_s": s}: debug, let NO reading pass
+                # for s seconds (0 ends it). The reading itself is control2's.
+                if "bypass_missing_s" in body:
+                    r = vacuum_set_bypass(body["bypass_missing_s"], self._client(body))
+                    return self._json({**r, "vacuum": vacuum_snapshot()} if r.get("ok") else r)
                 if "limit_torr" not in body:
-                    return self._json({"ok": False, "error": "give limit_torr (Torr)"}, HTTPStatus.OK)
+                    return self._json({"ok": False, "error": "give limit_torr (Torr) or "
+                                                             "bypass_missing_s"}, HTTPStatus.OK)
                 r = vacuum_set_limit(body["limit_torr"], self._client(body))
                 self._json({**r, "vacuum": vacuum_snapshot()} if r.get("ok") else r)
             elif path == "/api/hv-guard":
