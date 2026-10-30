@@ -1766,6 +1766,41 @@ def _raw_power_guard(cid: int, command: str, body: dict) -> tuple[dict | None, l
     return None, fids, state
 
 
+def _power_reply(cid: int, command: str, body: dict, resp, fids: list) -> tuple[dict, list]:
+    """What a raw power command really did, from the FIRMWARE's reply: ok only
+    when it says OK; a board_mask reply ([status, mask8, applied8, failed8,
+    state, mV16]) names every board that did not apply. Returns (fields for the
+    HTTP reply, the fids that DID apply). 2026-10-30: /api/cmd answered ok:true
+    to a batch VOLTAGE whose CH3 boards all failed (firmware BUS_ERROR), the GUI
+    said 'VOLTAGE -> 47 boards', and none of them was recorded at VOLTAGE."""
+    raw = (resp.get("raw") if isinstance(resp, dict) else None) or []
+    ok = bool(raw) and raw[0] == 0
+    out: dict = {"ok": ok}
+    applied = list(fids) if ok else []
+    if (command.upper() == "CH_SET_POWER_STATE" and body.get("board_mask") is not None
+            and len(raw) >= 25):
+        applied, failed = [], []
+        for ch in range(8):
+            for mux in range(8):
+                f = MAPPING.filament_for_board(cid - 1, ch, mux)
+                if (raw[9 + ch] >> mux) & 1 and f is not None:
+                    applied.append(f)
+                if (raw[17 + ch] >> mux) & 1:
+                    failed.append(f"Power {cid} CH{ch + 1}.{mux + 1}"
+                                  + (f" (filament {f})" if f is not None else ""))
+        out["applied"] = len(applied)
+        if failed:
+            out["failed"] = failed
+            out["error"] = (f"{len(failed)} board(s) did not apply it (firmware "
+                            f"{resp.get('status') or raw[0]}): " + ", ".join(failed[:8])
+                            + (f" and {len(failed) - 8} more" if len(failed) > 8 else "")
+                            + f"; {len(applied)} applied")
+    elif not ok:
+        out["error"] = (f"the firmware did not apply it ({resp.get('status') or 'no status'})"
+                        if isinstance(resp, dict) else "no reply")
+    return out, applied
+
+
 def _board_word(fid: int) -> str:
     """'Power 1 CH2.1 (filament 8)' -- how an operator finds the board."""
     c0, ch, pos, _ = filament_to_board(int(fid))
@@ -5939,11 +5974,16 @@ class CtHandler(BaseHTTPRequestHandler):
                         _vcap_note_set(resp)     # the rig's cap is now what was set
                     if command == "CH_SET_I2C_HZ":
                         _i2c_hz_note_set(cid, body, resp)   # kept, re-applied after a reset
-                    if pstate and fids and _status_ok(resp):
-                        # Track it like /api/filament-state does, so the ladder
-                        # and the ACTIVE dead-man see GUI/debug commands too.
-                        note_power_state(fids, pstate, {f: int(body.get("arg", 0)) for f in fids})
                     out = {"ok": True, "response": resp}
+                    if command.upper() in ("CH_SET_POWER_STATE", "CH_SET_TPS_ENABLE",
+                                           "CH_SET_TPS_VOLTAGE"):
+                        verdict, done = _power_reply(cid, command, body, resp, fids)
+                        out.update(verdict)
+                        if pstate and done:
+                            # Track it like /api/filament-state does, so the ladder
+                            # and the ACTIVE dead-man see GUI/debug commands too --
+                            # every board that DID apply, also from a partial batch.
+                            note_power_state(done, pstate, {f: int(body.get("arg", 0)) for f in done})
                     if body.get("_dead_skipped"):
                         out["dead_skipped"] = body["_dead_skipped"]
                         out["warning"] = "left out (marked dead): " + ", ".join(body["_dead_skipped"])
@@ -7103,9 +7143,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 try:
                     ft, flags, payload = build_command_payload(str(body.get("command", "")), body)
                     resp = link.client.send_request(ft, payload, flags=flags, timeout=2.5)
-                    if pstate and fids and _status_ok(resp):
-                        note_power_state(fids, pstate, {f: int(body.get("arg", 0)) for f in fids})
-                    out = {"ok": _status_ok(resp), "response": resp}
+                    verdict, done = _power_reply(cid, str(body.get("command", "")), body, resp, fids)
+                    if pstate and done:
+                        note_power_state(done, pstate, {f: int(body.get("arg", 0)) for f in done})
+                    out = {"response": resp, **verdict}
                     if body.get("_dead_skipped"):
                         out["dead_skipped"] = body["_dead_skipped"]
                         out["warning"] = "left out (marked dead): " + ", ".join(body["_dead_skipped"])

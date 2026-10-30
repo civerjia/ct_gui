@@ -84,6 +84,29 @@ ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE",
 check("/api/cmd single form (no target, no board_mask) is guarded too", ref and ref.get("refused"),
       str(ref))
 
+# --- the firmware's reply decides ok (2026-10-30: a batch VOLTAGE with every CH3
+# board failed came back ok:true and the GUI said "VOLTAGE -> 47 boards") ---
+m = [0] * 8
+m[dch] |= 1 << dpos
+m[lch] |= 1 << lpos
+applied = [0] * 8
+applied[lch] |= 1 << lpos
+failed = [0] * 8
+failed[dch] |= 1 << dpos
+resp = {"status": "BUS_ERROR", "raw": [0x0B] + m + applied + failed + [6, 0x98, 0x08]}
+out, done = S._power_reply(1, "CH_SET_POWER_STATE", {"board_mask": m}, resp, [dead_f, live_f])
+check("partial batch: not ok, the failed board named, the applied one kept",
+      not out["ok"] and out.get("failed") and f"filament {dead_f}" in out["failed"][0]
+      and done == [live_f] and out.get("applied") == 1, (out, done))
+resp = {"status": "OK", "raw": [0] + m + m + [0] * 8 + [6, 0x98, 0x08]}
+out, done = S._power_reply(1, "CH_SET_POWER_STATE", {"board_mask": m}, resp, [dead_f, live_f])
+check("whole batch applied: ok, both recorded", out["ok"] and sorted(done) == sorted([dead_f, live_f]),
+      (out, done))
+out, done = S._power_reply(1, "CH_SET_POWER_STATE", single(lch, lpos, state=4),
+                           {"status": "BUS_ERROR", "raw": [0x0B, lch, lpos, 0, 4, 0, 0]}, [live_f])
+check("single board refused by the firmware: not ok, nothing recorded",
+      not out["ok"] and not done and "did not apply" in out["error"], (out, done))
+
 ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", single(lch, lpos, state=5, arg=2600))
 check("STOP->ACTIVE (state unknown) is refused", ref and "ACTIVE" in ref["error"], str(ref))
 S.note_power_state([live_f], S.POWER_STATE_STANDBY)
