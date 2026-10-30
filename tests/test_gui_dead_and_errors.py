@@ -68,8 +68,21 @@ check("a read is never guarded", ref is None)
 mask = [0] * 8
 mask[dch] |= 1 << dpos
 mask[lch] |= 1 << lpos
-ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", {"board_mask": mask, "state": 3})
-check("a board_mask STANDBY with one dead board is refused whole", ref is not None)
+body = {"board_mask": list(mask), "state": 3}
+ref, got, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", body)
+check("board_mask with one dead board: the dead one taken out, the rest sent (2026-10-30)",
+      ref is None and not (body["board_mask"][dch] >> dpos) & 1
+      and (body["board_mask"][lch] >> lpos) & 1 and dead_f not in got and live_f in got, (ref, body))
+check("...and the reply names it", any(f"filament {dead_f}" in x for x in body.get("_dead_skipped", [])),
+      body.get("_dead_skipped"))
+only = [0] * 8
+only[dch] |= 1 << dpos
+ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", {"board_mask": only, "state": 3})
+check("board_mask of only dead boards: refused, nothing sent", ref and ref.get("refused"), str(ref))
+ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE",
+                               {"channel": dch, "mux_port": dpos, "state": 4, "arg": 1500})
+check("/api/cmd single form (no target, no board_mask) is guarded too", ref and ref.get("refused"),
+      str(ref))
 
 ref, _, _ = S._raw_power_guard(1, "CH_SET_POWER_STATE", single(lch, lpos, state=5, arg=2600))
 check("STOP->ACTIVE (state unknown) is refused", ref and "ACTIVE" in ref["error"], str(ref))

@@ -706,8 +706,9 @@ function wireBoards() {
   };
   reflectStateArg();
   // Batch power state — one board-masked CH_SET_POWER_STATE for the selection.
-  // The backend refuses the whole command if any selected board is dead or
-  // (for ACTIVE) not at IDLE, and says which.
+  // The backend leaves dead boards out and sends the rest (reply: warning /
+  // dead_skipped); it refuses the whole command if a board may not go to
+  // ACTIVE (not at IDLE), and says which.
   wireStateSeg('#bmBatchStateSeg button', 'bstate', 'bmBatchStateArg',
     () => bmBatchState, (v) => { bmBatchState = v; }, reflectBatchStateArg);
   $p('bmBatchApplyState').onclick = async () => {
@@ -724,7 +725,9 @@ function wireBoards() {
     // mask internally) — one round-trip instead of one command per board.
     const j = await postJ('/api/cmd', { controller: pwTarget, command: 'CH_SET_POWER_STATE', board_mask: boardMask(), state: bmBatchState, arg });
     if (btn) btn.disabled = false;
-    bmMsg(j.ok ? `${PS_NAME[bmBatchState]}${arg ? ' @ ' + arg : ''} → ${keys.length} board(s)`
+    const sent = keys.length - (j.dead_skipped ? j.dead_skipped.length : 0);
+    bmMsg(j.ok ? `${PS_NAME[bmBatchState]}${arg ? ' @ ' + arg : ''} → ${sent} board(s)` +
+                 (j.warning ? ` · ${j.warning}` : '')
               : (j.error || `${PS_NAME[bmBatchState]} failed`));
     refreshBoards();
   };

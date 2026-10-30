@@ -1668,7 +1668,12 @@ def _raw_cmd_targets(cid: int, body: dict) -> list[tuple[int, int, int | None]]:
     """(channel, mux, fid) every board a raw /api/cmd or /api/power-cmd body
     addresses: target=single -> one board, else the board_mask bits."""
     out = []
-    if body.get("target") == "single":
+    # /api/cmd's single-board form has no "target" at all: a channel and no
+    # board_mask (build_payload). Read as an empty mask, it skipped the dead
+    # and ladder checks entirely (found 2026-10-30).
+    single = body.get("target") == "single" or (
+        body.get("target") is None and body.get("board_mask") is None and "channel" in body)
+    if single:
         ch, mux = int(body.get("channel", 0)), int(body.get("mux_port", 0))
         out.append((ch, mux))
     else:
@@ -1684,8 +1689,12 @@ def _raw_power_guard(cid: int, command: str, body: dict) -> tuple[dict | None, l
     """The raw proxies (/api/cmd, /api/power-cmd) used to forward a power
     command as-is, so the GUI's debug/batch buttons and tests could power a
     DEAD filament or jump STOP->ACTIVE -- the very things /api/filament-state
-    refuses. Same rules here: refuse the WHOLE command (naming each board and
-    why), never a silent partial. Returns (refusal | None, fids, state)."""
+    refuses. Same rules here, never a silent partial: a single board, or a
+    ladder block, refuses the WHOLE command (naming each board and why). A
+    DEAD board in a board_mask is taken OUT of the mask and the rest is sent
+    (2026-10-30: the GUI's select-all always included dead #90, so every batch
+    VOLTAGE was refused); the body gets "_dead_skipped" for the reply.
+    Returns (refusal | None, fids, state)."""
     command = command.upper()
     energising = False
     state = None
@@ -1715,8 +1724,24 @@ def _raw_power_guard(cid: int, command: str, body: dict) -> tuple[dict | None, l
     elif energising:
         with _DEAD_LOCK:
             dead = {f: dict(v) for f, v in DEAD_FIDS.items()}
-        for ch, mux, f in targets:
-            if f in dead:
+        hit = [(ch, mux, f) for ch, mux, f in targets if f in dead]
+        if hit and body.get("board_mask") is not None and body.get("target") != "single":
+            mask = [int(x) & 0xFF for x in list(body["board_mask"])[:8]]
+            mask += [0] * (8 - len(mask))
+            for ch, mux, _f in hit:
+                mask[ch] &= ~(1 << mux) & 0xFF
+            if not any(mask):
+                blocked.append("every selected board is marked dead")
+            else:
+                body["board_mask"] = mask
+                body["_dead_skipped"] = [f"Power {cid} CH{ch + 1}.{mux + 1} (filament {f})"
+                                         for ch, mux, f in hit]
+                log.info("%s: dead %s left out of the batch (controller %d)", command,
+                         [f for _c, _m, f in hit], cid)
+                targets = [t for t in targets if t[2] not in dead]
+                fids = [f for _ch, _m, f in targets if f is not None]
+        else:
+            for ch, mux, f in hit:
                 why = dead[f].get("reason")
                 blocked.append(f"Power {cid} CH{ch + 1}.{mux + 1} (filament {f}) is marked dead"
                                + (f": {why}" if why else ""))
@@ -5918,7 +5943,11 @@ class CtHandler(BaseHTTPRequestHandler):
                         # Track it like /api/filament-state does, so the ladder
                         # and the ACTIVE dead-man see GUI/debug commands too.
                         note_power_state(fids, pstate, {f: int(body.get("arg", 0)) for f in fids})
-                    self._json({"ok": True, "response": resp})
+                    out = {"ok": True, "response": resp}
+                    if body.get("_dead_skipped"):
+                        out["dead_skipped"] = body["_dead_skipped"]
+                        out["warning"] = "left out (marked dead): " + ", ".join(body["_dead_skipped"])
+                    self._json(out)
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
             elif path == "/api/download":
@@ -7076,7 +7105,11 @@ class CtHandler(BaseHTTPRequestHandler):
                     resp = link.client.send_request(ft, payload, flags=flags, timeout=2.5)
                     if pstate and fids and _status_ok(resp):
                         note_power_state(fids, pstate, {f: int(body.get("arg", 0)) for f in fids})
-                    self._json({"ok": _status_ok(resp), "response": resp})
+                    out = {"ok": _status_ok(resp), "response": resp}
+                    if body.get("_dead_skipped"):
+                        out["dead_skipped"] = body["_dead_skipped"]
+                        out["warning"] = "left out (marked dead): " + ", ".join(body["_dead_skipped"])
+                    self._json(out)
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, HTTPStatus.OK)
             elif path == "/api/adc/ring-start":
