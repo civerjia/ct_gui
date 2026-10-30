@@ -116,8 +116,14 @@ class _MeasureMixin:
         arms the timeout has had to reclaim; non-zero means some caller's
         cleanup is not running.
         """
-        return self._post("/api/recover", {"stop_heating": bool(stop_heating)},
+        r = self._post("/api/recover", {"stop_heating": bool(stop_heating)},
                           timeout=30.0)
+        found = r.get("found") if isinstance(r, dict) else None
+        if isinstance(found, dict) and isinstance(found.get("energised_filaments"), list):
+            # The backend lists FIDs; say them in YOUR numbering.
+            found["energised_filaments"] = sorted(int(self._user_index_of(int(f)))
+                                                  for f in found["energised_filaments"])
+        return r
 
     def ready_status(self) -> dict:
         """Whether the pulse-envelope relay is armed, and how many edges it has

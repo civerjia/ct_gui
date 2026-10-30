@@ -1258,7 +1258,7 @@ class _ScheduleMixin:
         elif duration_s is not None:
             body["duration_s"] = float(duration_s)
         if expect is not None:
-            body["expect"] = list(expect)
+            body["expect"] = [int(self._fid_of(f)) for f in expect]   # the backend speaks FID
         return self._post("/api/sync/simulate", body, timeout=10.0)
 
     def simulate_sync_stop(self) -> dict:
@@ -1330,8 +1330,12 @@ class _ScheduleMixin:
         r = self._get("/api/filament-perf" + (f"?filaments={','.join(map(str, fids))}" if fids else ""))
         if not r.get("ok"):
             return r
-        return {"ok": True, "filaments": {int(self._user_index_of(int(k))): v
-                                          for k, v in (r.get("filaments") or {}).items()}}
+        out = {}
+        for k, v in (r.get("filaments") or {}).items():
+            u = int(self._user_index_of(int(k)))
+            # the inner "filament" too, or it still names the FID
+            out[u] = {**v, "filament": u} if isinstance(v, dict) and "filament" in v else v
+        return {"ok": True, "filaments": out}
 
     def filament_perf_clear(self, filaments="all") -> dict:
         """Drop the per-filament table's history: "all", or YOUR filament
@@ -1736,7 +1740,10 @@ class _ScheduleMixin:
             turn_times: list = []      # seconds per finished turn, this run
 
             def heat_est(f):
-                h = hist.get(str(self._fid_of(f))) or hist.get(int(self._fid_of(f))) or {}
+                # filament_perf() is already in YOUR numbering (int keys). Looked
+                # up by the FID until 2026-10-30: a renumbered filament got
+                # another filament's arrival history (0 read #16's).
+                h = hist.get(int(f)) or {}
                 near = sorted(x["arrive_raw_s"] for x in (h.get("samples") or [])
                               if x.get("arrive_raw_s") is not None and x.get("mv") is not None
                               and abs(int(x["mv"]) - mv[f]) <= 300)
