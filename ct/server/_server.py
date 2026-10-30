@@ -4149,10 +4149,12 @@ _SPELL: dict = {"connected": False, "error": None, "last_msg": None,
                 "status_bits": None, "status_at": None,
                 "pressure_torr": None, "pressure_at": None, "pressure_raw": None,
                 "lesker": None,
-                # GMC-300S Geiger counter on control2 (spellman_backend v6, 2026-10-30):
-                # gmc_point every ~1 s {cpm, delta_cpm, usvh}, gmc_status on (dis)connect.
+                # GMC-300S Geiger counter: its own WebSocket on raspberrypi5:8771
+                # (combined_backend's GMCBackend, 2026-10-30) -- cpm_update every
+                # ~1 s. spellman_backend's gmc_point (counter on a control2 COM
+                # port) is read too, should it ever come from there.
                 "gmc_cpm": None, "gmc_usvh": None, "gmc_delta_cpm": None, "gmc_at": None,
-                "gmc": None}
+                "gmc": None, "gmc_connected": False, "gmc_error": None}
 _SPELL_MA_HIST: list = []       # (monotonic, mA) of the last ~10 min, for the tail check
 _VAC_OVER = {"n": 0, "last_at": None}   # consecutive NEW readings over the limit
 
@@ -4308,6 +4310,67 @@ def hv_supply_snapshot() -> dict:
             "status_age_s": _age(s["status_at"], now)}
 
 
+GMC_WS_URL = os.environ.get("CT_GMC_WS", "ws://raspberrypi5:8771")
+
+
+def _gmc_on_message(m: dict, now: float) -> None:
+    """combined_backend's GMCBackend: {"type": "cpm_update", "cpm", "usvh",
+    "factor", "version", "timestamp"} / {"type": "status", "data": "..."}."""
+    t = m.get("type")
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
+    with _SPELL_LOCK:
+        if t == "cpm_update" and num(m.get("cpm")):
+            cpm, usvh = float(m["cpm"]), m.get("usvh")
+            prev = _SPELL["gmc_cpm"] if _SPELL["gmc_at"] is not None else None
+            _SPELL["gmc_delta_cpm"] = None if prev is None else cpm - prev
+            _SPELL["gmc_cpm"], _SPELL["gmc_at"] = cpm, now
+            _SPELL["gmc_usvh"] = float(usvh) if num(usvh) else None
+            _SPELL["gmc"] = {**(_SPELL["gmc"] or {}), "connected": True,
+                             "version": m.get("version"), "factor": m.get("factor")}
+        elif t == "status":
+            st = str(m.get("data") or "")
+            _SPELL["gmc"] = {**(_SPELL["gmc"] or {}), "status": st,
+                             "connected": st.startswith("Connected")}
+    if t == "cpm_update" and num(m.get("cpm")):
+        series_add("gmc_cpm", float(m["cpm"]))
+        if num(m.get("usvh")):
+            series_add("gmc_usvh", float(m["usvh"]))
+
+
+def _gmc_loop() -> None:
+    """Read-only: never sends (no connect_port / set_factor) -- the counter is
+    combined_backend's."""
+    try:
+        from websockets.sync.client import connect as ws_connect
+    except ImportError:
+        return
+    while not _STOPPING.is_set():
+        try:
+            with ws_connect(GMC_WS_URL, open_timeout=5, close_timeout=1, max_size=None) as ws:
+                with _SPELL_LOCK:
+                    _SPELL["gmc_connected"], _SPELL["gmc_error"] = True, None
+                log.info("Geiger counter reader connected to %s (read-only)", GMC_WS_URL)
+                while not _STOPPING.is_set():
+                    try:
+                        raw = ws.recv(timeout=SPELLMAN_STALE_S)
+                    except TimeoutError:
+                        continue
+                    try:
+                        m = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(m, dict):
+                        _gmc_on_message(m, time.monotonic())
+        except Exception as exc:
+            with _SPELL_LOCK:
+                was = _SPELL["gmc_connected"]
+                _SPELL["gmc_connected"] = False
+                _SPELL["gmc_error"] = f"{GMC_WS_URL}: {type(exc).__name__}: {exc}"
+            if was:
+                log.warning("Geiger counter reader lost %s: %s", GMC_WS_URL, exc)
+        _STOPPING.wait(SPELLMAN_RECONNECT_S)
+
+
 def radiation_snapshot() -> dict:
     """The Geiger counter (GMC-300S on control2), read-only. cpm / usvh are
     None -- never a stale number -- once no reading came for SPELLMAN_STALE_S."""
@@ -4315,9 +4378,10 @@ def radiation_snapshot() -> dict:
     with _SPELL_LOCK:
         cpm, usvh, dcpm, at, st, conn, err = (_SPELL["gmc_cpm"], _SPELL["gmc_usvh"],
                                               _SPELL["gmc_delta_cpm"], _SPELL["gmc_at"],
-                                              _SPELL["gmc"], _SPELL["connected"], _SPELL["error"])
+                                              _SPELL["gmc"], _SPELL["gmc_connected"],
+                                              _SPELL["gmc_error"])
     fresh = at is not None and now - at <= SPELLMAN_STALE_S
-    return {"ok": True, "source": SPELLMAN_WS_URL, "connected": conn, "error": err,
+    return {"ok": True, "source": GMC_WS_URL, "connected": conn, "error": err,
             "counter": st, "cpm": cpm if fresh else None, "usvh": usvh if fresh else None,
             "delta_cpm": dcpm if fresh else None, "age_s": _age(at, now)}
 
@@ -8564,6 +8628,7 @@ def main() -> None:
         log.warning("trend plot history not read back: %s", exc)
     threading.Thread(target=_series_flush_loop, name="series_writer", daemon=True).start()
     threading.Thread(target=_spellman_loop, name="spellman_reader", daemon=True).start()
+    threading.Thread(target=_gmc_loop, name="gmc_reader", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
     # Timed ACTIVE (active_s): returns filaments to IDLE when their time is up.

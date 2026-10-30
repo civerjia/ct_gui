@@ -49,6 +49,20 @@ check("a point without usvh: the old dose is not kept next to the new count",
 S._spellman_on_message({"type": "gmc_point", "data": {"cpm": "x"}}, clock["t"])
 check("a non-number cpm changes nothing", S.radiation_snapshot()["cpm"] == 30)
 
+# --- the counter's own WebSocket (raspberrypi5:8771, combined_backend GMCBackend) ---
+S._gmc_on_message({"type": "status", "data": "Connected to /dev/ttyUSB0 (GMC-300SRe 1.17)"}, clock["t"])
+S._gmc_on_message({"type": "cpm_update", "cpm": 11, "usvh": 0.0681, "factor": 161.54,
+                   "version": "GMC-300SRe 1.17", "timestamp": 1793402468.4}, clock["t"])
+S._gmc_on_message({"type": "cpm_update", "cpm": 14, "usvh": 0.0867, "factor": 161.54,
+                   "version": "GMC-300SRe 1.17", "timestamp": 1793402469.4}, clock["t"])
+r = S.radiation_snapshot()
+check("cpm_update: cpm, usvh, delta from the previous reading, version + status",
+      r["cpm"] == 14 and r["usvh"] == 0.0867 and r["delta_cpm"] == 3
+      and r["counter"]["version"] == "GMC-300SRe 1.17" and "ttyUSB0" in r["counter"]["status"], r)
+check("...plotted", ("gmc_cpm", 14.0) in added)
+S._gmc_on_message({"type": "status", "data": "Serial Disconnected"}, clock["t"])
+check("counter disconnected: said so", S.radiation_snapshot()["counter"]["connected"] is False)
+
 clock["t"] += S.SPELLMAN_STALE_S + 1
 r = S.radiation_snapshot()
 check("readings stopped: None, with the age", r["cpm"] is None and r["usvh"] is None

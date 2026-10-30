@@ -3999,8 +3999,9 @@ it has actually had to do. An empty `events` is the healthy answer; a non-empty
 one is a record of the hardware being walked back with nobody asking, worth
 reading after a run that ended badly.
 
-**`radiation()`** reads the GMC-300S Geiger counter on control2 (relayed by its
-spellman_backend, read-only): `cpm`, `usvh`, `delta_cpm`, `age_s` and
+**`radiation()`** reads the GMC-300S Geiger counter from its own WebSocket on
+raspberrypi5:8771 (combined_backend's GMC backend; `CT_GMC_WS` to change it),
+read-only -- the backend never sends it anything: `cpm`, `usvh`, `delta_cpm`, `age_s` and
 `counter` (connected / port / version). `cpm` and `usvh` are `None`, not the
 last value, once no reading came for a few seconds. The GUI shows it next to
 the vacuum and plots cpm in the supply & vacuum trend.
