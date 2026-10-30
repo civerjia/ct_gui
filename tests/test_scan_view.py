@@ -68,8 +68,10 @@ class Rig:
             self.done += 1
             self.in_row += 1
             self.counted[f] = self.counted.get(f, 0) + 1
-            self.ev_ring = (self.ev_ring + [{"id": self.ev_next, "filament": f,
-                                             "integral_mams": 1.0}])[-self.ev_cap:]
+            e = {"id": self.ev_next, "filament": f, "integral_mams": 1.0}
+            if f not in getattr(self, "no_current", ()):
+                e["emission_ma"] = 0.4              # the path conducted
+            self.ev_ring = (self.ev_ring + [e])[-self.ev_cap:]
             self.ev_next += 1
             if self.in_row >= self.rows[self.cur]["numPulses"]:
                 self._advance()
@@ -147,7 +149,8 @@ def make(rig: Rig):
     ct.ready_disarm = lambda: {"ok": True}
     ct.pulse_events_ma = lambda since=0: {"ok": True, "events": [e for e in rig.ev_ring
                                                                    if e["id"] > since]}
-    ct.shv_pulse_log = lambda c=1: [{"filament": f, "suppressed_not_hot": False}
+    ct.shv_pulse_log = lambda c=1: [{"filament": f, "suppressed_not_hot": False,
+                                     "on_mismatch": f in getattr(rig, "mismatch", ())}
                                     for f, k in rig.counted.items() for _ in range(k)
                                     if (f < 48) == (c == 1)]
 
@@ -412,6 +415,45 @@ rig.sim_busy = 2
 r = make(rig).scan_view([62, 63], trigger="sim", pulse_interval_ms=30, **ARGS)
 check("sim 'already running' tail: waited out, nothing skipped",
       r["ok"] and not r["skipped"] and r["fired"] == 2 and rig.sim_busy == 0, r)
+
+# --- ON read-back mismatch: judged by the measured current (2026-10-30 test7) ---
+rig = Rig()
+rig.mismatch, rig.no_current = {21, 22}, {22}
+r = make(rig).scan_view([20, 21, 22], trigger="ext", on_armed=lambda f: rig.edges(3), measure=True,
+                        **ARGS)
+by = {x["filament"]: x for x in r["rows"]}
+check("read-back mismatch, current flowed -> readback_unreliable, not on_mismatch",
+      not by[21].get("on_mismatch") and by[21].get("readback_unreliable") == [0, 1, 2], by[21])
+check("read-back mismatch, no current -> on_mismatch kept, run not ok",
+      by[22].get("on_mismatch") and not by[22].get("readback_unreliable") and not r["ok"], by[22])
+rig = Rig()
+rig.mismatch = {21}
+r = make(rig).scan_view([20, 21], trigger="ext", on_armed=lambda f: rig.edges(3), measure=True, **ARGS)
+check("only a wrong read-back -> run ok", r["ok"], [(x["filament"], x.get("on_mismatch")) for x in r["rows"]])
+rig = Rig()
+rig.mismatch = {21}
+r = make(rig).scan_view([20, 21], trigger="ext", on_armed=lambda f: rig.edges(3), **ARGS)
+check("read-back mismatch without measure -> on_mismatch kept, not ok",
+      not r["ok"] and r["rows"][1].get("on_mismatch"), r["rows"][1])
+
+# --- IDLE refused once with BUS_ERROR: tried again, no stale error -------------
+for fails, name in ((1, "once"), (999, "all through the run")):
+    rig = Rig()
+    ct = make(rig)
+    real = ct._state_one
+    left = {"n": fails}
+
+    def flaky(f, state, arg, op, extra=None, real=real, left=left):
+        if f == 70 and int(state) == 4 and left["n"] > 0 and rig.state in (1, 2):
+            left["n"] -= 1
+            return {"ok": False, "error": "P2 CH0.6 did not apply IDLE(4) (firmware status "
+                                          "BUS_ERROR, raw [11, 0, 0, 0, 4, 176, 4])"}
+        return real(f, state, arg, op, extra)
+    ct._state_one = flaky
+    r = ct.scan_view([70, 71], trigger="sim", **ARGS)
+    idle70 = [x for x in rig.log if x[:3] == ("state", 70, 4)]
+    check(f"IDLE BUS_ERROR {name}: IDLE applied, no idle_errors left",
+          idle70 and not r.get("idle_errors"), (r.get("idle_errors"), idle70))
 
 rig = Rig(hv=False)
 r = make(rig).scan_view([60, 61], **ARGS)

@@ -1290,11 +1290,17 @@ class _ScheduleMixin:
     _LINK_TROUBLE = ("not connected", "timed out", "timeout", "did not ack", "unreachable",
                      "connection", "bridge")
 
-    def _scan_retry(self, fn, until_s: float = 10.0, ok=lambda r: bool(r and r.get("ok"))):
+    # A failed I2C step of a transition: not the link, but not a refusal either.
+    _I2C_TRANSIENT = ("bus_error",)
+
+    def _scan_retry(self, fn, until_s: float = 10.0, ok=lambda r: bool(r and r.get("ok")),
+                    transient_until_s: float = 0.0):
         """An IDEMPOTENT call, repeated until it succeeds or until_s runs out (a
-        bridge that reconnects takes ~6 s). The last result, or a dict with the
-        exception. Never for a trigger."""
-        deadline = time.monotonic() + until_s
+        bridge that reconnects takes ~6 s). An I2C bus error is asked again
+        only within transient_until_s (0 = not at all). The last result, or a
+        dict with the exception. Never for a trigger."""
+        t_start = time.monotonic()
+        deadline = t_start + until_s
         last: dict = {}
         while True:
             try:
@@ -1305,7 +1311,9 @@ class _ScheduleMixin:
                 # schedule...) does not change by asking again: return it now.
                 # Only the link -- a bridge reconnecting -- is worth the wait.
                 why = str(last.get("error") or "").lower()
-                if last and not any(w in why for w in self._LINK_TROUBLE):
+                if (last and not any(w in why for w in self._LINK_TROUBLE)
+                        and not (any(w in why for w in self._I2C_TRANSIENT)
+                                 and time.monotonic() - t_start < transient_until_s)):
                     return last
             except Exception as exc:              # link errors are what this is for
                 last = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -1512,7 +1520,11 @@ class _ScheduleMixin:
         "dropped_edges", "suppressed_not_hot", "rows": [{"filament", "board",
         "mv", "fired", "wanted", "skipped"?, "heat_s" (raise -> hot), "waited_s"
         (hot, waiting for its turn), "gap_s" (previous filament's last pulse ->
-        this on_armed), "on_armed_s", "records", "measured"?, "mams"?}, ...],
+        this on_armed), "on_armed_s", "records", "measured"?, "mams"?,
+        "on_mismatch"? (a MOSFET read back open and the current did not prove
+        it closed: not ok), "readback_unreliable"? (read back open but every
+        such pulse drew current: the data is good, ok)}, ...],
+        "idle_errors"? ({filament: why} still not at IDLE at the end),
         "elapsed_s"}.
         """
         t0 = time.monotonic()
@@ -1646,10 +1658,15 @@ class _ScheduleMixin:
                 faulted_set.add(f)
             if f not in hot_now:
                 return
+            # BUS_ERROR is one failed I2C step, not a refusal: worth a few quick
+            # tries (2026-10-30 test7: three IDLEs failed once on it and the
+            # filaments stayed hot until the end of the run).
             r = self._scan_retry(lambda: self._state_one(f, IDLE, int(idle_ma), "scan_view",
-                                                         extra={"in_run": True}))
+                                                         extra={"in_run": True}),
+                                 transient_until_s=1.0)
             if r.get("ok"):
                 hot_now.discard(f)
+                (out.get("idle_errors") or {}).pop(f, None)   # an earlier try's error
             else:
                 out.setdefault("idle_errors", {})[f] = r.get("error") or str(r)
 
@@ -2079,6 +2096,7 @@ class _ScheduleMixin:
                 mine = events[k:k + row["counted"]]
                 k += row["counted"]
                 row["measured"] = mine
+                self._scan_row_readback_verdict(row)
                 vals = [e.get("integral_mams") for e in mine if e.get("integral_mams") is not None]
                 row["mams"] = round(sum(vals), 4) if vals else None
         out["fired"] = sum(1 for r in rows if r["fired"] == n and not r.get("skipped"))
@@ -2148,6 +2166,26 @@ class _ScheduleMixin:
             views[-1]["filaments"].append(int(r["filament"]))
         return {"ok": True, "n_views": len(views), "dead_left_out": sched.get("excluded"),
                 "truncated": sched.get("truncated"), "views": views}
+
+    def _scan_row_readback_verdict(self, row: dict) -> None:
+        """A MOSFET ON read-back mismatch is a switch that did not close or a
+        wrong 74HC165 read-back; the measured current says which, as in
+        fire_single_pulse. When EVERY mismatched pulse drew current (a closed
+        switch always carries the sub-board's diode path), the read-back was
+        wrong and the data is good: on_mismatch is dropped and
+        readback_unreliable set. Otherwise (no current, or records and events
+        not paired 1:1) on_mismatch stays and the run is not ok.
+        2026-10-30 test7: 7 of 29 filaments flagged, every pulse of them
+        measured like the rest (plateau ~2.3 mA over the background)."""
+        if not row.get("on_mismatch"):
+            return
+        recs, meas = row.get("records") or [], row.get("measured") or []
+        if not meas or len(recs) != len(meas):
+            return
+        bad = [i for i, r in enumerate(recs) if r.get("on_mismatch")]
+        if bad and all(meas[i].get("emission_ma") is not None for i in bad):
+            row.pop("on_mismatch")
+            row["readback_unreliable"] = bad          # index into records / measured
 
     def scan_views(self, views, active_mv: dict, idle_ma: float, settle_ms: int, *,
                    move_to=None,              # move_to(view): your motor, before each view
