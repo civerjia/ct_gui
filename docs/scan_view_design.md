@@ -164,7 +164,7 @@ def send_trigger(filament):      # the system calls this: "filament is hot and i
 
 | class | what happens | cases |
 |---|---|---|
-| **dangerous: stop now** | disarm, every hot filament to IDLE, nothing more heated, the reason reported | SHV fault; MOS stuck on after a pulse (165, `hv_stuck_on`); HV guard tripped (STM32 or backend); vacuum over its limit; HV switched off; a controller lost longer than `link_lost_timeout_s`; a HOT filament unreachable (its channel dark / board lost); host and firmware disagree on the row; the script gone (callback failed) or Ctrl-C; `on_armed` still running after `on_armed_timeout_s`; `on_armed` takes the wrong number of arguments |
+| **dangerous: stop now** | disarm, every hot filament to IDLE, nothing more heated, the reason reported | SHV fault; MOS stuck on after a pulse (165, `hv_stuck_on`); HV guard tripped (STM32 or backend); vacuum over its limit; a controller lost longer than `link_lost_timeout_s`; a HOT filament unreachable (its channel dark / board lost); host and firmware disagree on the row; the script gone (callback failed) or Ctrl-C; `on_armed` still running after `on_armed_timeout_s`; `on_armed` takes the wrong number of arguments |
 | **data lost: record it, go on** | the filament is skipped, or fires only part of its pulses; the result says what and why | never arrived within `heat_timeout_s`; capped; heating interrupted (output fault, over-current / short, open, dropped a lot) -- that filament is skipped at once, set to a safe state, and the rest goes on; `on_armed` raised; edges missing (`shot_wait_timeout_s`); edges dropped (early / extra / not hot); first-pulse 595=0 or MOS not on (`on_mismatch`); STM32 missed or saturated pulses; record buffers overflowed; a short link hiccup |
 
 ## Timeouts
@@ -264,8 +264,8 @@ New:
 - A filament skipped for an output fault is put to SLEEP after the run. During
   the run it goes to IDLE: the backend lets a running schedule's own
   filaments change only between IDLE and VOLTAGE.
-- HV (emission and focus) must be on: checked before anything is touched, and
-  the run stops if it goes off.
+- The emission and focus rails are the operator's: not checked or switched
+  (as fire_single_pulse; 2026-10-30). With them off a measured pulse reads ~0 mA.
 - The firmware change: RP2350 5c77778 (branch feat/scan-row-release), on P1
   and P2 since 2026-10-27.
 

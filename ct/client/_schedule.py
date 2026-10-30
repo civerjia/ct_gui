@@ -1495,7 +1495,7 @@ class _ScheduleMixin:
 
         FAULTS. Dangerous -> stop at once (disarm, everything to IDLE): SHV
         fault; MOS stuck on after a pulse; HV guard tripped; vacuum over its
-        limit; HV switched off; a controller lost > link_lost_timeout_s; host
+        limit; a controller lost > link_lost_timeout_s; host
         and firmware disagree on the row; on_armed still running after
         on_armed_timeout_s; no pulse at all for no_pulse_timeout_s; Ctrl-C.
         Data lost -> recorded on that filament's row, the rest goes on: never
@@ -1503,7 +1503,9 @@ class _ScheduleMixin:
         a faulted output is put to SLEEP, any other to IDLE), on_armed raised,
         its edges incomplete within shot_wait_timeout_s (rest skipped).
 
-        Before: every filament of the list at IDLE; HV (emission and focus) ON.
+        Before: every filament of the list at IDLE. The emission and focus
+        rails are NOT checked or switched -- that is the operator's job (as
+        fire_single_pulse); with them off a measured pulse reads ~0 mA.
 
         Returns {"ok" (every filament fired all its pulses), "stopped" (why,
         if a dangerous fault ended it), "fired", "skipped", "partial",
@@ -1581,10 +1583,10 @@ class _ScheduleMixin:
         armed = sorted(armed)
         master = (self.status() or {}).get("master")
         head = int(master) if master is not None and int(master) in armed else ctrls[0]
-        hv = self.hv_status() or {}
-        if not (hv.get("emission_on") and hv.get("focus_on")):
-            return refuse(f"HV is not on (emission_on={hv.get('emission_on')}, "
-                          f"focus_on={hv.get('focus_on')}): turn emission and focus on first")
+        # The emission / focus rails are the operator's, not this call's: it
+        # neither checks nor switches them (as fire_single_pulse). 2026-10-30:
+        # five scans were refused here, three on a P1 HTTP timeout that read
+        # as "off".
         guard = self._get("/api/hv-guard") or {}
         if guard.get("tripped"):
             return refuse(f"the HV guard is tripped: {guard.get('tripped')}")
@@ -1777,9 +1779,6 @@ class _ScheduleMixin:
                     raise self._ScanStop(f"the HV guard tripped: {g.get('tripped')}")
                 if not ((g.get("vacuum") or {}).get("within_limit", True)):
                     raise self._ScanStop(f"vacuum over its limit: {(g.get('vacuum') or {}).get('raw')}")
-                h = self.hv_status() or {}
-                if h.get("ok", True) and not (h.get("emission_on") and h.get("focus_on")):
-                    raise self._ScanStop("HV switched off during the run")
                 if first_armed_at is not None and time.monotonic() - last_pulse_at > no_pulse_s:
                     raise self._ScanStop(f"no pulse at all for {no_pulse_s:g} s "
                                          f"(no_pulse_timeout_s) -- is the trigger source alive?")
@@ -2630,11 +2629,12 @@ class _ScheduleMixin:
         fired at all and the error says so, so measure=True never leaves you
         guessing whether HV went out.
 
-        HV OFF. With measure=True a shot is only fired with the HV on: while
-        the HV guard has the HV down for a Spellman arc it waits (up to
-        HV_WAIT_FOR_RECOVERY_S, 30 s) for the HV to come back by itself; a
-        latch that needs a person, or HV switched off, is refused at once
-        ("hv_off": True, nothing heated or fired). If the guard acts DURING
+        HV GUARD. With measure=True, while the HV guard has the HV down for a
+        Spellman arc it waits (up to HV_WAIT_FOR_RECOVERY_S, 30 s) for the HV
+        to come back by itself; a latch that needs a person is refused at once
+        ("hv_off": True, nothing heated or fired). The emission and focus
+        rails themselves are not checked or switched -- that is the
+        operator's job (as scan_view). If the guard acts DURING
         the shot, the result is ok=False with "hv_off": True -- what was
         measured is not this filament's emission. (2026-10-29: shots fired
         into an HV that an arc had switched off read ~0 mA, and a tuner raised
@@ -2735,21 +2735,16 @@ class _ScheduleMixin:
     HV_WAIT_FOR_RECOVERY_S = 30.0
 
     def _hv_ready_for_shot(self) -> dict:
-        """{"ok": True, "trips": n} once the HV guard is not tripped and both
-        rails are on; waits up to HV_WAIT_FOR_RECOVERY_S for a trip that
-        recovers by itself. Otherwise {"ok": False, "error"}."""
+        """{"ok": True, "trips": n} once the HV guard is not tripped; waits up
+        to HV_WAIT_FOR_RECOVERY_S for a trip that recovers by itself.
+        Otherwise {"ok": False, "error"}. The emission / focus rails are the
+        operator's: not checked here (2026-10-30)."""
         deadline = time.monotonic() + self.HV_WAIT_FOR_RECOVERY_S
         while True:
             g = self._get("/api/hv-guard") or {}
             t = g.get("tripped")
             if not t:
-                hv = self.hv_status() or {}
-                if hv.get("emission_on") and hv.get("focus_on"):
-                    return {"ok": True, "trips": g.get("trips")}
-                why = (f"the HV is off (emission_on={hv.get('emission_on')}, "
-                       f"focus_on={hv.get('focus_on')}) -- a measured shot would read nothing")
-                if time.monotonic() >= deadline:
-                    return {"ok": False, "error": why + " -- not fired"}
+                return {"ok": True, "trips": g.get("trips")}
             elif not t.get("auto_recover"):
                 return {"ok": False, "error": f"the HV guard is tripped and needs a person: "
                                               f"{t.get('message') or t.get('source')} -- not fired"}

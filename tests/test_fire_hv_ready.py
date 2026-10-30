@@ -95,10 +95,10 @@ r = ct.fire_single_pulse(5, **KW)
 check("manual latch -> not fired, no wait", not fired and not r["ok"] and clock.t == t0
       and "needs a person" in r["error"], r)
 
-# 5. HV switched off (no trip) -> not fired.
+# 5. Rails off (no trip) -> fired anyway: the rails are the operator's (2026-10-30).
 ct, fired = make([QUIET], hv={"emission_on": False, "focus_on": True})
 r = ct.fire_single_pulse(5, **KW)
-check("HV off -> not fired", not fired and not r["ok"] and "HV is off" in r["error"], r)
+check("rails off, no trip -> fired, no hv_off", fired and not r.get("hv_off"), r)
 
 # 6. The guard acted during the shot -> a failure, the measurement kept but not trusted.
 ct, fired = make([QUIET], during={"tripped": None, "trips": 4})

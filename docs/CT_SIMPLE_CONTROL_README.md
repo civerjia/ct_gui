@@ -2361,7 +2361,6 @@ is in `r["stopped"]`.
 - a MOS stuck on after a pulse;
 - HV guard tripped;
 - vacuum over its limit;
-- HV switched off;
 - a controller lost longer than `link_lost_timeout_s`;
 - host and firmware disagree on the row;
 - `on_armed` still running after `on_armed_timeout_s`, or taking the wrong
@@ -2377,8 +2376,9 @@ Data loss is recorded on that filament's row, and the rest goes on.
 - its edges incomplete within `shot_wait_timeout_s`: the rest of its pulses
   are skipped.
 
-**Before:** every filament of the list at IDLE. HV (emission and focus) must
-be ON; it is refused otherwise.
+**Before:** every filament of the list at IDLE. The emission and focus rails
+are not checked or switched (as `fire_single_pulse`) -- that is the
+operator's job; with them off a measured pulse reads ~0 mA.
 
 `scan_views(views, active_mv, idle_ma, settle_ms, move_to=..., move_s=...,
 **scan_view_args)` runs `scan_view` per view. A filament skipped in one view

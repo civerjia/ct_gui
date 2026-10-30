@@ -335,8 +335,8 @@ def hv_off(f):
 
 
 r = make(rig).scan_view([55, 56, 59, 60, 61], trigger="ext", on_armed=hv_off, **ARGS)
-check("HV switched off mid-run: stopped before the rest", "HV switched off" in (r.get("stopped") or "")
-      and len(rig.counted) < 5 and not rig.raised, (r.get("stopped"), rig.counted))
+check("rails switched off mid-run: not scan_view's business, the run goes on",
+      not r.get("stopped") and len(rig.counted) == 5, (r.get("stopped"), rig.counted))
 rig = Rig()
 
 
@@ -347,8 +347,7 @@ def hv_off_last(f):
 
 
 r = make(rig).scan_view([62, 63], trigger="ext", on_armed=hv_off_last, **ARGS)
-check("HV off during the LAST filament: not ok, stopped", not r["ok"]
-      and "HV switched off" in (r.get("stopped") or ""), r.get("stopped"))
+check("rails off during the LAST filament: not stopped", not r.get("stopped"), r.get("stopped"))
 
 # --- a refused raise is not retried for 10 s -----------------------------------
 rig = Rig()
@@ -416,7 +415,7 @@ check("sim 'already running' tail: waited out, nothing skipped",
 
 rig = Rig(hv=False)
 r = make(rig).scan_view([60, 61], **ARGS)
-check("refused: HV off at the start", "HV is not on" in (r.get("error") or "") and not rig.log, r.get("error"))
+check("rails off at the start: not refused (operator's job)", r["ok"] and r["fired"] == 2, r.get("error"))
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 raise SystemExit(1 if FAILS else 0)
