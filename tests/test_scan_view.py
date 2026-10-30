@@ -116,25 +116,59 @@ class Rig:
         return after is not None and Clock.t - self.raised[f] >= after
 
 
+# The rig's REAL filament order (GET /api/filament-order, 2026-10-30): YOUR
+# number -> FID. Not identity, on purpose: with an identity fake a numbering
+# bug cannot show (scan_view matched pulse-log records on the FID for weeks).
+ORDER = [16, 17, 19, 18, 20, 21, 22, 23, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 3, 2, 4, 5, 6,
+         7, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+         44, 45, 46, 47, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 48, 49, 51, 52, 53,
+         54, 55, 56, 57, 58, 59, 72, 50, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85,
+         86, 87, 88, 89, 90, 91, 92, 93, 94, 95]
+USER_OF = {fid: u for u, fid in enumerate(ORDER)}
+
+
+def site(fid):
+    """The hardware place of a FID (what the backend's mapping says)."""
+    return {"controller": 1 if fid < 48 else 2, "channel": (fid % 48) // 8,
+            "position": fid % 8, "slot": fid % 48}
+
+
 def make(rig: Rig):
+    """The client is REAL down to its _get/_post: every numbering crossing
+    (_fid_of, _user_index_of, _plan_to_fids, shv_pulse_log, the mapping) runs
+    as on the rig. The fake backend below speaks FID / hardware sites only and
+    translates with its OWN copy of the order, so a client that sends or reads
+    the wrong numbering lands on the wrong filament here. The Rig model and its
+    log are in YOUR numbering, as the assertions are."""
     ct = CTClient("127.0.0.1", client_id="test", _local=True, keepalive=False)
-    site = lambda f: {"controller": 1 if f < 48 else 2, "channel": (f % 48) // 8,  # noqa: E731
-                      "position": f % 8, "slot": f % 48}
-    ct.filament_to_board = site
-    ct._is_dead = lambda f: f in rig.dead
-    ct._fid_of = lambda f: f
+    ct._adopt_order({"ok": True, "order": ORDER, "epoch": "test", "token": None})
+    ct._dead_cache = {ORDER[u] for u in rig.dead}       # the mask is physical (FID)
+    ct._refresh_dead = lambda force=False: None
+    ct.get_mapping = lambda: {"ok": True, "mapping": {"filaments": [
+        {"filament": fid, **{**site(fid), "controller": site(fid)["controller"] - 1}}
+        for fid in range(96)]}}
     ct._envelope_companion = lambda c: None if c == 1 else 1
     ct.status = lambda: {"master": 1, "controllers": {"1": {"connected": True},
                                                        "2": {"connected": True}}}
     ct.hv_status = lambda: {"ok": True, "emission_on": rig.hv, "focus_on": rig.hv}
-    ct._get = lambda path, timeout=None: ({"tripped": rig.tripped, "vacuum": {"within_limit": True}}
-                                          if path == "/api/hv-guard" else {})
-    ct.filament_perf = lambda fils=None: {"ok": True, "filaments": {}}
+
+    def get(path, timeout=None):
+        if path == "/api/hv-guard":
+            return {"tripped": rig.tripped, "vacuum": {"within_limit": True}}
+        if path.startswith("/api/filament-currents?filament="):
+            u = USER_OF[int(path.rsplit("=", 1)[1])]
+            return {"ok": True, "filaments": {str(ORDER[u]): {
+                "current_mA": 2000, "cc_mode": 3 if u in rig.fault_cc else 0}}}
+        if path.startswith("/api/filament-perf"):
+            return {"ok": True, "filaments": {}}
+        return {}
+    ct._get = get
 
     def download(plan):
-        rig.rows = list(plan["emission"])
+        fplan, _dead = ct._plan_to_fids(plan)            # the real crossing
+        rig.rows = [{**e, "filament": USER_OF[int(e["filament"])]} for e in fplan["emission"]]
         rig.config = plan["config"]
-        rig.log.append(("download", [e["filament"] for e in plan["emission"]], plan["config"].get("gated")))
+        rig.log.append(("download", [e["filament"] for e in rig.rows], plan["config"].get("gated")))
         return {"ok": True}
     ct.download = download
     ct._verify_retrying_timeouts = lambda plan: {"ok": True}
@@ -149,27 +183,48 @@ def make(rig: Rig):
     ct.ready_disarm = lambda: {"ok": True}
     ct.pulse_events_ma = lambda since=0: {"ok": True, "events": [e for e in rig.ev_ring
                                                                    if e["id"] > since]}
-    ct.shv_pulse_log = lambda c=1: [{"filament": f, "suppressed_not_hot": False,
-                                     "on_mismatch": f in getattr(rig, "mismatch", ())}
-                                    for f, k in rig.counted.items() for _ in range(k)
-                                    if (f < 48) == (c == 1)]
 
-    def state_one(f, state, arg, op, extra=None):
-        if int(state) == VOLTAGE and getattr(rig, "not_warm", {}).get(f, 0) > 0:
-            rig.not_warm[f] -= 1
-            return {"ok": False, "error": f"filament {f} may not go to timed VOLTAGE: "
-                                          f"not warm yet: at IDLE for 40 s"}
-        rig.log.append(("state", f, int(state), arg))
-        if int(state) == VOLTAGE:
-            rig.raised[f] = Clock.t
+    def pulse_log(c, start):
+        """The firmware's log: FIDs, on the controller that owns the FID."""
+        recs = [{"filament": ORDER[u], "suppressed_not_hot": False,
+                 "on_mismatch": u in getattr(rig, "mismatch", ()), "hv_stuck_on": False,
+                 "heat_meas_mA": 2000}
+                for u, k in rig.counted.items() for _ in range(k)
+                if site(ORDER[u])["controller"] == c]
+        if getattr(rig, "log_unreadable", False):
+            recs = []
+        return {"ok": True, "records": recs[start:], "total": len(recs)}
+
+    def filament_state(body):
+        u = USER_OF[int(body["filament"])]
+        state, arg = int(body["state"]), body.get("arg")
+        if state == VOLTAGE and getattr(rig, "not_warm", {}).get(u, 0) > 0:
+            rig.not_warm[u] -= 1
+            return {"ok": False, "error": f"filament {body['filament']} may not go to timed "
+                                          f"VOLTAGE: not warm yet: at IDLE for 40 s"}
+        flaky = getattr(rig, "idle_bus_error", {})
+        if state == IDLE and flaky.get(u, 0) > 0 and rig.state in (1, 2):
+            flaky[u] -= 1
+            return {"ok": False, "error": f"P{site(ORDER[u])['controller']} did not apply "
+                                          f"IDLE(4) (firmware status BUS_ERROR)"}
+        if state == VOLTAGE and u in getattr(rig, "refuse_voltage", ()):
+            return {"ok": False, "error": "currently at SLEEP(2); ACTIVE may only be "
+                                          "entered from IDLE(4)"}
+        if state == 2:
+            rig.log.append(("sleep", u))
+            return {"ok": True}
+        rig.log.append(("state", u, state, arg))
+        if state == VOLTAGE:
+            rig.raised[u] = Clock.t
         else:
-            rig.raised.pop(f, None)
+            rig.raised.pop(u, None)
         return {"ok": True}
-    ct._state_one = state_one
-    ct.sleep_one = lambda f, **kw: rig.log.append(("sleep", f)) or {"ok": True}
-    ct.read_filament_current_cached = lambda fs: {fs: {"cc_mode": 3 if fs in rig.fault_cc else 0}}
 
     def post(path, body, timeout=None):
+        if path == "/api/filament-state":
+            return filament_state(body)
+        if path == "/api/shv" and body.get("op") == "pulse_log":
+            return pulse_log(int(body["controller"]), int(body.get("start") or 0))
         if path == "/api/cmd":
             cmd = body["command"]
             if cmd == "CH_ARRIVAL_SETTLE":
@@ -180,15 +235,19 @@ def make(rig: Rig):
                 return {"ok": True, "response": {"raw": [0, rig.row_cmd(body["controller"], body["row"],
                                                                         body["action"])]}}
             if cmd == "CH_GET_HOT":
+                # Hardware bits: channel / position of each FID, its state by
+                # YOUR number through the backend's own copy of the order.
                 c = body["controller"]
                 raw = [0, 8]
                 for ch in range(8):
                     hot = intr = 0
                     for p in range(8):
-                        f = (0 if c == 1 else 48) + ch * 8 + p
-                        if rig.hot(f):
+                        if ch * 8 + p >= 48:          # CH7/CH8: no filament mapped
+                            continue
+                        u = USER_OF[(0 if c == 1 else 48) + ch * 8 + p]
+                        if rig.hot(u):
                             hot |= 1 << p
-                        if f in rig.interrupted and f in rig.raised:
+                        if u in rig.interrupted and u in rig.raised:
                             intr |= 1 << p
                     raw += [hot, intr]
                 return {"ok": True, "response": {"raw": raw + [0, 0, 0, 0]}}
@@ -354,11 +413,8 @@ check("rails off during the LAST filament: not stopped", not r.get("stopped"), r
 
 # --- a refused raise is not retried for 10 s -----------------------------------
 rig = Rig()
+rig.refuse_voltage = {71}
 ct = make(rig)
-real = ct._state_one
-ct._state_one = lambda f, state, arg, op, extra=None: (
-    {"ok": False, "error": "currently at SLEEP(2); ACTIVE may only be entered from IDLE(4)"}
-    if (f == 71 and state == VOLTAGE) else real(f, state, arg, op, extra))
 t_start = Clock.t
 r = ct.scan_view([70, 71], trigger="sim", **ARGS)
 check("a refused VOLTAGE skips that filament at once (no 10 s retry), the rest fires",
@@ -439,35 +495,48 @@ check("read-back mismatch without measure -> on_mismatch kept, not ok",
 # --- IDLE refused once with BUS_ERROR: tried again, no stale error -------------
 for fails, name in ((1, "once"), (999, "all through the run")):
     rig = Rig()
-    ct = make(rig)
-    real = ct._state_one
-    left = {"n": fails}
-
-    def flaky(f, state, arg, op, extra=None, real=real, left=left):
-        if f == 70 and int(state) == 4 and left["n"] > 0 and rig.state in (1, 2):
-            left["n"] -= 1
-            return {"ok": False, "error": "P2 CH0.6 did not apply IDLE(4) (firmware status "
-                                          "BUS_ERROR, raw [11, 0, 0, 0, 4, 176, 4])"}
-        return real(f, state, arg, op, extra)
-    ct._state_one = flaky
-    r = ct.scan_view([70, 71], trigger="sim", **ARGS)
+    rig.idle_bus_error = {70: fails}
+    r = make(rig).scan_view([70, 71], trigger="sim", **ARGS)
     idle70 = [x for x in rig.log if x[:3] == ("state", 70, 4)]
     check(f"IDLE BUS_ERROR {name}: IDLE applied, no idle_errors left",
           idle70 and not r.get("idle_errors"), (r.get("idle_errors"), idle70))
 
-# --- your numbering != the backend FID: the records still found (2026-10-30) ---
+# --- NUMBERING: filaments whose number is not their FID (the rig's order) ------
+# 0->16, 1->17, 16->0, 17->1, 2->19, 60->48 (other controller), 72->50.
+REN = [0, 1, 16, 17, 2, 60, 72]
 rig = Rig()
-rig.mismatch = {21}
-ct = make(rig)
-ct._fid_of = lambda f: (f + 16) % 96            # like ring 0 -> FID 16 on the rig
-r = ct.scan_view([20, 21], trigger="ext", on_armed=lambda f: rig.edges(3), **ARGS)
-check("FID != your number: every row has its records, the mismatch is seen",
-      all(len(x["records"]) == 3 and not x.get("records_short") for x in r["rows"])
-      and r["rows"][1].get("on_mismatch") and not r["ok"], [(x["filament"], len(x["records"])) for x in r["rows"]])
+rig.mismatch, rig.no_current = {16}, {16}             # a switch that really did not close
+r = make(rig).scan_view(REN, trigger="ext", on_armed=lambda f: rig.edges(3), measure=True, **ARGS)
+by = {x["filament"]: x for x in r["rows"]}
+check("numbering: the schedule fired YOUR filaments, in YOUR order",
+      [e for e in rig.log if e[0] == "download"][0][1] == REN and r["fired"] == len(REN),
+      ([e for e in rig.log if e[0] == "download"], r.get("fired")))
+check("numbering: every row's board is its FID's hardware place",
+      all(x["board"] == "P{controller} CH{ch}.{pos}".format(
+          controller=site(ORDER[x["filament"]])["controller"],
+          ch=site(ORDER[x["filament"]])["channel"] + 1,
+          pos=site(ORDER[x["filament"]])["position"] + 1) for x in r["rows"]),
+      [(x["filament"], x["board"]) for x in r["rows"]])
+check("numbering: every row has ITS OWN pulse-log records (heating snapshot, checks)",
+      all(len(x["records"]) == 3 and all(rec["filament"] == x["filament"] for rec in x["records"])
+          and not x.get("records_short") for x in r["rows"]),
+      [(x["filament"], len(x["records"])) for x in r["rows"]])
+check("numbering: the stuck switch is reported on #16 and nowhere else",
+      [x["filament"] for x in r["rows"] if x.get("on_mismatch")] == [16] and not r["ok"],
+      [(x["filament"], x.get("on_mismatch")) for x in r["rows"]])
+check("numbering: VOLTAGE went to each filament at ITS voltage",
+      all(e[3] == MV[e[1]] for e in rig.log if e[0] == "state" and e[2] == VOLTAGE)
+      and {e[1] for e in rig.log if e[0] == "state" and e[2] == VOLTAGE} == set(REN),
+      [e for e in rig.log if e[0] == "state" and e[2] == VOLTAGE])
+check("numbering: all ended at IDLE", not rig.raised, rig.raised)
+rig = Rig(dead=[16])
+r = make(rig).scan_view([0, 16], **ARGS)
+check("numbering: dead #16 (FID 0) refused, not #0 (FID 16)",
+      not r["ok"] and "16" in (r.get("error") or "") and not rig.log, r.get("error"))
+
 rig = Rig()
-ct = make(rig)
-ct.shv_pulse_log = lambda c=1: []               # the log could not be read
-r = ct.scan_view([20, 21], trigger="ext", on_armed=lambda f: rig.edges(3), **ARGS)
+rig.log_unreadable = True                             # the pulse log could not be read
+r = make(rig).scan_view([20, 21], trigger="ext", on_armed=lambda f: rig.edges(3), **ARGS)
 check("no pulse-log records -> records_short, not ok",
       not r["ok"] and all(x.get("records_short") for x in r["rows"]), r["rows"][0].get("records_short"))
 
