@@ -12,6 +12,7 @@ use comes from _base (star-imported, underscore names included -- see
 _base.__all__) or, for CTClient itself, is bound in by _client.py.
 """
 from ._base import *  # noqa: F401,F403
+import concurrent.futures
 import logging
 import threading
 from typing import TYPE_CHECKING
@@ -1152,9 +1153,11 @@ class _ScheduleMixin:
 
     def shv_pulse_log(self,
                       controller: int = 1,   # which RP2350 to read the log from
-                      start: int = 0) -> list[dict]:  # log index to start from
-                                                       # (paginate through a
-                                                       # long run's history)
+                      start: int = 0,        # log index to start from
+                                             # (paginate through a
+                                             # long run's history)
+                      max_pages: int | None = None) -> list[dict]:  # stop after
+                                                       # this many pages (None = all)
         """Fired pulse records, ALL of them, paging until the log is exhausted.
 
         Each record: {filament, seq, tOnUs, durationUs, flags, read165,
@@ -1177,7 +1180,7 @@ class _ScheduleMixin:
         out: list[dict] = []
         idx = int(start)
         total = None
-        for _ in range(512):     # bound: 4096-record log / smallest sane page
+        for _ in range(512 if max_pages is None else int(max_pages)):  # 4096 / smallest page
             r = self._shv(controller, {"op": "pulse_log", "start": idx})
             page = r.get("records") or []
             if total is None:
@@ -1186,7 +1189,9 @@ class _ScheduleMixin:
                 break            # empty page = nothing further, whatever total says
             out.extend(page)
             idx += len(page)
-            if total is not None and len(out) >= int(total):
+            # total counts the whole log, so compare the INDEX: with start > 0
+            # len(out) never reaches it and cost one empty extra round trip.
+            if total is not None and idx >= int(total):
                 break
         for rec in out:
             if "filament" in rec:
@@ -1650,6 +1655,26 @@ class _ScheduleMixin:
                 return
             if r.get("ok"):
                 take_events(r.get("events") or [])
+
+        # Pulse-log records, also read DURING the run: one page at a time while
+        # it waits for a filament to get hot, so only the last rows are left
+        # for the end. 2026-10-30: 660 records = 75 pages of ~43 ms, read after
+        # the last pulse, one controller after the other -- 3.3 s of tail.
+        log_acc = {c: [] for c in ctrls}
+
+        def drain_log_page():
+            """One page from a controller whose FINISHED rows have records not
+            read yet; nothing (no empty round trip) when all are in."""
+            for c in ctrls:
+                due = sum(r["counted"] for r in rows
+                          if r["done_s"] is not None and int(sites[r["filament"]]["controller"]) == c)
+                if len(log_acc[c]) >= due:
+                    continue
+                try:
+                    log_acc[c].extend(self.shv_pulse_log(c, start=len(log_acc[c]), max_pages=1) or [])
+                except Exception:
+                    pass
+                return
         settle_set = False
         stop_why = None
         push_on = False
@@ -1888,6 +1913,7 @@ class _ScheduleMixin:
                         links_ok()
                         check_at = time.monotonic() + 0.5
                     preheat(i)
+                    drain_log_page()       # not hot yet: the wait reads the log
                     time.sleep(0.05)
                 if why:
                     if pending_idle is not None:
@@ -2003,6 +2029,8 @@ class _ScheduleMixin:
                         links_ok()
                         check_at = time.monotonic() + 0.5
                     preheat(i)
+                    if fired < n:
+                        drain_log_page()   # still firing: earlier rows' records
                     time.sleep(0.05)
                 row["counted"] = fired      # incl. pulses staged 0x00 (not hot)
                 row["done_s"] = since()
@@ -2055,7 +2083,14 @@ class _ScheduleMixin:
                 out["on_armed_still_running"] = True
 
         # ---- what happened: pulse log + measurement, per filament -------------
-        logs = {c: (self.shv_pulse_log(c) or []) for c in ctrls}
+        # What the run did not read yet, both controllers at once.
+        def rest_of_log(c):
+            return log_acc[c] + list(self.shv_pulse_log(c, start=len(log_acc[c])) or [])
+        if len(ctrls) > 1:
+            with concurrent.futures.ThreadPoolExecutor(len(ctrls)) as pool:
+                logs = dict(zip(ctrls, pool.map(rest_of_log, ctrls)))
+        else:
+            logs = {c: rest_of_log(c) for c in ctrls}
         for c in ctrls:
             st = self.shv_status(c) or {}
             out["dropped_edges"] += int(st.get("droppedEdges") or 0)

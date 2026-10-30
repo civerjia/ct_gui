@@ -174,6 +174,9 @@ def make(rig: Rig):
     ct._verify_retrying_timeouts = lambda plan: {"ok": True}
 
     def shv_status(c=1):
+        if getattr(rig, "pending", 0) > 0:          # edges arriving over time (30 ms apart)
+            rig.pending -= 1
+            rig.edges(1)
         return {"state": 4 if rig.fault else rig.state, "stopReason": 5 if rig.fault else 0,
                 "totalPulsesDone": rig.done, "entryIndex": rig.cur, "gated": True,
                 "unsafeSlots": 0, "off_mismatches": 0, "droppedEdges": rig.dropped,
@@ -193,7 +196,9 @@ def make(rig: Rig):
                 if site(ORDER[u])["controller"] == c]
         if getattr(rig, "log_unreadable", False):
             recs = []
-        return {"ok": True, "records": recs[start:], "total": len(recs)}
+        page = recs[start:start + 9]                 # the real firmware: ~9 a page
+        rig.log_reads = getattr(rig, "log_reads", []) + [(c, start, len(page), rig.state in (1, 2))]
+        return {"ok": True, "records": page, "total": len(recs)}
 
     def filament_state(body):
         u = USER_OF[int(body["filament"])]
@@ -539,6 +544,22 @@ rig.log_unreadable = True                             # the pulse log could not 
 r = make(rig).scan_view([20, 21], trigger="ext", on_armed=lambda f: rig.edges(3), **ARGS)
 check("no pulse-log records -> records_short, not ok",
       not r["ok"] and all(x.get("records_short") for x in r["rows"]), r["rows"][0].get("records_short"))
+
+# --- the pulse log is read DURING the run, not all after the last pulse ------
+# (2026-10-30: 660 records = 75 pages read after the last pulse, 3.3 s of tail)
+FL = [20, 21, 22, 23, 60, 61, 62, 63]
+rig = Rig(hot_after={f: 3.0 for f in FL})         # ~3 s to hot, as on the rig (test7 3-6 s)
+r = make(rig).scan_view(FL, trigger="ext", on_armed=lambda f: setattr(rig, "pending", 20),
+                        **{**ARGS, "num_pulses": 20})
+during = sum(1 for x in rig.log_reads if x[3])
+after = sum(1 for x in rig.log_reads if not x[3])
+check("pulse log: most pages read during the run, the rest at the end",
+      during >= 10 and after <= 8 and r["ok"], (during, after, r.get("stopped")))
+check("pulse log: no empty page read during the run",
+      all(x[2] > 0 for x in rig.log_reads if x[3]), [x for x in rig.log_reads if x[3] and not x[2]])
+check("pulse log: every row still has exactly its own 20 records",
+      all(len(x["records"]) == 20 and all(q["filament"] == x["filament"] for q in x["records"])
+          for x in r["rows"]), [(x["filament"], len(x["records"])) for x in r["rows"]])
 
 rig = Rig(hv=False)
 r = make(rig).scan_view([60, 61], **ARGS)
