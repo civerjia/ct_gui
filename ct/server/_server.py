@@ -5912,6 +5912,8 @@ class CtHandler(BaseHTTPRequestHandler):
                         _slew_note_set(resp)     # the rig's slew is now what was set
                     if command == "CH_VOLTAGE_CAP" and body.get("millivolts") is not None:
                         _vcap_note_set(resp)     # the rig's cap is now what was set
+                    if command == "CH_SET_I2C_HZ":
+                        _i2c_hz_note_set(cid, body, resp)   # kept, re-applied after a reset
                     if pstate and fids and _status_ok(resp):
                         # Track it like /api/filament-state does, so the ladder
                         # and the ACTIVE dead-man see GUI/debug commands too.
@@ -7913,6 +7915,76 @@ def _vcap_check_one(link) -> dict:
     return {"before": cur["mv"], "after": after and after["mv"]}
 
 
+# ── Per-channel I2C clock kept at the rig's setting ─────────────────────────
+# CH_SET_I2C_HZ (fw 0x66) is not saved on the RP2350: a reset is back at
+# 400 kHz on every channel. What was last SET through /api/cmd is kept here,
+# per controller and channel (saved), and re-written by the slew keeper's tick
+# to a controller that reads differently. 2026-10-30: P2 CH3's marginal bus.
+I2C_HZ_STATE_PATH = STATE_DIR / "i2c_hz.json"
+I2C_HZ_DEFAULT = 400000
+
+
+def _i2c_hz_load() -> dict:
+    try:
+        d = json.loads(I2C_HZ_STATE_PATH.read_text())
+        return {str(c): {str(ch): int(hz) for ch, hz in v.items()} for c, v in d.get("want", {}).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+I2C_HZ_WANT: dict = _i2c_hz_load()       # {"2": {"2": 100000}} -- controller, 0-based channel
+_I2C_HZ_UNSUPPORTED: set = set()          # links whose firmware answered UNSUPPORTED
+
+
+def _i2c_hz_decode(resp) -> dict | None:
+    raw = (resp.get("raw") if isinstance(resp, dict) else None) or []
+    if len(raw) < 10 or raw[0] != 0:
+        return None
+    return {"channel": raw[1], "hz": int.from_bytes(bytes(raw[2:6]), "little"),
+            "default_hz": int.from_bytes(bytes(raw[6:10]), "little")}
+
+
+def _i2c_hz_note_set(cid: int, body: dict, resp) -> None:
+    got = _i2c_hz_decode(resp)
+    if not got:
+        return
+    want = I2C_HZ_WANT.setdefault(str(cid), {})
+    if got["hz"] == got["default_hz"]:
+        want.pop(str(got["channel"]), None)
+    else:
+        want[str(got["channel"])] = got["hz"]
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        I2C_HZ_STATE_PATH.write_text(json.dumps({"want": I2C_HZ_WANT}))
+    except OSError as exc:
+        log.warning("I2C clock setting not saved (%s) -- it holds until the backend restarts", exc)
+    log.warning("Power %d CH%d I2C clock set to %d kHz -- kept from now on (re-applied after "
+                "an RP2350 reset)", cid, got["channel"] + 1, got["hz"] // 1000)
+
+
+def _i2c_hz_check_one(cid: int, link) -> list:
+    """Re-write every kept channel clock that reads differently. [(ch, before, after)]."""
+    out = []
+    if link in _I2C_HZ_UNSUPPORTED:
+        return out
+    for ch_s, hz in sorted((I2C_HZ_WANT.get(str(cid)) or {}).items()):
+        ft, flags, payload = build_payload("CH_GET_I2C_HZ", {"channel": int(ch_s)})
+        resp = link.client.send_request(ft, payload, flags=flags, timeout=2.0)
+        cur = _i2c_hz_decode(resp)
+        if cur is None:
+            if isinstance(resp, dict) and "UNSUPPORTED" in str(resp.get("status", "")).upper():
+                _I2C_HZ_UNSUPPORTED.add(link)
+                log.warning("%s: firmware has no per-channel I2C clock (0x65) -- the kept "
+                            "setting is not applied", link.name)
+            return out
+        if cur["hz"] == hz:
+            continue
+        ft, flags, payload = build_payload("CH_SET_I2C_HZ", {"channel": int(ch_s), "hz": hz})
+        after = _i2c_hz_decode(link.client.send_request(ft, payload, flags=flags, timeout=2.0))
+        out.append((int(ch_s), cur["hz"], after and after["hz"]))
+    return out
+
+
 def _slew_keeper_loop() -> None:
     while True:
         time.sleep(SLEW_KEEP_PERIOD_S)
@@ -7937,6 +8009,11 @@ def _slew_keeper_loop() -> None:
                                 "its firmware default) — set to the rig's %s mV -> %s", link.name,
                                 v["before"], VCAP_WANT["mv"],
                                 "ok" if v["after"] == VCAP_WANT["mv"] else f"read back {v['after']}")
+                for ch, before, after in _i2c_hz_check_one(cid, link):
+                    want = I2C_HZ_WANT[str(cid)][str(ch)]
+                    log.warning("%s: CH%d I2C clock was %d kHz (an RP2350 reset restores 400) "
+                                "-- set to the rig's %d kHz -> %s", link.name, ch + 1, before // 1000,
+                                want // 1000, "ok" if after == want else f"read back {after}")
             except Exception as exc:
                 log.debug("slew keeper on %s: %s", getattr(link, "name", cid), exc)
 

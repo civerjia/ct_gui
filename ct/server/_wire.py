@@ -115,6 +115,13 @@ def build_payload(command: str, b: dict):
         return 0x63, 0, b""
     if command == "GET_BOOT_INFO":           # 0x64: [] -> boot guard record + firmware git hash
         return 0x64, 0, b""
+    if command == "CH_GET_I2C_HZ":           # 0x65: [ch] -> [status, ch, hz32, default32]
+        return 0x65, 0, bytes([ch])
+    if command == "CH_SET_I2C_HZ":           # 0x66: [ch, hz32] (0 = default 400 kHz), same reply
+        # One channel's I2C clock: a marginal bus runs slower instead of
+        # dropping boards. NOT saved on the RP2350; the backend keeps the
+        # setting and re-applies it after a reset (I2C_HZ_WANT).
+        return 0x66, 0, bytes([ch]) + int(b.get("hz", 0)).to_bytes(4, "little")
     if command == "CH_VOLTAGE_CAP":          # 0x3B: empty=GET, mV16=SET -> [status, cap16, ceiling16]
         # Output-voltage cap for EVERY channel of the controller: clamps the CC,
         # Voltage and Standby setpoints and the ramp's REF writes. A request
