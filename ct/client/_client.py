@@ -1116,6 +1116,17 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         """
         return self._get("/api/safety", timeout=5.0)
 
+    def radiation(self) -> dict:
+        """The Geiger counter (GMC-300S on control2), read-only.
+
+            {"ok", "cpm", "usvh", "delta_cpm", "age_s",
+             "counter": {"connected", "port", "baud", "version"}, ...}
+
+        cpm / usvh are None -- not the last number -- when no reading came in
+        the last few seconds (counter unplugged, or spellman_backend down);
+        `counter` says why."""
+        return self._get("/api/radiation", timeout=5.0)
+
     def safety_config(self, enabled: bool | None = None,
                       active_timeout_s: float | None = None,
                       active_fallback=None,          # PowerState, name or number

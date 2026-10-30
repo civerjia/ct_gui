@@ -3864,6 +3864,7 @@ def hv_guard_snapshot() -> dict:
     return {"ok": True, "enabled": _HV_GUARD["enabled"], "tripped": _HV_GUARD["tripped"],
             "trips": _HV_GUARD["trips"],
             "vacuum": vacuum_snapshot(), "hv_supply": hv_supply_snapshot(),
+            "radiation": radiation_snapshot(),
             "load_model": m or None, "spellman": _SPELL_WATCH.snapshot(now),
             "switch_frac": HV_GUARD_SWITCH_FRAC, "hold_s": HV_GUARD_HOLD_S}
 
@@ -3884,7 +3885,7 @@ def _hv_guard_loop() -> None:
 # SERIES_KEEP_S. /api/series hands out what is newer than ?since=.
 SERIES_KEEP_S = 3600.0
 SERIES_MAX_POINTS = 200_000         # per series, whatever the rate
-SERIES_NAMES = ("sp_kv", "sp_ma", "vac", "em_v", "em_i")
+SERIES_NAMES = ("sp_kv", "sp_ma", "vac", "em_v", "em_i", "gmc_cpm", "gmc_usvh")
 _SERIES_LOCK = threading.Lock()
 _SERIES = {n: collections.deque(maxlen=SERIES_MAX_POINTS) for n in SERIES_NAMES}
 _SERIES_LAST_ADS = [None]           # the shared ADS result last recorded (no duplicates)
@@ -4147,7 +4148,11 @@ _SPELL: dict = {"connected": False, "error": None, "last_msg": None,
                 "kv": None, "kv_at": None, "ma": None, "ma_at": None,
                 "status_bits": None, "status_at": None,
                 "pressure_torr": None, "pressure_at": None, "pressure_raw": None,
-                "lesker": None}
+                "lesker": None,
+                # GMC-300S Geiger counter on control2 (spellman_backend v6, 2026-10-30):
+                # gmc_point every ~1 s {cpm, delta_cpm, usvh}, gmc_status on (dis)connect.
+                "gmc_cpm": None, "gmc_usvh": None, "gmc_delta_cpm": None, "gmc_at": None,
+                "gmc": None}
 _SPELL_MA_HIST: list = []       # (monotonic, mA) of the last ~10 min, for the tail check
 _VAC_OVER = {"n": 0, "last_at": None}   # consecutive NEW readings over the limit
 
@@ -4202,6 +4207,20 @@ def _spellman_on_message(m: dict, now: float) -> None:
                 series_add("vac", float(p))
         elif t == "lesker_status":
             _SPELL["lesker"] = m.get("data")
+        elif t == "gmc_point" and isinstance(m.get("data"), dict):
+            d = m["data"]
+            cpm, usvh = d.get("cpm"), d.get("usvh")
+            num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
+            if num(cpm):
+                _SPELL["gmc_cpm"], _SPELL["gmc_at"] = float(cpm), now
+                _SPELL["gmc_delta_cpm"] = float(d["delta_cpm"]) if num(d.get("delta_cpm")) else None
+                # usvh only alongside its own cpm: never an old dose next to a new count
+                _SPELL["gmc_usvh"] = float(usvh) if num(usvh) else None
+                series_add("gmc_cpm", float(cpm))
+                if num(usvh):
+                    series_add("gmc_usvh", float(usvh))
+        elif t == "gmc_status" and isinstance(m.get("data"), dict):
+            _SPELL["gmc"] = m["data"]
     _spellman_watch_feed(m, now)
 
 
@@ -4287,6 +4306,20 @@ def hv_supply_snapshot() -> dict:
             "ma": s["ma"] if fresh(s["ma_at"]) else None, "ma_age_s": _age(s["ma_at"], now),
             "status_bits": s["status_bits"] if fresh(s["status_at"]) else None,
             "status_age_s": _age(s["status_at"], now)}
+
+
+def radiation_snapshot() -> dict:
+    """The Geiger counter (GMC-300S on control2), read-only. cpm / usvh are
+    None -- never a stale number -- once no reading came for SPELLMAN_STALE_S."""
+    now = time.monotonic()
+    with _SPELL_LOCK:
+        cpm, usvh, dcpm, at, st, conn, err = (_SPELL["gmc_cpm"], _SPELL["gmc_usvh"],
+                                              _SPELL["gmc_delta_cpm"], _SPELL["gmc_at"],
+                                              _SPELL["gmc"], _SPELL["connected"], _SPELL["error"])
+    fresh = at is not None and now - at <= SPELLMAN_STALE_S
+    return {"ok": True, "source": SPELLMAN_WS_URL, "connected": conn, "error": err,
+            "counter": st, "cpm": cpm if fresh else None, "usvh": usvh if fresh else None,
+            "delta_cpm": dcpm if fresh else None, "age_s": _age(at, now)}
 
 
 def vacuum_snapshot() -> dict:
@@ -5008,6 +5041,8 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json(hv_supply_snapshot())
         elif path == "/api/vacuum":
             self._json(vacuum_snapshot())
+        elif path == "/api/radiation":
+            self._json(radiation_snapshot())
         elif path == "/api/hv-guard":
             snap = hv_guard_snapshot()
             link = CONTROLLERS.get(MASTER)

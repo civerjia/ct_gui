@@ -3999,6 +3999,12 @@ it has actually had to do. An empty `events` is the healthy answer; a non-empty
 one is a record of the hardware being walked back with nobody asking, worth
 reading after a run that ended badly.
 
+**`radiation()`** reads the GMC-300S Geiger counter on control2 (relayed by its
+spellman_backend, read-only): `cpm`, `usvh`, `delta_cpm`, `age_s` and
+`counter` (connected / port / version). `cpm` and `usvh` are `None`, not the
+last value, once no reading came for a few seconds. The GUI shows it next to
+the vacuum and plots cpm in the supply & vacuum trend.
+
 `never_commanded: True` on a filament means this backend has seen no command
 for one it believes is ACTIVE — normally because it restarted while the
 filament was already hot. That counts as **expired**, not as fresh: it is

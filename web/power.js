@@ -891,6 +891,7 @@ const HV_HTML = `
       <div class="metric" title="Spellman output voltage (read-only, control2)"><span class="metric-label">Spellman V</span><span id="spKv" class="metric-value">—</span></div>
       <div class="metric" title="Spellman output current (read-only, control2)"><span class="metric-label">Spellman I</span><span id="spMa" class="metric-value">—</span></div>
       <div class="metric" title="Lesker gauge via raspberrypi5 / control2. Over the limit, or no reading: HV ON and ACTIVE/VOLTAGE are refused."><span class="metric-label">Vacuum</span><span id="vacP" class="metric-value">—</span></div>
+      <div class="metric" title="GMC-300S Geiger counter on control2 (read-only)"><span class="metric-label">Radiation</span><span id="gmcCpm" class="metric-value">—</span></div>
       <div class="metric" title="HV guard: STM32 (ms) + backend. Tripped = HV off and latched."><span class="metric-label">HV guard</span><span id="hvGuardState" class="metric-value">—</span></div>
     </div>
     <div id="hvGuardMsg" class="hw-status bad" hidden></div>
@@ -2395,7 +2396,7 @@ function wireSupplyMonitor() {
   };
   const tick = async () => {
     const r = await getSafety();
-    if (!r || !r.ok) { set(['spKv', 'spMa', 'vacP', 'hvGuardState'], '—', 'stale', 'backend unreachable'); return; }
+    if (!r || !r.ok) { set(['spKv', 'spMa', 'vacP', 'gmcCpm', 'hvGuardState'], '—', 'stale', 'backend unreachable'); return; }
     const g = r.hv_guard || {}, v = g.vacuum || {}, h = g.hv_supply || {};
     const why = (x) => (x.connected ? '' : 'not connected to ' + (x.source || 'control2') + (x.error ? ': ' + x.error : ''));
     // Spellman
@@ -2422,6 +2423,16 @@ function wireSupplyMonitor() {
       const over = v.within_limit === false;
       set(['vacP'], (+v.pressure_torr).toExponential(2) + ' Torr', over ? 'bad' : null,
           `limit ${(+v.limit_torr).toExponential(1)} Torr · ${v.age_s} s old` + (v.interlock ? '' : ' · interlock OFF'));
+    }
+    // Radiation (Geiger counter): no data, never the last count
+    const rad = g.radiation || {}, ctr = rad.counter || {};
+    if (rad.cpm == null) {
+      set(['gmcCpm'], 'no data', 'stale', why(rad) ||
+          (ctr.connected === false ? `counter not connected (${ctr.port || '?'})` : `no reading for ${rad.age_s ?? 'ever'} s`));
+    } else {
+      set(['gmcCpm'], `${Math.round(rad.cpm)} cpm` + (rad.usvh != null ? ` · ${(+rad.usvh).toFixed(3)} µSv/h` : ''), null,
+          `${ctr.version || 'GMC'} on ${ctr.port || '?'} · ${rad.age_s} s old` +
+          (rad.delta_cpm != null ? ` · Δ ${rad.delta_cpm >= 0 ? '+' : ''}${rad.delta_cpm} cpm` : ''));
     }
     // HV guard
     const t = g.tripped;

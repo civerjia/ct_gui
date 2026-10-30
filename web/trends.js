@@ -18,6 +18,7 @@ const STRIPS = [
   { key: 'em_v', label: 'Emission V', unit: 'V', color: '#1f8a70', fmt: (v) => v.toFixed(1) },
   { key: 'em_i', label: 'Emission I', unit: 'mA', color: '#c46a1b', fmt: (v) => v.toFixed(2) },
   { key: 'vac', label: 'Vacuum', unit: 'Torr', color: '#56636b', fmt: (v) => v.toExponential(2), log: true, limit: null },   // limit: the backend's
+  { key: 'gmc_cpm', label: 'Radiation', unit: 'cpm', color: '#a3342b', fmt: (v) => v.toFixed(0) },   // GMC-300S, control2
 ];
 const STRIP_H = 58, GAP = 6, AXIS_H = 18, LEFT = 84, RIGHT = 8;
 
