@@ -1525,6 +1525,8 @@ class _ScheduleMixin:
         it closed: not ok), "readback_unreliable"? (read back open but every
         such pulse drew current: the data is good, ok)}, ...],
         "idle_errors"? ({filament: why} still not at IDLE at the end),
+        rows also carry "records_short"? (fewer pulse-log records than counted
+        pulses: the per-pulse checks were not all made -- not ok),
         "elapsed_s"}.
         """
         t0 = time.monotonic()
@@ -2054,8 +2056,16 @@ class _ScheduleMixin:
         for row in rows:
             f = row["filament"]
             c = int(sites[f]["controller"])
-            fid = int(self._fid_of(f))
-            row["records"] = [r for r in logs[c] if r.get("filament") == fid]
+            # shv_pulse_log() already speaks YOUR numbering. Matched on the
+            # backend FID until 2026-10-30, every filament whose number differs
+            # from its FID (ring 0-3, 16, 17 on the rig) had no records: no
+            # heating snapshot, and no stuck-on / read-back check at all.
+            row["records"] = [r for r in logs[c] if r.get("filament") == f]
+            if len(row["records"]) != row["counted"]:
+                # The per-pulse safety flags come from these records: missing
+                # ones are checks not made, never a clean result.
+                row["records_short"] = (f"{len(row['records'])} pulse-log records for "
+                                        f"{row['counted']} counted pulses")
             row["suppressed"] = sum(1 for r in row["records"] if r.get("suppressed_not_hot"))
             row["fired"] = max(0, row["counted"] - row["suppressed"])   # actually emitted
             if any(r.get("hv_stuck_on") for r in row["records"]):
@@ -2103,7 +2113,8 @@ class _ScheduleMixin:
         out["rows"] = rows
         out["ok"] = (not out.get("stopped") and out.get("completed", False)
                      and not out["skipped"] and not out["partial"]
-                     and not any(r.get("hv_stuck_on") or r.get("on_mismatch") for r in rows))
+                     and not any(r.get("hv_stuck_on") or r.get("on_mismatch")
+                                 or r.get("records_short") for r in rows))
         out["elapsed_s"] = since()
         try:
             recs = [{"filament": int(self._fid_of(r["filament"])), "mv": r["mv"],

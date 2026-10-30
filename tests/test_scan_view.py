@@ -455,6 +455,22 @@ for fails, name in ((1, "once"), (999, "all through the run")):
     check(f"IDLE BUS_ERROR {name}: IDLE applied, no idle_errors left",
           idle70 and not r.get("idle_errors"), (r.get("idle_errors"), idle70))
 
+# --- your numbering != the backend FID: the records still found (2026-10-30) ---
+rig = Rig()
+rig.mismatch = {21}
+ct = make(rig)
+ct._fid_of = lambda f: (f + 16) % 96            # like ring 0 -> FID 16 on the rig
+r = ct.scan_view([20, 21], trigger="ext", on_armed=lambda f: rig.edges(3), **ARGS)
+check("FID != your number: every row has its records, the mismatch is seen",
+      all(len(x["records"]) == 3 and not x.get("records_short") for x in r["rows"])
+      and r["rows"][1].get("on_mismatch") and not r["ok"], [(x["filament"], len(x["records"])) for x in r["rows"]])
+rig = Rig()
+ct = make(rig)
+ct.shv_pulse_log = lambda c=1: []               # the log could not be read
+r = ct.scan_view([20, 21], trigger="ext", on_armed=lambda f: rig.edges(3), **ARGS)
+check("no pulse-log records -> records_short, not ok",
+      not r["ok"] and all(x.get("records_short") for x in r["rows"]), r["rows"][0].get("records_short"))
+
 rig = Rig(hv=False)
 r = make(rig).scan_view([60, 61], **ARGS)
 check("rails off at the start: not refused (operator's job)", r["ok"] and r["fired"] == 2, r.get("error"))
