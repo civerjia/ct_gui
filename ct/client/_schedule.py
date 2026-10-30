@@ -2629,10 +2629,10 @@ class _ScheduleMixin:
         fired at all and the error says so, so measure=True never leaves you
         guessing whether HV went out.
 
-        HV GUARD. With measure=True, while the HV guard has the HV down for a
-        Spellman arc it waits (up to HV_WAIT_FOR_RECOVERY_S, 30 s) for the HV
-        to come back by itself; a latch that needs a person is refused at once
-        ("hv_off": True, nothing heated or fired). The emission and focus
+        HV GUARD. With measure=True, a tripped HV guard -- a big arc (the HV
+        comes back by itself, ~15 s later) or a latch that needs a person --
+        is refused at once ("hv_off": True, nothing heated or fired), as
+        scan_view stops on it; a small arc never trips the guard. The emission and focus
         rails themselves are not checked or switched -- that is the
         operator's job (as scan_view). If the guard acts DURING
         the shot, the result is ok=False with "hv_off": True -- what was
@@ -2728,32 +2728,23 @@ class _ScheduleMixin:
                                 + (f"; also: {res.get('error')}" if res.get("error") else ""))
         return res
 
-    # A big arc takes the HV down for ~15 s and the guard puts it back itself
-    # (2026-10-29). A measured shot waits that out instead of firing into an
-    # HV that is off -- which measured 0 mA, and a tuner read that as "heat
-    # more" (#86 went to 9563 mV, past the 9.5 V cap).
-    HV_WAIT_FOR_RECOVERY_S = 30.0
-
     def _hv_ready_for_shot(self) -> dict:
-        """{"ok": True, "trips": n} once the HV guard is not tripped; waits up
-        to HV_WAIT_FOR_RECOVERY_S for a trip that recovers by itself.
-        Otherwise {"ok": False, "error"}. The emission / focus rails are the
-        operator's: not checked here (2026-10-30)."""
-        deadline = time.monotonic() + self.HV_WAIT_FOR_RECOVERY_S
-        while True:
-            g = self._get("/api/hv-guard") or {}
-            t = g.get("tripped")
-            if not t:
-                return {"ok": True, "trips": g.get("trips")}
-            elif not t.get("auto_recover"):
-                return {"ok": False, "error": f"the HV guard is tripped and needs a person: "
-                                              f"{t.get('message') or t.get('source')} -- not fired"}
-            elif time.monotonic() >= deadline:
-                return {"ok": False, "error": (f"the HV guard tripped ({t.get('source')}) and "
-                                               f"the Spellman was not stable again within "
-                                               f"{self.HV_WAIT_FOR_RECOVERY_S:g} s "
-                                               f"(waiting for: {t.get('waiting_for')}) -- not fired")}
-            time.sleep(0.5)
+        """{"ok": True, "trips": n} when the HV guard is not tripped, else
+        {"ok": False, "error"} at once -- a big arc included: it is not waited
+        out (2026-10-30, the user: the ~15 s it keeps the HV down is longer
+        than a filament stays heated; as scan_view, which stops on it). A
+        small arc never trips the guard, so it never stops a shot. The
+        emission / focus rails are the operator's: not checked here."""
+        g = self._get("/api/hv-guard") or {}
+        t = g.get("tripped")
+        if not t:
+            return {"ok": True, "trips": g.get("trips")}
+        if t.get("auto_recover"):
+            return {"ok": False, "error": (f"the HV guard is tripped ({t.get('source')}): the HV "
+                                           f"is off until the Spellman is stable again (waiting "
+                                           f"for: {t.get('waiting_for')}) -- not fired")}
+        return {"ok": False, "error": f"the HV guard is tripped and needs a person: "
+                                      f"{t.get('message') or t.get('source')} -- not fired"}
 
     def _fire_single_pulse_run(self, filament, num_pulses, width_us, interval, tmo,
                                max_on_ms, total_ms, controller, trigger,

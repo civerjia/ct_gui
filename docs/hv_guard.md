@@ -152,8 +152,8 @@ While the guard has the HV down, it **refuses to heat any filament to ACTIVE or 
 
 | situation | what happens |
 |---|---|
-| guard tripped, HV coming back by itself | waits up to 30 s for it |
-| guard tripped and needs a person | refuses at once (`hv_off: True`) |
+| guard tripped: a big arc (HV comes back by itself) or a latch that needs a person | refuses at once (`hv_off: True`), not waited out: the ~15 s outlasts the heating (2026-10-30). `scan_view` stops on it the same way |
+| small arc (kV back within 2 s) | never trips the guard: ignored, logged in `arcs.jsonl` |
 | guard acted during the shot (counted by `trips` in `GET /api/hv-guard`) | returns `ok=False`, `hv_off: True` |
 
 The emission and focus rails themselves are the operator's: neither `fire_single_pulse` nor `scan_view` checks or switches them (2026-10-30). With them off a measured pulse reads ~0 mA.

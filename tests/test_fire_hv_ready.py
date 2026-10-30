@@ -76,17 +76,12 @@ ct, fired = make([QUIET])
 r = ct.fire_single_pulse(5, **KW)
 check("HV on, guard quiet -> fired, ok", fired and r["ok"], r)
 
-# 2. A big arc is being waited out -> waits, then fires once the HV is back.
-ct, fired = make([AUTO, AUTO, AUTO, {"tripped": None, "trips": 4}])
+# 2. A big arc in progress -> not fired, no wait (2026-10-30: the wait outlasts the heating).
+ct, fired = make([AUTO, {"tripped": None, "trips": 4}])
 t0 = clock.t
 r = ct.fire_single_pulse(5, **KW)
-check("big arc in progress -> waited, then fired", fired and r["ok"] and clock.t - t0 >= 1.0, (r, clock.t - t0))
-
-# 3. Still tripped after 30 s -> not fired, says why.
-ct, fired = make([AUTO])
-r = ct.fire_single_pulse(5, **KW)
-check("not back within 30 s -> not fired, error names the wait", not fired and not r["ok"]
-      and "30 s" in r["error"], r)
+check("big arc in progress -> not fired, no wait", not fired and not r["ok"] and clock.t == t0
+      and r.get("hv_off") and "spellman_big_arc" in r["error"], r)
 
 # 4. A latch that needs a person -> not fired at once.
 ct, fired = make([{"tripped": {"source": "stm32", "auto_recover": None, "message": "MOSFET on"}, "trips": 5}])
