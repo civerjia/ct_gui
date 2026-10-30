@@ -159,6 +159,10 @@ class ControllerLink:
         self.wifi: dict[str, Any] = {}
         self._wifi_at = 0.0
         self._http_hist: deque = deque(maxlen=240)
+        # monotonic time this link's bridge went down and stayed down (None =
+        # up, or never connected). auto_connect replaces a host that has been
+        # gone this long when another bridge appears (a swapped ESP32).
+        self.down_since: float | None = None
 
     def hold_monitor(self, seconds: float = MONITOR_YIELD_S) -> None:
         """Keep the board monitor off this link for `seconds` (renewed by every
@@ -171,6 +175,7 @@ class ControllerLink:
             self._stop_poll()
             self.client.connect(host, BRIDGE_PORT)
             self.host = host
+            self.down_since = None
             self._poll_pause_until = 0.0             # a fresh connection always polls
             self.rp_last = 0.0
             self.rp_rtt_ms = None
@@ -208,6 +213,7 @@ class ControllerLink:
             with _suppress():
                 self.client.disconnect()
             self.host = None
+            self.down_since = None
 
     def request(self, frame_type: int, payload: bytes = b"", flags: int = 0, timeout: float = 2.0):
         """Send one framed command and return the decoded response (raises if down)."""
@@ -270,6 +276,7 @@ class ControllerLink:
                         log.warning("%s: bridge RECONNECTED to %s after %.0f s down "
                                     "(%d attempts)", self.name, host, down_s, attempts)
                     reconnecting = False
+                    self.down_since = None
                     self.rp_last = 0.0
                     self.rp_rtt_ms = None
                     connected_at = time.monotonic()
@@ -278,6 +285,7 @@ class ControllerLink:
                     attempts += 1
                     if not reconnecting:
                         down_since = reminded = now
+                        self.down_since = now
                         attempts = 1
                         print(f"[{self.name}] bridge down, reconnecting to {host}…", flush=True)
                         log.warning("%s: bridge DOWN, reconnecting to %s (%s)",

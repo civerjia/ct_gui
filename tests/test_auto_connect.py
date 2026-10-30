@@ -35,6 +35,7 @@ class FakeLink:
         self.name = name
         self.client = FakeClient()
         self.host = None
+        self.down_since = None
 
     def connect(self, host):
         self.host = host
@@ -105,6 +106,45 @@ LAN[B] = stm
 S.auto_connect()                              # B appears -> Power 2 -> swapped
 check("STM32 board found later, both auto-connected: swapped into Power 1",
       hosts() == (B, A) and S.MASTER == 1, str(hosts()))
+
+# --- 2026-10-30: the P1 ESP32 swapped; its slot kept the old address --------
+OLD, NEW = "192.168.8.157", "192.168.8.203"
+
+
+def gone(cid, host, for_s):
+    S.CONTROLLERS[cid].host = host                   # kept, link retrying it
+    S.CONTROLLERS[cid].client.connected = False
+    S.CONTROLLERS[cid].down_since = S.time.monotonic() - for_s
+
+
+fresh(**{A: ok, NEW: stm})
+S.CONTROLLERS[2].connect(A)
+gone(1, OLD, 30)
+S.auto_connect()
+check("swapped board, old address down 30 s: not replaced yet", hosts() == (OLD, A), str(hosts()))
+gone(1, OLD, 61)
+S.auto_connect()
+check("down 61 s, one new STM32 bridge: Power 1 -> the new board", hosts() == (NEW, A), str(hosts()))
+
+fresh(**{A: ok, NEW: stm, C: stm})
+S.CONTROLLERS[2].connect(A)
+gone(1, OLD, 120)
+r = S.auto_connect()
+check("two STM32 candidates: not guessed, said why", hosts() == (OLD, A) and "1" in r["failed"],
+      str((hosts(), r["failed"])))
+
+fresh(**{B: stm, NEW: ok, C: stm})
+S.CONTROLLERS[1].connect(B)
+gone(2, "192.168.8.242", 120)
+S.auto_connect()
+check("Power 2 stale: takes the one bridge WITHOUT an STM32", hosts() == (B, NEW), str(hosts()))
+
+fresh(**{A: ok, NEW: stm})
+S.CONTROLLERS[2].connect(A)
+gone(1, OLD, 120)
+S._AUTO_MANUAL.add(1)                                # the user connected .157 by hand
+S.auto_connect()
+check("a hand-connected stale slot is left to the user", hosts() == (OLD, A), str(hosts()))
 
 fresh()
 r = S.auto_connect()

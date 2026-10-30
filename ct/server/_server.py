@@ -7911,6 +7911,11 @@ def _slew_keeper_loop() -> None:
 # CT_NO_AUTO_CONNECT=1 turns the background loop off.
 AUTO_CONNECT_MIN_S = 30.0          # first retry interval while a slot is empty
 AUTO_CONNECT_MAX_S = 300.0         # backs off to this when nothing new is found
+# A slot whose bridge has been unreachable this long is STALE: if a scan finds
+# exactly one free bridge for its role, that one replaces it. 2026-10-30 the P1
+# ESP32 was swapped; the slot kept retrying the old board's address for 20 min
+# and only a backend restart freed it for the new one (.157 -> .203).
+AUTO_REPLACE_DOWN_S = 60.0
 _AUTO_LOCK = threading.Lock()
 # Set once a restart has begun. On Windows the old process does not exit: it
 # WAITS for the new one (restart_in_place), and its daemon threads keep running
@@ -7950,6 +7955,14 @@ def scan_bridges() -> list[dict]:
 def _slot_free(cid: int) -> bool:
     link = CONTROLLERS.get(cid)
     return bool(link) and not link.host
+
+
+def _slot_stale(cid: int) -> bool:
+    """Has a host, but its bridge has been down for AUTO_REPLACE_DOWN_S."""
+    link = CONTROLLERS.get(cid)
+    since = getattr(link, "down_since", None) if link else None
+    return (bool(link) and bool(link.host) and not link.client.connected
+            and since is not None and time.monotonic() - since >= AUTO_REPLACE_DOWN_S)
 
 
 def auto_connect(explicit: bool = False) -> dict:
@@ -7999,6 +8012,27 @@ def auto_connect(explicit: bool = False) -> dict:
             queue.remove(pick)
             put(cid, pick)
 
+        # A stale slot (its board gone for AUTO_REPLACE_DOWN_S -- swapped, or
+        # back with a new DHCP address) takes a new bridge of ITS role: Power 1
+        # the STM32 one, Power 2 one without. Only when exactly one fits: two
+        # candidates is a guess, and a guess here drives the wrong hardware.
+        for cid in sorted(CONTROLLERS):
+            if cid in _AUTO_MANUAL or not _slot_stale(cid):
+                continue
+            fit = [b for b in queue if b["has_stm32"] == (cid == 1)]
+            if len(fit) != 1:
+                if fit:
+                    failed[str(cid)] = (f"{CONTROLLERS[cid].host} down; {len(fit)} candidate "
+                                        f"bridges -- not guessing, use Scan")
+                continue
+            old = CONTROLLERS[cid].host
+            CONTROLLERS[cid].disconnect()
+            queue.remove(fit[0])
+            if put(cid, fit[0]):
+                log.warning("auto-connect: Power %d's bridge %s gone for %.0f s -- replaced by "
+                            "%s (%s)", cid, old, AUTO_REPLACE_DOWN_S, fit[0]["host"],
+                            fit[0].get("name"))
+
         # Power 1 must be the STM32 board. If the code (not the user) ended up
         # with it in slot 2, swap the two.
         stm_hosts = {b["host"] for b in found if b["has_stm32"]}
@@ -8032,7 +8066,8 @@ def _auto_connect_loop() -> None:
         if os.environ.get("CT_NO_AUTO_CONNECT") or _STOPPING.is_set():
             return
         try:
-            if not any(_slot_free(c) and c not in _AUTO_MANUAL for c in CONTROLLERS):
+            if not any((_slot_free(c) or _slot_stale(c)) and c not in _AUTO_MANUAL
+                       for c in CONTROLLERS):
                 wait = AUTO_CONNECT_MIN_S       # nothing to do; check again later
                 continue
             if _lease_snapshot().get("held"):
