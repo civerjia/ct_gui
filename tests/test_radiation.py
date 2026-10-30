@@ -31,13 +31,13 @@ added = []
 r = S.radiation_snapshot()
 check("nothing yet: no count", r["cpm"] is None and r["usvh"] is None and r["age_s"] is None, r)
 
-S._spellman_on_message({"type": "gmc_status", "data": {"connected": True, "port": "COM4", "baud": 57600,
-                                                       "version": "GMC-300SRe 1.17"}}, clock["t"])
+S._spellman_on_message({"type": "gmc_status", "data": {"connected": False, "port": "COM4"}}, clock["t"])
+check("spellman_backend's gmc_status (a counter it does not have) is ignored",
+      S.radiation_snapshot()["counter"] is None, S.radiation_snapshot())
 S._spellman_on_message({"type": "gmc_point", "data": {"elapsed_s": 5.0, "timestamp_s": 9.0, "cpm": 23,
                                                       "delta_cpm": 4, "usvh": 0.15}}, clock["t"])
 r = S.radiation_snapshot()
-check("a point: cpm, usvh, delta, counter status", r["cpm"] == 23 and r["usvh"] == 0.15
-      and r["delta_cpm"] == 4 and r["counter"]["port"] == "COM4", r)
+check("a point: cpm, usvh, delta", r["cpm"] == 23 and r["usvh"] == 0.15 and r["delta_cpm"] == 4, r)
 check("...and both go to the trend", ("gmc_cpm", 23.0) in added and ("gmc_usvh", 0.15) in added, added)
 check("/api/safety carries it", S.hv_guard_snapshot()["radiation"]["cpm"] == 23)
 

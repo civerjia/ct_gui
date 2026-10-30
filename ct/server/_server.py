@@ -4221,8 +4221,9 @@ def _spellman_on_message(m: dict, now: float) -> None:
                 series_add("gmc_cpm", float(cpm))
                 if num(usvh):
                     series_add("gmc_usvh", float(usvh))
-        elif t == "gmc_status" and isinstance(m.get("data"), dict):
-            _SPELL["gmc"] = m["data"]
+        # spellman_backend's gmc_status is NOT taken: it describes a counter on
+        # a control2 COM port that is not there (connected: false, COM4) and
+        # would overwrite the Pi counter's real state.
     _spellman_watch_feed(m, now)
 
 
