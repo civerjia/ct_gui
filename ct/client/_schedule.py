@@ -1516,18 +1516,32 @@ class _ScheduleMixin:
         and firmware disagree on the row; on_armed still running after
         on_armed_timeout_s; no pulse at all for no_pulse_timeout_s; Ctrl-C.
         Data lost -> recorded on that filament's row, the rest goes on: never
-        arrived within heat_timeout_s (skipped), heating interrupted (skipped;
-        a faulted output is put to SLEEP, any other to IDLE), on_armed raised,
-        its edges incomplete within shot_wait_timeout_s (rest skipped).
+        arrived within heat_timeout_s, heating interrupted (a faulted output is
+        put to SLEEP, any other to IDLE), VOLTAGE refused, dead; on_armed
+        raised, its edges incomplete within shot_wait_timeout_s (rest skipped).
+
+        NO FILAMENT IS SKIPPED (2026-10-30, the user). One that cannot fire --
+        not hot, heating interrupted, VOLTAGE refused, dead -- gets a FAKE TURN:
+        at its place in the order on_armed(f) is still called (sim: the train
+        still runs), so the detector gets its frames, but there is no HV -- its
+        firmware row is skipped (a dead one has none) and the next row is not
+        released until all num_pulses of those edges have been dropped (or
+        shot_wait_timeout_s), so no fake edge can fire the next filament. Its
+        row says fake_armed, skipped (why) and ignored_edges; the run is not
+        ok, since that filament's data is missing. A dead filament is no longer
+        refused; only a list with every filament dead is.
 
         Before: every filament of the list at IDLE. The emission and focus
         rails are NOT checked or switched -- that is the operator's job (as
         fire_single_pulse); with them off a measured pulse reads ~0 mA.
 
         Returns {"ok" (every filament fired all its pulses), "stopped" (why,
-        if a dangerous fault ended it), "fired", "skipped", "partial",
-        "dropped_edges", "suppressed_not_hot", "rows": [{"filament", "board",
-        "mv", "fired", "wanted", "skipped"?, "heat_s" (raise -> hot), "waited_s"
+        if a dangerous fault ended it), "fired", "skipped" (had a fake turn),
+        "partial", "dropped_edges" (lost triggers, the fake turns' left out),
+        "ignored_edges" (the fake turns' edges, dropped on purpose),
+        "suppressed_not_hot", "rows": [{"filament", "board",
+        "mv", "fired", "wanted", "skipped"?, "fake_armed"?, "ignored_edges"?,
+        "heat_s" (raise -> hot), "waited_s"
         (hot, waiting for its turn), "gap_s" (previous filament's last pulse ->
         this on_armed), "on_armed_s", "records", "measured"?, "mams"?,
         "on_mismatch"? (a MOSFET read back open and the current did not prove
@@ -1542,7 +1556,7 @@ class _ScheduleMixin:
         since = lambda: round(time.monotonic() - t0, 3)  # noqa: E731
         fils = [int(f) for f in filaments]
         out: dict = {"ok": False, "rows": [], "fired": 0, "skipped": [], "partial": [],
-                     "dropped_edges": 0, "suppressed_not_hot": 0}
+                     "dropped_edges": 0, "ignored_edges": 0, "suppressed_not_hot": 0}
 
         def refuse(msg):
             out.update(error=msg, elapsed_s=since())
@@ -1556,13 +1570,18 @@ class _ScheduleMixin:
         if not isinstance(active_mv, dict):
             return refuse(f"active_mv must be {{filament: mV}} with every filament's own "
                           f"voltage, got {active_mv!r}")
-        missing = [f for f in fils if f not in active_mv and str(f) not in active_mv]
+        # A DEAD filament is not refused (2026-10-30, the user: never skip a
+        # filament): it gets no HV and no schedule row, but its turn still
+        # runs the caller's trigger -- a fake turn, see fake_turn below.
+        dead = {f for f in fils if self._is_dead(f)}
+        if len(dead) == len(fils):
+            return refuse(f"every filament is dead: {sorted(dead)}")
+        missing = [f for f in fils if f not in dead and f not in active_mv
+                   and str(f) not in active_mv]
         if missing:
             return refuse(f"active_mv has no voltage for filament(s) {missing}")
-        mv = {f: int(active_mv[f] if f in active_mv else active_mv[str(f)]) for f in fils}
-        dead = [f for f in fils if self._is_dead(f)]
-        if dead:
-            return refuse(f"dead filament(s) {dead} in the list")
+        mv = {f: (int(active_mv[f] if f in active_mv else active_mv[str(f)])
+                  if (f in active_mv or str(f) in active_mv) else 0) for f in fils}
         trigger = str(trigger or "sim").lower()
         if trigger not in ("sim", "ext"):
             return refuse(f"trigger must be 'sim' or 'ext', got {trigger!r}")
@@ -1623,11 +1642,16 @@ class _ScheduleMixin:
         plan = {"config": {"interPulseMs": int(tmo), "maxOnMs": int(max_on_ms),
                            "totalMs": int(total_ms), "triggerEdge": 0, "gated": 1},
                 "emission": [{"filament": f, "numPulses": n, "widthUs": int(width_us)}
-                             for f in fils],
+                             for f in fils if f not in dead],
                 "heating": []}
+        # Row i of the view -> its row in the FIRMWARE schedule (None: dead, no row).
+        fw: dict = {}
+        for i, f in enumerate(fils):
+            fw[i] = None if f in dead else sum(1 for x in fils[:i] if x not in dead)
 
         rows = [{"filament": f, "board": board[f], "mv": mv[f], "wanted": n, "counted": 0, "fired": 0,
-                 "raise_s": None, "hot_s": None, "armed_s": None, "done_s": None}
+                 "raise_s": None, "hot_s": None, "armed_s": None, "done_s": None,
+                 **({"skipped": "marked dead: no HV"} if f in dead else {})}
                 for f in fils]
         hot_now: set = set()          # raised, not yet dropped
         measuring = None
@@ -1741,7 +1765,7 @@ class _ScheduleMixin:
                     return refuse(f"controller {c} did not take the gated run (firmware "
                                   f"before 5c77778?)")
                 unsafe = st.get("unsafeSlots") or 0
-                bad = [f for f in fils if int(sites[f]["controller"]) == c
+                bad = [f for f in fils if f not in dead and int(sites[f]["controller"]) == c
                        and (unsafe >> int(sites[f]["slot"])) & 1]
                 if bad:
                     return refuse(f"filament(s) {bad} skipped as unsafe at arm (isolated rail "
@@ -1867,20 +1891,127 @@ class _ScheduleMixin:
             last_pulse_at = time.monotonic()
             last_done_at = None
             check_at = 0.0
+
+            def trigger_turn(f, row):
+                """The caller's trigger for this filament's turn: on_armed(f), and
+                for sim the simulated train. The error, or None."""
+                nonlocal check_at
+                err_box: dict = {}
+                if callable(on_armed):
+                    def call(f=f, box=err_box):
+                        try:
+                            on_armed(f)
+                        except BaseException as exc:   # noqa: BLE001 -- reported, not lost
+                            box["error"] = f"{type(exc).__name__}: {exc}"
+                    th = threading.Thread(target=call, name=f"on_armed_{f}", daemon=True)
+                    armed_thread["t"] = th
+                    th.start()
+                    t_call = time.monotonic()
+                    while th.is_alive():
+                        time.sleep(0.02)
+                        if time.monotonic() - t_call > armed_wait_s:
+                            raise self._ScanStop(f"on_armed({f}) still running after "
+                                                 f"{armed_wait_s:g} s (on_armed_timeout_s)")
+                        if time.monotonic() > check_at:
+                            dangers(first_armed_at, last_pulse_at)
+                            check_at = time.monotonic() + 0.5
+                    row["on_armed_s"] = round(time.monotonic() - t_call, 3)
+                    if err_box.get("error"):
+                        if (err_box["error"].startswith("TypeError")
+                                and "positional argument" in err_box["error"]):
+                            raise self._ScanStop(
+                                f"on_armed must take ONE argument (the filament): "
+                                f"{err_box['error']}")
+                        row["on_armed_error"] = err_box["error"]
+                        return err_box["error"]
+                if trigger == "sim":
+                    # The previous row's train has fired and been counted (its row
+                    # is done), but the backend clears its "running" flag only on
+                    # its next ~0.3 s status poll: "already running" right after a
+                    # row is that tail, not a second train. It skipped a hot
+                    # filament per view on 2026-10-28; wait it out, briefly.
+                    busy_end = time.monotonic() + 2.0
+                    while True:
+                        r = self._post("/api/sync/simulate", {"count": n, "interval_ms": float(interval),
+                                                             "controller": int(head)}, timeout=10.0)
+                        if (r.get("ok") or "already running" not in str(r.get("error", ""))
+                                or time.monotonic() > busy_end):
+                            break
+                        time.sleep(0.05)
+                    if not r.get("ok"):
+                        row["on_armed_error"] = f"simulated trigger refused: {r.get('error', r)}"
+                        return row["on_armed_error"]
+                return None
+
+            def fake_turn(i, f, why):
+                """A filament that cannot fire -- not hot, heating interrupted,
+                VOLTAGE refused, dead -- is NOT skipped (the user, 2026-10-30): its
+                turn still runs the caller's trigger, so the detector gets its
+                frames and the view stays in step. No HV: its firmware row is
+                skipped and the next one is not released yet, so the firmware
+                drops those edges (ignored_edges). The next row is released only
+                once all n have been dropped (or shot_wait_timeout_s), so no fake
+                edge can fire the next filament."""
+                nonlocal pending_idle, last_pulse_at, first_armed_at, check_at
+                row = rows[i]
+                row["skipped"] = why
+                row["fake_armed"] = True
+                if pending_idle is not None:
+                    to_idle(pending_idle)
+                    pending_idle = None
+                if fw[i] is not None:
+                    res = self._shv_row(armed, fw[i], 1)
+                    if any(v != 0 for v in res.values()):
+                        raise self._ScanStop(f"row {fw[i]}: could not skip ({res})")
+                drops0 = {c: int((self.shv_status(c) or {}).get("droppedEdges") or 0) for c in ctrls}
+                row["armed_s"] = since()
+                if first_armed_at is None:
+                    first_armed_at = time.monotonic()
+                last_pulse_at = time.monotonic()
+                err = trigger_turn(f, row)
+                got = 0
+                if not err:
+                    end = time.monotonic() + float(shot_wait_timeout_s)
+                    quiet_end = None
+                    while True:
+                        st = self.shv_status(head) or {}
+                        got = int(st.get("droppedEdges") or 0) - drops0.get(head, 0)
+                        if got >= n or time.monotonic() > end:
+                            break
+                        if st.get("state") not in (SHV_ARMED, SHV_RUNNING):
+                            # Nothing left armed (the last row): no drops are
+                            # counted. Nothing can be mis-fired either; give
+                            # the train its own length, then go on.
+                            if quiet_end is None:
+                                quiet_end = time.monotonic() + n * float(interval) / 1000.0 + 0.3
+                            if time.monotonic() > quiet_end:
+                                break
+                        if time.monotonic() > check_at:
+                            dangers(first_armed_at, last_pulse_at)
+                            links_ok()
+                            check_at = time.monotonic() + 0.5
+                        preheat(i + 1)
+                        drain_log_page()
+                        time.sleep(0.05)
+                drops1 = {c: int((self.shv_status(c) or {}).get("droppedEdges") or 0) for c in ctrls}
+                out["ignored_edges"] += sum(max(0, drops1[c] - drops0[c]) for c in ctrls)
+                row["ignored_edges"] = got
+                last_pulse_at = time.monotonic()
+                row["done_s"] = since()
+                out["skipped"].append(f)
+
             for i, f in enumerate(fils):
                 row = rows[i]
                 own = int(sites[f]["controller"])
                 ch, pos = int(sites[f]["channel"]), int(sites[f]["position"])
                 preheat(i)
                 if row.get("skipped"):
-                    self._shv_row(armed, i, 1)
-                    out["skipped"].append(f)
+                    fake_turn(i, f, row["skipped"])
                     continue
                 if row["raise_s"] is None:
                     raise_(i, 0.0)
                     if row.get("skipped"):
-                        self._shv_row(armed, i, 1)
-                        out["skipped"].append(f)
+                        fake_turn(i, f, row["skipped"])
                         continue
                 # 1. wait until it is HOT (or its heating is interrupted / never came)
                 deadline = t0 + row["raise_s"] + float(heat_timeout_s) + settle_s + 0.5
@@ -1916,14 +2047,7 @@ class _ScheduleMixin:
                     drain_log_page()       # not hot yet: the wait reads the log
                     time.sleep(0.05)
                 if why:
-                    if pending_idle is not None:
-                        to_idle(pending_idle)
-                        pending_idle = None
-                    row["skipped"] = why
-                    res = self._shv_row(armed, i, 1)
-                    if any(v != 0 for v in res.values()):
-                        raise self._ScanStop(f"row {i}: could not skip ({res})")
-                    out["skipped"].append(f)
+                    fake_turn(i, f, why)
                     continue
                 if row["hot_s"] is None:
                     row["hot_s"] = since()
@@ -1937,10 +2061,10 @@ class _ScheduleMixin:
                 # Count BEFORE the release: once released, an edge fires at once
                 # (ext), and a count read after it would not include that pulse.
                 done0 = (self.shv_status(own) or {}).get("totalPulsesDone") or 0
-                res = self._shv_row(armed, i, 0)
+                res = self._shv_row(armed, fw[i], 0)
                 if any(v != 0 for v in res.values()):
                     raise self._ScanStop(
-                        f"row {i} (filament {f}): release refused -- "
+                        f"row {fw[i]} (filament {f}): release refused -- "
                         + ", ".join(f"controller {c}: {self._ROW_RESULT.get(v, v)}"
                                     for c, v in res.items()))
                 if pending_idle is not None:
@@ -1957,49 +2081,7 @@ class _ScheduleMixin:
                 if first_armed_at is None:
                     first_armed_at = time.monotonic()
                     last_pulse_at = first_armed_at
-                err_box: dict = {}
-                if callable(on_armed):
-                    def call(f=f, box=err_box):
-                        try:
-                            on_armed(f)
-                        except BaseException as exc:   # noqa: BLE001 -- reported, not lost
-                            box["error"] = f"{type(exc).__name__}: {exc}"
-                    th = threading.Thread(target=call, name=f"on_armed_{f}", daemon=True)
-                    armed_thread["t"] = th
-                    th.start()
-                    t_call = time.monotonic()
-                    while th.is_alive():
-                        time.sleep(0.02)
-                        if time.monotonic() - t_call > armed_wait_s:
-                            raise self._ScanStop(f"on_armed({f}) still running after "
-                                                 f"{armed_wait_s:g} s (on_armed_timeout_s)")
-                        if time.monotonic() > check_at:
-                            dangers(first_armed_at, last_pulse_at)
-                            check_at = time.monotonic() + 0.5
-                    row["on_armed_s"] = round(time.monotonic() - t_call, 3)
-                    if err_box.get("error"):
-                        if (err_box["error"].startswith("TypeError")
-                                and "positional argument" in err_box["error"]):
-                            raise self._ScanStop(
-                                f"on_armed must take ONE argument (the filament): "
-                                f"{err_box['error']}")
-                        row["on_armed_error"] = err_box["error"]
-                if trigger == "sim" and not err_box.get("error"):
-                    # The previous row's train has fired and been counted (its row
-                    # is done), but the backend clears its "running" flag only on
-                    # its next ~0.3 s status poll: "already running" right after a
-                    # row is that tail, not a second train. It skipped a hot
-                    # filament per view on 2026-10-28; wait it out, briefly.
-                    busy_end = time.monotonic() + 2.0
-                    while True:
-                        r = self._post("/api/sync/simulate", {"count": n, "interval_ms": float(interval),
-                                                             "controller": int(head)}, timeout=10.0)
-                        if (r.get("ok") or "already running" not in str(r.get("error", ""))
-                                or time.monotonic() > busy_end):
-                            break
-                        time.sleep(0.05)
-                    if not r.get("ok"):
-                        row["on_armed_error"] = f"simulated trigger refused: {r.get('error', r)}"
+                trig_err = trigger_turn(f, row)
                 # 3. its pulses, within shot_wait_timeout_s
                 wait_end = time.monotonic() + float(shot_wait_timeout_s)
                 fired = 0
@@ -2014,12 +2096,12 @@ class _ScheduleMixin:
                     # waiting for pulses anyway (nothing waits on this read).
                     if measuring is not None and counted_before + fired - len(ev["pool"]) >= 64:
                         drain_events()
-                    if (st.get("entryIndex") or 0) > i or st.get("state") == SHV_COMPLETE:
+                    if (st.get("entryIndex") or 0) > fw[i] or st.get("state") == SHV_COMPLETE:
                         break
-                    if err_box.get("error") or time.monotonic() > wait_end:
-                        res = self._shv_row(armed, i, 2, until_s=3.0)
+                    if trig_err or time.monotonic() > wait_end:
+                        res = self._shv_row(armed, fw[i], 2, until_s=3.0)
                         if any(v != 0 for v in res.values()):
-                            raise self._ScanStop(f"row {i}: could not skip the rest ({res})")
+                            raise self._ScanStop(f"row {fw[i]}: could not skip the rest ({res})")
                         row["skipped"] = (row.get("on_armed_error")
                                           or f"{fired} of {n} pulses within shot_wait_timeout_s "
                                              f"({shot_wait_timeout_s:g} s)")
@@ -2095,6 +2177,8 @@ class _ScheduleMixin:
             st = self.shv_status(c) or {}
             out["dropped_edges"] += int(st.get("droppedEdges") or 0)
             out["suppressed_not_hot"] += int(st.get("suppressedNotHot") or 0)
+        # A fake turn's edges are dropped ON PURPOSE: not a lost trigger.
+        out["dropped_edges"] = max(0, out["dropped_edges"] - out["ignored_edges"])
         for row in rows:
             f = row["filament"]
             c = int(sites[f]["controller"])
@@ -2247,23 +2331,25 @@ class _ScheduleMixin:
         """scan_view() for several views in a row. Per view: move_to(view) if
         given, wait move_s, then scan_view(view["filaments"], active_mv,
         idle_ma, settle_ms, **scan_view_args) -- every other argument is
-        scan_view's, unchanged. A filament skipped in one view (data lost) is
-        left out of the later ones -- except one refused only because its IDLE
-        was not warm yet (row["skip_transient"]): that is the moment, not the
-        filament, and the next view tries it again (the guard still refuses it
-        if it is still cold). A dangerous stop ends the run.
+        scan_view's, unchanged. EVERY view runs EVERY one of its filaments: one
+        that cannot fire gets a fake turn there (see scan_view), view after
+        view, so each view gives the detector the same frames (the user,
+        2026-10-30; it used to be left out of the later views). A dangerous
+        stop ends the run.
 
-        Returns {"ok", "stopped"?, "views_done", "views_total", "left_out",
+        Returns {"ok", "stopped"?, "views_done", "views_total",
+        "failed" ({filament: views it had a fake turn in}), "left_out" (always
+        [] now, kept for old scripts),
         "per_view": [{"view", "center", "ok", "fired", "skipped", "partial",
         "stopped"?, "elapsed_s"}], "results": [each scan_view result],
         "elapsed_s"}."""
         t0 = time.monotonic()
-        left_out: list = []
+        failed: dict = {}
         per: list = []
         results: list = []
         out: dict = {"ok": True}
         for v in views:
-            fils = [f for f in v["filaments"] if f not in left_out]
+            fils = list(v["filaments"])
             if callable(move_to):
                 move_to(v)
             if move_s:
@@ -2276,15 +2362,15 @@ class _ScheduleMixin:
             if r.get("stopped") or r.get("error"):
                 row["stopped"] = r.get("stopped") or r.get("error")
             per.append(row)
-            transient = {x["filament"] for x in (r.get("rows") or []) if x.get("skip_transient")}
-            left_out += [f for f in row["skipped"] if f not in left_out and f not in transient]
+            for f in row["skipped"]:
+                failed.setdefault(f, []).append(v.get("view"))
             if row.get("stopped"):
                 out.update(ok=False, stopped=f"view {v.get('view')}: {row['stopped']}")
                 break
             if not row["ok"]:
                 out["ok"] = False
         out.update(views_done=sum(1 for p in per if not p.get("stopped")),
-                   views_total=len(views), left_out=left_out, per_view=per,
+                   views_total=len(views), failed=failed, left_out=[], per_view=per,
                    results=results, elapsed_s=round(time.monotonic() - t0, 1))
         return out
 

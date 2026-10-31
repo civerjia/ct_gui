@@ -2376,13 +2376,27 @@ Data loss is recorded on that filament's row, and the rest goes on.
 - its edges incomplete within `shot_wait_timeout_s`: the rest of its pulses
   are skipped.
 
+**No filament is skipped** (2026-10-30). One that cannot fire -- not hot,
+heating interrupted, VOLTAGE refused, dead -- gets a **fake turn**: at its
+place in the order `on_armed(f)` is still called (sim: the train still runs),
+so the detector gets its frames, but there is no HV. Its firmware row is
+skipped (a dead filament has none), and the next row is released only after
+all `num_pulses` of those edges were dropped (or `shot_wait_timeout_s`), so a
+fake edge never fires the next filament. The row says `fake_armed`, `skipped`
+(why) and `ignored_edges`; the result's `ignored_edges` counts them apart from
+`dropped_edges`. The run is not `ok` (that filament's data is missing). A dead
+filament no longer refuses the call; only a list of nothing but dead ones does.
+
 **Before:** every filament of the list at IDLE. The emission and focus rails
 are not checked or switched (as `fire_single_pulse`) -- that is the
 operator's job; with them off a measured pulse reads ~0 mA.
 
 `scan_views(views, active_mv, idle_ma, settle_ms, move_to=..., move_s=...,
-**scan_view_args)` runs `scan_view` per view. A filament skipped in one view
-is left out of the later ones. A dangerous stop ends the run.
+**scan_view_args)` runs `scan_view` per view. Every view runs every one of its
+filaments -- one that cannot fire gets a fake turn in each view, so every view
+gives the detector the same frames; `failed` lists, per filament, the views it
+had a fake turn in (`left_out` is always `[]` now). A dangerous stop ends the
+run.
 
 **`filament_perf(filaments=None)`** returns the per-filament table that
 `scan_view` keeps (`state/filament_perf.json`), which `preheat_ahead="auto"`

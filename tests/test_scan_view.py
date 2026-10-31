@@ -326,19 +326,27 @@ for e in rig.log:
         peak = max(peak, len(hot))
 check("max_hot=3 is never exceeded", peak == 3, peak)
 
-# --- data lost: skipped, the run goes on ---------------------------------------
+# --- data lost: NOT skipped -- a fake turn (2026-10-30, the user: never skip a
+# filament): its trigger still runs for the detector, no HV, the edges dropped --
 rig = Rig(hot_after={31: None})
 calls = []
 r = make(rig).scan_view([30, 31, 32], trigger="ext", on_armed=ext_on_armed(rig, calls), **ARGS)
-check("never hot: skipped (not released), the rest fired, filament back to IDLE",
-      [f for f, _ in calls] == [30, 32] and ("skip", 1) in rig.log and r["skipped"] == [31]
-      and "not hot" in r["rows"][1]["skipped"] and 31 not in rig.raised and not r.get("stopped"), r)
+check("never hot: on_armed still called for it (fake turn), its row not released",
+      [f for f, _ in calls] == [30, 31, 32] and ("skip", 1) in rig.log and ("release", 1) not in rig.log
+      and r["rows"][1].get("fake_armed") and "not hot" in r["rows"][1]["skipped"], r)
+check("...no HV for it: its 3 edges dropped as ignored_edges, not counted, not dropped_edges",
+      31 not in rig.counted and r["ignored_edges"] == 3 and r["dropped_edges"] == 0
+      and r["rows"][1]["ignored_edges"] == 3, (rig.counted, r["ignored_edges"], r["dropped_edges"]))
+check("...the next filament fired its own 3, none of the fake ones; data marked lost, not ok",
+      r["rows"][2]["fired"] == 3 and rig.counted.get(32) == 3 and r["skipped"] == [31]
+      and not r["ok"] and 31 not in rig.raised and not r.get("stopped"), r)
 
 rig = Rig(interrupted=[34], fault_cc=[34])
 calls = []
 r = make(rig).scan_view([33, 34, 35], trigger="ext", on_armed=ext_on_armed(rig, calls), **ARGS)
-check("output fault: skipped, IDLE during the run, SLEEP after the disarm",
-      [f for f, _ in calls] == [33, 35] and "output fault" in r["rows"][1]["skipped"]
+check("output fault: fake turn, IDLE during the run, SLEEP after the disarm",
+      [f for f, _ in calls] == [33, 34, 35] and "output fault" in r["rows"][1]["skipped"]
+      and r["rows"][1].get("fake_armed") and 34 not in rig.counted
       and rig.log.index(("sleep", 34)) > max(i for i, e in enumerate(rig.log) if e[0] == "disarm"), r)
 
 rig = Rig(edges_short={37: 1})
@@ -421,18 +429,19 @@ rig = Rig()
 rig.refuse_voltage = {71}
 ct = make(rig)
 t_start = Clock.t
-r = ct.scan_view([70, 71], trigger="sim", **ARGS)
-check("a refused VOLTAGE skips that filament at once (no 10 s retry), the rest fires",
-      r["skipped"] == [71] and "SLEEP" in r["rows"][1]["skipped"] and r["rows"][0]["fired"] == 3
-      and Clock.t - t_start < 9.0, (r.get("skipped"), round(Clock.t - t_start, 2)))
+# (refused one first: the fake walks ONE shared row pointer, so it cannot skip the last row)
+r = ct.scan_view([71, 70], trigger="sim", **ARGS)
+check("a refused VOLTAGE: fake turn at once (no 10 s retry), the rest fires",
+      r["skipped"] == [71] and "SLEEP" in r["rows"][0]["skipped"] and r["rows"][0].get("fake_armed")
+      and r["rows"][1]["fired"] == 3 and 71 not in rig.counted
+      and Clock.t - t_start < 9.0, (r.get("skipped"), round(Clock.t - t_start, 2), r.get("stopped")))
 
 # --- refused before anything is touched -----------------------------------------
 for name, kw, want in (
         ("a single voltage", dict(active_mv=7000), "every filament"),
         ("a missing voltage", dict(active_mv={60: 7000}), "[61]"),
-        ("ext without on_armed", dict(trigger="ext"), "on_armed"),
-        ("a dead filament", dict(), "dead")):
-    rig = Rig(dead=[61] if name == "a dead filament" else [])
+        ("ext without on_armed", dict(trigger="ext"), "on_armed")):
+    rig = Rig()
     a = {**ARGS, **kw}
     r = make(rig).scan_view([60, 61], **a)
     check(f"refused: {name}", not r["ok"] and want in (r.get("error") or "") and not rig.log, r.get("error"))
@@ -457,18 +466,19 @@ check("ring overrun: lost rows have NO measurement, never another row's",
       not wrong and r.get("measure_lost") and any(x.get("measure_lost") for x in r["rows"]),
       (wrong, r.get("measure_note")))
 
-# --- scan_views: "not warm yet" is the moment, not the filament ---------------
-rig = Rig(hot_after={72: None})                 # 72 never gets hot: really lost
-rig.not_warm = {71: 1}                          # 71 refused once, then fine
+# --- scan_views: every view runs every filament (2026-10-30: none left out) ----
+rig = Rig(hot_after={72: None})                 # 72 never gets hot
 # (skipped rows first: the fake walks ONE shared row pointer, so it cannot skip the last row)
 V = [{"view": 0, "filaments": [72, 71, 70]}, {"view": 1, "filaments": [72, 71, 70]}]
+calls = []
 r = make(rig).scan_views(V, active_mv=MV, idle_ma=1100, settle_ms=500, trigger="ext",
-                         on_armed=ext_on_armed(rig, []), num_pulses=3, width_us=1000,
+                         on_armed=ext_on_armed(rig, calls), num_pulses=3, width_us=1000,
                          heat_timeout_s=3.0, shot_wait_timeout_s=2.0)
 v0, v1 = r["results"]
-check("not warm: skipped in view 0, fired in view 1; never-hot 72 left out",
-      71 in v0["skipped"] and any(x["filament"] == 71 and x["fired"] == 3 for x in v1["rows"])
-      and r["left_out"] == [72], (r["left_out"], v0["skipped"], [(x["filament"], x["fired"]) for x in v1["rows"]]))
+check("scan_views: never-hot 72 is NOT left out -- a fake turn in both views, the rest fired",
+      [f for f, _ in calls] == [72, 71, 70, 72, 71, 70] and r["failed"] == {72: [0, 1]}
+      and r["left_out"] == [] and all(x["fired"] == 3 for v in (v0, v1) for x in v["rows"][1:]),
+      (r["failed"], [f for f, _ in calls]))
 
 # --- sim: the backend still says "already running" just after a train --------
 rig = Rig()
@@ -535,9 +545,15 @@ check("numbering: VOLTAGE went to each filament at ITS voltage",
       [e for e in rig.log if e[0] == "state" and e[2] == VOLTAGE])
 check("numbering: all ended at IDLE", not rig.raised, rig.raised)
 rig = Rig(dead=[16])
-r = make(rig).scan_view([0, 16], **ARGS)
-check("numbering: dead #16 (FID 0) refused, not #0 (FID 16)",
-      not r["ok"] and "16" in (r.get("error") or "") and not rig.log, r.get("error"))
+r = make(rig).scan_view([16, 0], **ARGS)
+check("numbering: dead #16 (FID 0) gets the fake turn and no schedule row, #0 (FID 16) fires",
+      [e for e in rig.log if e[0] == "download"][0][1] == [0] and r["rows"][0].get("fake_armed")
+      and "dead" in r["rows"][0]["skipped"] and r["rows"][1]["fired"] == 3 and 16 not in rig.counted,
+      ([e for e in rig.log if e[0] == "download"], [(x["filament"], x.get("skipped")) for x in r["rows"]]))
+rig = Rig(dead=[60, 61])
+r = make(rig).scan_view([60, 61], **ARGS)
+check("every filament dead: refused, nothing touched", not r["ok"] and "dead" in (r.get("error") or "")
+      and not rig.log, r.get("error"))
 
 rig = Rig()
 rig.log_unreadable = True                             # the pulse log could not be read
