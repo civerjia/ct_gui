@@ -341,6 +341,12 @@ check("...the next filament fired its own 3, none of the fake ones; data marked 
       r["rows"][2]["fired"] == 3 and rig.counted.get(32) == 3 and r["skipped"] == [31]
       and not r["ok"] and 31 not in rig.raised and not r.get("stopped"), r)
 
+from ct.client._base import Result  # noqa: E402
+txt, full = repr(Result(r)), Result(r).full()
+check("print: one line per filament, the fake turn named, per-pulse detail only in full()",
+      txt.count("\n") < 25 and "FAKE TURN" in txt and "r.full()" in txt
+      and "tOnUs" not in txt and "tOnUs" in full, txt)
+
 rig = Rig(interrupted=[34], fault_cc=[34])
 calls = []
 r = make(rig).scan_view([33, 34, 35], trigger="ext", on_armed=ext_on_armed(rig, calls), **ARGS)

@@ -470,12 +470,76 @@ class Result(dict):
         """Every field, nothing hidden -- the firmware-level detail included."""
         return self._render_all(brief=False)
 
+    # ---- scan_view / scan_views: one line per filament ----------------------
+    # The user, 2026-10-31: a 33-filament view printed 18 447 lines (every
+    # pulse's record and measurement spelled out) and the Windows console took
+    # seconds to show it. The brief print is a table, one line per filament;
+    # the data is all still in the dict and r.full() prints every field.
+    _SCAN_HIDDEN_NOTE = ("  (per-pulse records / measurements hidden -- r.full() prints every "
+                         "field; r['rows'][i]['records'] / ['measured'] hold them)")
+
+    @staticmethod
+    def _is_scan(d) -> bool:
+        rows = d.get("rows") if isinstance(d, dict) else None
+        return (isinstance(rows, list) and bool(rows)
+                and all(isinstance(x, dict) and "wanted" in x and "counted" in x for x in rows))
+
+    @classmethod
+    def _scan_table(cls, res: dict) -> list:
+        def num(v, fmt):
+            return format(v, fmt) if isinstance(v, (int, float)) and not isinstance(v, bool) else "-"
+        out = ["  rows: [%d filaments]" % len(res["rows"]),
+               "     filament  board        mV   fired   mA*ms  heat_s  wait_s  note"]
+        for x in res["rows"]:
+            note = []
+            if x.get("fake_armed"):
+                note.append("FAKE TURN (no HV): " + str(x.get("skipped") or ""))
+            elif x.get("skipped"):
+                note.append(("partial: " if x.get("fired") else "skipped: ") + str(x["skipped"]))
+            for k, word in (("on_mismatch", "MOS read-back OPEN"), ("hv_stuck_on", "MOS STUCK ON"),
+                            ("records_short", "records short"), ("measure_lost", "measurement lost"),
+                            ("on_armed_error", None)):
+                if x.get(k) and not (k == "on_armed_error" and x.get("fake_armed")):
+                    note.append(word or f"on_armed: {x[k]}")
+            if x.get("readback_unreliable"):
+                note.append("read-back unreliable (current flowed)")
+            out.append("     %-8s  %-11s %5s  %2s/%-2s  %7s  %6s  %6s  %s" % (
+                x.get("filament"), x.get("board") or "-", num(x.get("mv"), "d"),
+                x.get("fired", 0), x.get("wanted", "?"), num(x.get("mams"), ".1f"),
+                num(x.get("heat_s"), ".2f"), num(x.get("waited_s"), ".2f"), "; ".join(note)))
+        return out
+
+    def _render_scan(self) -> str:
+        head = "ok" if self.get("ok") else "FAILED"
+        out: list[str] = []
+        for k in ("stopped", "error"):
+            if self.get(k):
+                self._render(k, self[k], 2, out)
+        out.extend(self._scan_table(self))
+        for k, v in self.items():
+            if k in ("ok", "stopped", "error", "rows"):
+                continue
+            self._render(k, v, 2, out)
+        out.append(self._SCAN_HIDDEN_NOTE)
+        return f"Result({head})\n" + "\n".join(out)
+
     def __repr__(self) -> str:
         return self._render_all(brief=True)
 
     def _render_all(self, brief: bool) -> str:
         if not self:
             return "Result({})"
+        if brief and self._is_scan(self):
+            return self._render_scan()
+        if (brief and isinstance(self.get("results"), list) and self.get("results")
+                and all(self._is_scan(x) for x in self["results"] if isinstance(x, dict))
+                and "per_view" in self):
+            # scan_views: per_view is the summary; each view's full result is
+            # one r["results"][i] away (and prints as its own table).
+            brief_self = {k: v for k, v in self.items() if k != "results"}
+            text = Result(brief_self)._render_all(brief=True)
+            return text + ("\n  (each view's result hidden -- r['results'][i] prints its table, "
+                           "r.full() everything)")
         if self._has_detail(self):
             if brief:
                 text = Result(self._brief(dict(self)))._render_all(brief=True)
