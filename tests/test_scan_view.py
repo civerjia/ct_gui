@@ -345,7 +345,7 @@ from ct.client._base import Result  # noqa: E402
 txt, full = repr(Result(r)), Result(r).full()
 check("print: one line per filament, the fake turn named, per-pulse detail only in full()",
       txt.count("\n") < 25 and "FAKE TURN" in txt and "r.full()" in txt
-      and "tOnUs" not in txt and "tOnUs" in full, txt)
+      and "heat_meas_mA" not in txt and "heat_meas_mA" in full, txt)
 
 rig = Rig(interrupted=[34], fault_cc=[34])
 calls = []
