@@ -2386,6 +2386,11 @@ fake edge never fires the next filament. The row says `fake_armed`, `skipped`
 (why) and `ignored_edges`; the result's `ignored_edges` counts them apart from
 `dropped_edges`. The run is not `ok` (that filament's data is missing). A dead
 filament no longer refuses the call; only a list of nothing but dead ones does.
+A board the firmware's pre-arm check would refuse -- at STOP (isolated rail
+off), absent, lost, or on a dark channel -- is found from the board snapshot
+before the arm and gets the same fake turn (2026-11-01: after an HV-guard trip
+set eleven filaments to STOP, every scan failed to arm). It is not raised from
+STOP; bring it up yourself when it is safe.
 
 **Before:** every filament of the list at IDLE. The emission and focus rails
 are not checked or switched (as `fire_single_pulse`) -- that is the

@@ -1635,6 +1635,35 @@ class _ScheduleMixin:
         if not ((guard.get("vacuum") or {}).get("within_limit", True)):
             return refuse(f"vacuum over its limit: {(guard.get('vacuum') or {}).get('raw')}")
 
+        # A board the firmware's pre-arm check would refuse -- at STOP (isolated
+        # rail off), absent, lost, or on a dark channel -- refused the WHOLE arm:
+        # 2026-11-01 the HV guard had set eleven filaments to STOP and every
+        # later scan failed "IsoOff". Like a dead one it gets a fake turn and
+        # no schedule row. It is NOT raised: whoever set STOP had a reason.
+        excluded = {f: "marked dead: no HV" for f in dead}
+        for c in ctrls:
+            snap = self._get(f"/api/board-snapshot?controller={c}") or {}
+            for b in snap.get("boards") or []:
+                if b.get("fid") is None:
+                    continue
+                f = int(self._user_index_of(int(b["fid"])))
+                if f not in fils or f in excluded:
+                    continue
+                if b.get("channel_dark"):
+                    why = "its channel is dark (mux not answering)"
+                elif b.get("lost"):
+                    why = "its board is lost (not answering)"
+                elif b.get("present") is False:
+                    why = "its board is not present"
+                elif b.get("power_state") == 1:
+                    why = "at STOP (isolated rail off)"
+                else:
+                    continue
+                excluded[f] = f"{why}: no HV"
+        if len(excluded) == len(fils):
+            return refuse("no filament can be armed: " + "; ".join(
+                f"{f} {w}" for f, w in excluded.items()))
+
         # Per-row worst case, for the firmware's whole-list cap and the timed heat.
         turn_max_s = float(heat_timeout_s) + settle_s + armed_wait_s + float(shot_wait_timeout_s) + 5.0
         if total_ms is None:
@@ -1642,16 +1671,16 @@ class _ScheduleMixin:
         plan = {"config": {"interPulseMs": int(tmo), "maxOnMs": int(max_on_ms),
                            "totalMs": int(total_ms), "triggerEdge": 0, "gated": 1},
                 "emission": [{"filament": f, "numPulses": n, "widthUs": int(width_us)}
-                             for f in fils if f not in dead],
+                             for f in fils if f not in excluded],
                 "heating": []}
-        # Row i of the view -> its row in the FIRMWARE schedule (None: dead, no row).
+        # Row i of the view -> its row in the FIRMWARE schedule (None: excluded, no row).
         fw: dict = {}
         for i, f in enumerate(fils):
-            fw[i] = None if f in dead else sum(1 for x in fils[:i] if x not in dead)
+            fw[i] = None if f in excluded else sum(1 for x in fils[:i] if x not in excluded)
 
         rows = [{"filament": f, "board": board[f], "mv": mv[f], "wanted": n, "counted": 0, "fired": 0,
                  "raise_s": None, "hot_s": None, "armed_s": None, "done_s": None,
-                 **({"skipped": "marked dead: no HV"} if f in dead else {})}
+                 **({"skipped": excluded[f]} if f in excluded else {})}
                 for f in fils]
         hot_now: set = set()          # raised, not yet dropped
         measuring = None
@@ -1754,18 +1783,27 @@ class _ScheduleMixin:
                 ev["cursor"] = int(m["since"])
             arm_all = self._post("/api/arm", {"repeats": 1, "controllers": armed})
             per = arm_all.get("results") or {}
-            for c in armed:
-                ar = per.get(str(c)) or ({} if per else arm_all)
-                if not ar.get("ok"):
-                    code, why = self._arm_failure(ar)
-                    return refuse(f"arm refused on controller {c} (code {code}): {why}")
+            failed = [(c, per.get(str(c)) or ({} if per else arm_all)) for c in armed]
+            failed = [(c, ar) for c, ar in failed if not ar.get("ok")]
+            if failed or (not per and not arm_all.get("ok")):
+                # The controller that REFUSED first (one with a firmware code), not
+                # one that was only left unarmed because the other failed --
+                # 2026-11-01 that printed "controller 1 (code None): no reason
+                # given" while the backend's own error said why (P2: IsoOff).
+                failed.sort(key=lambda x: self._arm_failure(x[1])[0] is None)
+                c, ar = failed[0] if failed else (armed[0], arm_all)
+                code, why = self._arm_failure(ar)
+                more = arm_all.get("error")
+                return refuse(f"arm refused on controller {c}"
+                              + (f" (code {code})" if code is not None else "") + f": {why}"
+                              + (f" -- backend: {more}" if more and more not in why else ""))
             for c in ctrls:
                 st = self.shv_status(c) or {}
                 if not st.get("gated"):
                     return refuse(f"controller {c} did not take the gated run (firmware "
                                   f"before 5c77778?)")
                 unsafe = st.get("unsafeSlots") or 0
-                bad = [f for f in fils if f not in dead and int(sites[f]["controller"]) == c
+                bad = [f for f in fils if f not in excluded and int(sites[f]["controller"]) == c
                        and (unsafe >> int(sites[f]["slot"])) & 1]
                 if bad:
                     return refuse(f"filament(s) {bad} skipped as unsafe at arm (isolated rail "

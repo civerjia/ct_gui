@@ -161,6 +161,12 @@ def make(rig: Rig):
                 "current_mA": 2000, "cc_mode": 3 if u in rig.fault_cc else 0}}}
         if path.startswith("/api/filament-perf"):
             return {"ok": True, "filaments": {}}
+        if path.startswith("/api/board-snapshot?controller="):
+            c = int(path.rsplit("=", 1)[1])
+            return {"ok": True, "boards": [
+                {"fid": ORDER[u], "power_state": 1 if u in getattr(rig, "at_stop", ()) else 4,
+                 "present": True, "lost": False, "channel_dark": False}
+                for u in range(96) if site(ORDER[u])["controller"] == c]}
         return {}
     ct._get = get
 
@@ -256,6 +262,10 @@ def make(rig: Rig):
                             intr |= 1 << p
                     raw += [hot, intr]
                 return {"ok": True, "response": {"raw": raw + [0, 0, 0, 0]}}
+        if path == "/api/arm" and getattr(rig, "arm_fail", None):
+            return {"ok": False, "error": rig.arm_fail[2], "results": {
+                str(rig.arm_fail[0]): {"ok": False, "reject": 6},
+                str(rig.arm_fail[1]): {"ok": False}}}
         if path == "/api/arm":
             rig.state = 1
             rig.cur, rig.in_row, rig.released = 0, 0, {}   # an ARM starts the table over
@@ -582,6 +592,24 @@ check("pulse log: no empty page read during the run",
 check("pulse log: every row still has exactly its own 20 records",
       all(len(x["records"]) == 20 and all(q["filament"] == x["filament"] for q in x["records"])
           for x in r["rows"]), [(x["filament"], len(x["records"])) for x in r["rows"]])
+
+# --- a board at STOP is not armable: fake turn, not a refused arm (2026-11-01) ---
+rig = Rig()
+rig.at_stop = {21}
+calls = []
+r = make(rig).scan_view([21, 20, 22], trigger="ext", on_armed=ext_on_armed(rig, calls), **ARGS)
+check("a filament at STOP: no schedule row, a fake turn, the rest fired",
+      [e for e in rig.log if e[0] == "download"][0][1] == [20, 22] and r["rows"][0].get("fake_armed")
+      and "STOP" in r["rows"][0]["skipped"] and [f for f, _ in calls] == [21, 20, 22]
+      and r["rows"][1]["fired"] == 3 and r["rows"][2]["fired"] == 3 and 21 not in rig.raised,
+      ([e for e in rig.log if e[0] == "download"], r.get("error"), r.get("stopped")))
+
+rig = Rig()
+rig.arm_fail = (2, 1, "arm failed, nothing left armed: Power 2: arm rejected - IsoOff")
+r = make(rig).scan_view([60, 10], **ARGS)
+check("arm refused: names the controller that refused, with the backend's reason",
+      "controller 2" in (r.get("error") or "") and "IsoOff" in (r.get("error") or "")
+      and "no reason given" not in (r.get("error") or ""), r.get("error"))
 
 rig = Rig(hv=False)
 r = make(rig).scan_view([60, 61], **ARGS)
