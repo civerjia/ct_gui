@@ -77,6 +77,14 @@ reading.update(mv=2600, ma=1150)
 run(5)
 check("one high reading (a corrupt read): nothing done", not sent and not events, events)
 
+reading.update(mv=3404, ma=1191)      # +1 V, current unchanged: a false bus-voltage read (11-02, F28)
+run(8)
+check("high voltage at an unchanged current (false read): nothing done, not even tracked",
+      not sent and not events and F not in S._IDLE_V_OVER, (sent, events))
+reading.update(mv=3404, ma=None)
+run(8)
+check("...nor with no current to back it", not sent and not events, (sent, events))
+
 reading.update(mv=7184, ma=2305, age=9000)
 run(6)
 check("a stale reading does not count", not sent, sent)

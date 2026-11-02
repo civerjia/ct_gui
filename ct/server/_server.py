@@ -1707,6 +1707,15 @@ def _active_deadline_loop() -> None:
 # come down -> SLEEP. From the board monitor's cache, no I2C of its own.
 IDLE_V_OVER_MV = 700           # over its IDLE voltage by more than this ...
 IDLE_V_OVER_HOLD_S = 3.0       # ... on every fresh reading for this long
+# ... AND the current says so. A real overshoot pushes the current up with the
+# voltage (I = V/R); a false bus-voltage read leaves it where it was. 2026-11-02
+# evening: filament 28 read 3404 mV against 2364 at an unchanged 1191 mA (the
+# +1 V bit pattern the firmware's vmtrace holds as false) -- the watch would
+# have re-sent, and after three, sent a healthy filament to SLEEP. Over = the
+# current at least this much above what it draws at its IDLE voltage (the
+# learned mA, else IDLE_V_OVER_REF_MA).
+IDLE_V_OVER_MA_FRAC = 1.15
+IDLE_V_OVER_REF_MA = 1200
 IDLE_V_FRESH_MS = 3000         # a reading older than this does not count
 IDLE_V_FIX_MAX = 3             # corrections within IDLE_V_FIX_WINDOW_S ...
 IDLE_V_FIX_WINDOW_S = 60.0     # ... before the filament goes to SLEEP
@@ -1751,7 +1760,8 @@ def _idle_v_watch_tick(now: float) -> None:
         if rd is None:
             continue                        # no fresh reading: neither over nor cleared
         mv, ma, c0 = rd
-        if mv <= target + IDLE_V_OVER_MV:
+        ref_ma = (IDLE_MV_TABLE.get(f) or {}).get("mA") or IDLE_V_OVER_REF_MA
+        if mv <= target + IDLE_V_OVER_MV or ma is None or ma < ref_ma * IDLE_V_OVER_MA_FRAC:
             _IDLE_V_OVER.pop(f, None)
             _IDLE_V_GAVE_UP.discard(f)
             continue
