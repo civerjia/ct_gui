@@ -132,7 +132,7 @@ The GUI's HV guard tile shows the arc count. Its tooltip shows the model and the
 
 ## 4. Trend data on disk
 
-Every plotted reading goes to disk: Spellman kV and mA, vacuum, emission V and I.
+Every plotted reading goes to disk: Spellman kV and mA, vacuum, emission V and I. Two series are recorded without being plotted: `fo_v`, the focus rail in V, and `sp_st`, the Spellman GetStatus bits as one integer (bit k is the k-th bit).
 
 | file | content | kept |
 |---|---|---|
@@ -140,6 +140,30 @@ Every plotted reading goes to disk: Spellman kV and mA, vacuum, emission V and I
 | `logs/series/summary_<date>.csv` | `minute,name,n,min,max,mean` | for good |
 
 When a raw hour falls outside the kept window, it is compacted into the summary and deleted. A restart reads the last hour back into the plot.
+
+### Incident evidence
+
+An incident keeps its own copy of the data at full resolution. Nothing ever deletes it, and the 6 h raw limit does not apply.
+
+These are incidents:
+- the HV guard trips or recovers, including an auto-recovery;
+- a grid switch is closed when it should be open, or is slow to turn off;
+- a voltage IDLE overshoots and is sent to SLEEP;
+- the safety fallback fails, or cannot reach a controller;
+- the Spellman has a big arc, a System Fault or an over-current.
+
+An ordinary arc is not an incident; it stays in `arcs.jsonl`.
+
+The capture covers 15 min before the incident to 2 min after it. Another incident inside that window joins the same capture and moves its end. A capture is cut at 30 min. When the window has passed, `logs/incidents/<date>T<time>_<kinds>/` is written:
+
+| file | content |
+|---|---|
+| `incident.jsonl` | the triggering events, one per line |
+| `series.csv` | `unix_t,name,value`, every reading as received, nothing thinned |
+| `power.csv` | `unix_t,controller,channel,mux,fid,power_state,current_mA,bus_mV,age_ms,source`, every board-monitor reading: 4 Hz when idle; during a run, the 1 Hz cache read plus the telemetry push. An absent value is empty, never 0 |
+| `arcs.jsonl`, `backend.log`, `client.jsonl` | the lines of those logs inside the window; `client.jsonl` holds every scan's per-pulse records |
+
+If the backend stops while a capture is open, it writes what it has.
 
 ## 5. Shots while the HV is off
 

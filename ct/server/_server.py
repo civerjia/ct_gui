@@ -27,6 +27,7 @@ import logging
 import logging.handlers
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -115,7 +116,7 @@ from ct.protocol import (
 # filesystem depending on how it was launched.
 
 # Directories: all under the repository root, defined once in ct/paths.py.
-from ct.paths import CALIB_DIR, LOG_DIR, RECORD_DIR, RUN_REPORT_DIR, STATE_DIR  # noqa: E402
+from ct.paths import CALIB_DIR, CLIENT_LOG_DIR, LOG_DIR, RECORD_DIR, RUN_REPORT_DIR, STATE_DIR  # noqa: E402
 from ct.paths import WEB_DIR as STATIC_DIR  # noqa: E402
 
 # The backend's subsystems (ct/server/_*.py), moved out of this file verbatim.
@@ -510,9 +511,12 @@ def _board_monitor_loop() -> None:
                     continue
                 with _BOARD_MON_LOCK:
                     prev = _BOARD_MON.get(cid)
+                prev_boards = (prev or {}).get("boards")
                 snap = _board_monitor_tick(cid, link, time.monotonic(), prev)
                 with _BOARD_MON_LOCK:
                     _BOARD_MON[cid] = snap
+                if snap.get("boards") is not None and snap.get("boards") is not prev_boards:
+                    power_ring_add(cid, snap["boards"], snap.get("source"))
             except Exception as exc:
                 log.debug("board monitor controller %s: %s", cid, exc)
         time.sleep(max(0.02, MONITOR_PERIOD_S - (time.monotonic() - t0)))
@@ -3935,6 +3939,8 @@ def _spellman_events(events: list, now: float) -> None:
                     fh.write(json.dumps({k: v for k, v in ev.items() if k != "t"}) + "\n")
             except OSError:
                 pass
+            if ev["kind"] in ("big_arc", "system_fault"):
+                incident_note("spellman_" + ev["kind"], {k: v for k, v in ev.items() if k != "t"})
             if ev["kind"] == "status":
                 log.info("Spellman status: set %s, cleared %s (HV on %s, %s kV)", ev["set"], ev["cleared"],
                          ev["hv_on"], ev["kv"])
@@ -4097,7 +4103,10 @@ def _hv_guard_loop() -> None:
 # SERIES_KEEP_S. /api/series hands out what is newer than ?since=.
 SERIES_KEEP_S = 3600.0
 SERIES_MAX_POINTS = 200_000         # per series, whatever the rate
-SERIES_NAMES = ("sp_kv", "sp_ma", "vac", "em_v", "em_i", "gmc_cpm", "gmc_usvh")
+# fo_v (focus rail) and sp_st (Spellman GetStatus bits as an int, bit k = the
+# k-th of its 17 bits) only for the record and incident evidence: the 11-01
+# over-current was a focus-rail sag the plot did not have.
+SERIES_NAMES = ("sp_kv", "sp_ma", "vac", "em_v", "em_i", "gmc_cpm", "gmc_usvh", "fo_v", "sp_st")
 _SERIES_LOCK = threading.Lock()
 _SERIES = {n: collections.deque(maxlen=SERIES_MAX_POINTS) for n in SERIES_NAMES}
 _SERIES_LAST_ADS = [None]           # the shared ADS result last recorded (no duplicates)
@@ -4239,6 +4248,8 @@ def series_from_ads(r) -> None:
         series_add("em_v", float(r["emiss_v"]), t)
     if isinstance(r.get("emiss_i_ma"), (int, float)):
         series_add("em_i", float(r["emiss_i_ma"]), t)
+    if isinstance(r.get("focus_v"), (int, float)):
+        series_add("fo_v", float(r["focus_v"]), t)
 
 
 def series_get(names, since: float = 0.0, max_points: int = 4000) -> dict:
@@ -4256,6 +4267,230 @@ def series_get(names, since: float = 0.0, max_points: int = 4000) -> dict:
             out[n] = [[round(t, 3), v] for t, v in pts]
     return {"ok": True, "now": round(time.time(), 3), "keep_s": SERIES_KEEP_S, "series": out,
             "vacuum_limit_torr": vacuum_limit()}
+
+
+# ── Incident evidence: full resolution, kept for good ─────────────────────────
+# The 2026-11-01 16:59 Spellman over-current could only be pieced together
+# from control2's Spellman session log and the client call log: the raw series
+# had been compacted to per-minute rows after 6 h, and the heating side was not
+# on disk at all. The user: an important incident keeps its evidence at the
+# highest resolution, never limited by the 6 h.
+#
+# An incident (INCIDENT_KINDS, through _safety_record, or a Spellman big arc /
+# system fault) opens a capture: INCIDENT_PRE_S before it to INCIDENT_POST_S
+# after it. Another incident inside that window joins the same capture (and
+# moves its end). When the window has passed, one directory is written under
+# logs/incidents/ and nothing ever deletes it:
+#   incident.jsonl   the triggering events, one per line
+#   series.csv       unix_t,name,value -- every Spellman / vacuum / ADS / GMC
+#                    reading as received (no thinning)
+#   power.csv        every board-monitor reading: unix_t,controller,channel,
+#                    mux,fid,power_state,current_mA,bus_mV,age_ms,source
+#   arcs.jsonl, backend.log, client.jsonl   the lines of those logs in the window
+INCIDENT_DIR = LOG_DIR / "incidents"
+INCIDENT_PRE_S = 900.0
+INCIDENT_POST_S = 120.0
+INCIDENT_MAX_S = 1800.0            # a run of incidents is cut into captures this long
+INCIDENT_KINDS = frozenset({
+    "hv_guard_tripped", "hv_guard_recovered", "hv_guard_auto_recovered",
+    "grid_stray_closed", "slow_turn_off_warning", "idle_v_overshoot_sleep",
+    "fallback_error", "fallback_unreachable",
+    "spellman_big_arc", "spellman_system_fault", "spellman_over_current",
+})
+POWER_RING_S = INCIDENT_PRE_S + INCIDENT_POST_S + 60.0
+_POWER_RING_LOCK = threading.Lock()
+_POWER_RING: collections.deque = collections.deque()   # (unix_t, cid, source, packed boards)
+# One board = 10 bytes (15 min of 2 controllers at 4 Hz is ~5 MB, not ~60 MB of
+# tuples): channel, mux, power_state, current_mA, bus_mV, age_ms; an absent value
+# is its sentinel and comes back as None, never 0.
+_POWER_REC = struct.Struct("<BBbhHH")
+_PR_NONE_PS, _PR_NONE_MA, _PR_NONE_U16 = -128, -32768, 0xFFFF
+_INCIDENT_LOCK = threading.Lock()
+_INCIDENT_OPEN: dict = {}           # the capture still collecting: start, end, events
+_INCIDENT_WAKE = threading.Event()
+
+
+def power_ring_add(cid: int, boards: dict, source, t: float | None = None) -> None:
+    """One board-monitor reading (all boards of one controller) into the ring."""
+    t = time.time() if t is None else t
+
+    def val(v, none, lo, hi):
+        return none if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi else v
+    packed = b"".join(
+        _POWER_REC.pack(int(k[0]) & 0xFF, int(k[1]) & 0xFF,
+                        val(b.get("power_state"), _PR_NONE_PS, -127, 127),
+                        val(b.get("current_mA"), _PR_NONE_MA, -32767, 32767),
+                        val(b.get("bus_mV"), _PR_NONE_U16, 0, 0xFFFE),
+                        val(b.get("age_ms"), _PR_NONE_U16, 0, 0xFFFE))
+        for k, b in sorted(boards.items()) if b.get("present"))
+    with _POWER_RING_LOCK:
+        _POWER_RING.append((t, int(cid), source, packed))
+        while _POWER_RING and t - _POWER_RING[0][0] > POWER_RING_S:
+            _POWER_RING.popleft()
+
+
+def incident_note(kind: str, event: dict | None = None, t: float | None = None) -> bool:
+    """An incident happened: open (or extend) the evidence capture. True if it
+    is one (INCIDENT_KINDS)."""
+    if kind not in INCIDENT_KINDS:
+        return False
+    t = time.time() if t is None else t
+    with _INCIDENT_LOCK:
+        cap = _INCIDENT_OPEN
+        if cap and t - cap["start"] < INCIDENT_MAX_S:
+            cap["end"] = max(cap["end"], t + INCIDENT_POST_S)
+        else:
+            if cap:                         # too long: close it now, start a new one
+                cap["end"] = min(cap["end"], t)
+                _INCIDENT_DONE.append(dict(cap))
+            cap.clear()
+            cap.update(start=t - INCIDENT_PRE_S, first=t, end=t + INCIDENT_POST_S, events=[])
+        cap["events"].append({**(event or {}), "kind": kind, "unix_t": round(t, 3)})
+    _INCIDENT_WAKE.set()
+    log.warning("incident %s: evidence from %s to %s will be kept in %s", kind,
+                datetime.datetime.fromtimestamp(t - INCIDENT_PRE_S).strftime("%H:%M:%S"),
+                datetime.datetime.fromtimestamp(_INCIDENT_OPEN["end"]).strftime("%H:%M:%S"),
+                INCIDENT_DIR)
+    return True
+
+
+_INCIDENT_DONE: list = []           # captures whose window has passed, to write
+
+
+def _lines_in_window(paths, start: float, end: float, stamp):
+    """Lines of these text files whose time (stamp(line) -> unix t or None) is
+    in [start, end]. A line with no time of its own (a traceback) goes with the
+    line before it."""
+    for path in paths:
+        try:
+            if path.stat().st_mtime < start:
+                continue
+            fh = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            keep = False
+            for line in fh:
+                t = stamp(line)
+                if t is not None:
+                    if t > end:
+                        break
+                    keep = t >= start
+                if keep:
+                    yield line
+
+
+def _stamp_backend(line: str):
+    try:
+        return datetime.datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def _stamp_json(key: str):
+    probe = f'"{key}": "'
+
+    def stamp(line: str):
+        i = line.find(probe)
+        if i < 0:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(line[i + len(probe): i + len(probe) + 29].split('"')[0]).timestamp()
+        except ValueError:
+            return None
+    return stamp
+
+
+def incident_write(cap: dict) -> Path | None:
+    """Write one capture's directory. Every part is tried on its own: a log
+    that cannot be read never costs the series."""
+    start, end = cap["start"], cap["end"]
+    first = cap.get("first", start + INCIDENT_PRE_S)
+    kinds = sorted({e["kind"] for e in cap["events"]})
+    name = datetime.datetime.fromtimestamp(first).strftime("%Y-%m-%dT%H%M%S") + "_" + "+".join(kinds)[:80]
+    out = INCIDENT_DIR / name
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error("incident evidence NOT kept (%s): %s", out, exc)
+        return None
+
+    def part(fname, write):
+        try:
+            with open(out / fname, "w", encoding="utf-8", newline="") as fh:
+                write(fh)
+        except Exception as exc:
+            log.warning("incident %s: %s not written: %s", name, fname, exc)
+
+    def w_events(fh):
+        for e in cap["events"]:
+            fh.write(json.dumps(e, default=str) + "\n")
+
+    def w_series(fh):
+        with _SERIES_LOCK:
+            rows = sorted((t, n, v) for n, d in _SERIES.items() for t, v in d if start <= t <= end)
+        fh.write("unix_t,name,value\n")
+        fh.writelines(f"{t:.3f},{n},{v:.6g}\n" for t, n, v in rows)
+
+    def w_power(fh):
+        with _POWER_RING_LOCK:
+            ring = [r for r in _POWER_RING if start <= r[0] <= end]
+        fh.write("unix_t,controller,channel,mux,fid,power_state,current_mA,bus_mV,age_ms,source\n")
+        blank = lambda v: "" if v is None else v   # noqa: E731 -- absent stays absent, never 0
+        for t, cid, src, packed in ring:
+            for ch, mux, ps, ma, mv, age in _POWER_REC.iter_unpack(packed):
+                ps = None if ps == _PR_NONE_PS else ps
+                ma = None if ma == _PR_NONE_MA else ma
+                mv = None if mv == _PR_NONE_U16 else mv
+                age = None if age == _PR_NONE_U16 else age
+                try:
+                    fid = MAPPING.filament_for_board(cid - 1, ch, mux)
+                except Exception:
+                    fid = None
+                fh.write(f"{t:.3f},{cid},{ch},{mux},{blank(fid)},{blank(ps)},{blank(ma)},{blank(mv)},"
+                         f"{blank(age)},{src or ''}\n")
+
+    def w_lines(paths, stamp):
+        return lambda fh: fh.writelines(_lines_in_window(paths, start, end, stamp))
+
+    by_age = lambda ps: sorted(ps, key=lambda p: p.stat().st_mtime)   # noqa: E731
+    part("incident.jsonl", w_events)
+    part("series.csv", w_series)
+    part("power.csv", w_power)
+    part("arcs.jsonl", w_lines([ARC_LOG_PATH], _stamp_json("at")))
+    part("backend.log", w_lines(by_age(LOG_DIR.glob("backend.log*")), _stamp_backend))
+    part("client.jsonl", w_lines(by_age(CLIENT_LOG_DIR.glob("ct_client_*.jsonl")), _stamp_json("t")))
+    log.warning("incident evidence kept: %s (%s .. %s)", out,
+                datetime.datetime.fromtimestamp(start).strftime("%H:%M:%S"),
+                datetime.datetime.fromtimestamp(end).strftime("%H:%M:%S"))
+    return out
+
+
+def incident_flush(now: float | None = None, force: bool = False) -> list:
+    """Write every capture whose window has passed (all of them with force:
+    shutdown). Returns the directories written."""
+    now = time.time() if now is None else now
+    with _INCIDENT_LOCK:
+        if _INCIDENT_OPEN and (force or now >= _INCIDENT_OPEN["end"]):
+            _INCIDENT_DONE.append(dict(_INCIDENT_OPEN))
+            _INCIDENT_OPEN.clear()
+        todo, _INCIDENT_DONE[:] = list(_INCIDENT_DONE), []
+    series_flush()
+    return [p for p in (incident_write(c) for c in todo) if p]
+
+
+def _incident_loop() -> None:
+    while not _STOPPING.is_set():
+        _INCIDENT_WAKE.wait(5.0)
+        _INCIDENT_WAKE.clear()
+        try:
+            incident_flush()
+        except Exception as exc:
+            log.exception("incident evidence writer failed: %s", exc)
+    incident_flush(force=True)
+
+
+INCIDENT_HOOK[0] = incident_note
 
 
 # ── Spellman HV supply + vacuum, READ-ONLY (control2's spellman_backend) ──────
@@ -4403,6 +4638,7 @@ def _spellman_on_message(m: dict, now: float) -> None:
                     series_add("sp_ma", v)
             elif cmd == "GetStatus" and isinstance(data, list) and data:
                 _SPELL["status_bits"], _SPELL["status_at"] = list(data), now
+                series_add("sp_st", float(sum(1 << k for k, b in enumerate(data) if b)))
         elif t == "conditioning_point" and isinstance(m.get("data"), dict):
             d = m["data"]
             if isinstance(d.get("measured_kv"), (int, float)):
@@ -9047,6 +9283,8 @@ def main() -> None:
     except Exception as exc:
         log.warning("trend plot history not read back: %s", exc)
     threading.Thread(target=_series_flush_loop, name="series_writer", daemon=True).start()
+    # Incident evidence at full resolution, kept for good (see incident_note).
+    threading.Thread(target=_incident_loop, name="incident_writer", daemon=True).start()
     threading.Thread(target=_spellman_loop, name="spellman_reader", daemon=True).start()
     threading.Thread(target=_gmc_loop, name="gmc_reader", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).

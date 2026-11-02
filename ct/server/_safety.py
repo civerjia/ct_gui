@@ -122,12 +122,22 @@ def safety_touch_filaments(fids, when: float | None = None) -> None:
             _SAFETY_TOUCH_FIL[int(f)] = t
 
 
+# Set by the server: (kind, event) -> keeps the evidence around an incident
+# (see incident_note). Here only so _safety_record can call it.
+INCIDENT_HOOK: list = [None]
+
+
 def _safety_record(kind: str, detail: dict) -> None:
     ev = {"kind": kind, "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), **detail}
     with _SAFETY_LOCK:
         _SAFETY_EVENTS.append(ev)
         del _SAFETY_EVENTS[:-100]
     log.warning("safety-watchdog: %s %s", kind, detail)
+    if INCIDENT_HOOK[0]:
+        try:
+            INCIDENT_HOOK[0](kind, ev)
+        except Exception as exc:          # evidence must never break the safety path
+            log.warning("incident evidence not started for %s: %s", kind, exc)
 
 
 FORCE_OFF_DEADLINE_S = 15.0      # keep trying this long before reporting a switch stuck ON
@@ -622,7 +632,7 @@ __all__ = [
     "DEFAULT_GROUP_SIZE", "ENERGISING_STATES", "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT",
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
-    "IdleMv", "IDLE_VOLT_NOW", "IDLE_V_HOOK", "LAST_IDLE", "IDLE_MV_TABLE", "IDLE_V_CEILING_MV",
+    "IdleMv", "IDLE_VOLT_NOW", "IDLE_V_HOOK", "INCIDENT_HOOK", "LAST_IDLE", "IDLE_MV_TABLE", "IDLE_V_CEILING_MV",
     "IDLE_V_WARM_HOLD_S", "IDLE_V_MIN_FRAC", "IDLE_V_MIN_MA", "is_idle", "is_hot",
     "_idle_v_not_warm",
     "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "IDLE_SINCE", "IDLE_WARM_HOLD_S", "IDLE_WARM_TOL_FRAC", "IDLE_WARM_TOL_MA", "LAST_ACTIVE_LEFT", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
