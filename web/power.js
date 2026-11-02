@@ -344,7 +344,7 @@ function buildTileParts(tile) {
 }
 
 // Short power-state labels for the tile chip (full name in the tooltip).
-const PS_SHORT = { STOP: 'STOP', SLEEP: 'SLEEP', STANDBY: 'STBY', IDLE: 'IDLE', ACTIVE: 'ACTIVE', VOLTAGE: 'VOLT' };
+const PS_SHORT = { STOP: 'STOP', SLEEP: 'SLEEP', STANDBY: 'STBY', IDLE: 'IDLE', 'IDLE(V)': 'IDLE V', ACTIVE: 'ACTIVE', VOLTAGE: 'VOLT' };
 
 function renderBoardGrid() {
   const grid = $p('bmGrid'); if (!grid) return;
@@ -389,10 +389,13 @@ function renderBoardGrid() {
     // Then: DEAD (backend dead mask -- refused any power, on purpose) is a
     // different thing from STOP (alive, just not started), so it gets its own
     // look; a live board is coloured by its power state.
+    // A voltage IDLE: the firmware says VOLTAGE, the backend knows it is an
+    // IDLE (b.idle_voltage) -- coloured as IDLE, named "IDLE(V)".
     const psName = b.power_state_name || null;
+    const psClass = b.idle_voltage ? 'idle' : (psName ? psName.toLowerCase() : 'unknown');
     const cls = b.channel_dark ? 'dark' : b.lost ? 'lost'
       : b.tps_fault ? 'fault' : b.dead ? 'dead'
-      : b.present ? `present ps-${psName ? psName.toLowerCase() : 'unknown'}` : 'absent';
+      : b.present ? `present ps-${psClass}` : 'absent';
     tile.className = 'status-tile ' + cls + (boardSel.has(k) ? ' selected' : '')
       + (chEnabled(b.channel) ? '' : ' masked')
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');

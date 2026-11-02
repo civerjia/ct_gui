@@ -4,7 +4,7 @@
     python3 examples/scan_view.py --host 192.168.8.118:8780                 # trigger="sim"
     python3 examples/scan_view.py --host 192.168.8.118:8780 --trigger ext   # your edges
 
-WHAT YOU EDIT: FILAMENTS, ACTIVE_MV, IDLE_MA, NUM_PULSES and on_armed() below.
+WHAT YOU EDIT: FILAMENTS, ACTIVE_MV, NUM_PULSES and on_armed() below.
 Everything else is the call itself, with every argument written out.
 
 HOW ONE RUN GOES (3 filaments, preheat_ahead=1; time runs to the right):
@@ -41,7 +41,8 @@ WHEN SOMETHING GOES WRONG
     within heat_timeout_s, heating interrupted, on_armed raised, its edges not
     all in within shot_wait_timeout_s.
 
-BEFORE: every filament of the list at IDLE (the rig keeps them there), and
+BEFORE: every filament of the list at IDLE (the rig keeps them there) with an
+IDLE voltage learnt (ct.learn_idle_voltages(), once), and
 emission + focus HV on -- either already, or pass --hv-on and this script turns
 it on and back off at the end. AFTER: every filament at IDLE (a faulted one at
 SLEEP).
@@ -56,7 +57,6 @@ from ct_simple_control import CTClient
 # ---- WHAT YOU EDIT ---------------------------------------------------------
 FILAMENTS = [0, 1, 95]                    # fired in THIS order (user numbering)
 ACTIVE_MV = {0: 7000, 1: 7050, 95: 6950}  # EVERY filament its own heating voltage, mV
-IDLE_MA = 1200                            # each one back to this after its pulses, mA
 NUM_PULSES = 20                           # pulses per filament
 # ----------------------------------------------------------------------------
 
@@ -117,7 +117,7 @@ with ct.lease(ttl=120, note="scan_view example"):
         r = ct.scan_view(
             FILAMENTS,                  # fired in this order
             ACTIVE_MV,                  # {filament: mV}, every filament its own
-            IDLE_MA,                    # back to this after its pulses, mA
+            None,                       # idle_ma: unused -- back to its own IDLE voltage
             1000,                       # settle_ms: hot = this long after its FIRST arrival
             # -- heating ahead --
             preheat_ahead="auto",       # how many ahead heat: "auto" (learnt per filament) or a number

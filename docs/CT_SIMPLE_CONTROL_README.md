@@ -1265,6 +1265,56 @@ for ma in (500, 1000, 1500, 2000):        # IDLE is capped at 2000 mA
 state. Dead-masked filaments are always stripped from both `filaments` and
 `currents` before the request is sent — see [Dead mask](#dead-mask).
 
+#### IDLE in voltage mode
+
+IDLE can hold a **voltage** instead of a current (2026-11-02). The CC loop's
+IDLE failed where the voltage loop held (P2 CH3, 2026-11-01), so a voltage IDLE
+is the steadier one. The firmware runs it as its VOLTAGE state at the
+filament's own IDLE voltage. The backend knows it is an IDLE:
+
+- the ladder guard lets ACTIVE / timed VOLTAGE start from it;
+- timed returns go back to it;
+- the HV guard does not count it as hot;
+- the GUI shows it as `IDLE V`.
+
+```python
+ct.idle_all(default_ma=1200, verify=True, timeout_s=30)   # CC IDLE first
+ct.learn_idle_voltages()          # each one's voltage at that current, saved
+ct.idle_voltages()                # {"filaments": {f: {"mV", "mA", ...}}, ...}
+ct.idle_voltage_all()             # everything to its voltage IDLE
+ct.idle_voltage_one(5)            # one filament, its own IDLE voltage
+ct.idle_voltage_one(5, 2450)      # ...or a given one (<= 4000 mV)
+ct.set_idle_voltages({5: 2450})   # by hand (None removes it)
+ct.voltage_one(5, 7600, active_s=10, then_idle_voltage=True)
+```
+
+**Learning the IDLE voltages:**
+
+- `learn_idle_voltages()` reads each filament's load voltage while it holds its
+  CC IDLE. It takes six monitor reads and keeps the median of those within
+  100 mA (or 8 %) of the target.
+- Filaments that are not at a CC IDLE, or that read off-target, are listed under
+  `skipped` with the reason.
+- A filament with no IDLE voltage is refused, never given a default.
+- At 1200 mA the rig's filaments sit at 2.1–2.9 V.
+
+**When a voltage IDLE counts as warm for ACTIVE:** the voltage arrives in a
+second or two whatever the filament's temperature, so arrival alone does not
+mean the filament is warm. It counts as warm when all of these hold:
+
+- the voltage has arrived;
+- it has been at IDLE (either mode) for 10 s;
+- the current is at least half of the current the voltage was learned at.
+
+A switch from a warm CC IDLE is warm at once. A filament just down from heating
+is warm for 30 s.
+
+**Where a timed ACTIVE / VOLTAGE returns to** (`active_s`):
+
+- `then_idle_ma` returns to a CC IDLE.
+- `then_idle_voltage=True` returns to the voltage IDLE.
+- With neither, it returns to whichever IDLE the filament was last at.
+
 ### Board heating status
 
 Distinct from [`read_filament_currents()`](#filament-heating-current)
@@ -2293,7 +2343,10 @@ firmware 5c77778+ on every controller it uses.
 
 `scan_view` fires a list of filaments **strictly in that order**, each the
 moment it is **hot**, with the next ones already heating. Every filament ends
-at IDLE.
+at its **voltage IDLE** (since 2026-11-02; see
+[IDLE in voltage mode](#idle-in-voltage-mode)). Learn the IDLE voltages once with
+`ct.learn_idle_voltages()`. A filament without one refuses the run. `idle_ma` is
+no longer used: pass `None`.
 
 ```python
 def on_armed(filament):        # the SYSTEM calls this, once per filament,
@@ -2304,7 +2357,7 @@ def on_armed(filament):        # the SYSTEM calls this, once per filament,
 r = ct.scan_view(
     [23, 24, 25],              # fired in this order
     active_mv={23: 7688, 24: 7698, 25: 8228},  # each one's voltage, mV
-    idle_ma=1100,              # back to this after its pulses, mA
+    idle_ma=None,              # unused: back to each one's IDLE voltage
     settle_ms=1000,            # hot = this long after its FIRST arrival, ms
     preheat_ahead="auto",      # heat ahead: "auto" (learnt) or N filaments
     preheat_margin_s=0.3,      # "auto": start heating this much earlier, s

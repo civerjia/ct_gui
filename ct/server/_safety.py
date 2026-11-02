@@ -308,6 +308,52 @@ def _safety_schedule_running() -> tuple[bool, str | None]:
 LAST_IDLE_MA: dict[int, int] = {}
 
 
+# ── IDLE in voltage mode (2026-11-02) ───────────────────────────────────────
+# IDLE can hold a VOLTAGE instead of a current: the CC loop's IDLE failed
+# where the voltage loop held (P2 CH3, 2026-11-01). The firmware has no such
+# state -- it is its VOLTAGE(6) at the filament's IDLE voltage -- so WHICH
+# VOLTAGE is an IDLE is kept here. LAST_POWER_STATE still says 6 (what the
+# firmware is in); everything that asks "at IDLE?" / "hot?" goes through
+# is_idle() / is_hot() below.
+class IdleMv(int):
+    """An IDLE to go back to, in mV (voltage mode). A plain int is mA."""
+
+
+IDLE_VOLT_NOW: dict[int, int] = {}      # FID -> mV, while at voltage IDLE
+# What each FID was last idled at: int = mA (CC), IdleMv = mV. The default a
+# timed ACTIVE/VOLTAGE returns to.
+LAST_IDLE: dict[int, int] = {}
+# Per-filament IDLE voltage: {FID: {"mV", "mA", "at_mA", "learned"}} -- learned
+# from the filament's own voltage at its CC IDLE, or set by hand. Loaded and
+# saved by the server (STATE_DIR/idle_voltage.json).
+IDLE_MV_TABLE: dict[int, dict] = {}
+# No IDLE voltage above this: an "IDLE" is not allowed to heat like ACTIVE.
+# The learned ones are 2.1-2.9 V at 1200 mA (2026-11-02).
+IDLE_V_CEILING_MV = 4000
+# A voltage IDLE is warm when the voltage has arrived, it has been held this
+# long, and the current says the filament is there (an open filament's voltage
+# arrives too): at least IDLE_V_MIN_FRAC of the current it was learned at, or
+# IDLE_V_MIN_MA when that is not known.
+IDLE_V_WARM_HOLD_S = 10.0
+IDLE_V_MIN_FRAC = 0.5
+IDLE_V_MIN_MA = 300
+
+
+def is_idle(fid: int, st: int | None = None) -> bool:
+    """At IDLE, either mode."""
+    if st is None:
+        st = (LAST_POWER_STATE.get(int(fid)) or (None, 0))[0]
+    return st == POWER_STATE_IDLE or (st == POWER_STATE_VOLTAGE and int(fid) in IDLE_VOLT_NOW)
+
+
+def is_hot(fid: int, st: int | None = None) -> bool:
+    """At ACTIVE, or a VOLTAGE that is not an IDLE."""
+    if st is None:
+        st = (LAST_POWER_STATE.get(int(fid)) or (None, 0))[0]
+    return st == POWER_STATE_ACTIVE or (st == POWER_STATE_VOLTAGE
+                                        and int(fid) not in IDLE_VOLT_NOW)
+
+
 # Timed ACTIVE: FID -> (monotonic deadline, IDLE mA to return to). Set by the
 # state endpoints when an ACTIVE command carries active_s; the deadline loop
 # walks the filament back to IDLE when it passes. ANY later state command for
@@ -330,12 +376,22 @@ WARM_AFTER_ACTIVE_S = 30.0
 IDLE_SINCE: dict[int, float] = {}
 
 
-def note_active_transition(fid: int, old_state, new_state: int, when: float) -> None:
-    """Record leaving ACTIVE and entering IDLE. Caller holds _SAFETY_LOCK."""
-    if old_state == POWER_STATE_ACTIVE and int(new_state) != POWER_STATE_ACTIVE:
+def note_active_transition(fid: int, old_state, new_state: int, when: float,
+                           old_idle_v: bool = False, new_idle_v: bool = False) -> None:
+    """Record leaving ACTIVE and entering IDLE. Caller holds _SAFETY_LOCK.
+    *_idle_v: that VOLTAGE is a voltage IDLE -- an IDLE here, not heating. A
+    switch between CC IDLE and voltage IDLE stays one IDLE (the filament did
+    not cool), so it keeps IDLE_SINCE; leaving a heating VOLTAGE counts like
+    leaving ACTIVE."""
+    old_idle = old_state == POWER_STATE_IDLE or (old_state == POWER_STATE_VOLTAGE and old_idle_v)
+    new_idle = int(new_state) == POWER_STATE_IDLE or (int(new_state) == POWER_STATE_VOLTAGE
+                                                      and new_idle_v)
+    old_hot = old_state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE) and not old_idle
+    new_hot = int(new_state) in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE) and not new_idle
+    if old_hot and not new_hot:
         LAST_ACTIVE_LEFT[int(fid)] = when
-    if int(new_state) == POWER_STATE_IDLE:
-        if old_state != POWER_STATE_IDLE or int(fid) not in IDLE_SINCE:
+    if new_idle:
+        if not old_idle or int(fid) not in IDLE_SINCE:
             IDLE_SINCE[int(fid)] = when
     else:
         IDLE_SINCE.pop(int(fid), None)
@@ -366,27 +422,39 @@ def owned_filaments(owner: str) -> list[int]:
         return [f for f, o in POWER_OWNER.items() if o == owner]
 
 
-def note_power_state(fids, state: int, args=None) -> None:
+def note_power_state(fids, state: int, args=None, idle_v: bool = False) -> None:
     """Record CONFIRMED power-state commands. `args`: the mA each FID was given
     ({fid: mA}, or one number for all) -- kept for IDLE, as a timed ACTIVE's
-    default return current."""
+    default return current. idle_v: `state` is the firmware VOLTAGE(6) that
+    holds a voltage IDLE, and `args` are its mV."""
     now = time.monotonic()
     owner = request_owner()
+    idle_v = bool(idle_v) and int(state) == POWER_STATE_VOLTAGE
     with _SAFETY_LOCK:
         for f in fids:
             if owner:
                 POWER_OWNER[int(f)] = owner
             prev = LAST_POWER_STATE.get(int(f))
-            note_active_transition(int(f), prev[0] if prev else None, int(state), now)
-            if int(state) in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE) or \
-                    (prev and prev[0] in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE)):
+            was_idle_v = int(f) in IDLE_VOLT_NOW
+            note_active_transition(int(f), prev[0] if prev else None, int(state), now,
+                                   old_idle_v=was_idle_v, new_idle_v=idle_v)
+            if (not idle_v and int(state) in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE)) or \
+                    (prev and is_hot(int(f), prev[0])):
                 _LAST_HOT[int(f)] = now
             LAST_POWER_STATE[int(f)] = (int(state), now)
             ACTIVE_DEADLINES.pop(int(f), None)
-            if int(state) == POWER_STATE_IDLE and args is not None:
+            a = None
+            if args is not None:
                 a = args.get(int(f)) if isinstance(args, dict) else args
+            if idle_v:
                 if a is not None:
+                    IDLE_VOLT_NOW[int(f)] = int(a)
+                    LAST_IDLE[int(f)] = IdleMv(int(a))
+            else:
+                IDLE_VOLT_NOW.pop(int(f), None)
+                if int(state) == POWER_STATE_IDLE and a is not None:
                     LAST_IDLE_MA[int(f)] = int(a)
+                    LAST_IDLE[int(f)] = int(a)
     # Every power-state COMMAND funnels through here, which makes it the one
     # place the dead-man timer has to be renewed from. Reads do not reach it.
     safety_touch_filaments(fids, now)
@@ -394,11 +462,13 @@ def note_power_state(fids, state: int, args=None) -> None:
 
 def set_active_deadlines(fids, active_s: float, idle_ma: dict) -> None:
     """Start the timed-ACTIVE clock for FIDs that just LANDED at ACTIVE. Call
-    after note_power_state (which clears any previous deadline)."""
+    after note_power_state (which clears any previous deadline). idle_ma values:
+    int = back to that IDLE current, IdleMv = back to that IDLE voltage."""
     until = time.monotonic() + float(active_s)
     with _SAFETY_LOCK:
         for f in fids:
-            ACTIVE_DEADLINES[int(f)] = (until, int(idle_ma[int(f)]))
+            b = idle_ma[int(f)]
+            ACTIVE_DEADLINES[int(f)] = (until, b if isinstance(b, IdleMv) else int(b))
 
 
 # A filament held at IDLE this long, whose measured current is within
@@ -429,22 +499,25 @@ def ladder_blocks_active(fid: int, arrival: str | None = None,
                 "connect, or the controller reconnected) — run the ladder "
                 "STOP→SLEEP→STANDBY→IDLE first")
     st, when = known
-    if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
+    idle_v = st == POWER_STATE_VOLTAGE and int(fid) in IDLE_VOLT_NOW
+    if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE) and not idle_v:
         # Re-commanding while already hot: both are only reachable from a
         # settled IDLE (this guard), so the filament is warm. scan_view
         # pre-heats the next filaments to VOLTAGE and their own
         # fire_single_pulse then sets VOLTAGE again.
         return None
-    if st != POWER_STATE_IDLE:
+    if st != POWER_STATE_IDLE and not idle_v:
         return (f"currently at {power_state_name(st)}; ACTIVE may only be entered "
                 f"from IDLE(4) — going straight to firing current damages the "
                 f"filament, and in vacuum that is unrepairable. Ladder: "
                 f"STOP→SLEEP→STANDBY→IDLE→(settle)→ACTIVE")
     if not arrival_known:
         return None          # older firmware reports no arrival: state-only check
+    held_s = time.monotonic() - IDLE_SINCE.get(int(fid), when)
+    if idle_v:
+        return _idle_v_not_warm(int(fid), arrival, current_ma, held_s)
     if arrival == "settled":
         return None
-    held_s = time.monotonic() - IDLE_SINCE.get(int(fid), when)
     # "ramping" is not only "still warming up". The firmware clears its
     # settled flag whenever the current drifts more than 60 mA off target
     # (kCurrentLoopReengageBandMa) and only sets it again after 4 flat reads --
@@ -473,6 +546,33 @@ def ladder_blocks_active(fid: int, arrival: str | None = None,
             f"{IDLE_WARM_HOLD_S:.0f} s at IDLE within "
             f"{IDLE_WARM_TOL_MA} mA of target — promoting an unwarmed filament "
             f"to firing current is what this guard prevents")
+
+
+def _idle_v_not_warm(fid: int, arrival, current_ma, held_s: float) -> str | None:
+    """ladder_blocks_active for a voltage IDLE. Its voltage arrives in a second
+    or two whatever the filament's temperature, so arrival alone is not
+    warmth: the voltage must have arrived, be held IDLE_V_WARM_HOLD_S (the
+    time counts from entering IDLE in either mode -- a switch from a warm CC
+    IDLE is already warm), and the current must show a filament (an open one
+    arrives at its voltage with nothing flowing). Just down from heating
+    (WARM_AFTER_ACTIVE_S) it is warm if the current is there."""
+    ent = IDLE_MV_TABLE.get(int(fid)) or {}
+    min_ma = (IDLE_V_MIN_FRAC * float(ent["mA"])) if ent.get("mA") else IDLE_V_MIN_MA
+    mv = IDLE_VOLT_NOW.get(int(fid))
+    cur_ok = current_ma is not None and float(current_ma) >= min_ma
+    left = LAST_ACTIVE_LEFT.get(int(fid))
+    if cur_ok and left is not None and time.monotonic() - left <= WARM_AFTER_ACTIVE_S \
+            and arrival != "capped":
+        return None
+    if cur_ok and arrival in ("settled", "settling") and held_s >= IDLE_V_WARM_HOLD_S:
+        return None
+    meas = (f"measured {current_ma:.0f} mA (needs >= {min_ma:.0f})"
+            if current_ma is not None else "no current reading")
+    return (f"not warm yet: at voltage IDLE {mv} mV for {held_s:.0f} s, voltage loop "
+            f"'{arrival}', {meas}. ACTIVE is allowed once the voltage has arrived, "
+            f"{IDLE_V_WARM_HOLD_S:.0f} s at IDLE have passed and the current shows a "
+            f"filament — promoting an unwarmed filament to firing current is what "
+            f"this guard prevents")
 
 
 def _with_dead_stopped(out: dict, stopped: dict) -> dict:
@@ -511,6 +611,9 @@ __all__ = [
     "DEFAULT_GROUP_SIZE", "ENERGISING_STATES", "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT",
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
+    "IdleMv", "IDLE_VOLT_NOW", "LAST_IDLE", "IDLE_MV_TABLE", "IDLE_V_CEILING_MV",
+    "IDLE_V_WARM_HOLD_S", "IDLE_V_MIN_FRAC", "IDLE_V_MIN_MA", "is_idle", "is_hot",
+    "_idle_v_not_warm",
     "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "IDLE_SINCE", "IDLE_WARM_HOLD_S", "IDLE_WARM_TOL_FRAC", "IDLE_WARM_TOL_MA", "LAST_ACTIVE_LEFT", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",
     "LOG_DIR", "NO_FILAMENT", "PING_PAYLOAD", "PING_TYPE", "LINK_SILENT_S", "MONITOR_YIELD_S", "WIFI_DIAG_PERIOD_S", "POLL_PAUSE_MAX_S",
     "POWER_SLOTS", "POWER_STATE_ACTIVE", "POWER_STATE_IDLE", "POWER_STATE_NAMES",

@@ -1386,7 +1386,9 @@ def safety_snapshot() -> dict:
     # beside it so nothing downstream has to own a copy of the table.
     cfg["active_fallback_name"] = power_state_name(cfg["active_fallback"])
     with _SAFETY_LOCK:
-        timed = {str(f): {"in_s": round(max(0.0, d - now), 1), "then_idle_ma": ma}
+        timed = {str(f): {"in_s": round(max(0.0, d - now), 1),
+                          **({"then_idle_mv": int(ma)} if isinstance(ma, IdleMv)
+                             else {"then_idle_ma": ma})}
                  for f, (d, ma) in sorted(ACTIVE_DEADLINES.items())}
     return {"ok": True, **cfg,
             "timed_active": timed,
@@ -1539,10 +1541,16 @@ def _parse_timed_active(body: dict, state: int, filaments,
     defaulted: a timed ACTIVE with nowhere to go back to is not done.
     """
     raw_s, raw_ma = body.get("active_s"), body.get("then_idle_ma")
+    raw_mv, raw_v = body.get("then_idle_mv"), body.get("then_idle_voltage")
     if raw_s is None:
-        if raw_ma is not None:
-            return None, "then_idle_ma needs active_s (it is what a TIMED ACTIVE returns to)"
+        for k, v in (("then_idle_ma", raw_ma), ("then_idle_mv", raw_mv),
+                     ("then_idle_voltage", raw_v)):
+            if v is not None and v is not False:
+                return None, f"{k} needs active_s (it is what a TIMED ACTIVE returns to)"
         return None, None
+    if sum(v is not None and v is not False for v in (raw_ma, raw_mv, raw_v)) > 1:
+        return None, ("give one of then_idle_ma (CC IDLE), then_idle_mv or "
+                      "then_idle_voltage (voltage IDLE), not several")
     if int(state) == POWER_STATE_VOLTAGE and not allow_voltage:
         return None, ("a timed VOLTAGE(6) is single-filament only -- use "
                       "/api/filament-state per filament")
@@ -1566,13 +1574,40 @@ def _parse_timed_active(body: dict, state: int, filaments,
         if not (0 < ma <= IDLE_CEILING_MA):
             return None, f"then_idle_ma {ma} out of range 1..{IDLE_CEILING_MA} mA"
         return {"active_s": active_s, "idle_ma": {f: ma for f in fids}}, None
+    if raw_mv is not None:
+        try:
+            mv = int(raw_mv)
+        except (TypeError, ValueError):
+            return None, f"then_idle_mv must be a number of mV, got {raw_mv!r}"
+        if not (TPS_MIN_OUTPUT_MV <= mv <= IDLE_V_CEILING_MV):
+            return None, (f"then_idle_mv {mv} out of range {TPS_MIN_OUTPUT_MV}.."
+                          f"{IDLE_V_CEILING_MV} mV (the voltage IDLE ceiling)")
+        return {"active_s": active_s, "idle_ma": {f: IdleMv(mv) for f in fids}}, None
+    if raw_v:
+        back, err = idle_mv_for(fids)
+        if err:
+            return None, err
+        return {"active_s": active_s, "idle_ma": back}, None
     with _SAFETY_LOCK:
-        known = {f: LAST_IDLE_MA.get(f) for f in fids}
+        known = {f: LAST_IDLE.get(f) or LAST_IDLE_MA.get(f) for f in fids}
     missing = [f for f, v in known.items() if not v]
     if missing:
-        return None, (f"no IDLE current known for filament(s) {missing} -- pass "
-                      f"then_idle_ma (the IDLE current to return to after active_s)")
+        return None, (f"no IDLE current known for filament(s) {missing} (nor an IDLE "
+                      f"voltage) -- pass then_idle_ma (CC IDLE) or then_idle_voltage "
+                      f"(voltage IDLE): what to return to after active_s")
     return {"active_s": active_s, "idle_ma": known}, None
+
+
+def idle_mv_for(fids) -> tuple[dict | None, str | None]:
+    """({fid: IdleMv}, None) from the IDLE voltage table, or (None, why) naming
+    every filament that has none -- never a guessed voltage."""
+    with _SAFETY_LOCK:
+        got = {int(f): (IDLE_MV_TABLE.get(int(f)) or {}).get("mV") for f in fids}
+    missing = sorted(f for f, v in got.items() if not v)
+    if missing:
+        return None, (f"no IDLE voltage known for filament(s) {missing} -- learn it at "
+                      f"their CC IDLE (POST /api/idle-voltage {{\"learn\": true}}) or set it")
+    return {f: IdleMv(int(v)) for f, v in got.items()}, None
 
 
 def _active_deadline_loop() -> None:
@@ -1590,9 +1625,7 @@ def _active_deadline_loop() -> None:
                 continue
             # No longer ACTIVE (or no board): nothing to walk back.
             gone = [f for f in due
-                    if LAST_POWER_STATE.get(f, (None, 0.0))[0] not in (POWER_STATE_ACTIVE,
-                                                                       POWER_STATE_VOLTAGE)
-                    or filament_to_board(f)[0] is None]
+                    if not is_hot(f) or filament_to_board(f)[0] is None]
             if gone:
                 with _SAFETY_LOCK:
                     for f in gone:
@@ -1615,16 +1648,20 @@ def _active_deadline_loop() -> None:
                     deferred_logged = True
                 continue
             deferred_logged = False
-            by_ctrl: dict[int, dict[int, int]] = {}
+            # Per controller and IDLE mode: a CC IDLE (mA) and a voltage IDLE
+            # (IdleMv) are different frames.
+            by_ctrl: dict[tuple, dict[int, int]] = {}
             for f, (_d, ma) in due.items():
-                by_ctrl.setdefault(int(filament_to_board(f)[0]), {})[f] = ma
-            for c0, group in by_ctrl.items():
+                by_ctrl.setdefault((int(filament_to_board(f)[0]), isinstance(ma, IdleMv)),
+                                   {})[f] = ma
+            for (c0, idle_v), group in by_ctrl.items():
                 link = CONTROLLERS.get(c0 + 1)
                 landed, err = [], None
                 if link and link.client.connected:
                     try:
                         r = prep_filaments(link, c0, POWER_STATE_IDLE, list(group),
-                                           currents=group, default_arg=0)
+                                           currents={f: int(v) for f, v in group.items()},
+                                           default_arg=0, idle_v=idle_v)
                         landed = [int(f) for f in (r.get("landed") or [])]
                     except Exception as exc:
                         err = str(exc)
@@ -1636,7 +1673,8 @@ def _active_deadline_loop() -> None:
                         if f in ACTIVE_DEADLINES:
                             ACTIVE_DEADLINES[f] = (now + ACTIVE_DEADLINE_RETRY_S, group[f])
                 _safety_record("timed_active_to_idle" if not left else "timed_active_to_idle_failed",
-                               {"controller": c0 + 1, "to_idle": {str(f): group[f] for f in landed},
+                               {"controller": c0 + 1, "to_idle": {str(f): int(group[f]) for f in landed},
+                                "idle_mode": "voltage" if idle_v else "current",
                                 "retrying": left, **({"error": err} if err else {})})
         except Exception as exc:          # never let it die
             log.exception("timed-active tick failed: %s", exc)
@@ -1662,6 +1700,11 @@ def _annotate_board_rows(cid: int, rows: list) -> None:
         r["power_state"] = int(st) if st else None
         r["power_state_name"] = POWER_STATE_NAMES.get(int(st)) if st else None
         r["power_state_src"] = src
+        # The firmware says VOLTAGE for a voltage IDLE; this backend knows which.
+        r["idle_voltage"] = bool(fid is not None and st == POWER_STATE_VOLTAGE
+                                 and fid in IDLE_VOLT_NOW)
+        if r["idle_voltage"]:
+            r["power_state_name"] = "IDLE(V)"
 
 
 def _raw_cmd_targets(cid: int, body: dict) -> list[tuple[int, int, int | None]]:
@@ -2355,11 +2398,17 @@ def download_to_controller(link: "ControllerLink", controller: int, plan: dict,
 # ---------------------------------------------------------------------------
 def prep_filaments(link: "ControllerLink", controller: int, state: int,
                    filaments=None, currents=None, default_arg: int = 0,
-                   channels=DEFAULT_CHANNELS, allow_dead: bool = False) -> dict:
+                   channels=DEFAULT_CHANNELS, allow_dead: bool = False,
+                   idle_v: bool = False) -> dict:
     """Apply CH_SET_POWER_STATE to a set of this controller's filaments. `filaments`
     is a FID 0-95 list (only this controller's are touched); None = every
     populated board the controller owns. `currents` maps FID→mA for the
     Idle/Active arg (falls back to default_arg).
+
+    idle_v (state IDLE only): IDLE in voltage mode -- each filament's IDLE
+    voltage (`currents` as mV, else the IDLE voltage table), sent as the
+    firmware's VOLTAGE(6) and recorded as a voltage IDLE. A filament with no
+    IDLE voltage, or one over IDLE_V_CEILING_MV, is refused and named.
 
     Dead filaments are dropped here and returned in "dead_skipped". This is the
     enforcement point for the whole batch path BECAUSE it is where `None`
@@ -2447,7 +2496,32 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # that was asked for would never finish with nothing saying why. Per
     # filament, since `currents` can carry an override that the batch default
     # does not show.
-    if int(state) == POWER_STATE_IDLE:
+    idle_v = bool(idle_v) and int(state) == POWER_STATE_IDLE
+    if idle_v:
+        # mV per filament: an explicit one, else the table. Never a default:
+        # a voltage nobody chose for this filament is not an IDLE.
+        mvs: dict[int, int] = {}
+        for f in fils:
+            v = currents.get(f, currents.get(str(f)))
+            if v is None:
+                v = (IDLE_MV_TABLE.get(int(f)) or {}).get("mV")
+            if not v:
+                ladder_reasons[str(int(f))] = ("no IDLE voltage known -- learn it at its CC "
+                                               "IDLE (POST /api/idle-voltage {\"learn\": true}) "
+                                               "or set it")
+            elif not (TPS_MIN_OUTPUT_MV <= int(v) <= IDLE_V_CEILING_MV):
+                ladder_reasons[str(int(f))] = (f"IDLE {int(v)} mV out of range "
+                                               f"{TPS_MIN_OUTPUT_MV}..{IDLE_V_CEILING_MV} mV "
+                                               f"(the voltage IDLE ceiling)")
+            else:
+                mvs[int(f)] = int(v)
+                continue
+            ladder_blocked.append(int(f))
+        if ladder_blocked:
+            log.warning("prep_filaments: refused voltage IDLE for %s", ladder_blocked)
+        fils = [f for f in fils if int(f) in mvs]
+        currents = mvs
+    if int(state) == POWER_STATE_IDLE and not idle_v:
         over = []
         for f in fils:
             ma = int(currents.get(f, currents.get(str(f), default_arg)) or 0)
@@ -2528,8 +2602,9 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         m[ch] = (m[ch] | (1 << pos)) & 0xFF
         members.setdefault(arg, []).append(f)
     reqs, keys = [], []
+    wire_state = POWER_STATE_VOLTAGE if idle_v else int(state)
     for arg, m in groups.items():
-        reqs.append((CH_SET_POWER_STATE, bytes(m) + bytes([int(state) & 0xFF]) + _u16(arg), 0))
+        reqs.append((CH_SET_POWER_STATE, bytes(m) + bytes([int(wire_state) & 0xFF]) + _u16(arg), 0))
         keys.append(arg)
     # Few frames (<=8, one per channel) and each is ~instant on the RP2350, so send
     # them serially via the reliable single-request path. _pipeline_reliable's
@@ -2559,7 +2634,7 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
     # Record only what the firmware CONFIRMED it applied. Recording the intent
     # would let a failed write leave the backend believing a filament is at
     # IDLE, which is exactly the belief the ACTIVE guard depends on.
-    note_power_state(landed, state, landed_args)
+    note_power_state(landed, wire_state, landed_args, idle_v=idle_v)
     # A filament the guards refused (ladder_blocked) was asked for and not
     # done, the same as a failed one. It used to leave ok True: an
     # idle_all(default_ma=2500) refused every filament at the 2000 mA ceiling
@@ -2569,6 +2644,8 @@ def prep_filaments(link: "ControllerLink", controller: int, state: int,
         {"controller": controller,
          "ok": not failed and not unslotted and not ladder_blocked, "applied": applied,
          "total": len(fils), "failed": failed, "state": int(state),
+         **({"idle_voltage": True, "idle_mv": {str(f): landed_args[f] for f in landed}}
+            if idle_v else {}),
          "landed": landed, "touched": fils, "not_this_controller": not_this_controller,
          "unslotted": unslotted, "dead_skipped": dead_skipped,
          "ladder_blocked": ladder_blocked, "ladder_reasons": ladder_reasons},
@@ -3252,7 +3329,7 @@ def _hv_guard_stop_hot(now: float, recent_s: float = None) -> list[int]:
     recent_s = HV_GUARD_STOP_RECENT_S if recent_s is None else recent_s
     with _SAFETY_LOCK:
         hot_now = {int(f) for f, (st, _w) in LAST_POWER_STATE.items()
-                   if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE)}
+                   if is_hot(f, st)}
         recent = {f for f, t in _LAST_HOT.items() if now - t <= recent_s}
     stop = sorted(hot_now | recent)
     if stop:
@@ -3490,7 +3567,7 @@ def _hv_guard_suspects(now: float) -> list[int]:
     """Filaments hot right now first, then the recently hot, most recent first."""
     with _SAFETY_LOCK:
         hot_now = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
-                         if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+                         if is_hot(f, st))
         hot = sorted(((t, f) for f, t in _LAST_HOT.items() if now - t <= HV_GUARD_HOT_RECENT_S),
                      reverse=True)
     return hot_now + [f for _, f in hot if f not in hot_now]
@@ -3714,7 +3791,7 @@ def _spellman_events(events: list, now: float) -> None:
         if ev["kind"] in ("arc", "big_arc", "hv_off", "status", "system_fault"):
             with _SAFETY_LOCK:
                 ev["hot"] = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
-                                   if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+                                   if is_hot(f, st))
             with _SIM_LOCK:
                 ev["sim_running"] = bool(_SIM_STATE.get("running"))
             try:
@@ -4428,13 +4505,13 @@ def drop_hot_to_idle(now: float) -> tuple[list, list]:
     timed-ACTIVE loop does the write), SLEEP if no IDLE current is known.
     IDLE, not lower: IDLE keeps the vacuum (the rig's rule)."""
     with _SAFETY_LOCK:
-        hot = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
-                     if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+        hot = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items() if is_hot(f, st))
         to_idle, no_idle = [], []
         for f in hot:
-            ma = (ACTIVE_DEADLINES.get(f) or (None, LAST_IDLE_MA.get(f)))[1]
+            ma = (ACTIVE_DEADLINES.get(f) or (None, LAST_IDLE.get(f) or LAST_IDLE_MA.get(f)))[1]
             if ma:
-                ACTIVE_DEADLINES[f] = (now, int(ma))    # the timed-ACTIVE loop takes it to IDLE now
+                # The timed-ACTIVE loop takes it to IDLE now (its own mode).
+                ACTIVE_DEADLINES[f] = (now, ma if isinstance(ma, IdleMv) else int(ma))
                 to_idle.append(f)
             else:
                 no_idle.append(f)
@@ -4450,7 +4527,7 @@ def _wait_not_hot(timeout_s: float = 3.0) -> list:
     while True:
         with _SAFETY_LOCK:
             hot = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
-                         if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+                         if is_hot(f, st))
         if not hot or time.monotonic() - t0 >= timeout_s:
             return hot
         time.sleep(0.1)
@@ -4542,7 +4619,7 @@ def _tail_on_train_start(now: float) -> None:
     """Called when a sim train starts: the baseline and who is firing."""
     with _SAFETY_LOCK:
         firing = sorted(int(f) for f, (st, _w) in LAST_POWER_STATE.items()
-                        if st in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE))
+                        if is_hot(f, st))
     pre = [m for t, m, _f in _HVG_HIST if now - t <= 10.0]
     with _SPELL_LOCK:
         spre = [m for t, m in _SPELL_MA_HIST if now - 6.0 <= t <= now]
@@ -5108,6 +5185,8 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json(vacuum_snapshot())
         elif path == "/api/radiation":
             self._json(radiation_snapshot())
+        elif path == "/api/idle-voltage":
+            self._json(idle_voltage_snapshot())
         elif path == "/api/hv-guard":
             snap = hv_guard_snapshot()
             link = CONTROLLERS.get(MASTER)
@@ -6396,6 +6475,21 @@ class CtHandler(BaseHTTPRequestHandler):
                         f"Power {c}: {r.get('error') or 'refused'}"
                         for c, r in sorted(results.items()) if not r.get("ok"))
                 self._json(out)
+            elif path == "/api/idle-voltage":
+                # Per-filament IDLE voltage (voltage-mode IDLE). {"learn": true,
+                # "filaments": [FID...] | absent = all}: from each filament's own
+                # voltage at its CC IDLE. {"set": {FID: mV | null}}: by hand.
+                if body.get("learn"):
+                    fl = body.get("filaments")
+                    r = idle_voltage_learn(None if fl is None else [int(f) for f in fl])
+                elif isinstance(body.get("set"), dict):
+                    r = idle_voltage_set(body["set"])
+                else:
+                    return self._json({"ok": False, "error": "give learn: true (+ filaments) "
+                                                             "or set: {filament: mV}"},
+                                      HTTPStatus.OK)
+                self._json({**r, **{k: v for k, v in idle_voltage_snapshot().items()
+                                    if k != "ok"}})
             elif path == "/api/vacuum":
                 # {"limit_torr": x}: the interlock's limit, saved (survives a
                 # restart). {"bypass_missing_s": s}: debug, let NO reading pass
@@ -6533,6 +6627,22 @@ class CtHandler(BaseHTTPRequestHandler):
                                                f"({', '.join(f'{v}={n}' for v, n in sorted(POWER_STATE_NAMES.items()))})"},
                         HTTPStatus.BAD_REQUEST)
                 arg = int(body.get("arg", 0))
+                # IDLE in voltage mode: {"state": 4, "voltage": true, "arg": mV or
+                # 0 = this filament's IDLE voltage from the table}. Sent as the
+                # firmware's VOLTAGE(6), recorded as an IDLE (see IDLE_VOLT_NOW).
+                idle_v = state == POWER_STATE_IDLE and bool(body.get("voltage"))
+                if idle_v:
+                    if arg <= 0:
+                        got, err = idle_mv_for([filament])
+                        if err:
+                            return self._json({"ok": False, "filament": filament, "error": err},
+                                              HTTPStatus.OK)
+                        arg = int(got[filament])
+                    if not (TPS_MIN_OUTPUT_MV <= arg <= IDLE_V_CEILING_MV):
+                        return self._json({"ok": False, "filament": filament, "error":
+                                           f"voltage IDLE {arg} mV out of range "
+                                           f"{TPS_MIN_OUTPUT_MV}..{IDLE_V_CEILING_MV} mV "
+                                           f"(the voltage IDLE ceiling)"}, HTTPStatus.OK)
                 # Enforcement, not just bookkeeping: ct_simple_control filters its
                 # own dead mask before calling, but the GUI, a curl, or anyone
                 # else's script does not -- and this backend would happily carry
@@ -6562,7 +6672,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # rather than a clamp: the firmware already clamps this one
                 # SILENTLY, so passing it through returns ok for a current that
                 # will never be reached.
-                if state == POWER_STATE_IDLE and arg > IDLE_CEILING_MA:
+                if state == POWER_STATE_IDLE and not idle_v and arg > IDLE_CEILING_MA:
                     return self._json({"ok": False, "above_idle_ceiling": True,
                                        "filament": filament,
                                        "idle_ceiling_mA": IDLE_CEILING_MA, "error":
@@ -6664,8 +6774,9 @@ class CtHandler(BaseHTTPRequestHandler):
                     if vr:
                         return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
                                           HTTPStatus.OK)
+                wire_state = POWER_STATE_VOLTAGE if idle_v else state
                 ft, flags, payload = build_payload("CH_SET_POWER_STATE", {
-                    "channel": ch, "mux_port": pos, "state": state, "arg": arg,
+                    "channel": ch, "mux_port": pos, "state": wire_state, "arg": arg,
                 })
                 try:
                     resp = link.client.send_request(ft, payload, flags=flags, timeout=3.0)
@@ -6674,10 +6785,12 @@ class CtHandler(BaseHTTPRequestHandler):
                 raw = resp.get("raw") if isinstance(resp, dict) else None
                 applied = bool(raw and len(raw) >= 4 and raw[3] == 1)
                 if applied:
-                    note_power_state([filament], state, {filament: arg})
+                    note_power_state([filament], wire_state, {filament: arg}, idle_v=idle_v)
                 out = {"ok": _status_ok(resp) and applied, "filament": filament,
                        "controller": cid, "channel": ch, "mux_port": pos,
                        "state": state, "arg": arg}
+                if idle_v:
+                    out["idle_voltage"], out["idle_mv"] = True, arg
                 if not out["ok"]:
                     # Without this the result had no error at all and the audit
                     # line read just "failed" (filament 11 -> IDLE, 2026-10-28).
@@ -6692,7 +6805,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 if applied and timed:
                     set_active_deadlines([filament], timed["active_s"], timed["idle_ma"])
                     out["active_s"] = timed["active_s"]
-                    out["then_idle_ma"] = timed["idle_ma"][filament]
+                    back = timed["idle_ma"][filament]
+                    out["then_idle_mv" if isinstance(back, IdleMv) else "then_idle_ma"] = int(back)
                 if dead_stopped:
                     out["dead_stopped"] = True
                     out["note"] = (f"filament {filament} is marked dead: STOPped "
@@ -6742,7 +6856,8 @@ class CtHandler(BaseHTTPRequestHandler):
                             continue
                         results[str(cid)] = prep_filaments(link, cid - 1, state, filaments,
                                                            currents, default_arg, channels,
-                                                           allow_dead=bool(body.get("allow_dead")))
+                                                           allow_dead=bool(body.get("allow_dead")),
+                                                           idle_v=bool(body.get("voltage")))
                     except Exception as exc:
                         results[str(cid)] = {"ok": False, "error": str(exc)}
                 if not results:
@@ -6777,7 +6892,12 @@ class CtHandler(BaseHTTPRequestHandler):
                     landed = [int(f) for r in results.values() for f in (r.get("landed") or [])]
                     set_active_deadlines(landed, timed["active_s"], timed["idle_ma"])
                     out["active_s"] = timed["active_s"]
-                    out["then_idle_ma"] = {str(f): timed["idle_ma"][f] for f in landed}
+                    backs = {f: timed["idle_ma"][f] for f in landed}
+                    out["then_idle_ma"] = {str(f): int(b) for f, b in backs.items()
+                                           if not isinstance(b, IdleMv)}
+                    mv_backs = {str(f): int(b) for f, b in backs.items() if isinstance(b, IdleMv)}
+                    if mv_backs:
+                        out["then_idle_mv"] = mv_backs
                 if blocked:
                     out["ladder_blocked"] = blocked
                 # One readable sentence for people (the lists stay for programs);
@@ -8087,6 +8207,158 @@ def _vcap_check_one(link) -> dict:
     ft, flags, payload = build_payload("CH_VOLTAGE_CAP", {"millivolts": VCAP_WANT["mv"]})
     after = _vcap_decode(link.client.send_request(ft, payload, flags=flags, timeout=2.0))
     return {"before": cur["mv"], "after": after and after["mv"]}
+
+
+# ── Per-filament IDLE voltage (voltage-mode IDLE) ──────────────────────────
+# What each filament's voltage IDLE holds, in mV. Learned from the filament's
+# own load voltage at its CC IDLE (1200 mA on 2026-11-02: 2.1-2.9 V), or set by
+# hand; saved, so it survives a restart. FID keys. See IDLE_MV_TABLE.
+IDLE_MV_STATE_PATH = STATE_DIR / "idle_voltage.json"
+IDLE_LEARN_SAMPLES = 6           # monitor reads per learn ...
+IDLE_LEARN_GAP_S = 0.5           # ... this far apart
+IDLE_LEARN_MIN_GOOD = 4          # in-band reads needed to learn a filament
+
+
+def _idle_mv_load() -> None:
+    try:
+        d = json.loads(IDLE_MV_STATE_PATH.read_text())
+        got = {int(f): dict(v) for f, v in (d.get("filaments") or {}).items()
+               if isinstance(v, dict) and v.get("mV")}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return
+    with _SAFETY_LOCK:
+        IDLE_MV_TABLE.clear()
+        IDLE_MV_TABLE.update(got)
+
+
+def _idle_mv_save() -> str | None:
+    with _SAFETY_LOCK:
+        d = {str(f): v for f, v in sorted(IDLE_MV_TABLE.items())}
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        IDLE_MV_STATE_PATH.write_text(json.dumps({"filaments": d}, indent=1))
+        return None
+    except OSError as exc:
+        log.warning("IDLE voltages not saved (%s) -- they hold until the backend restarts", exc)
+        return str(exc)
+
+
+_idle_mv_load()
+
+
+def idle_voltage_snapshot() -> dict:
+    with _SAFETY_LOCK:
+        table = {str(f): dict(v) for f, v in sorted(IDLE_MV_TABLE.items())}
+        now_v = {str(f): mv for f, mv in sorted(IDLE_VOLT_NOW.items())}
+    return {"ok": True, "filaments": table, "at_voltage_idle": now_v,
+            "ceiling_mV": IDLE_V_CEILING_MV}
+
+
+def idle_voltage_learn(fids=None) -> dict:
+    """Learn each filament's IDLE voltage from its own load voltage while it
+    holds its CC IDLE: IDLE_LEARN_SAMPLES monitor reads, kept only where the
+    firmware says IDLE, this backend commanded that CC IDLE, and the current is
+    within IDLE_WARM_TOL_MA (or _FRAC) of the target; the median voltage of at
+    least IDLE_LEARN_MIN_GOOD such reads. Everything else is named with why."""
+    want = None if fids is None else {int(f) for f in fids}
+    samples: dict[int, list] = {}
+    for k in range(IDLE_LEARN_SAMPLES):
+        if k:
+            time.sleep(IDLE_LEARN_GAP_S)
+        for cid, link in CONTROLLERS.items():
+            if not link.client.connected:
+                continue
+            rows, meta = monitor_board_rows(cid)
+            if not meta.get("fresh"):
+                continue
+            for r in rows:
+                f = MAPPING.filament_for_board(cid - 1, r["channel"], r["mux_port"])
+                if f is None or (want is not None and int(f) not in want):
+                    continue
+                samples.setdefault(int(f), []).append(
+                    (r.get("power_state"), r.get("bus_mV"), r.get("current_mA")))
+    learned, skipped = {}, {}
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    # The IDLE current each one regulates to: what this backend commanded, or
+    # -- after a backend restart, when it has commanded nothing yet -- the
+    # firmware's own CC target (one bulk 0x3A per controller, no I2C).
+    fw_target: dict[int, int] = {}
+    for cid, link in CONTROLLERS.items():
+        if link.client.connected:
+            try:
+                for ff, ent in (read_cached_telemetry(link, cid - 1) or {}).items():
+                    if ent.get("cc_mode") == 1 and ent.get("target_mA"):
+                        fw_target[int(ff)] = int(ent["target_mA"])
+            except Exception:
+                pass
+    for f in sorted(want if want is not None else samples):
+        with _SAFETY_LOCK:
+            st = (LAST_POWER_STATE.get(f) or (None, 0))[0]
+            target = LAST_IDLE_MA.get(f) if st == POWER_STATE_IDLE else None
+        if f in dead_fids():
+            skipped[str(f)] = "marked dead"
+            continue
+        if st is not None and st != POWER_STATE_IDLE:
+            skipped[str(f)] = f"not at a CC IDLE (at {power_state_name(st)})"
+            continue
+        target = target or fw_target.get(f)
+        if not target:
+            skipped[str(f)] = "no CC IDLE target known (not regulating a current)"
+            continue
+        tol = max(IDLE_WARM_TOL_MA, IDLE_WARM_TOL_FRAC * float(target))
+        good = [(mv, ma) for ps, mv, ma in samples.get(f, [])
+                if ps == POWER_STATE_IDLE and mv and ma is not None
+                and abs(float(ma) - float(target)) <= tol]
+        if len(good) < IDLE_LEARN_MIN_GOOD:
+            seen = [(mv, ma) for _ps, mv, ma in samples.get(f, [])][-3:]
+            skipped[str(f)] = (f"only {len(good)} of {IDLE_LEARN_SAMPLES} reads at IDLE within "
+                               f"{tol:.0f} mA of {target} mA (last reads mV/mA: {seen})")
+            continue
+        mvs = sorted(int(mv) for mv, _ in good)
+        mv = mvs[len(mvs) // 2]
+        if not (TPS_MIN_OUTPUT_MV <= mv <= IDLE_V_CEILING_MV):
+            skipped[str(f)] = f"{mv} mV is outside {TPS_MIN_OUTPUT_MV}..{IDLE_V_CEILING_MV} mV"
+            continue
+        ent = {"mV": mv, "mA": round(sum(float(a) for _, a in good) / len(good)),
+               "at_mA": int(target), "learned": stamp,
+               "spread_mV": mvs[-1] - mvs[0]}
+        learned[str(f)] = ent
+    with _SAFETY_LOCK:
+        for f, ent in learned.items():
+            IDLE_MV_TABLE[int(f)] = ent
+    err = _idle_mv_save() if learned else None
+    out = {"ok": bool(learned) and not err, "learned": learned, "skipped": skipped}
+    if err:
+        out["error"] = f"learned but not saved: {err}"
+    elif not learned:
+        out["error"] = "nothing learned -- every filament asked for was skipped (see skipped)"
+    return out
+
+
+def idle_voltage_set(values: dict) -> dict:
+    """{fid: mV} by hand (None removes the filament's entry)."""
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    bad = {}
+    for f, v in values.items():
+        if v is None:
+            continue
+        try:
+            mv = int(v)
+        except (TypeError, ValueError):
+            bad[str(f)] = f"not a number of mV: {v!r}"
+            continue
+        if not (TPS_MIN_OUTPUT_MV <= mv <= IDLE_V_CEILING_MV):
+            bad[str(f)] = f"{mv} mV out of range {TPS_MIN_OUTPUT_MV}..{IDLE_V_CEILING_MV}"
+    if bad:
+        return {"ok": False, "error": "nothing set: " + "; ".join(f"{f}: {w}" for f, w in bad.items())}
+    with _SAFETY_LOCK:
+        for f, v in values.items():
+            if v is None:
+                IDLE_MV_TABLE.pop(int(f), None)
+            else:
+                IDLE_MV_TABLE[int(f)] = {"mV": int(v), "set": stamp}
+    err = _idle_mv_save()
+    return {"ok": not err, **({"error": f"set but not saved: {err}"} if err else {})}
 
 
 # ── Per-channel I2C clock kept at the rig's setting ─────────────────────────

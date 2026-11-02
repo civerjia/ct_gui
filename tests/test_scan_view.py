@@ -161,6 +161,11 @@ def make(rig: Rig):
                 "current_mA": 2000, "cc_mode": 3 if u in rig.fault_cc else 0}}}
         if path.startswith("/api/filament-perf"):
             return {"ok": True, "filaments": {}}
+        if path == "/api/idle-voltage":
+            # The backend's table: keyed by FID, like everything on the wire.
+            return {"ok": True, "filaments": {
+                str(ORDER[u]): {"mV": 2400 + u} for u in range(96)
+                if u not in getattr(rig, "no_idle_v", ())}}
         if path.startswith("/api/board-snapshot?controller="):
             c = int(path.rsplit("=", 1)[1])
             return {"ok": True, "boards": [
@@ -225,6 +230,10 @@ def make(rig: Rig):
             rig.log.append(("sleep", u))
             return {"ok": True}
         rig.log.append(("state", u, state, arg))
+        # How it asked to get back to IDLE: the voltage IDLE, never a CC current.
+        rig.idle_how = getattr(rig, "idle_how", []) + [(u, state, bool(body.get("voltage")),
+                                                         body.get("then_idle_voltage"),
+                                                         body.get("then_idle_ma"))]
         if state == VOLTAGE:
             rig.raised[u] = Clock.t
         else:
@@ -316,6 +325,14 @@ check("11 waited its turn hot (waited_s > 0), no new wait after 10",
       r["rows"][1]["waited_s"] > 0 and r["rows"][1]["gap_s"] < 0.5, r["rows"][1])
 check("ok, all fired 3/3, nothing hot at the end",
       r["ok"] and r["fired"] == 3 and not rig.raised and all(x["fired"] == 3 for x in r["rows"]), r)
+check("every IDLE is a voltage IDLE (arg 0 = its own), no CC current anywhere",
+      all(v and ma is None for u, st, v, tv, ma in rig.idle_how if st == IDLE)
+      and all(e[3] == 0 for e in rig.log if e[0] == "state" and e[2] == IDLE)
+      and len([1 for x in rig.idle_how if x[1] == IDLE]) == 3, rig.idle_how)
+check("every raise returns to the voltage IDLE (then_idle_voltage, no then_idle_ma)",
+      all(tv is True and ma is None for u, st, v, tv, ma in rig.idle_how if st == VOLTAGE)
+      and len([1 for x in rig.idle_how if x[1] == VOLTAGE]) == 3, rig.idle_how)
+check("idle_ma given -> said it is not used", "not used" in (r.get("note_idle_ma") or ""), r)
 check("settle and max drop set, settle back to 0 at the end",
       ("settle", 1, 500, 500) in rig.log and ("settle", 1, 0, None) in rig.log)
 check("disarmed at the end",
@@ -461,6 +478,14 @@ for name, kw, want in (
     a = {**ARGS, **kw}
     r = make(rig).scan_view([60, 61], **a)
     check(f"refused: {name}", not r["ok"] and want in (r.get("error") or "") and not rig.log, r.get("error"))
+# No IDLE voltage for one filament: refused, named in YOUR numbering (filament 3
+# is FID 18 on the rig -- the table is keyed by FID).
+rig = Rig()
+rig.no_idle_v = {3}
+r = make(rig).scan_view([2, 3], **ARGS)
+check("refused: no IDLE voltage, named as 3 (not FID 18), nothing touched",
+      not r["ok"] and "[3]" in (r.get("error") or "") and "18" not in r["error"]
+      and "learn_idle_voltages" in r["error"] and not rig.log, r.get("error"))
 # --- measure: more pulses than the ESP32's 128-event ring -------------------
 FILS = list(range(20, 30))                      # 10 x 20 = 200 pulses
 rig = Rig()
@@ -614,6 +639,28 @@ check("arm refused: names the controller that refused, with the backend's reason
 rig = Rig(hv=False)
 r = make(rig).scan_view([60, 61], **ARGS)
 check("rails off at the start: not refused (operator's job)", r["ok"] and r["fired"] == 2, r.get("error"))
+
+# --- the IDLE voltage table API speaks YOUR numbering (FIDs on the wire) -------
+rig = Rig()
+ct = make(rig)
+posted = []
+ct._post = lambda path, body, timeout=None: (posted.append((path, body)) or {
+    "ok": True, "learned": {str(ORDER[3]): {"mV": 2410}}, "skipped": {str(ORDER[2]): "x"},
+    "filaments": {str(ORDER[3]): {"mV": 2410}}})
+r = ct.learn_idle_voltages([2, 3])
+check("learn_idle_voltages: FIDs on the wire, your numbers back",
+      posted[-1][1] == {"learn": True, "filaments": [ORDER[2], ORDER[3]]}
+      and list(r["learned"]) == [3] and list(r["skipped"]) == [2], (posted[-1], r))
+ct.set_idle_voltages({3: 2450, 2: None})
+check("set_idle_voltages: keyed by FID on the wire",
+      posted[-1][1] == {"set": {str(ORDER[3]): 2450, str(ORDER[2]): None}}, posted[-1])
+ct.idle_voltage_one(3)
+check("idle_voltage_one: IDLE(4), voltage, arg 0 (= its own), to its FID",
+      posted[-1] == ("/api/filament-state", {"filament": ORDER[3], "state": IDLE, "arg": 0,
+                                             "voltage": True}), posted[-1])
+r = make(Rig()).idle_voltages()
+check("idle_voltages: your numbering", r["filaments"][3]["mV"] == 2403
+      and r["filaments"][2]["mV"] == 2402, list(r["filaments"].items())[:4])
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))
 raise SystemExit(1 if FAILS else 0)

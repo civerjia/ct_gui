@@ -38,12 +38,14 @@ running = {"v": False}
 fail_next = {"v": 0}
 
 
-def fake_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None):
-    calls.append((c0, state, list(fids), dict(currents or {})))
+def fake_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None,
+              idle_v=False):
+    calls.append((c0, state, list(fids), dict(currents or {}), idle_v))
     if fail_next["v"]:
         fail_next["v"] -= 1
         return {"landed": []}
-    S.note_power_state(fids, state, currents)
+    S.note_power_state(fids, S.POWER_STATE_VOLTAGE if idle_v else state, currents,
+                       idle_v=idle_v)
     return {"landed": list(fids)}
 
 

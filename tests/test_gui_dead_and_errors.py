@@ -180,7 +180,8 @@ class _Link:
         return {}
 
 
-def _fake_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None, allow_dead=False):
+def _fake_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None, allow_dead=False,
+               idle_v=False):
     mine = [f for f in fids if board_of(f)[0] == c0]
     dead = [f for f in mine if f in S.DEAD_FIDS]
     live = [f for f in mine if f not in S.DEAD_FIDS]
@@ -207,7 +208,8 @@ check("...and the summary says it was left off on purpose",
 seen = {}
 
 
-def _spy_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None, allow_dead=False):
+def _spy_prep(link, c0, state, fids, currents=None, default_arg=0, channels=None, allow_dead=False,
+              idle_v=False):
     seen["allow_dead"] = allow_dead
     return _fake_prep(link, c0, state, fids, currents, default_arg, channels)
 

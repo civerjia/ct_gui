@@ -86,10 +86,15 @@ class _PowerMixin:
             if isinstance(row, dict) and isinstance(row.get("ladder_reasons"), dict):
                 row["ladder_reasons"] = {str(self._user_index_of(int(k))): v
                                          for k, v in row["ladder_reasons"].items()}
-        # then_idle_ma (timed ACTIVE) is keyed by FID too.
-        if isinstance(r.get("then_idle_ma"), dict):
-            r["then_idle_ma"] = {str(self._user_index_of(int(k))): v
-                                 for k, v in r["then_idle_ma"].items()}
+        # then_idle_ma / then_idle_mv (timed ACTIVE) are keyed by FID too, and
+        # so is a voltage IDLE's idle_mv.
+        for key in ("then_idle_ma", "then_idle_mv"):
+            if isinstance(r.get(key), dict):
+                r[key] = {str(self._user_index_of(int(k))): v for k, v in r[key].items()}
+        for row in (r.get("results") or {}).values():
+            if isinstance(row, dict) and isinstance(row.get("idle_mv"), dict):
+                row["idle_mv"] = {str(self._user_index_of(int(k))): v
+                                  for k, v in row["idle_mv"].items()}
         if dead_skipped:
             r["dead_skipped"] = dead_skipped
         return self._name_states(r)
@@ -322,6 +327,52 @@ class _PowerMixin:
         return (self._verify_batch(r, currents, default_ma, tolerance_ma, timeout_s)
                 if verify else r)
 
+    def idle_voltage_all(self, filaments=None) -> dict:
+        """IDLE in VOLTAGE mode, a batch (dead mask excluded): each filament at
+        its own IDLE voltage from idle_voltages() -- learn them first with
+        learn_idle_voltages(). The firmware holds a voltage (its VOLTAGE
+        state) instead of running the CC loop; the backend knows it as an
+        IDLE: the ladder guard, timed ACTIVE/VOLTAGE returns and the HV guard
+        treat it like a CC IDLE. A filament with no IDLE voltage is refused and
+        named (ladder_blocked / ladder_reasons), never given a default.
+
+            ct.learn_idle_voltages()      # once, with everything at CC IDLE
+            ct.idle_voltage_all()
+        """
+        return self._prep(IDLE, filaments, None, arg=0, extra={"voltage": True})
+
+    def idle_voltages(self) -> dict:
+        """The IDLE voltage table, in YOUR numbering: result["filaments"] =
+        {filament: {"mV", "mA" (current it was learned at), "at_mA",
+        "learned"|"set"}}, result["at_voltage_idle"] = {filament: mV} for the
+        ones holding a voltage IDLE now."""
+        r = self._get("/api/idle-voltage") or {}
+        return self._idle_voltage_users(r)
+
+    def learn_idle_voltages(self, filaments=None) -> dict:
+        """Learn each filament's IDLE voltage from its own load voltage while it
+        holds its CC IDLE (~3 s of monitor reads; median of the reads within
+        tolerance of its IDLE current). Filaments not at a settled CC IDLE are
+        listed under "skipped" with why. Saved by the backend."""
+        body: dict = {"learn": True}
+        if filaments is not None:
+            body["filaments"] = [int(self._fid_of(f)) for f in filaments]
+        r = self._post("/api/idle-voltage", body, timeout=20.0) or {}
+        return self._idle_voltage_users(r)
+
+    def set_idle_voltages(self, values: dict) -> dict:
+        """Set IDLE voltages by hand: {filament: mV} (None removes one)."""
+        body = {"set": {str(self._fid_of(int(f))): (None if v is None else int(v))
+                        for f, v in values.items()}}
+        return self._idle_voltage_users(self._post("/api/idle-voltage", body) or {})
+
+    def _idle_voltage_users(self, r: dict) -> dict:
+        for key in ("filaments", "at_voltage_idle", "learned", "skipped"):
+            if isinstance(r.get(key), dict):
+                r[key] = {int(self._user_index_of(int(k))): v for k, v in r[key].items()}
+                r[key] = dict(sorted(r[key].items()))
+        return r
+
     def active_all(self,
                    filaments=None,               # None = every populated
                                                   # board (minus dead mask)
@@ -406,14 +457,19 @@ class _PowerMixin:
     # disconnected controller, or a board that simply didn't ACK all come
     # back as {"ok": False, "error": "...", ...} — check "ok" yourself.
 
-    def _timed_active_body(self, active_s, then_idle_ma):
+    def _timed_active_body(self, active_s, then_idle_ma, then_idle_voltage=False):
         """The request fields for a timed ACTIVE: {} when not timed, the fields
         when valid, an error string when not. Range checks are repeated by the
-        backend; these just say it before anything is sent."""
+        backend; these just say it before anything is sent.
+        then_idle_voltage: return to the filament's voltage IDLE instead."""
         if active_s is None:
             if then_idle_ma is not None:
                 return "then_idle_ma needs active_s (it is what a timed ACTIVE returns to)"
+            if then_idle_voltage:
+                return "then_idle_voltage needs active_s (it is what a timed ACTIVE returns to)"
             return {}
+        if then_idle_voltage and then_idle_ma is not None:
+            return "give then_idle_ma (CC IDLE) or then_idle_voltage, not both"
         try:
             secs = float(active_s)
         except (TypeError, ValueError):
@@ -426,6 +482,8 @@ class _PowerMixin:
             if not (0 < ma <= self._IDLE_CEILING_MA):
                 return f"then_idle_ma {ma} out of range 1..{self._IDLE_CEILING_MA} mA"
             extra["then_idle_ma"] = ma
+        if then_idle_voltage:
+            extra["then_idle_voltage"] = True
         return extra
 
     def _idle_ceiling_refusal(self, filament, arg: int) -> dict | None:
@@ -475,7 +533,7 @@ class _PowerMixin:
     def _state_one(self, filament: int, state: int, arg: int, op: str,
                    extra: dict | None = None) -> dict:
         self._ensure_keepalive(state)
-        if state == IDLE:
+        if state == IDLE and not (extra or {}).get("voltage"):   # a voltage IDLE's arg is mV
             refusal = self._idle_ceiling_refusal(int(filament), int(arg))
             if refusal:
                 return refusal
@@ -1167,6 +1225,12 @@ class _PowerMixin:
                                                        tolerance_ma, timeout_s)}
         return r
 
+    def idle_voltage_one(self, filament: int, millivolts: float | None = None) -> dict:
+        """IDLE one filament in VOLTAGE mode: at `millivolts`, or (None) its own
+        IDLE voltage from idle_voltages(). See idle_voltage_all()."""
+        return self._state_one(filament, IDLE, int(millivolts or 0), "idle_voltage_one",
+                               extra={"voltage": True})
+
     def active_one(self, filament: int,
                    current_ma: float,             # target ACTIVE (firing) current
                                                    # in mA -- the real operating
@@ -1266,7 +1330,8 @@ class _PowerMixin:
                     active_s: float | None = None,  # TIMED: heat at this voltage
                                                     # this long, then the BACKEND
                                                     # returns it to IDLE
-                    then_idle_ma: float | None = None) -> dict:
+                    then_idle_ma: float | None = None,
+                    then_idle_voltage: bool = False) -> dict:   # back to its voltage IDLE
         """Drive a single filament to manual VOLTAGE mode (PowerState 6) at
         `millivolts` mV -- a fixed voltage hold, NOT current-regulated
         (unlike IDLE/ACTIVE, which hold a commanded mA via the closed CC
@@ -1295,8 +1360,9 @@ class _PowerMixin:
         active_s it is the plain debug setting it always was.
 
             ct.voltage_one(f, 7600, active_s=10, then_idle_ma=1200)
+            ct.voltage_one(f, 7600, active_s=10, then_idle_voltage=True)
         """
-        extra = self._timed_active_body(active_s, then_idle_ma)
+        extra = self._timed_active_body(active_s, then_idle_ma, then_idle_voltage)
         if isinstance(extra, str):
             return {"ok": False, "filament": int(filament), "error": extra}
         mv = int(millivolts)

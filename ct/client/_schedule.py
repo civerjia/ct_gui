@@ -1397,7 +1397,8 @@ class _ScheduleMixin:
     def scan_view(self,
                   filaments,                       # filament numbers, fired in THIS order
                   active_mv: dict,                 # {filament: mV} -- every filament its own
-                  idle_ma: float,                  # each back to this after its pulses (mA)
+                  idle_ma,                         # UNUSED since 2026-11-02 (pass None): each
+                                                   # filament goes back to its own IDLE VOLTAGE
                   settle_ms: int,                  # hot = this long after its FIRST arrival
                   *,
                   preheat_ahead="auto",            # "auto" or a number of filaments ahead
@@ -1426,6 +1427,12 @@ class _ScheduleMixin:
         each the moment it is HOT, with the next ones already heating. Every
         filament ends at IDLE. Design and flow: docs/scan_view_design.md.
 
+        IDLE is VOLTAGE-mode IDLE (2026-11-02): after its pulses each filament
+        goes back to its own IDLE voltage (idle_voltages(); learn them once with
+        learn_idle_voltages() while everything holds its CC IDLE), not to a CC
+        current. A filament with no IDLE voltage refuses the run. idle_ma is
+        no longer used.
+
             def on_armed(filament):        # the SYSTEM calls this, once per filament,
                 my_trigger.send(20)        # in list order: that filament is hot and
                                            # its row released -- send its edges now
@@ -1434,7 +1441,7 @@ class _ScheduleMixin:
             r = ct.scan_view(
                 [23, 24, 25],              # fired in this order
                 active_mv={23: 7688, 24: 7698, 25: 8228},  # each one's voltage, mV
-                idle_ma=1100,              # back to this after its pulses, mA
+                idle_ma=None,              # unused: back to each one's IDLE voltage
                 settle_ms=1000,            # hot = this long after its FIRST arrival, ms
                 preheat_ahead="auto",      # heat ahead: "auto" (learnt) or N filaments
                 preheat_margin_s=0.3,      # "auto": start heating this much earlier, s
@@ -1663,6 +1670,17 @@ class _ScheduleMixin:
         if len(excluded) == len(fils):
             return refuse("no filament can be armed: " + "; ".join(
                 f"{f} {w}" for f, w in excluded.items()))
+        # Back to a VOLTAGE IDLE after the pulses, each filament its own: the
+        # backend returns it there (then_idle_voltage) and refuses one it has
+        # no IDLE voltage for -- so ask before anything is touched.
+        if idle_ma is not None:
+            out["note_idle_ma"] = (f"idle_ma={idle_ma} is not used: every filament goes back "
+                                   f"to its own IDLE voltage (idle_voltages())")
+        known = (self.idle_voltages() or {}).get("filaments") or {}
+        no_idle_v = [f for f in fils if f not in excluded and int(f) not in known]
+        if no_idle_v:
+            return refuse(f"no IDLE voltage for filament(s) {no_idle_v} -- learn it at their CC "
+                          f"IDLE first: ct.learn_idle_voltages({no_idle_v})")
 
         # Per-row worst case, for the firmware's whole-list cap and the timed heat.
         turn_max_s = float(heat_timeout_s) + settle_s + armed_wait_s + float(shot_wait_timeout_s) + 5.0
@@ -1745,8 +1763,8 @@ class _ScheduleMixin:
             # BUS_ERROR is one failed I2C step, not a refusal: worth a few quick
             # tries (2026-10-30 test7: three IDLEs failed once on it and the
             # filaments stayed hot until the end of the run).
-            r = self._scan_retry(lambda: self._state_one(f, IDLE, int(idle_ma), "scan_view",
-                                                         extra={"in_run": True}),
+            r = self._scan_retry(lambda: self._state_one(f, IDLE, 0, "scan_view",
+                                                         extra={"in_run": True, "voltage": True}),
                                  transient_until_s=1.0)
             if r.get("ok"):
                 hot_now.discard(f)
@@ -1849,7 +1867,7 @@ class _ScheduleMixin:
                 hold = min(3600.0, wait_s + float(heat_timeout_s) + settle_s + turn_max_s)
                 r = self._scan_retry(lambda: self._state_one(
                     f, VOLTAGE, mv[f], "scan_view",
-                    extra={"active_s": hold, "then_idle_ma": int(idle_ma), "in_run": True}))
+                    extra={"active_s": hold, "then_idle_voltage": True, "in_run": True}))
                 if r.get("ok"):
                     hot_now.add(f)
                     rows[j]["raise_s"] = since()
@@ -2362,7 +2380,7 @@ class _ScheduleMixin:
             row.pop("on_mismatch")
             row["readback_unreliable"] = bad          # index into records / measured
 
-    def scan_views(self, views, active_mv: dict, idle_ma: float, settle_ms: int, *,
+    def scan_views(self, views, active_mv: dict, idle_ma, settle_ms: int, *,
                    move_to=None,              # move_to(view): your motor, before each view
                    move_s: float | None = 0.0,  # then wait this long (s); None = 0
                    **scan_view_args) -> dict:

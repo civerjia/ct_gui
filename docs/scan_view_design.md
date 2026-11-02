@@ -20,7 +20,7 @@ after 3 reads in a row.
 
 ## How it works, at a glance
 
-`ct.scan_view([1, 2, 3], active_mv={1: 7600, 2: 7700, 3: 7650}, idle_ma=1100,
+`ct.scan_view([1, 2, 3], active_mv={1: 7600, 2: 7700, 3: 7650}, idle_ma=None,
 num_pulses=20, settle_ms=1000, trigger="ext", on_armed=send_trigger)`
 
 **Timeline** (filament 2 is hot before 1, then waits its turn):
@@ -210,9 +210,12 @@ def send_trigger(filament):      # the system calls this: "filament is hot and i
 
 Same meaning as in `fire_single_pulse`, so same name:
 - `active_mv`: here `{filament: mV}`, every filament its own.
-- `idle_ma`, `num_pulses`, `width_us`, `pulse_interval_ms`,
+- `num_pulses`, `width_us`, `pulse_interval_ms`,
   `trigger_timeout_ms`, `max_on_ms`, `total_ms`, `trigger`.
 - `on_armed`: here called as `on_armed(filament)`.
+- `idle_ma`: not used since 2026-11-02 (pass `None`). Each filament goes back
+  to its own voltage IDLE (`ct.idle_voltages()`, learnt with
+  `ct.learn_idle_voltages()`). A filament without one refuses the run.
 - `shot_wait_timeout_s`, `heat_timeout_s`, `verify`, `measure`, `rate_hz`,
   `bg_gap_us`, `bg_window_us`.
 - `settle_ms`: here it means the wait from first arrival to hot (see Words

@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 from ct import _http as requests
@@ -20,7 +21,8 @@ PORT = 8797
 BASE = f"http://127.0.0.1:{PORT}"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV = dict(os.environ, CT_NO_AUTO_UPDATE="1", CT_NO_AUTO_CONNECT="1", CT_SLEW_KEEP="0",
-           CT_GUI_PORT=str(PORT), CT_GUI_HOST="127.0.0.1", CT_AUTO_UPDATE="0")
+           CT_GUI_PORT=str(PORT), CT_GUI_HOST="127.0.0.1", CT_AUTO_UPDATE="0",
+           CT_STATE_DIR=tempfile.mkdtemp(prefix="ct_tv_"))
 FAILS = []
 
 
@@ -64,6 +66,22 @@ try:
                       headers={"X-CT-Client": "tv-test"}, timeout=10).json()
     check("batch timed VOLTAGE refused (single-filament only)",
           not r["ok"] and "single-filament" in str(r.get("error")), r)
+    # IDLE in voltage mode (2026-11-02)
+    r = fs(filament=5, state=4, voltage=True)
+    check("voltage IDLE with no IDLE voltage known: refused, says how to get one",
+          not r["ok"] and "no IDLE voltage known" in r["error"] and "learn" in r["error"], r)
+    r = fs(filament=5, state=4, voltage=True, arg=6000)
+    check("voltage IDLE over the 4 V ceiling: refused", not r["ok"] and "ceiling" in r["error"], r)
+    r = requests.post(BASE + "/api/idle-voltage", json={"set": {"5": 2400}},
+                      headers={"X-CT-Client": "tv-test"}, timeout=10).json()
+    g = requests.get(BASE + "/api/idle-voltage", timeout=10).json()
+    check("IDLE voltage set and read back", r.get("ok") and g["filaments"]["5"]["mV"] == 2400, (r, g))
+    r = fs(filament=5, state=4, voltage=True)
+    check("voltage IDLE from the table passes the guards (only the link is missing)",
+          not r["ok"] and "not connected" in r["error"], r)
+    r = fs(filament=5, state=6, arg=7600, active_s=5, then_idle_voltage=True,
+           then_idle_ma=1200)
+    check("then_idle_voltage AND then_idle_ma refused", not r["ok"] and "not several" in r["error"], r)
 finally:
     p.send_signal(signal.SIGTERM)
     try:
