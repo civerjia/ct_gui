@@ -1246,9 +1246,10 @@ class _PowerMixin:
                    active_s: float | None = None,     # hold ACTIVE this long,
                                                        # then the BACKEND returns
                                                        # it to IDLE -- see below
-                   then_idle_ma: float | None = None) -> dict:  # IDLE current to
+                   then_idle_ma: float | None = None,  # IDLE current to
                                                        # return to; None = the
-                                                       # filament's last IDLE current
+                                                       # filament's last IDLE
+                   then_idle_voltage: bool = False) -> dict:  # or its voltage IDLE
         """Promote a single filament to ACTIVE at `current_ma` mA.
 
         The filament MUST already be at IDLE. Going straight to ACTIVE is not
@@ -1288,8 +1289,9 @@ class _PowerMixin:
 
             ct.active_one(f, 2600, active_s=20)            # back to its IDLE current
             ct.active_one(f, 2600, active_s=20, then_idle_ma=1500)
+            ct.active_one(f, 2600, active_s=20, then_idle_voltage=True)
         """
-        extra = self._timed_active_body(active_s, then_idle_ma)
+        extra = self._timed_active_body(active_s, then_idle_ma, then_idle_voltage)
         if isinstance(extra, str):
             return {"ok": False, "filament": int(filament), "error": extra}
         # The backend enforces the ladder; this mirrors it so the reason is

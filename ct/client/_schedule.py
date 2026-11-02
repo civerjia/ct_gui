@@ -2475,8 +2475,9 @@ class _ScheduleMixin:
                                           # only AFTER the arm, fire, and
                                           # drop to idle_ma at once -- see
                                           # "active_ma" in the docstring
-        idle_ma: float | None = None,    # active_ma only: IDLE current to
-                                          # return to right after the pulse
+        idle_ma: float | str | None = None,  # IDLE current (mA) to return to
+                                          # right after the pulse, or "voltage":
+                                          # the filament's own voltage IDLE
         heat_timeout_s: float = 5.0,     # longest wait for the heating to
                                           # ARRIVE (ACTIVE current, or the
                                           # VOLTAGE within +-150 mV); not
@@ -2539,6 +2540,7 @@ class _ScheduleMixin:
         Give active_ma OR active_mv.
 
             ct.fire_single_pulse(f, active_mv=7600, idle_ma=1200, measure=True)
+            ct.fire_single_pulse(f, active_mv=7600, idle_ma="voltage", measure=True)
 
         settle_ms: with active_ma or active_mv -- how long the heating must STAY
         arrived before on_armed is called and the trigger goes out, timed by the
@@ -3040,7 +3042,16 @@ class _ScheduleMixin:
             return {"ok": False, "fired": 0, "records": [], "status": {},
                     "error": f"{'active_mv' if active_mv is not None else 'active_ma'} "
                              f"needs idle_ma: the IDLE current to drop "
-                             "back to as soon as the pulse is done"}
+                             "back to as soon as the pulse is done, or \"voltage\" for "
+                             "the filament's voltage IDLE"}
+        # idle_ma="voltage" (2026-11-02): back to the filament's own voltage
+        # IDLE (idle_voltages()), not a CC current.
+        idle_v = isinstance(idle_ma, str)
+        if idle_v and idle_ma.lower() != "voltage":
+            return {"ok": False, "fired": 0, "records": [], "status": {},
+                    "error": f"idle_ma must be a current in mA or \"voltage\", got {idle_ma!r}"}
+        back = ({"then_idle_voltage": True} if idle_v else {"then_idle_ma": idle_ma})
+        idle_txt = "its voltage IDLE" if idle_v else f"IDLE {idle_ma} mA"
         user_on_armed = kw.pop("on_armed", None)
         heat = {"raised": False, "dropped": False, "active": None, "idle": None,
                 "t_active": None, "t_idle": None}
@@ -3063,7 +3074,7 @@ class _ScheduleMixin:
             r = self.active_one(filament, active_ma, verify=True,
                                 timeout_s=heat_timeout_s,
                                 active_s=float(heat_timeout_s) + float(kw["timeout_s"]) + 5.0,
-                                then_idle_ma=idle_ma)
+                                **back)
             heat["active"] = r
             if not r.get("ok"):
                 # Refused (not at IDLE, dead, ...): ACTIVE never applied, so
@@ -3101,7 +3112,7 @@ class _ScheduleMixin:
         def raise_voltage():
             r = self.voltage_one(filament, active_mv,
                                  active_s=float(heat_timeout_s) + float(kw["timeout_s"]) + 5.0,
-                                 then_idle_ma=idle_ma)
+                                 **back)
             heat["active"] = r
             if not r.get("ok"):
                 heat["raised"] = False       # refused: nothing applied to drop
@@ -3154,7 +3165,8 @@ class _ScheduleMixin:
             # drop gets one more try there.
             if heat["raised"] and not heat["dropped"]:
                 try:
-                    heat["idle"] = self.idle_one(filament, idle_ma)
+                    heat["idle"] = (self.idle_voltage_one(filament) if idle_v
+                                    else self.idle_one(filament, idle_ma))
                 except Exception as exc:
                     heat["idle"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 heat["dropped"] = bool(heat["idle"].get("ok"))
@@ -3173,7 +3185,7 @@ class _ScheduleMixin:
         if heat["idle"] is not None and not heat["idle"].get("ok"):
             out["ok"] = False
             out["error"] = ((out["error"] + "; ") if out.get("error") else "") + (
-                f"could not return filament {filament} to IDLE {idle_ma} mA after "
+                f"could not return filament {filament} to {idle_txt} after "
                 f"the shot: {heat['idle'].get('error') or heat['idle']} -- the "
                 f"backend's timed ACTIVE will still drop it")
         return out

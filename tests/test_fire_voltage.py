@@ -92,6 +92,20 @@ check("heating summary: voltage mode, settled, its current", r["heating"]["mode"
       and r["heating"]["commanded_mv"] == 7600, r["heating"])
 check("total_ms grew by the arrival timeout", seen["total_ms"] == 6000 + 5000 + 1000, seen["total_ms"])
 
+# 1b. idle_ma="voltage": back to the filament's voltage IDLE, never a CC current.
+ct, calls, seen = make()
+ct.idle_voltage_one = lambda f, mv=None: calls.append("idle_v") or {"ok": True}
+r = ct.fire_single_pulse(16, active_mv=7000, idle_ma="voltage", **KW)
+mv, kw = seen["v"]
+check('idle_ma="voltage": timed VOLTAGE returns to the voltage IDLE, no then_idle_ma',
+      r["ok"] and kw.get("then_idle_voltage") is True and "then_idle_ma" not in kw, kw)
+check('...dropped with idle_voltage_one, never idle_one',
+      calls[-1] == "idle_v" and "idle" not in calls, calls)
+ct, calls, seen = make()
+r = ct.fire_single_pulse(16, active_mv=7000, idle_ma="volts", **KW)
+check('idle_ma="volts" (a typo) refused, nothing done', not r["ok"] and not calls
+      and "voltage" in r["error"], (r, calls))
+
 # 2. Refused (not at a settled IDLE): nothing fired, no IDLE write.
 ct, calls, seen = make(volt_ok=False)
 r = ct.fire_single_pulse(16, active_mv=7600, idle_ma=1200, **KW)

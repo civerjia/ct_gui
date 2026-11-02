@@ -251,5 +251,27 @@ check("set by hand", r["ok"] and S.IDLE_MV_TABLE[a]["mV"] == 2450 and S.IDLE_MV_
 r = S.idle_voltage_set({b: None})
 check("None removes one", r["ok"] and b not in S.IDLE_MV_TABLE)
 
+# --- a backend restart still knows which VOLTAGE is an IDLE ------------------------
+import json  # noqa: E402
+S.note_power_state([a], V, {a: 2450}, idle_v=True)
+saved = json.loads(S.IDLE_MV_STATE_PATH.read_text())
+check("voltage IDLE saved the moment it lands", saved["at_voltage_idle"].get(str(a)) == 2450, saved)
+S.note_power_state([b], V, {b: 2550}, idle_v=True)      # b was a voltage IDLE too...
+# "restart": memory gone, the firmware still says VOLTAGE for a, IDLE for b.
+S.LAST_POWER_STATE.clear(); S.IDLE_VOLT_NOW.clear(); S.IDLE_SINCE.clear()
+S._idle_mv_load()
+check("restored from the file", S.IDLE_VOLT_NOW.get(a) == 2450 and S.IDLE_VOLT_NOW.get(b) == 2550,
+      S.IDLE_VOLT_NOW)
+_, cha, pa, _ = S.filament_to_board(a)
+_, chb, pb, _ = S.filament_to_board(b)
+S._adopt_firmware_power_states(0, {(cha, pa): {"known": True, "power_state": V},
+                                   (chb, pb): {"known": True, "power_state": IDLE}},
+                               time.monotonic())
+check("adopted VOLTAGE that was saved as a voltage IDLE: an IDLE, not hot",
+      S.is_idle(a) and not S.is_hot(a) and a in S.IDLE_SINCE)
+check("...one the firmware now reports at CC IDLE: the claim is dropped (and saved)",
+      b not in S.IDLE_VOLT_NOW and S.is_idle(b)
+      and str(b) not in json.loads(S.IDLE_MV_STATE_PATH.read_text())["at_voltage_idle"])
+
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

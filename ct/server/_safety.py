@@ -320,6 +320,11 @@ class IdleMv(int):
 
 
 IDLE_VOLT_NOW: dict[int, int] = {}      # FID -> mV, while at voltage IDLE
+# Called (no lock held) whenever IDLE_VOLT_NOW changes: the server saves it, so
+# a restarted backend still knows which firmware VOLTAGE is an IDLE -- without
+# it every voltage IDLE read back as heating, and an HV guard trip would STOP
+# them all.
+IDLE_V_HOOK: list = [None]
 # What each FID was last idled at: int = mA (CC), IdleMv = mV. The default a
 # timed ACTIVE/VOLTAGE returns to.
 LAST_IDLE: dict[int, int] = {}
@@ -430,6 +435,7 @@ def note_power_state(fids, state: int, args=None, idle_v: bool = False) -> None:
     now = time.monotonic()
     owner = request_owner()
     idle_v = bool(idle_v) and int(state) == POWER_STATE_VOLTAGE
+    before = dict(IDLE_VOLT_NOW)
     with _SAFETY_LOCK:
         for f in fids:
             if owner:
@@ -455,6 +461,11 @@ def note_power_state(fids, state: int, args=None, idle_v: bool = False) -> None:
                 if int(state) == POWER_STATE_IDLE and a is not None:
                     LAST_IDLE_MA[int(f)] = int(a)
                     LAST_IDLE[int(f)] = int(a)
+    if IDLE_VOLT_NOW != before and IDLE_V_HOOK[0]:
+        try:
+            IDLE_V_HOOK[0]()
+        except Exception:
+            pass
     # Every power-state COMMAND funnels through here, which makes it the one
     # place the dead-man timer has to be renewed from. Reads do not reach it.
     safety_touch_filaments(fids, now)
@@ -611,7 +622,7 @@ __all__ = [
     "DEFAULT_GROUP_SIZE", "ENERGISING_STATES", "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT",
     "EspCmdClient", "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE",
     "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ",
-    "IdleMv", "IDLE_VOLT_NOW", "LAST_IDLE", "IDLE_MV_TABLE", "IDLE_V_CEILING_MV",
+    "IdleMv", "IDLE_VOLT_NOW", "IDLE_V_HOOK", "LAST_IDLE", "IDLE_MV_TABLE", "IDLE_V_CEILING_MV",
     "IDLE_V_WARM_HOLD_S", "IDLE_V_MIN_FRAC", "IDLE_V_MIN_MA", "is_idle", "is_hot",
     "_idle_v_not_warm",
     "ACTIVE_DEADLINES", "IDLE_CEILING_MA", "IDLE_SINCE", "IDLE_WARM_HOLD_S", "IDLE_WARM_TOL_FRAC", "IDLE_WARM_TOL_MA", "LAST_ACTIVE_LEFT", "LAST_IDLE_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S", "LOCK_TTL_MAX_S",

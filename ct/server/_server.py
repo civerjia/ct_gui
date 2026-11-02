@@ -306,6 +306,7 @@ def _adopt_firmware_power_states(c0: int, cache: dict, read_at: float) -> list:
     command, but the dead-man clock starts now, so an adopted ACTIVE that
     nobody renews still falls back on time. Returns [(fid, state, was)]."""
     adopted = []
+    dropped_idle_v = False
     with _SAFETY_LOCK:
         for (ch, mux), b in (cache or {}).items():
             st = b.get("power_state")
@@ -317,9 +318,18 @@ def _adopt_firmware_power_states(c0: int, cache: dict, read_at: float) -> list:
             cur = LAST_POWER_STATE.get(int(fid))
             if cur is not None and (cur[0] == int(st) or cur[1] >= read_at):
                 continue
-            note_active_transition(int(fid), cur[0] if cur else None, int(st), read_at)
+            # A saved voltage IDLE stays one only while the firmware says VOLTAGE.
+            idle_v = int(fid) in IDLE_VOLT_NOW
+            if idle_v and int(st) != POWER_STATE_VOLTAGE:
+                IDLE_VOLT_NOW.pop(int(fid), None)
+                dropped_idle_v = True
+            note_active_transition(int(fid), cur[0] if cur else None, int(st), read_at,
+                                   old_idle_v=idle_v, new_idle_v=idle_v
+                                   and int(st) == POWER_STATE_VOLTAGE)
             LAST_POWER_STATE[int(fid)] = (int(st), read_at)
             adopted.append((int(fid), int(st), cur[0] if cur else None))
+    if dropped_idle_v and IDLE_V_HOOK[0]:
+        IDLE_V_HOOK[0]()
     if adopted:
         safety_touch_filaments([f for f, _st, _was in adopted])
         new = [f for f, _st, was in adopted if was is None]
@@ -8224,26 +8234,38 @@ def _idle_mv_load() -> None:
         d = json.loads(IDLE_MV_STATE_PATH.read_text())
         got = {int(f): dict(v) for f, v in (d.get("filaments") or {}).items()
                if isinstance(v, dict) and v.get("mV")}
+        now_v = {int(f): int(mv) for f, mv in (d.get("at_voltage_idle") or {}).items()}
     except (OSError, ValueError, AttributeError, TypeError):
         return
     with _SAFETY_LOCK:
         IDLE_MV_TABLE.clear()
         IDLE_MV_TABLE.update(got)
+        # Which were at voltage IDLE when the last backend stopped. Only a
+        # claim until the firmware confirms VOLTAGE (_adopt_firmware_power_states
+        # drops one it reports in any other state).
+        IDLE_VOLT_NOW.clear()
+        IDLE_VOLT_NOW.update(now_v)
 
 
 def _idle_mv_save() -> str | None:
     with _SAFETY_LOCK:
         d = {str(f): v for f, v in sorted(IDLE_MV_TABLE.items())}
+        now_v = {str(f): mv for f, mv in sorted(IDLE_VOLT_NOW.items())}
     try:
         STATE_DIR.mkdir(exist_ok=True)
-        IDLE_MV_STATE_PATH.write_text(json.dumps({"filaments": d}, indent=1))
+        with _IDLE_MV_SAVE_LOCK:
+            tmp = IDLE_MV_STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"filaments": d, "at_voltage_idle": now_v}, indent=1))
+            os.replace(tmp, IDLE_MV_STATE_PATH)
         return None
     except OSError as exc:
         log.warning("IDLE voltages not saved (%s) -- they hold until the backend restarts", exc)
         return str(exc)
 
 
+_IDLE_MV_SAVE_LOCK = threading.Lock()
 _idle_mv_load()
+IDLE_V_HOOK[0] = _idle_mv_save
 
 
 def idle_voltage_snapshot() -> dict:
