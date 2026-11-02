@@ -13,6 +13,7 @@ _base.__all__) or, for CTClient itself, is bound in by _client.py.
 """
 from ._base import *  # noqa: F401,F403
 import concurrent.futures
+import datetime
 import logging
 import threading
 from typing import TYPE_CHECKING
@@ -1646,6 +1647,7 @@ class _ScheduleMixin:
         # nothing, and the stop read "row 60: could not skip the rest". The
         # counter cannot be missed.
         trips0 = guard.get("trips")
+        wall0 = datetime.datetime.now().astimezone()
         if not ((guard.get("vacuum") or {}).get("within_limit", True)):
             return refuse(f"vacuum over its limit: {(guard.get('vacuum') or {}).get('raw')}")
 
@@ -1918,7 +1920,7 @@ class _ScheduleMixin:
                 if trips0 is not None and g.get("trips") is not None and g["trips"] != trips0:
                     raise self._ScanStop("the HV guard acted during the run (it forced every grid "
                                          "open; it may already have recovered): "
-                                         + self._guard_last_action())
+                                         + self._guard_last_action(since=wall0))
                 if not ((g.get("vacuum") or {}).get("within_limit", True)):
                     raise self._ScanStop(f"vacuum over its limit: {(g.get('vacuum') or {}).get('raw')}")
                 if first_armed_at is not None and time.monotonic() - last_pulse_at > no_pulse_s:
@@ -2231,6 +2233,10 @@ class _ScheduleMixin:
                     self._post("/api/live-push", {"on": False})
                 except Exception:
                     pass
+            if stop_why and stop_why.endswith(self._GUARD_DETAIL_PENDING):
+                # Everything is safe by now; the guard's own report is due.
+                stop_why = (stop_why[: -len(self._GUARD_DETAIL_PENDING)]
+                            + self._guard_last_action(since=wall0, wait_s=3.0))
             if stop_why:
                 out["stopped"] = stop_why
             th = armed_thread["t"]
@@ -2980,16 +2986,32 @@ class _ScheduleMixin:
                                 + (f"; also: {res.get('error')}" if res.get("error") else ""))
         return res
 
-    def _guard_last_action(self) -> str:
-        """The HV guard's latest action, from the backend's safety log: source,
-        and its own message. Never empty."""
-        try:
-            ev = [e for e in ((self._get("/api/safety") or {}).get("events") or [])
-                  if str(e.get("kind", "")).startswith("hv_guard")]
-        except Exception:
-            ev = []
+    _GUARD_DETAIL_PENDING = "its report follows when it recovers"
+
+    def _guard_last_action(self, since=None, wait_s: float = 0.0) -> str:
+        """The HV guard's action since `since` (aware datetime), from the
+        backend's safety log: source and its own message. The guard writes its
+        entry when it RECOVERS (1-3 s after the trip), so wait_s polls for it.
+        An entry from before `since` is never reported as this one. Never empty."""
+        end = time.monotonic() + float(wait_s)
+        while True:
+            try:
+                ev = [e for e in ((self._get("/api/safety") or {}).get("events") or [])
+                      if str(e.get("kind", "")).startswith("hv_guard")]
+            except Exception:
+                ev = []
+            if since is not None:
+                def at(e):
+                    try:
+                        return datetime.datetime.fromisoformat(str(e.get("at")))
+                    except ValueError:
+                        return None
+                ev = [e for e in ev if at(e) is not None and at(e) >= since]
+            if ev or time.monotonic() >= end:
+                break
+            time.sleep(0.3)
         if not ev:
-            return "no detail in the backend's safety log"
+            return self._GUARD_DETAIL_PENDING
         e = ev[-1]
         return (f"{e.get('at', '')[11:19]} {e.get('kind')} (source {e.get('source')}): "
                 f"{str(e.get('message') or '')[:300]}")

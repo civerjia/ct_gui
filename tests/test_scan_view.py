@@ -10,6 +10,7 @@ import _path  # noqa: F401
 
 import os
 import threading
+import datetime
 import time
 
 os.environ.setdefault("CT_NO_AUTO_UPDATE", "1")
@@ -157,9 +158,17 @@ def make(rig: Rig):
             return {"tripped": rig.tripped, "vacuum": {"within_limit": True},
                     "trips": getattr(rig, "trips", 0)}
         if path == "/api/safety":
-            return {"ok": True, "events": [{"kind": "hv_guard_recovered", "source": "stm32",
-                                            "at": "2026-11-02T12:35:59-05:00",
-                                            "message": "the current was over its baseline"}]}
+            # An OLD guard entry (must never be reported as this run's), and --
+            # once the guard "recovered" -- this run's own.
+            ev = [{"kind": "hv_guard_recovered", "source": "vacuum",
+                   "at": "2026-01-01T00:00:00-05:00", "message": "an old one"}]
+            if getattr(rig, "trips", 0):
+                rig.safety_reads = getattr(rig, "safety_reads", 0) + 1
+                if rig.safety_reads > 2:      # written only on recovery, a little later
+                    ev.append({"kind": "hv_guard_recovered", "source": "stm32",
+                               "at": datetime.datetime.now().astimezone().isoformat(),
+                               "message": "the current was over its baseline"})
+            return {"ok": True, "events": ev}
         if path.startswith("/api/filament-currents?filament="):
             u = USER_OF[int(path.rsplit("=", 1)[1])]
             return {"ok": True, "filaments": {str(ORDER[u]): {
@@ -663,8 +672,10 @@ def tripping_on_armed(f):
 r = make(rig).scan_view([60, 61, 62, 63], trigger="ext", on_armed=tripping_on_armed, **ARGS)
 check("guard trip that recovered: stopped, named as the HV guard, not 'could not skip'",
       not r["ok"] and "HV guard acted" in (r.get("stopped") or r.get("error") or "")
-      and "could not skip" not in str(r.get("stopped")) and "stm32" in str(r.get("stopped")),
-      (r.get("stopped"), r.get("error")))
+      and "could not skip" not in str(r.get("stopped")), (r.get("stopped"), r.get("error")))
+check("...its own report, written on recovery, is waited for; the old entry is never used",
+      "stm32" in str(r.get("stopped")) and "an old one" not in str(r.get("stopped"))
+      and "follows when it recovers" not in str(r.get("stopped")), r.get("stopped"))
 check("...no filament after 61 released or triggered",
       [f for f, _ in calls] == [60, 61] and r["rows"][2]["fired"] == 0
       and r["rows"][2].get("armed_s") is None, (calls, r["rows"][2]))
