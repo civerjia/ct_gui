@@ -154,7 +154,12 @@ def make(rig: Rig):
 
     def get(path, timeout=None):
         if path == "/api/hv-guard":
-            return {"tripped": rig.tripped, "vacuum": {"within_limit": True}}
+            return {"tripped": rig.tripped, "vacuum": {"within_limit": True},
+                    "trips": getattr(rig, "trips", 0)}
+        if path == "/api/safety":
+            return {"ok": True, "events": [{"kind": "hv_guard_recovered", "source": "stm32",
+                                            "at": "2026-11-02T12:35:59-05:00",
+                                            "message": "the current was over its baseline"}]}
         if path.startswith("/api/filament-currents?filament="):
             u = USER_OF[int(path.rsplit("=", 1)[1])]
             return {"ok": True, "filaments": {str(ORDER[u]): {
@@ -639,6 +644,30 @@ check("arm refused: names the controller that refused, with the backend's reason
 rig = Rig(hv=False)
 r = make(rig).scan_view([60, 61], **ARGS)
 check("rails off at the start: not refused (operator's job)", r["ok"] and r["fired"] == 2, r.get("error"))
+
+# --- the HV guard acts and recovers within a second (2026-11-02, after 78) ------
+# The trip is gone before the next "tripped" check; its counter is not. The run
+# must stop at once, say it was the guard, and release no later filament.
+rig = Rig()
+calls = []
+
+
+def tripping_on_armed(f):
+    calls.append((f, Clock.t))
+    rig.edges(3)
+    if f == 61:
+        rig.trips = getattr(rig, "trips", 0) + 1   # the guard acted...
+        rig.state = 0                              # ...and the run is disarmed
+
+
+r = make(rig).scan_view([60, 61, 62, 63], trigger="ext", on_armed=tripping_on_armed, **ARGS)
+check("guard trip that recovered: stopped, named as the HV guard, not 'could not skip'",
+      not r["ok"] and "HV guard acted" in (r.get("stopped") or r.get("error") or "")
+      and "could not skip" not in str(r.get("stopped")) and "stm32" in str(r.get("stopped")),
+      (r.get("stopped"), r.get("error")))
+check("...no filament after 61 released or triggered",
+      [f for f, _ in calls] == [60, 61] and r["rows"][2]["fired"] == 0
+      and r["rows"][2].get("armed_s") is None, (calls, r["rows"][2]))
 
 # --- the IDLE voltage table API speaks YOUR numbering (FIDs on the wire) -------
 rig = Rig()

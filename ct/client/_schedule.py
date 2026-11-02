@@ -1639,6 +1639,13 @@ class _ScheduleMixin:
         guard = self._get("/api/hv-guard") or {}
         if guard.get("tripped"):
             return refuse(f"the HV guard is tripped: {guard.get('tripped')}")
+        # Every time the guard acts (STM32 trip, grid forced open, latch) its
+        # counter goes up. A trip that recovers by itself within a second is
+        # gone before the next 0.5 s check sees "tripped" -- 2026-11-02 the
+        # STM32 trip after filament 78 disarmed the run, 79 was released into
+        # nothing, and the stop read "row 60: could not skip the rest". The
+        # counter cannot be missed.
+        trips0 = guard.get("trips")
         if not ((guard.get("vacuum") or {}).get("within_limit", True)):
             return refuse(f"vacuum over its limit: {(guard.get('vacuum') or {}).get('raw')}")
 
@@ -1908,6 +1915,10 @@ class _ScheduleMixin:
                 g = self._get("/api/hv-guard") or {}
                 if g.get("tripped"):
                     raise self._ScanStop(f"the HV guard tripped: {g.get('tripped')}")
+                if trips0 is not None and g.get("trips") is not None and g["trips"] != trips0:
+                    raise self._ScanStop("the HV guard acted during the run (it forced every grid "
+                                         "open; it may already have recovered): "
+                                         + self._guard_last_action())
                 if not ((g.get("vacuum") or {}).get("within_limit", True)):
                     raise self._ScanStop(f"vacuum over its limit: {(g.get('vacuum') or {}).get('raw')}")
                 if first_armed_at is not None and time.monotonic() - last_pulse_at > no_pulse_s:
@@ -2119,6 +2130,7 @@ class _ScheduleMixin:
                 done0 = (self.shv_status(own) or {}).get("totalPulsesDone") or 0
                 res = self._shv_row(armed, fw[i], 0)
                 if any(v != 0 for v in res.values()):
+                    dangers(first_armed_at, last_pulse_at)   # a guard trip says why
                     raise self._ScanStop(
                         f"row {fw[i]} (filament {f}): release refused -- "
                         + ", ".join(f"controller {c}: {self._ROW_RESULT.get(v, v)}"
@@ -2155,9 +2167,14 @@ class _ScheduleMixin:
                     if (st.get("entryIndex") or 0) > fw[i] or st.get("state") == SHV_COMPLETE:
                         break
                     if trig_err or time.monotonic() > wait_end:
+                        dangers(first_armed_at, last_pulse_at)   # a guard trip says why
                         res = self._shv_row(armed, fw[i], 2, until_s=3.0)
                         if any(v != 0 for v in res.values()):
-                            raise self._ScanStop(f"row {fw[i]}: could not skip the rest ({res})")
+                            raise self._ScanStop(
+                                f"row {fw[i]} (filament {f}): {fired} of {n} pulses, and the "
+                                f"rest could not be skipped -- "
+                                + ", ".join(f"controller {c}: {self._ROW_RESULT.get(v, v)}"
+                                            for c, v in res.items()))
                         row["skipped"] = (row.get("on_armed_error")
                                           or f"{fired} of {n} pulses within shot_wait_timeout_s "
                                              f"({shot_wait_timeout_s:g} s)")
@@ -2962,6 +2979,20 @@ class _ScheduleMixin:
                                 + ") -- its measurement is not this filament's emission"
                                 + (f"; also: {res.get('error')}" if res.get("error") else ""))
         return res
+
+    def _guard_last_action(self) -> str:
+        """The HV guard's latest action, from the backend's safety log: source,
+        and its own message. Never empty."""
+        try:
+            ev = [e for e in ((self._get("/api/safety") or {}).get("events") or [])
+                  if str(e.get("kind", "")).startswith("hv_guard")]
+        except Exception:
+            ev = []
+        if not ev:
+            return "no detail in the backend's safety log"
+        e = ev[-1]
+        return (f"{e.get('at', '')[11:19]} {e.get('kind')} (source {e.get('source')}): "
+                f"{str(e.get('message') or '')[:300]}")
 
     def _hv_ready_for_shot(self) -> dict:
         """{"ok": True, "trips": n} when the HV guard is not tripped, else
