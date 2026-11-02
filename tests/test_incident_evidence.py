@@ -70,13 +70,19 @@ S.ARC_LOG_PATH.write_text(json.dumps({"kind": "arc", "kv_before": 45, "at": S.da
 
 check("an ordinary arc is not an incident", not S.incident_note("arc", {}, T))
 check("a timed-active return is not an incident", not S.incident_note("timed_active_to_idle", {}, T))
+check("a guard trip that recovers by itself is not (auto_recover)",
+      not S.incident_note("hv_guard_tripped", {"auto_recover": True}, T))
+check("a recovered guard action is not", not S.incident_note("hv_guard_recovered", {}, T))
+check("a stray-closed switch that was opened is not", not S.incident_note("grid_stray_closed", {"opened": True}, T))
+check("a Spellman big arc is not (it recovers by itself)", not S.incident_note("spellman_big_arc", {}, T))
+check("nothing opened by those", not S._INCIDENT_OPEN)
 SF._safety_record("hv_guard_tripped", {"source": "spellman_over_current", "ma": 1.0745})
 with S._INCIDENT_LOCK:
     S._INCIDENT_OPEN.update(start=T - S.INCIDENT_PRE_S, first=T, end=T + S.INCIDENT_POST_S)
     S._INCIDENT_OPEN["events"][0]["unix_t"] = T
 check("_safety_record opened a capture through the hook", S._INCIDENT_OPEN.get("events")
       and S._INCIDENT_OPEN["events"][0]["kind"] == "hv_guard_tripped")
-S.incident_note("hv_guard_recovered", {"why": "second one"}, T + 30)
+S.incident_note("grid_stray_closed", {"opened": False, "why": "second one"}, T + 30)
 check("a second incident inside the window joins the same capture",
       len(S._INCIDENT_OPEN["events"]) == 2 and S._INCIDENT_OPEN["end"] == T + 30 + S.INCIDENT_POST_S)
 
@@ -84,9 +90,9 @@ check("nothing written while the window is still open", S.incident_flush(T + 60)
 out = S.incident_flush(T + 30 + S.INCIDENT_POST_S + 1)
 check("written once the window has passed", len(out) == 1, out)
 d = out[0] if out else tmp
-check("...named after the time and the kinds", d.name.endswith("hv_guard_recovered+hv_guard_tripped"), d.name)
+check("...named after the time and the kinds", d.name.endswith("grid_stray_closed+hv_guard_tripped"), d.name)
 ev = [json.loads(ln) for ln in (d / "incident.jsonl").read_text().splitlines()]
-check("incident.jsonl: both events", [e["kind"] for e in ev] == ["hv_guard_tripped", "hv_guard_recovered"])
+check("incident.jsonl: both events", [e["kind"] for e in ev] == ["hv_guard_tripped", "grid_stray_closed"])
 rows = list(csv.DictReader(open(d / "series.csv")))
 sp = [r for r in rows if r["name"] == "sp_ma"]
 lo, hi = T - S.INCIDENT_PRE_S, T + 30 + S.INCIDENT_POST_S
@@ -107,11 +113,33 @@ check("client.jsonl: the window's calls only", "read_ads_all" in cl and "late" n
 check("arcs.jsonl: the arc 3 s before", '"kv_before": 45' in (d / "arcs.jsonl").read_text())
 check("nothing left to write", S.incident_flush(now + 3600) == [])
 
-S._SPELL_WATCH = S._SPELL_WATCH       # Spellman big arc goes the same way
 S._spellman_events([{"kind": "big_arc", "t": time.monotonic(), "kv_before": 45, "min_kv": 1}], time.monotonic())
-check("a Spellman big arc opens a capture", S._INCIDENT_OPEN.get("events", [{}])[-1].get("kind") == "spellman_big_arc")
+check("a Spellman big arc opens no capture", not S._INCIDENT_OPEN)
+S.incident_note("fallback_unreachable", {"filaments": [3]})
 forced = S.incident_flush(force=True)
 check("shutdown writes an open capture early rather than losing it", len(forced) == 1, forced)
+
+# Every board-monitor reading also on disk for a week, gzipped after its hour.
+S.POWER_DIR = tmp / "power"
+S._POWER_PENDING.clear()
+h0 = float(int(now // 3600) * 3600)
+S.power_ring_add(1, boards, "cache", h0 - 7200 + 5)          # two hours ago
+S.power_ring_add(1, boards, "cache", h0 + 1)                 # this hour
+S.power_ring_add(1, boards, "cache", h0 - 8 * 24 * 3600 + 5)  # 8 days ago
+check("power: every reading written", S.power_flush() == 3)
+files = sorted(p.name for p in S.POWER_DIR.iterdir())
+check("...one file per hour", len(files) == 3, files)
+old_rows = (S.POWER_DIR / S._power_path(h0 - 7200 + 5).name).read_text().splitlines()
+check("...header + one row per present board", old_rows[0] == S.POWER_CSV_HEADER.strip() and len(old_rows) == 3
+      and old_rows[1].split(",")[5:9] == ["6", "2458", "8368", "12"], old_rows)
+done = S.power_compact(h0 + 30)
+names = sorted(p.name for p in S.POWER_DIR.iterdir())
+check("power compact: older than a week deleted, finished hour gzipped, this hour left",
+      len(done["deleted"]) == 1 and len(done["gzipped"]) == 1
+      and names == sorted([S._power_path(h0 - 7200 + 5).name + ".gz", S._power_path(h0 + 1).name]), (done, names))
+import gzip  # noqa: E402
+gz = [p for p in S.POWER_DIR.iterdir() if p.suffix == ".gz"]
+check("...the gzip holds the same rows", gz and gzip.open(gz[0], "rt").read().splitlines() == old_rows)
 
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 raise SystemExit(1 if FAILS else 0)

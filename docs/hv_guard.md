@@ -136,23 +136,22 @@ Every plotted reading goes to disk: Spellman kV and mA, vacuum, emission V and I
 
 | file | content | kept |
 |---|---|---|
-| `logs/series/raw_<date>T<hour>.csv` | `unix_t,name,value`, full rate, about 13 rows/s | `CT_SERIES_RAW_HOURS`, default 6 h |
+| `logs/series/raw_<date>T<hour>.csv` | `unix_t,name,value`, full rate, about 13 rows/s | `CT_SERIES_RAW_HOURS`, default 1 week |
+| `logs/power/power_<date>T<hour>.csv[.gz]` | every board-monitor reading: `unix_t,controller,channel,mux,fid,power_state,current_mA,bus_mV,age_ms,source`; gzipped once its hour is over | `CT_POWER_KEEP_HOURS`, default 1 week, then deleted |
 | `logs/series/summary_<date>.csv` | `minute,name,n,min,max,mean` | for good |
 
 When a raw hour falls outside the kept window, it is compacted into the summary and deleted. A restart reads the last hour back into the plot.
 
 ### Incident evidence
 
-An incident keeps its own copy of the data at full resolution. Nothing ever deletes it, and the 6 h raw limit does not apply.
+A big incident keeps its own copy of the data at full resolution. Nothing ever deletes it, unlike the one-week raw files.
 
-These are incidents:
-- the HV guard trips or recovers, including an auto-recovery;
-- a grid switch is closed when it should be open, or is slow to turn off;
-- a voltage IDLE overshoots and is sent to SLEEP;
-- the safety fallback fails, or cannot reach a controller;
-- the Spellman has a big arc, a System Fault or an over-current.
+Only big incidents count, the ones that need a person:
+- a latched HV-guard trip: a grid switch that cannot be turned off, Spellman over-current, vacuum;
+- a grid switch closed with no command that could not be opened;
+- hot filaments the safety fallback could not walk back.
 
-An ordinary arc is not an incident; it stays in `arcs.jsonl`.
+Trips that recover by themselves (arcs, big arcs, System Fault), recovered guard actions and warnings are not incidents. They remain in the week of raw data, `arcs.jsonl` and `backend.log`.
 
 The capture covers 15 min before the incident to 2 min after it. Another incident inside that window joins the same capture and moves its end. A capture is cut at 30 min. When the window has passed, `logs/incidents/<date>T<time>_<kinds>/` is written:
 

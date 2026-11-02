@@ -26,6 +26,8 @@ import json
 import logging
 import logging.handlers
 import os
+import gzip
+import shutil
 import socket
 import struct
 import sys
@@ -3939,8 +3941,6 @@ def _spellman_events(events: list, now: float) -> None:
                     fh.write(json.dumps({k: v for k, v in ev.items() if k != "t"}) + "\n")
             except OSError:
                 pass
-            if ev["kind"] in ("big_arc", "system_fault"):
-                incident_note("spellman_" + ev["kind"], {k: v for k, v in ev.items() if k != "t"})
             if ev["kind"] == "status":
                 log.info("Spellman status: set %s, cleared %s (HV on %s, %s kV)", ev["set"], ev["cleared"],
                          ev["hv_on"], ev["kv"])
@@ -4123,15 +4123,15 @@ def series_add(name: str, value: float, t: float | None = None) -> None:
 
 
 # Every reading also goes to disk (the user, 2026-10-29: a restart lost the
-# plot, and nothing was on disk at all). Full rate only for a few hours, older
-# hours as a per-minute summary (the user: keep a few hours, only a summary of
-# the old):
+# plot, and nothing was on disk at all). Full rate for a week (the user,
+# 2026-11-02: 6 h had already thrown away the 11-01 over-current), older hours
+# as a per-minute summary:
 #   logs/series/raw_<YYYY-MM-DD>T<HH>.csv     unix_t,name,value   (~13 rows/s)
 #   logs/series/summary_<YYYY-MM-DD>.csv      minute,name,n,min,max,mean
 # The last SERIES_KEEP_S is read back at start-up.
 SERIES_DIR = LOG_DIR / "series"
 SERIES_FLUSH_S = 2.0
-SERIES_RAW_KEEP_H = float(os.environ.get("CT_SERIES_RAW_HOURS", "6"))
+SERIES_RAW_KEEP_H = float(os.environ.get("CT_SERIES_RAW_HOURS", str(7 * 24)))
 SERIES_COMPACT_S = 600.0
 _SERIES_PENDING: list = []
 
@@ -4229,13 +4229,16 @@ def _series_flush_loop() -> None:
     last_compact = 0.0
     while not _STOPPING.wait(SERIES_FLUSH_S):
         series_flush()
+        power_flush()
         if time.monotonic() - last_compact >= SERIES_COMPACT_S:
             last_compact = time.monotonic()
             try:
                 series_compact()
+                power_compact()
             except Exception as exc:
                 log.warning("series compaction failed: %s", exc)
     series_flush()
+    power_flush()
 
 
 def series_from_ads(r) -> None:
@@ -4291,15 +4294,28 @@ INCIDENT_DIR = LOG_DIR / "incidents"
 INCIDENT_PRE_S = 900.0
 INCIDENT_POST_S = 120.0
 INCIDENT_MAX_S = 1800.0            # a run of incidents is cut into captures this long
-INCIDENT_KINDS = frozenset({
-    "hv_guard_tripped", "hv_guard_recovered", "hv_guard_auto_recovered",
-    "grid_stray_closed", "slow_turn_off_warning", "idle_v_overshoot_sleep",
-    "fallback_error", "fallback_unreachable",
-    "spellman_big_arc", "spellman_system_fault", "spellman_over_current",
-})
+# Only the big ones (the user, 2026-11-02: "只记大事故") -- what needs a person:
+# a LATCHED HV-guard trip (stuck grid switch, Spellman over-current, vacuum;
+# not the arcs / system faults that recover by themselves), a stray-closed
+# switch that could not be opened, and hot filaments the safety fallback could
+# not walk back. Everything else is in the week of raw data anyway.
+INCIDENT_KINDS = frozenset({"hv_guard_tripped", "grid_stray_closed", "fallback_error",
+                            "fallback_unreachable", "spellman_over_current"})
+
+
+def incident_is_major(kind: str, event: dict | None) -> bool:
+    ev = event or {}
+    if kind not in INCIDENT_KINDS:
+        return False
+    if kind == "hv_guard_tripped":
+        return not ev.get("auto_recover")
+    if kind == "grid_stray_closed":
+        return not ev.get("opened")
+    return True
 POWER_RING_S = INCIDENT_PRE_S + INCIDENT_POST_S + 60.0
 _POWER_RING_LOCK = threading.Lock()
 _POWER_RING: collections.deque = collections.deque()   # (unix_t, cid, source, packed boards)
+_POWER_PENDING: list = []           # the same, not yet on disk (see power_flush)
 # One board = 10 bytes (15 min of 2 controllers at 4 Hz is ~5 MB, not ~60 MB of
 # tuples): channel, mux, power_state, current_mA, bus_mV, age_ms; an absent value
 # is its sentinel and comes back as None, never 0.
@@ -4325,14 +4341,95 @@ def power_ring_add(cid: int, boards: dict, source, t: float | None = None) -> No
         for k, b in sorted(boards.items()) if b.get("present"))
     with _POWER_RING_LOCK:
         _POWER_RING.append((t, int(cid), source, packed))
+        _POWER_PENDING.append((t, int(cid), source, packed))
         while _POWER_RING and t - _POWER_RING[0][0] > POWER_RING_S:
             _POWER_RING.popleft()
 
 
+POWER_CSV_HEADER = "unix_t,controller,channel,mux,fid,power_state,current_mA,bus_mV,age_ms,source\n"
+
+
+def _power_lines(readings):
+    """CSV lines of packed board-monitor readings. An absent value is an empty
+    field, never 0."""
+    blank = lambda v: "" if v is None else v   # noqa: E731
+    fids: dict = {}
+    for t, cid, src, packed in readings:
+        for ch, mux, ps, ma, mv, age in _POWER_REC.iter_unpack(packed):
+            key = (cid, ch, mux)
+            if key not in fids:
+                try:
+                    fids[key] = MAPPING.filament_for_board(cid - 1, ch, mux)
+                except Exception:
+                    fids[key] = None
+            yield (f"{t:.3f},{cid},{ch},{mux},{blank(fids[key])},{'' if ps == _PR_NONE_PS else ps},"
+                   f"{'' if ma == _PR_NONE_MA else ma},{'' if mv == _PR_NONE_U16 else mv},"
+                   f"{'' if age == _PR_NONE_U16 else age},{src or ''}\n")
+
+
+# Every board-monitor reading also goes to disk, like the series (the user,
+# 2026-11-02: every measurement at full resolution): one CSV per hour in
+# logs/power/, gzipped once the hour is over (~10x smaller), deleted after
+# POWER_KEEP_H. Incident captures keep their own copy for good.
+POWER_DIR = LOG_DIR / "power"
+POWER_KEEP_H = float(os.environ.get("CT_POWER_KEEP_HOURS", str(7 * 24)))
+
+
+def _power_path(t: float) -> Path:
+    return POWER_DIR / f"power_{datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%dT%H')}.csv"
+
+
+def power_flush() -> int:
+    with _POWER_RING_LOCK:
+        todo, _POWER_PENDING[:] = list(_POWER_PENDING), []
+    if not todo:
+        return 0
+    try:
+        POWER_DIR.mkdir(parents=True, exist_ok=True)
+        by_file: dict = {}
+        for r in todo:
+            by_file.setdefault(_power_path(r[0]), []).append(r)
+        for path, rs in by_file.items():
+            new = not path.exists()
+            with open(path, "a", encoding="ascii") as fh:
+                if new:
+                    fh.write(POWER_CSV_HEADER)
+                fh.writelines(_power_lines(rs))
+    except OSError as exc:
+        log.warning("power readings not written (%s)", exc)
+    return len(todo)
+
+
+def power_compact(now: float | None = None) -> dict:
+    """Finished hours -> .csv.gz; files older than POWER_KEEP_H deleted."""
+    now = time.time() if now is None else now
+    done = {"gzipped": [], "deleted": []}
+    if not POWER_DIR.is_dir():
+        return done
+    for path in sorted(POWER_DIR.glob("power_*.csv*")):
+        try:
+            hour = datetime.datetime.strptime(path.name[6:19], "%Y-%m-%dT%H").timestamp()
+        except ValueError:
+            continue
+        try:
+            if hour + 3600.0 < now - POWER_KEEP_H * 3600.0:
+                path.unlink()
+                done["deleted"].append(path.name)
+            elif path.suffix == ".csv" and hour + 3600.0 + 60.0 < now:
+                gz = path.with_suffix(".csv.gz")
+                with open(path, "rb") as src, gzip.open(gz, "wb", compresslevel=6) as dst:
+                    shutil.copyfileobj(src, dst)
+                path.unlink()
+                done["gzipped"].append(gz.name)
+        except OSError as exc:
+            log.warning("power file %s not compacted: %s", path.name, exc)
+    return done
+
+
 def incident_note(kind: str, event: dict | None = None, t: float | None = None) -> bool:
     """An incident happened: open (or extend) the evidence capture. True if it
-    is one (INCIDENT_KINDS)."""
-    if kind not in INCIDENT_KINDS:
+    is a big one (incident_is_major) -- only those are kept."""
+    if not incident_is_major(kind, event):
         return False
     t = time.time() if t is None else t
     with _INCIDENT_LOCK:
@@ -4435,20 +4532,8 @@ def incident_write(cap: dict) -> Path | None:
     def w_power(fh):
         with _POWER_RING_LOCK:
             ring = [r for r in _POWER_RING if start <= r[0] <= end]
-        fh.write("unix_t,controller,channel,mux,fid,power_state,current_mA,bus_mV,age_ms,source\n")
-        blank = lambda v: "" if v is None else v   # noqa: E731 -- absent stays absent, never 0
-        for t, cid, src, packed in ring:
-            for ch, mux, ps, ma, mv, age in _POWER_REC.iter_unpack(packed):
-                ps = None if ps == _PR_NONE_PS else ps
-                ma = None if ma == _PR_NONE_MA else ma
-                mv = None if mv == _PR_NONE_U16 else mv
-                age = None if age == _PR_NONE_U16 else age
-                try:
-                    fid = MAPPING.filament_for_board(cid - 1, ch, mux)
-                except Exception:
-                    fid = None
-                fh.write(f"{t:.3f},{cid},{ch},{mux},{blank(fid)},{blank(ps)},{blank(ma)},{blank(mv)},"
-                         f"{blank(age)},{src or ''}\n")
+        fh.write(POWER_CSV_HEADER)
+        fh.writelines(_power_lines(ring))
 
     def w_lines(paths, stamp):
         return lambda fh: fh.writelines(_lines_in_window(paths, start, end, stamp))
