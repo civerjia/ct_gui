@@ -1406,6 +1406,7 @@ def safety_snapshot() -> dict:
             "grid_closed": grid_closed,
             "hv_idle_for_s": round(hv_age, 1) if hv_age is not None else None,
             "hv_guard": hv_guard_snapshot(),
+            "idle_v_over": idle_v_watch_snapshot(),
             "events": events}
 
 
@@ -1688,6 +1689,130 @@ def _active_deadline_loop() -> None:
                                 "retrying": left, **({"error": err} if err else {})})
         except Exception as exc:          # never let it die
             log.exception("timed-active tick failed: %s", exc)
+
+
+# ── Voltage IDLE overshoot watch ────────────────────────────────────────────
+# A filament the backend holds at voltage IDLE must sit at its IDLE voltage.
+# 2026-11-02 three did not and nothing noticed: P2 CH5.7 at 7.2 V / 2.3 A for
+# ~3 min, P1 CH2.5 at 5.8 V, P1 CH2.4 at 3.4 V -- all recorded as IDLE (cause in
+# the firmware, not found yet: boards on flaky channels, after a lost/recover
+# or a neighbour's heating). This watch is the net under it: fresh readings
+# held over the target -> the voltage IDLE is sent again; one that will not
+# come down -> SLEEP. From the board monitor's cache, no I2C of its own.
+IDLE_V_OVER_MV = 700           # over its IDLE voltage by more than this ...
+IDLE_V_OVER_HOLD_S = 3.0       # ... on every fresh reading for this long
+IDLE_V_FRESH_MS = 3000         # a reading older than this does not count
+IDLE_V_FIX_MAX = 3             # corrections within IDLE_V_FIX_WINDOW_S ...
+IDLE_V_FIX_WINDOW_S = 60.0     # ... before the filament goes to SLEEP
+IDLE_V_WATCH_TICK_S = 1.0
+_IDLE_V_OVER: dict[int, dict] = {}     # fid -> {"since", "mv", "ma", "target"}
+_IDLE_V_FIXES: dict[int, list] = {}    # fid -> [monotonic of each correction]
+_IDLE_V_GAVE_UP: set = set()           # sent to SLEEP: never re-sent IDLE, only SLEEP again
+
+
+def _idle_v_readings() -> dict:
+    """{fid: (bus_mV, current_mA, controller0)} -- fresh monitor readings only."""
+    out = {}
+    for cid in list(CONTROLLERS):
+        try:
+            rows, meta = monitor_board_rows(cid)
+        except Exception:
+            continue
+        if not meta.get("fresh"):
+            continue
+        for r in rows:
+            age = r.get("age_ms")
+            if r.get("bus_mV") is None or age is None or age > IDLE_V_FRESH_MS:
+                continue
+            f = MAPPING.filament_for_board(cid - 1, r["channel"], r["mux_port"])
+            if f is not None:
+                out[int(f)] = (int(r["bus_mV"]), r.get("current_mA"), cid - 1)
+    return out
+
+
+def _idle_v_watch_tick(now: float) -> None:
+    with _SAFETY_LOCK:
+        held = dict(IDLE_VOLT_NOW)
+    for f in list(_IDLE_V_OVER) + list(_IDLE_V_GAVE_UP):
+        if f not in held:
+            _IDLE_V_OVER.pop(f, None)      # no longer a voltage IDLE: not ours
+            _IDLE_V_GAVE_UP.discard(f)
+    if not held:
+        return
+    reads = _idle_v_readings()
+    for f, target in held.items():
+        rd = reads.get(f)
+        if rd is None:
+            continue                        # no fresh reading: neither over nor cleared
+        mv, ma, c0 = rd
+        if mv <= target + IDLE_V_OVER_MV:
+            _IDLE_V_OVER.pop(f, None)
+            _IDLE_V_GAVE_UP.discard(f)
+            continue
+        o = _IDLE_V_OVER.setdefault(f, {"since": now})
+        o.update(mv=mv, ma=ma, target=target)
+        if now - o["since"] < IDLE_V_OVER_HOLD_S:
+            continue
+        fixes = [t for t in _IDLE_V_FIXES.get(f, []) if now - t <= IDLE_V_FIX_WINDOW_S]
+        link = CONTROLLERS.get(c0 + 1)
+        if len(fixes) >= IDLE_V_FIX_MAX or f in _IDLE_V_GAVE_UP:
+            # Given up on IDLE: SLEEP, and again while it still reads high --
+            # never back to an IDLE that would raise a board out of control.
+            again = f in _IDLE_V_GAVE_UP
+            _safety_record("idle_v_overshoot_sleep",
+                           {"filament": f, "target_mv": target, "measured_mv": mv,
+                            "measured_ma": ma, "corrections": len(fixes), "again": again,
+                            "message": (f"filament {f} still reads {mv} mV / {ma} mA after it "
+                                        f"was sent to SLEEP -- SLEEP again" if again else
+                                        f"filament {f} at voltage IDLE {target} mV reads {mv} mV / "
+                                        f"{ma} mA after {len(fixes)} corrections in "
+                                        f"{IDLE_V_FIX_WINDOW_S:.0f} s -- sent to SLEEP")})
+            log.error("voltage IDLE overshoot: filament %d at %d mV (target %d) will not come "
+                      "down -- SLEEP", f, mv, target)
+            _safety_fallback_filaments([f], POWER_STATE_SLEEP)
+            _IDLE_V_GAVE_UP.add(f)
+            _IDLE_V_FIXES.pop(f, None)
+            o["since"] = now
+            continue
+        ok, err = False, None
+        if link and link.client.connected:
+            try:
+                r = prep_filaments(link, c0, POWER_STATE_IDLE, [f], currents={f: target},
+                                   idle_v=True)
+                ok = f in (r.get("landed") or [])
+                if not ok:
+                    err = r.get("error") or f"not applied (failed {r.get('failed')})"
+            except Exception as exc:
+                err = str(exc)
+        else:
+            err = "controller not connected"
+        fixes.append(now)
+        _IDLE_V_FIXES[f] = fixes
+        o["since"] = now                    # the next correction waits a full hold again
+        _safety_record("idle_v_overshoot",
+                       {"filament": f, "target_mv": target, "measured_mv": mv, "measured_ma": ma,
+                        "resent": ok, **({"error": err} if err else {}),
+                        "message": f"filament {f} at voltage IDLE {target} mV read {mv} mV / "
+                                   f"{ma} mA for {IDLE_V_OVER_HOLD_S:.0f} s -- voltage IDLE "
+                                   f"sent again ({'landed' if ok else 'FAILED: ' + str(err)})"})
+        log.warning("voltage IDLE overshoot: filament %d at %d mV / %s mA (target %d) -- "
+                    "re-sent (%s)", f, mv, ma, target, "ok" if ok else err)
+
+
+def idle_v_watch_snapshot() -> dict:
+    now = time.monotonic()
+    return {str(f): {"target_mv": o.get("target"), "measured_mv": o.get("mv"),
+                     "measured_ma": o.get("ma"), "for_s": round(now - o["since"], 1)}
+            for f, o in sorted(_IDLE_V_OVER.items())}
+
+
+def _idle_v_watch_loop() -> None:
+    while not _STOPPING.is_set():
+        time.sleep(IDLE_V_WATCH_TICK_S)
+        try:
+            _idle_v_watch_tick(time.monotonic())
+        except Exception as exc:          # never let it die
+            log.exception("voltage IDLE watch tick failed: %s", exc)
 
 
 def _annotate_board_rows(cid: int, rows: list) -> None:
@@ -8928,6 +9053,8 @@ def main() -> None:
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
     # Timed ACTIVE (active_s): returns filaments to IDLE when their time is up.
     threading.Thread(target=_active_deadline_loop, name="timed_active", daemon=True).start()
+    # Voltage IDLE overshoot: a filament held at voltage IDLE but reading far above it.
+    threading.Thread(target=_idle_v_watch_loop, name="idle_v_watch", daemon=True).start()
     log.info("safety watchdog: ACTIVE -> %s after %.0fs, grid MOSFETs opened after %.0fs "
              "without an HV grid command (rails never touched; commands renew, reads do not)",
              power_state_name(SAFETY_ACTIVE_FALLBACK), SAFETY_ACTIVE_TIMEOUT_S,
