@@ -359,7 +359,7 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .status-tile.ps-standby { background: #e0f2ec; }
 .status-tile.ps-idle    { background: #fbefd2; }
 .status-tile.ps-active  { background: #fadcd2; }
-.status-tile.ps-voltage { background: #ece3f5; }
+.status-tile.ps-voltage { background: #eaf0d2; }   /* olive: not purple -- purple is a DARK channel */
 .status-tile.ps-unknown { background: #f6f4ef; }
 .status-tile.dead { background: repeating-linear-gradient(135deg, #3b4047, #3b4047 5px, #454b53 5px, #454b53 10px); border-color: #22262b; }
 .status-tile.dead .tile-title, .status-tile.dead .tile-measure { color: #c9ced4; }
@@ -370,7 +370,7 @@ body:not([data-view="debug"]) .dbg-only { display: none; }
 .ps-chip.ps-standby, .status-tile.ps-standby .ps-chip { background: #2b8a76; }
 .ps-chip.ps-idle,    .status-tile.ps-idle .ps-chip    { background: #b9820f; }
 .ps-chip.ps-active,  .status-tile.ps-active .ps-chip  { background: #c23f22; }
-.ps-chip.ps-voltage, .status-tile.ps-voltage .ps-chip { background: #7650a6; }
+.ps-chip.ps-voltage, .status-tile.ps-voltage .ps-chip { background: #6b7d12; }
 .ps-chip.ps-dead,    .status-tile.dead .ps-chip       { background: #111417; color: #ff8b7a; outline: 1px solid #ff8b7a; }
 .status-tile.recovering { box-shadow: inset 0 0 0 2px #d39e00; }
 /* channel masked off in the enable mask — dimmed + non-interactive */
