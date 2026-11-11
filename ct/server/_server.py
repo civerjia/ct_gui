@@ -3736,15 +3736,13 @@ def hv_guard_tick(now: float | None = None) -> dict | None:
     sp = _spellman_tick(now)
     if sp:
         return sp
-    # Before the latched early return: over the limit (or no reading) the
-    # heating must go to SLEEP whatever latched the guard first.
-    vt = _vacuum_tick(now)
-    if vt:
-        return vt
     if _HV_GUARD["tripped"]:
         if _HV_GUARD["tripped"].get("auto_recover"):
             return _spellman_try_recover(now)
         return None
+    vt = _vacuum_tick(now)
+    if vt:
+        return vt
     st = _hv_guard_stm32_flags()
     # The flag, not the reason: the reason is first-wins until the STM32 resets,
     # so after a cleared latch it still says 8 and would re-trip at once.
@@ -4799,11 +4797,6 @@ def vacuum_set_limit(value, who: str = "?") -> dict:
     return {"ok": True, "limit_torr": v, "was": old, "saved": saved}
 VACUUM_INTERLOCK = os.environ.get("CT_VACUUM_INTERLOCK", "1") != "0"
 VACUUM_TRIP_READINGS = 2        # consecutive fresh readings over the limit -> trip
-# No reading at all for this long trips the same way (the user, 2026-11-11:
-# a gauge that vanished must not leave HV and heating on). Counted from the
-# last reading, or from start-up. The debug bypass (bypass_missing_s) holds it.
-VACUUM_MISSING_TRIP_S = float(os.environ.get("CT_VACUUM_MISSING_TRIP_S", "60"))
-_VAC_T0 = time.monotonic()
 # DEBUG: while the gauge relay is down for work (2026-10-30, raspberrypi5 being
 # debugged), a person may let "no reading" pass for a while -- from the GUI or
 # POST /api/vacuum {"bypass_missing_s": s}, no restart. Never a reading OVER the
@@ -5104,8 +5097,6 @@ def vacuum_refusal(action: str) -> str | None:
     """Why `action` (HV ON, heating to ACTIVE/VOLTAGE) may not happen now, or
     None. No fresh reading counts as NOT OK: an unknown vacuum is not a good
     one. CT_VACUUM_INTERLOCK=0 turns this off."""
-    if _VAC_LATCH[0]:
-        return vacuum_heat_refusal(action)
     if not VACUUM_INTERLOCK:
         return None
     v = vacuum_snapshot()
@@ -5208,22 +5199,15 @@ def _vacuum_latch_save() -> None:
         log.warning("vacuum latch not saved (%s) -- it holds until the backend restarts", exc)
 
 
-def _vacuum_why(p: float | None, missing_s: float | None = None) -> str:
-    if p is None:
-        return (f"no vacuum reading for {missing_s or 0:.0f} s (more than "
-                f"{VACUUM_MISSING_TRIP_S:.0f} s)")
-    return f"vacuum {p:.2e} Torr over the {vacuum_limit():.1e} Torr limit"
-
-
-def vacuum_latch_set(p: float | None, missing_s: float | None = None) -> None:
+def vacuum_latch_set(p: float) -> None:
     if _VAC_LATCH[0]:
         return
     _VAC_LATCH[0] = {"source": "vacuum", "pressure_torr": p, "limit_torr": vacuum_limit(),
-                     "missing_s": missing_s,
                      "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-                     "message": (f"{_vacuum_why(p, missing_s)}: heating to SLEEP and latched -- "
-                                 f"no heating (IDLE included) until a person clears it (Clear HV "
-                                 f"guard latch), once a fresh reading is within the limit")}
+                     "message": (f"vacuum {p:.2e} Torr went over the {vacuum_limit():.1e} Torr "
+                                 f"limit: heating to SLEEP and latched -- no heating (IDLE "
+                                 f"included) until a person clears it (Clear HV guard latch), "
+                                 f"once the vacuum is back within the limit")}
     _vacuum_latch_save()
 
 
@@ -5237,8 +5221,8 @@ def vacuum_latch_clear(who: str = "?") -> str | None:
     if v["pressure_torr"] > vacuum_limit():
         return (f"vacuum latch kept: {v['pressure_torr']:.2e} Torr is still over the "
                 f"{vacuum_limit():.1e} Torr limit")
-    log.warning("vacuum latch cleared by %s (latched %s: %s)", who,
-                _VAC_LATCH[0].get("at"), _VAC_LATCH[0].get("message"))
+    log.warning("vacuum latch cleared by %s (latched %s at %.2e Torr)", who,
+                _VAC_LATCH[0].get("at"), _VAC_LATCH[0].get("pressure_torr") or 0)
     _VAC_LATCH[0] = None
     _vacuum_latch_save()
     return None
@@ -5250,9 +5234,8 @@ def vacuum_heat_refusal(action: str) -> str | None:
     not refuse IDLE -- IDLE is what keeps the vacuum when the gauge relay is
     merely down."""
     if _VAC_LATCH[0]:
-        pt = _VAC_LATCH[0].get("pressure_torr")
         return (f"vacuum latch ({_VAC_LATCH[0].get('at')}, "
-                f"{'%.2e Torr' % pt if pt is not None else 'no reading'}): heating stays off until a "
+                f"{_VAC_LATCH[0].get('pressure_torr', 0):.2e} Torr): heating stays off until a "
                 f"person clears it (POST /api/hv-guard {{\"clear\": true}}) -- refusing {action}")
     if not VACUUM_INTERLOCK:
         return None
@@ -5290,10 +5273,9 @@ def vacuum_sleep_all(now: float) -> tuple[list, dict]:
     return todo, {"not_confirmed": still}
 
 
-def _vacuum_trip(p: float | None, now: float, missing_s: float | None = None) -> dict:
-    """Pressure over the limit (or no reading for VACUUM_MISSING_TRIP_S) with
-    HV possibly on: rails off, every filament to SLEEP (heating off), latched
-    like the HV guard."""
+def _vacuum_trip(p: float, now: float) -> dict:
+    """Pressure over the limit with HV possibly on: rails off, every filament
+    to SLEEP (heating off), latched like the HV guard."""
     link = CONTROLLERS.get(MASTER)
     off = {}
     for ch in ("emission", "focus"):
@@ -5301,15 +5283,15 @@ def _vacuum_trip(p: float | None, now: float, missing_s: float | None = None) ->
             off[ch] = bool((stm32_hv_enable_set(link.host, ch, False) if link and link.host else {}).get("ok"))
         except Exception:
             off[ch] = False
-    vacuum_latch_set(p, missing_s)
+    vacuum_latch_set(p)
     to_sleep, info = vacuum_sleep_all(now)
     _VAC_OVER["slept"] = not info["not_confirmed"]     # else the next readings retry
     _hvg_count()
     nc = info["not_confirmed"]
     rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": vacuum_limit(), "hv_off": off,
-           "missing_s": missing_s, "to_sleep": to_sleep, "sleep_not_confirmed": nc,
-           "message": (f"HV OFF + heating SLEEP: {_vacuum_why(p, missing_s)} "
-                       f"-- emission and focus switched off, {len(to_sleep)} filament(s) "
+           "to_sleep": to_sleep, "sleep_not_confirmed": nc,
+           "message": (f"HV OFF + heating SLEEP: vacuum {p:.2e} Torr over the {vacuum_limit():.1e} "
+                       f"Torr limit -- emission and focus switched off, {len(to_sleep)} filament(s) "
                        f"to SLEEP{f' (NOT confirmed at SLEEP: {nc})' if nc else ''}; "
                        f"heating (IDLE too) and HV ON are refused until a person clears the latch "
                        f"(POST /api/hv-guard {{\"clear\": true}}) with the vacuum back within the "
@@ -5326,49 +5308,33 @@ def _vacuum_tick(now: float) -> dict | None:
         return None
     v = vacuum_snapshot()
     p = v["pressure_torr"]
-    missing_s = None
-    if p is None:
+    if p is None or p <= vacuum_limit():
         _VAC_OVER["n"] = 0
-        if v["bypass_missing_s"]:
-            return None                     # a person let "no reading" pass for now
-        # From the last reading, or from start-up when there was none yet.
-        with _SPELL_LOCK:
-            at = _SPELL["pressure_at"]
-        missing_s = now - max(at if at is not None else _VAC_T0, _VAC_T0)
-        if missing_s < VACUUM_MISSING_TRIP_S:
-            return None
-        if _VAC_OVER["slept"] and (_HV_GUARD["tripped"] or _VAC_LATCH[0]):
-            return None
-        if now - _VAC_OVER.get("tried_at", -1e9) < 10.0:
-            return None                     # a SLEEP not confirmed: retry every 10 s, not every tick
-        _VAC_OVER["tried_at"] = now
-    elif p <= vacuum_limit():
-        _VAC_OVER["n"] = 0
-        _VAC_OVER["slept"] = False          # recovered: the next excursion sleeps again
+        if p is not None:
+            _VAC_OVER["slept"] = False      # recovered: the next excursion sleeps again
         return None
-    else:
-        if _VAC_OVER["slept"] and (_HV_GUARD["tripped"] or _VAC_LATCH[0]):
-            return None
-        with _SPELL_LOCK:
-            at = _SPELL["pressure_at"]
-        if at == _VAC_OVER["last_at"]:
-            return None                     # the gauge sends every 2 s; ticks are 1 s
-        _VAC_OVER["last_at"] = at
-        _VAC_OVER["n"] += 1
-        if _VAC_OVER["n"] < VACUUM_TRIP_READINGS:
-            return None
-        _VAC_OVER["n"] = 0
-    if not _HV_GUARD["tripped"] or _HV_GUARD["tripped"].get("auto_recover"):
-        return _vacuum_trip(p, now, missing_s)   # an arc's auto-recovery must not put HV back
+    if _HV_GUARD["tripped"] and _VAC_OVER["slept"]:
+        return None
+    with _SPELL_LOCK:
+        at = _SPELL["pressure_at"]
+    if at == _VAC_OVER["last_at"]:
+        return None                         # the gauge sends every 2 s; ticks are 1 s
+    _VAC_OVER["last_at"] = at
+    _VAC_OVER["n"] += 1
+    if _VAC_OVER["n"] < VACUUM_TRIP_READINGS:
+        return None
+    _VAC_OVER["n"] = 0
+    if not _HV_GUARD["tripped"]:
+        return _vacuum_trip(p, now)
     # Latched already (another source, or a vacuum trip cleared by hand while
     # still over): the HV is off, but the heating must still go to SLEEP.
-    vacuum_latch_set(p, missing_s)
+    vacuum_latch_set(p)
     to_sleep, info = vacuum_sleep_all(now)
     _VAC_OVER["slept"] = not info["not_confirmed"]
     rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": vacuum_limit(),
-           "missing_s": missing_s, "to_sleep": to_sleep, "sleep_not_confirmed": info["not_confirmed"],
-           "message": (f"{_vacuum_why(p, missing_s)} (HV guard already latched) -- "
-                       f"{len(to_sleep)} filament(s) to SLEEP")}
+           "to_sleep": to_sleep, "sleep_not_confirmed": info["not_confirmed"],
+           "message": (f"vacuum {p:.2e} Torr over the {vacuum_limit():.1e} Torr limit (HV guard "
+                       f"already latched) -- {len(to_sleep)} filament(s) to SLEEP")}
     log.error("vacuum over limit: %s", rec["message"])
     _safety_record("vacuum_sleep", rec)
     return {"action": "slept", **rec}
