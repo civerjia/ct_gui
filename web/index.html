@@ -443,7 +443,7 @@
             <summary class="section-head foldable-summary">
               <h2>Supply &amp; Vacuum Trend <span class="hint">— Spellman (control2, read-only) · emission (ADS1115) · vacuum · radiation</span></h2>
             </summary>
-            <div class="row compact">
+            <div class="row compact wrap trend-controls">
               <span class="hint">window</span>
               <div class="seg sm" id="trendWindow">
                 <button class="seg-btn active" data-s="120">2 min</button>
@@ -453,10 +453,11 @@
                 <button class="seg-btn" data-s="86400">24 h</button>
               </div>
               <span id="trendView" class="hint" title="Scroll on the plot to zoom, drag to pan (last 24 h), double-click to go back to live"></span>
-              <span class="hint" title="The vacuum interlock: over this (or no reading) HV ON and ACTIVE/VOLTAGE are refused; going over it: HV off, all heating to SLEEP, latched until a person clears it (Clear HV guard latch) with the vacuum back within the limit. Saved on the backend.">vacuum limit</span>
+              <span class="trend-vac"><span class="hint" title="The vacuum interlock: over this (or no reading) HV ON and ACTIVE/VOLTAGE are refused; going over it: HV off, all heating to SLEEP, latched until a person clears it (Clear HV guard latch) with the vacuum back within the limit. Saved on the backend.">vacuum limit</span>
               <input autocomplete="off" id="vacLimit" class="vac-limit" type="text" inputmode="decimal" placeholder="2.5e-5" data-nostick />
               <span class="hint">Torr</span>
               <button id="vacLimitSet" class="xs">Set</button>
+              </span>
               <span id="vacLimitMsg" class="hint"></span>
             </div>
             <canvas id="trendCanvas" class="trend-canvas"></canvas>
