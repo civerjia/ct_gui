@@ -38,6 +38,7 @@ export function initTrends() {
   let clockOffset = 0;   // backend time - browser time, s (from each reply's `now`)
   // The view: live (right edge = now) or parked with its right edge at endT.
   let follow = true, endT = 0;
+  let vacEdited = false;   // the limit input holds a value not yet Set
   let rng = null, rngBusy = false, rngWant = null, rngAt = 0;   // /api/series?from= reply
   const nowT = () => Date.now() / 1000 + clockOffset;
   const view = () => {
@@ -134,8 +135,11 @@ export function initTrends() {
       if (typeof r.now === 'number') clockOffset = r.now - (t0 + Date.now() / 1000) / 2;
       if (typeof r.vacuum_limit_torr === 'number') {
         STRIPS[4].limit = r.vacuum_limit_torr;
+        // Not while someone is typing a new limit: clicking Set blurs the
+        // input first, and a refresh landing in that gap put the old value
+        // back -- Set then sent the old limit (2026-11-11, "takes several clicks").
         const inp = $('vacLimit');
-        if (inp && document.activeElement !== inp) inp.value = r.vacuum_limit_torr.toExponential(1);
+        if (inp && !vacEdited && document.activeElement !== inp) inp.value = r.vacuum_limit_torr.toExponential(1);
       }
       for (const s of STRIPS) {
         const pts = (r.series || {})[s.key] || [];
@@ -256,14 +260,22 @@ export function initTrends() {
     }
   }
 
-  const setBtn = $('vacLimitSet'), msg = $('vacLimitMsg');
+  const setBtn = $('vacLimitSet'), msg = $('vacLimitMsg'), vacInp = $('vacLimit');
+  if (vacInp) {
+    vacInp.addEventListener('input', () => { vacEdited = true; });
+    vacInp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && setBtn) setBtn.click(); });
+  }
   if (setBtn) setBtn.onclick = async () => {
-    const v = parseFloat(($('vacLimit') || {}).value);
+    const v = parseFloat((vacInp || {}).value);
     if (!(v > 0)) { if (msg) msg.textContent = 'enter a pressure in Torr, e.g. 2.5e-5'; return; }
     const r = await postJ('/api/vacuum', { limit_torr: v });
     if (msg) msg.textContent = r.ok ? `limit ${r.limit_torr.toExponential(1)} Torr (was ${r.was.toExponential(1)})`
                                     : (r.error || 'not changed');
-    if (r.ok) { STRIPS[4].limit = r.limit_torr; draw(); }
+    if (r.ok) {
+      vacEdited = false;
+      if (vacInp) vacInp.value = r.limit_torr.toExponential(1);
+      STRIPS[4].limit = r.limit_torr; draw();
+    }
   };
   markSeg();
   card.addEventListener('toggle', draw);
