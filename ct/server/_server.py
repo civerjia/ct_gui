@@ -4800,9 +4800,11 @@ def vacuum_set_limit(value, who: str = "?") -> dict:
 VACUUM_INTERLOCK = os.environ.get("CT_VACUUM_INTERLOCK", "1") != "0"
 VACUUM_TRIP_READINGS = 2        # consecutive fresh readings over the limit -> trip
 # No reading at all for this long trips the same way (the user, 2026-11-11:
-# a gauge that vanished must not leave HV and heating on). Counted from the
-# last reading, or from start-up. The debug bypass (bypass_missing_s) holds it.
-VACUUM_MISSING_TRIP_S = float(os.environ.get("CT_VACUUM_MISSING_TRIP_S", "60"))
+# a gauge that vanished must not leave HV and heating on; "丢数据就立刻保护"
+# unless debug mode is on). 10 s = the reading counts as missing at all
+# (SPELLMAN_STALE_S, ~5 gauge readings). Counted from the last reading, or
+# from start-up. Debug mode (or the old timed bypass) holds it.
+VACUUM_MISSING_TRIP_S = float(os.environ.get("CT_VACUUM_MISSING_TRIP_S", "10"))
 _VAC_T0 = time.monotonic()
 # DEBUG: while the gauge relay is down for work (2026-10-30, raspberrypi5 being
 # debugged), a person may let "no reading" pass for a while -- from the GUI or
@@ -4823,6 +4825,42 @@ def vacuum_bypass_left() -> float | None:
         log.warning("vacuum debug bypass ended (time up) -- no reading refuses again")
         return None
     return left
+
+
+# Vacuum debug mode (the user, 2026-11-11: a checkbox in the GUI). On: a
+# MISSING reading is ignored -- no refusal, no trip. Off: no reading for
+# VACUUM_MISSING_TRIP_S trips at once, like over-pressure. A reading over the
+# limit trips either way. Saved: a restart keeps what a person chose.
+VACUUM_DEBUG_PATH = STATE_DIR / "vacuum_debug.json"
+
+
+def _vacuum_debug_load() -> dict | None:
+    try:
+        v = json.loads(VACUUM_DEBUG_PATH.read_text())
+        return v if isinstance(v, dict) and v.get("on") else None
+    except (OSError, ValueError):
+        return None
+
+
+_VAC_DEBUG = [_vacuum_debug_load()]
+
+
+def vacuum_set_debug(on, who: str) -> dict:
+    on = bool(on)
+    _VAC_DEBUG[0] = ({"on": True, "by": who,
+                      "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+                     if on else None)
+    try:
+        VACUUM_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        VACUUM_DEBUG_PATH.write_text(json.dumps(_VAC_DEBUG[0] or {}))
+        saved = True
+    except OSError as exc:
+        saved = False
+        log.warning("vacuum debug mode not saved (%s)", exc)
+    log.warning("vacuum debug mode %s by %s%s", "ON" if on else "OFF", who,
+                ": a missing reading is ignored (no refusal, no trip)" if on
+                else ": a missing reading trips at once")
+    return {"ok": True, "debug": on, "saved": saved}
 
 
 def vacuum_set_bypass(seconds, who: str) -> dict:
@@ -5097,7 +5135,9 @@ def vacuum_snapshot() -> dict:
             "pressure_torr": p if fresh else None, "age_s": _age(at, now), "raw": raw if fresh else None,
             "limit_torr": vacuum_limit(), "interlock": VACUUM_INTERLOCK,
             "within_limit": (p <= vacuum_limit()) if fresh else None, "lesker": les,
-            "bypass_missing_s": vacuum_bypass_left(), "bypass_by": _VAC_BYPASS["by"]}
+            "bypass_missing_s": vacuum_bypass_left(), "bypass_by": _VAC_BYPASS["by"],
+            "debug": bool(_VAC_DEBUG[0]), "debug_by": (_VAC_DEBUG[0] or {}).get("by"),
+            "missing_trip_s": VACUUM_MISSING_TRIP_S}
 
 
 def vacuum_refusal(action: str) -> str | None:
@@ -5109,7 +5149,7 @@ def vacuum_refusal(action: str) -> str | None:
     if not VACUUM_INTERLOCK:
         return None
     v = vacuum_snapshot()
-    if v["pressure_torr"] is None and v["bypass_missing_s"]:
+    if v["pressure_torr"] is None and (v["debug"] or v["bypass_missing_s"]):
         return None          # debug bypass: a person let "no reading" pass for now
     if v["pressure_torr"] is None:
         since = "ever" if v["age_s"] is None else "%.0f s" % v["age_s"]
@@ -5118,7 +5158,7 @@ def vacuum_refusal(action: str) -> str | None:
                 f"-- refusing {action}. "
                 f"Start control2's spellman_backend (it relays the Lesker gauge), or, to "
                 f"debug without it, let a missing reading pass for a while: the GUI's "
-                f"vacuum 'Debug' button / POST /api/vacuum {{\"bypass_missing_s\": 3600}}")
+                f"vacuum 'debug' checkbox / POST /api/vacuum {{\"debug\": true}}")
     if v["pressure_torr"] > vacuum_limit():
         return (f"vacuum interlock: {v['pressure_torr']:.2e} Torr is over the {vacuum_limit():.1e} "
                 f"Torr limit -- refusing {action}")
@@ -5210,8 +5250,7 @@ def _vacuum_latch_save() -> None:
 
 def _vacuum_why(p: float | None, missing_s: float | None = None) -> str:
     if p is None:
-        return (f"no vacuum reading for {missing_s or 0:.0f} s (more than "
-                f"{VACUUM_MISSING_TRIP_S:.0f} s)")
+        return f"no vacuum reading for {missing_s or 0:.0f} s (vacuum debug mode off)"
     return f"vacuum {p:.2e} Torr over the {vacuum_limit():.1e} Torr limit"
 
 
@@ -5232,9 +5271,10 @@ def vacuum_latch_clear(who: str = "?") -> str | None:
     if not _VAC_LATCH[0]:
         return None
     v = vacuum_snapshot()
-    if v["pressure_torr"] is None:
-        return "vacuum latch kept: no fresh pressure reading to show the vacuum has recovered"
-    if v["pressure_torr"] > vacuum_limit():
+    if v["pressure_torr"] is None and not v["debug"]:
+        return ("vacuum latch kept: no fresh pressure reading to show the vacuum has recovered "
+                "(vacuum debug mode lets a person clear it without one)")
+    if v["pressure_torr"] is not None and v["pressure_torr"] > vacuum_limit():
         return (f"vacuum latch kept: {v['pressure_torr']:.2e} Torr is still over the "
                 f"{vacuum_limit():.1e} Torr limit")
     log.warning("vacuum latch cleared by %s (latched %s: %s)", who,
@@ -5329,8 +5369,8 @@ def _vacuum_tick(now: float) -> dict | None:
     missing_s = None
     if p is None:
         _VAC_OVER["n"] = 0
-        if v["bypass_missing_s"]:
-            return None                     # a person let "no reading" pass for now
+        if v["debug"] or v["bypass_missing_s"]:
+            return None                     # debug mode: a missing reading is ignored
         # From the last reading, or from start-up when there was none yet.
         with _SPELL_LOCK:
             at = _SPELL["pressure_at"]
@@ -7272,6 +7312,9 @@ class CtHandler(BaseHTTPRequestHandler):
                 # {"limit_torr": x}: the interlock's limit, saved (survives a
                 # restart). {"bypass_missing_s": s}: debug, let NO reading pass
                 # for s seconds (0 ends it). The reading itself is control2's.
+                if "debug" in body:
+                    r = vacuum_set_debug(body["debug"], self._client(body))
+                    return self._json({**r, "vacuum": vacuum_snapshot()})
                 if "bypass_missing_s" in body:
                     r = vacuum_set_bypass(body["bypass_missing_s"], self._client(body))
                     return self._json({**r, "vacuum": vacuum_snapshot()} if r.get("ok") else r)
