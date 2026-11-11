@@ -1957,6 +1957,10 @@ def _raw_power_guard(cid: int, command: str, body: dict) -> tuple[dict | None, l
         vr = heat_refusal(f"raw {command} to {power_state_name(state)}")
         if vr:
             return {"ok": False, "refused": True, "error": vr}, fids, state
+    elif state in (POWER_STATE_STANDBY, POWER_STATE_IDLE):
+        vr = vacuum_heat_refusal(f"raw {command} to {power_state_name(state)}")
+        if vr:
+            return {"ok": False, "refused": True, "error": vr}, fids, state
     return None, fids, state
 
 
@@ -4089,7 +4093,8 @@ def hv_guard_snapshot() -> dict:
     m = dict(_HVG_LAST_MODEL)
     if m:
         m["age_s"] = round(now - m.pop("at"), 1)
-    return {"ok": True, "enabled": _HV_GUARD["enabled"], "tripped": _HV_GUARD["tripped"],
+    return {"ok": True, "enabled": _HV_GUARD["enabled"],
+            "tripped": _HV_GUARD["tripped"] or _VAC_LATCH[0], "vacuum_latch": _VAC_LATCH[0],
             "trips": _HV_GUARD["trips"],
             "vacuum": vacuum_snapshot(), "hv_supply": hv_supply_snapshot(),
             "radiation": radiation_snapshot(),
@@ -4120,6 +4125,25 @@ SERIES_NAMES = ("sp_kv", "sp_ma", "vac", "em_v", "em_i", "gmc_cpm", "gmc_usvh", 
 _SERIES_LOCK = threading.Lock()
 _SERIES = {n: collections.deque(maxlen=SERIES_MAX_POINTS) for n in SERIES_NAMES}
 _SERIES_LAST_ADS = [None]           # the shared ADS result last recorded (no duplicates)
+# The plot zooms and pans over SERIES_RANGE_KEEP_S (the user, 2026-11-11: 24 h,
+# not 1 h). Zoomed out, it is drawn from a min/max envelope per SERIES_ENV_S
+# (kept in memory, cheap); zoomed in on an older stretch, from the raw hour
+# files on disk -- every reading, spikes kept either way (see series_range).
+SERIES_RANGE_KEEP_S = 24 * 3600.0
+SERIES_ENV_S = 10
+_SERIES_ENV = {n: {} for n in SERIES_NAMES}   # bucket -> [t_lo, lo, t_hi, hi]
+
+
+def _series_env_add(env: dict, t: float, v: float) -> None:
+    k = int(t // SERIES_ENV_S)
+    e = env.get(k)
+    if e is None:
+        env[k] = [t, v, t, v]
+        return
+    if v < e[1]:
+        e[0], e[1] = t, v
+    if v > e[3]:
+        e[2], e[3] = t, v
 
 
 def series_add(name: str, value: float, t: float | None = None) -> None:
@@ -4129,6 +4153,12 @@ def series_add(name: str, value: float, t: float | None = None) -> None:
         d.append((t, value))
         while d and t - d[0][0] > SERIES_KEEP_S:
             d.popleft()
+        env = _SERIES_ENV[name]
+        _series_env_add(env, t, value)
+        if len(env) > SERIES_RANGE_KEEP_S / SERIES_ENV_S + 360:   # ~once an hour
+            cut = int((t - SERIES_RANGE_KEEP_S) // SERIES_ENV_S)
+            for k in [k for k in env if k < cut]:
+                del env[k]
         _SERIES_PENDING.append((t, name, value))
 
 
@@ -4197,6 +4227,125 @@ def series_load(now: float | None = None) -> int:
                 _SERIES[nm].append((t, v))
         n += len(rows)
     return n
+
+
+def series_env_fill(now: float | None = None) -> int:
+    """The envelope for the last SERIES_RANGE_KEEP_S from the raw hour files
+    (start-up, in the background). min/max are idempotent, so a reading that
+    also arrived live is not counted twice."""
+    now = time.time() if now is None else now
+    since, n = now - SERIES_RANGE_KEEP_S, 0
+    for k in range(int(SERIES_RANGE_KEEP_S // 3600) + 2):
+        path = _series_path(since + k * 3600.0)
+        if not path.exists():
+            continue
+        rows = [(t, nm, v) for t, nm, v in _series_rows(path) if t >= since]
+        with _SERIES_LOCK:
+            for t, nm, v in rows:
+                _series_env_add(_SERIES_ENV[nm], t, v)
+        n += len(rows)
+    return n
+
+
+_SERIES_HOUR_LOCK = threading.Lock()
+_SERIES_HOUR_CACHE: collections.OrderedDict = collections.OrderedDict()
+
+
+def _series_hour(path: Path) -> dict:
+    """{name: [(t, v), ...] sorted} of one raw hour file, the last few cached
+    (a finished hour never changes; the current one is re-read when it grew)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    key = (st.st_mtime, st.st_size)
+    with _SERIES_HOUR_LOCK:
+        c = _SERIES_HOUR_CACHE.get(path)
+        if c and c[0] == key:
+            _SERIES_HOUR_CACHE.move_to_end(path)
+            return c[1]
+    d: dict = {}
+    for t, nm, v in _series_rows(path):
+        d.setdefault(nm, []).append((t, v))
+    for lst in d.values():
+        lst.sort()
+    with _SERIES_HOUR_LOCK:
+        _SERIES_HOUR_CACHE[path] = (key, d)
+        while len(_SERIES_HOUR_CACHE) > 6:
+            _SERIES_HOUR_CACHE.popitem(last=False)
+    return d
+
+
+def _series_reduce(pts: list, t0: float, w: float) -> list:
+    """Per bucket of w s: its lowest and highest reading, in time order -- a
+    one-sample spike survives any zoom level."""
+    out: list = []
+    cur, lo, hi = None, None, None
+
+    def flush():
+        if lo is None:
+            return
+        if lo[0] == hi[0]:
+            out.append(lo)
+        else:
+            out.extend((lo, hi) if lo[0] < hi[0] else (hi, lo))
+    for t, v in pts:
+        k = int((t - t0) // w)
+        if k != cur:
+            flush()
+            cur, lo, hi = k, (t, v), (t, v)
+        else:
+            if v < lo[1]:
+                lo = (t, v)
+            if v > hi[1]:
+                hi = (t, v)
+    flush()
+    return out
+
+
+def series_range(names, t0: float, t1: float, buckets: int = 1000) -> dict:
+    """{name: [[t, v], ...]} between t0 and t1 (epoch s, at most the last
+    SERIES_RANGE_KEEP_S), at most ~2 points per bucket: raw readings (memory,
+    then disk) when a bucket is shorter than SERIES_ENV_S, else the envelope."""
+    now = time.time()
+    t1 = min(float(t1), now)
+    t0 = max(float(t0), now - SERIES_RANGE_KEEP_S)
+    buckets = max(10, min(int(buckets), 5000))
+    out = {}
+    w = (t1 - t0) / buckets if t1 > t0 else 0.0
+    for n in names:
+        if n not in _SERIES or w <= 0:
+            continue
+        if w >= SERIES_ENV_S:
+            pts = []
+            with _SERIES_LOCK:
+                env = _SERIES_ENV[n]
+                for k in range(int(t0 // SERIES_ENV_S), int(t1 // SERIES_ENV_S) + 1):
+                    e = env.get(k)
+                    if e:
+                        pts.extend(((e[0], e[1]), (e[2], e[3])) if e[0] <= e[2]
+                                   else ((e[2], e[3]), (e[0], e[1])))
+            pts = [p for p in pts if t0 <= p[0] <= t1]
+        else:
+            with _SERIES_LOCK:
+                d = _SERIES[n]
+                mem_from = d[0][0] if d else now
+                mem = [p for p in d if t0 <= p[0] <= t1]
+            pts = []
+            if t0 < mem_from:
+                hours = sorted({_series_path(t0 + k * 3600.0)
+                                for k in range(int((min(t1, mem_from) - t0) // 3600) + 1)}
+                               | {_series_path(min(t1, mem_from))})
+                for path in hours:
+                    pts += [p for p in _series_hour(path).get(n, ())
+                            if t0 <= p[0] <= t1 and p[0] < mem_from]
+            pts += mem
+        if len(pts) > 2 * buckets:
+            pts = _series_reduce(pts, t0, w)
+        out[n] = [[round(t, 3), v] for t, v in pts]
+    return {"ok": True, "now": round(now, 3), "from": round(t0, 3), "to": round(t1, 3),
+            "bucket_s": w, "keep_s": SERIES_RANGE_KEEP_S, "series": out,
+            "vacuum_limit_torr": vacuum_limit()}
 
 
 def series_compact(now: float | None = None) -> list:
@@ -4310,7 +4459,7 @@ INCIDENT_MAX_S = 1800.0            # a run of incidents is cut into captures thi
 # switch that could not be opened, and hot filaments the safety fallback could
 # not walk back. Everything else is in the week of raw data anyway.
 INCIDENT_KINDS = frozenset({"hv_guard_tripped", "grid_stray_closed", "fallback_error",
-                            "fallback_unreachable", "spellman_over_current"})
+                            "fallback_unreachable", "spellman_over_current", "vacuum_sleep"})
 
 
 def incident_is_major(kind: str, event: dict | None) -> bool:
@@ -4698,7 +4847,8 @@ _SPELL: dict = {"connected": False, "error": None, "last_msg": None,
                 "gmc_cpm": None, "gmc_usvh": None, "gmc_delta_cpm": None, "gmc_at": None,
                 "gmc": None, "gmc_connected": False, "gmc_error": None}
 _SPELL_MA_HIST: list = []       # (monotonic, mA) of the last ~10 min, for the tail check
-_VAC_OVER = {"n": 0, "last_at": None}   # consecutive NEW readings over the limit
+_VAC_OVER = {"n": 0, "last_at": None,   # consecutive NEW readings over the limit
+             "slept": False}             # heating already put to SLEEP for this excursion
 
 
 def _spellman_number(v):
@@ -5019,13 +5169,113 @@ def heat_refusal(action: str) -> str | None:
                else "a person must clear the latch (POST /api/hv-guard {\"clear\": true})")
         return (f"HV guard tripped ({t.get('source')}, {t.get('at')}) -- the HV is off, so "
                 f"refusing {action}; {how}")
-    return vacuum_refusal(action)
+    return vacuum_heat_refusal(action) if _VAC_LATCH[0] else vacuum_refusal(action)
+
+
+# Over the limit latches the heating off until a PERSON clears it -- a vacuum
+# that recovers does not bring the heating back by itself (the user,
+# 2026-11-11: "气压需要手动恢复，不能自动恢复"). Saved, so a backend restart
+# does not clear it either. Cleared with the HV guard latch (POST /api/hv-guard
+# {"clear": true}), and only while a fresh reading is within the limit.
+VACUUM_LATCH_PATH = STATE_DIR / "vacuum_latch.json"
+
+
+def _vacuum_latch_load():
+    try:
+        v = json.loads(VACUUM_LATCH_PATH.read_text())
+        return v if isinstance(v, dict) and v else None
+    except (OSError, ValueError):
+        return None
+
+
+_VAC_LATCH = [_vacuum_latch_load()]
+
+
+def _vacuum_latch_save() -> None:
+    try:
+        VACUUM_LATCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+        VACUUM_LATCH_PATH.write_text(json.dumps(_VAC_LATCH[0] or {}))
+    except OSError as exc:
+        log.warning("vacuum latch not saved (%s) -- it holds until the backend restarts", exc)
+
+
+def vacuum_latch_set(p: float) -> None:
+    if _VAC_LATCH[0]:
+        return
+    _VAC_LATCH[0] = {"source": "vacuum", "pressure_torr": p, "limit_torr": vacuum_limit(),
+                     "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                     "message": (f"vacuum {p:.2e} Torr went over the {vacuum_limit():.1e} Torr "
+                                 f"limit: heating to SLEEP and latched -- no heating (IDLE "
+                                 f"included) until a person clears it (Clear HV guard latch), "
+                                 f"once the vacuum is back within the limit")}
+    _vacuum_latch_save()
+
+
+def vacuum_latch_clear(who: str = "?") -> str | None:
+    """Clear the vacuum latch; None when cleared (or none), else why not."""
+    if not _VAC_LATCH[0]:
+        return None
+    v = vacuum_snapshot()
+    if v["pressure_torr"] is None:
+        return "vacuum latch kept: no fresh pressure reading to show the vacuum has recovered"
+    if v["pressure_torr"] > vacuum_limit():
+        return (f"vacuum latch kept: {v['pressure_torr']:.2e} Torr is still over the "
+                f"{vacuum_limit():.1e} Torr limit")
+    log.warning("vacuum latch cleared by %s (latched %s at %.2e Torr)", who,
+                _VAC_LATCH[0].get("at"), _VAC_LATCH[0].get("pressure_torr") or 0)
+    _VAC_LATCH[0] = None
+    _vacuum_latch_save()
+    return None
+
+
+def vacuum_heat_refusal(action: str) -> str | None:
+    """Why heating at all (STANDBY/IDLE too) may not happen now, or None: the
+    vacuum latch, or a FRESH reading over the limit. A missing reading does
+    not refuse IDLE -- IDLE is what keeps the vacuum when the gauge relay is
+    merely down."""
+    if _VAC_LATCH[0]:
+        return (f"vacuum latch ({_VAC_LATCH[0].get('at')}, "
+                f"{_VAC_LATCH[0].get('pressure_torr', 0):.2e} Torr): heating stays off until a "
+                f"person clears it (POST /api/hv-guard {{\"clear\": true}}) -- refusing {action}")
+    if not VACUUM_INTERLOCK:
+        return None
+    p = vacuum_snapshot()["pressure_torr"]
+    if p is not None and p > vacuum_limit():
+        return (f"vacuum interlock: {p:.2e} Torr is over the {vacuum_limit():.1e} Torr limit "
+                f"-- heating is off (SLEEP) until it recovers; refusing {action}")
+    return None
+
+
+def vacuum_sleep_all(now: float) -> tuple[list, dict]:
+    """Every filament not known to be at STOP/SLEEP to SLEEP now -- unknown ones
+    too. Over the vacuum limit nothing is heated, IDLE included (the user,
+    2026-11-11: "超过气压后自动停止加热进入sleep"). Timed ACTIVEs are dropped
+    first so the deadline loop does not bring them back to IDLE."""
+    fids = []
+    for cid in sorted(CONTROLLERS):
+        try:
+            fids += [int(f) for f in MAPPING.filaments(cid - 1)]
+        except Exception:
+            continue
+    with _SAFETY_LOCK:
+        for f in fids:
+            ACTIVE_DEADLINES.pop(f, None)
+        off = (POWER_STATE_STOP, POWER_STATE_SLEEP)
+        todo = sorted(f for f in fids
+                      if (LAST_POWER_STATE.get(f) or (None, 0))[0] not in off)
+    dead = dead_fids()                       # prep_filaments STOPs those itself
+    todo = [f for f in todo if f not in dead]
+    if todo:
+        _safety_fallback_filaments(todo, POWER_STATE_SLEEP)
+    with _SAFETY_LOCK:
+        still = sorted(f for f in todo
+                       if (LAST_POWER_STATE.get(f) or (None, 0))[0] != POWER_STATE_SLEEP)
+    return todo, {"not_confirmed": still}
 
 
 def _vacuum_trip(p: float, now: float) -> dict:
-    """Pressure over the limit with HV possibly on: rails off, hot filaments
-    back to their IDLE (not STOP: IDLE keeps the vacuum -- the rig's rule),
-    latched like the HV guard."""
+    """Pressure over the limit with HV possibly on: rails off, every filament
+    to SLEEP (heating off), latched like the HV guard."""
     link = CONTROLLERS.get(MASTER)
     off = {}
     for ch in ("emission", "focus"):
@@ -5033,15 +5283,19 @@ def _vacuum_trip(p: float, now: float) -> dict:
             off[ch] = bool((stm32_hv_enable_set(link.host, ch, False) if link and link.host else {}).get("ok"))
         except Exception:
             off[ch] = False
-    to_idle, no_idle = drop_hot_to_idle(now)
+    vacuum_latch_set(p)
+    to_sleep, info = vacuum_sleep_all(now)
+    _VAC_OVER["slept"] = not info["not_confirmed"]     # else the next readings retry
     _hvg_count()
+    nc = info["not_confirmed"]
     rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": vacuum_limit(), "hv_off": off,
-           "to_idle": to_idle, "to_sleep_no_idle_known": no_idle,
-           "message": (f"HV OFF: vacuum {p:.2e} Torr over the {vacuum_limit():.1e} Torr limit -- "
-                       f"emission and focus switched off, heating back to IDLE for {to_idle or 'none'}"
-                       f"{f', SLEEP for {no_idle} (no IDLE current known)' if no_idle else ''}; HV ON is "
-                       f"refused until the vacuum recovers and the latch is cleared "
-                       f"(POST /api/hv-guard {{\"clear\": true}})")}
+           "to_sleep": to_sleep, "sleep_not_confirmed": nc,
+           "message": (f"HV OFF + heating SLEEP: vacuum {p:.2e} Torr over the {vacuum_limit():.1e} "
+                       f"Torr limit -- emission and focus switched off, {len(to_sleep)} filament(s) "
+                       f"to SLEEP{f' (NOT confirmed at SLEEP: {nc})' if nc else ''}; "
+                       f"heating (IDLE too) and HV ON are refused until a person clears the latch "
+                       f"(POST /api/hv-guard {{\"clear\": true}}) with the vacuum back within the "
+                       f"limit; IDLE is then brought back by hand")}
     with _HV_GUARD_LOCK:
         _HV_GUARD["tripped"] = {"at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), **rec}
     log.error("HV guard TRIPPED (vacuum): %s", rec["message"])
@@ -5050,12 +5304,16 @@ def _vacuum_trip(p: float, now: float) -> dict:
 
 
 def _vacuum_tick(now: float) -> dict | None:
-    if not VACUUM_INTERLOCK or _HV_GUARD["tripped"]:
+    if not VACUUM_INTERLOCK:
         return None
     v = vacuum_snapshot()
     p = v["pressure_torr"]
     if p is None or p <= vacuum_limit():
         _VAC_OVER["n"] = 0
+        if p is not None:
+            _VAC_OVER["slept"] = False      # recovered: the next excursion sleeps again
+        return None
+    if _HV_GUARD["tripped"] and _VAC_OVER["slept"]:
         return None
     with _SPELL_LOCK:
         at = _SPELL["pressure_at"]
@@ -5066,7 +5324,20 @@ def _vacuum_tick(now: float) -> dict | None:
     if _VAC_OVER["n"] < VACUUM_TRIP_READINGS:
         return None
     _VAC_OVER["n"] = 0
-    return _vacuum_trip(p, now)
+    if not _HV_GUARD["tripped"]:
+        return _vacuum_trip(p, now)
+    # Latched already (another source, or a vacuum trip cleared by hand while
+    # still over): the HV is off, but the heating must still go to SLEEP.
+    vacuum_latch_set(p)
+    to_sleep, info = vacuum_sleep_all(now)
+    _VAC_OVER["slept"] = not info["not_confirmed"]
+    rec = {"source": "vacuum", "pressure_torr": p, "limit_torr": vacuum_limit(),
+           "to_sleep": to_sleep, "sleep_not_confirmed": info["not_confirmed"],
+           "message": (f"vacuum {p:.2e} Torr over the {vacuum_limit():.1e} Torr limit (HV guard "
+                       f"already latched) -- {len(to_sleep)} filament(s) to SLEEP")}
+    log.error("vacuum over limit: %s", rec["message"])
+    _safety_record("vacuum_sleep", rec)
+    return {"action": "slept", **rec}
 
 
 # Slow turn-off early warning. 2026-10-27, FID 20 (P2 CH2.1): before the
@@ -5644,6 +5915,13 @@ class CtHandler(BaseHTTPRequestHandler):
                 maxp = max(10, min(int(q.get("max_points") or 4000), 50_000))
             except ValueError:
                 return self._json({"ok": False, "error": "since must be a number (epoch s), max_points an integer"})
+            if q.get("from") is not None:
+                try:
+                    t0, t1 = float(q["from"]), float(q.get("to") or time.time())
+                    nb = int(q.get("buckets") or 1000)
+                except ValueError:
+                    return self._json({"ok": False, "error": "from/to must be epoch s, buckets an integer"})
+                return self._json(series_range(names, t0, t1, nb))
             self._json(series_get(names, since, maxp))
         elif path == "/api/hv-supply":
             self._json(hv_supply_snapshot())
@@ -6997,12 +7275,15 @@ class CtHandler(BaseHTTPRequestHandler):
                         _HV_GUARD["enabled"] = bool(body["enabled"])
                         log.warning("HV guard %s by %s", "enabled" if _HV_GUARD["enabled"]
                                     else "DISABLED", self._client(body))
+                vac_kept = vacuum_latch_clear(self._client(body)) if body.get("clear") else None
                 _HVG_HIST.clear()
                 _HVG_HIGH_SINCE[0] = None
                 _SPELL_WATCH.reset_over()
                 snap = hv_guard_snapshot()
                 if stm32_clear is not None:
                     snap["stm32_clear"] = stm32_clear
+                if vac_kept:
+                    snap.update(ok=False, error=vac_kept)
                 self._json(snap)
             elif path == "/api/safety":
                 # Dead-man watchdog: read the state, or change the rules.
@@ -7235,11 +7516,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 # Last, after every request-level check above (dead, floor,
                 # ceiling, cap, ladder, run): the vacuum is the state of the
                 # machine, not of this request, and those refusals say more.
+                vr = None
                 if state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
                     vr = heat_refusal(f"heating filament {filament} to {power_state_name(state)}")
-                    if vr:
-                        return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
-                                          HTTPStatus.OK)
+                elif state in (POWER_STATE_STANDBY, POWER_STATE_IDLE):
+                    vr = vacuum_heat_refusal(f"filament {filament} to {power_state_name(state)}")
+                if vr:
+                    return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
+                                      HTTPStatus.OK)
                 wire_state = POWER_STATE_VOLTAGE if idle_v else state
                 ft, flags, payload = build_payload("CH_SET_POWER_STATE", {
                     "channel": ch, "mux_port": pos, "state": wire_state, "arg": arg,
@@ -7306,11 +7590,14 @@ class CtHandler(BaseHTTPRequestHandler):
                 timed, err = _parse_timed_active(body, state, filaments)
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                vr = None
                 if state in (POWER_STATE_ACTIVE, POWER_STATE_VOLTAGE):
                     vr = heat_refusal(f"heating to {power_state_name(state)}")
-                    if vr:
-                        return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
-                                          HTTPStatus.OK)
+                elif state in (POWER_STATE_STANDBY, POWER_STATE_IDLE):
+                    vr = vacuum_heat_refusal(f"heating to {power_state_name(state)}")
+                if vr:
+                    return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
+                                      HTTPStatus.OK)
                 results = {}
                 for cid, link in CONTROLLERS.items():
                     if not link.client.connected:
@@ -9377,6 +9664,10 @@ def main() -> None:
                  series_load(), SERIES_KEEP_S / 60, SERIES_DIR)
     except Exception as exc:
         log.warning("trend plot history not read back: %s", exc)
+    threading.Thread(target=lambda: log.info("trend plot: %d readings of the last %.0f h read "
+                                             "into the zoom envelope", series_env_fill(),
+                                             SERIES_RANGE_KEEP_S / 3600),
+                     name="series_env_fill", daemon=True).start()
     threading.Thread(target=_series_flush_loop, name="series_writer", daemon=True).start()
     # Incident evidence at full resolution, kept for good (see incident_note).
     threading.Thread(target=_incident_loop, name="incident_writer", daemon=True).start()

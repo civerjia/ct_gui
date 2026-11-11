@@ -32,7 +32,7 @@ def reset():
                   "pressure_torr", "pressure_at", "pressure_raw"):
             S._SPELL[k] = None
     S._SPELL_MA_HIST.clear()
-    S._VAC_OVER.update(n=0, last_at=None)
+    S._VAC_OVER.update(n=0, last_at=None, slept=False)
     S._HV_GUARD.update(enabled=True, tripped=None)
 
 
@@ -79,7 +79,17 @@ S.VACUUM_INTERLOCK = True
 rails = []
 S.stm32_hv_enable_set = lambda host, ch, on: (rails.append((ch, on)), {"ok": True})[1]
 S._safety_record = lambda *a, **k: None
-S._safety_fallback_filaments = lambda fids, st: None
+slept = []
+
+
+def _fake_fallback(fids, st):
+    slept.append((list(fids), int(st)))
+    for f in fids:
+        S.LAST_POWER_STATE[f] = (int(st), 0.0)
+
+
+S._safety_fallback_filaments = _fake_fallback
+S.MAPPING.filaments = lambda c: [20, 21, 22, 23] if c == 0 else []
 
 
 class _Cl:
@@ -96,6 +106,9 @@ S.CONTROLLERS.update({1: _L()})
 reset()
 S.LAST_POWER_STATE.clear()
 S.LAST_POWER_STATE[20] = (int(S.POWER_STATE_VOLTAGE), 0.0)
+S.LAST_POWER_STATE[21] = (int(S.POWER_STATE_IDLE), 0.0)
+S.LAST_POWER_STATE[22] = (int(S.POWER_STATE_SLEEP), 0.0)
+S.LAST_POWER_STATE[23] = (int(S.POWER_STATE_STOP), 0.0)
 S.ACTIVE_DEADLINES.clear()
 S.ACTIVE_DEADLINES[20] = (1e12, 1200)
 t = S.time.monotonic()    # freshness is judged against the real clock
@@ -108,8 +121,45 @@ r2 = S._vacuum_tick(t + 2.5)
 check("second NEW over-limit reading -> tripped, source vacuum", r2 and r2["action"] == "tripped"
       and S._HV_GUARD["tripped"]["source"] == "vacuum", r2)
 check("...emission and focus switched off", ("emission", False) in rails and ("focus", False) in rails, rails)
-check("...the VOLTAGE filament is due back to its IDLE 1200 mA now",
-      S.ACTIVE_DEADLINES.get(20) == (t + 2.5, 1200) and r2["to_idle"] == [20], S.ACTIVE_DEADLINES)
+check("...every heated filament to SLEEP (IDLE too), STOP/SLEEP ones left alone, timed ACTIVE dropped",
+      r2["to_sleep"] == [20, 21] and slept == [([20, 21], int(S.POWER_STATE_SLEEP))]
+      and 20 not in S.ACTIVE_DEADLINES, (r2.get("to_sleep"), slept))
+check("...confirmed, so no retry", S._VAC_OVER["slept"] and not r2["sleep_not_confirmed"], r2)
+r3 = S._vacuum_tick(t + 4.5)
+check("still over, latched and slept -> nothing more", r3 is None and len(slept) == 1, r3)
+r = S.vacuum_heat_refusal("IDLE")
+check("IDLE refused (vacuum latch)", r and "vacuum latch" in r, r)
+
+# 4b. Latched by something else first: over the limit still puts heating to SLEEP.
+reset()
+slept.clear()
+S.LAST_POWER_STATE[20] = (int(S.POWER_STATE_IDLE), 0.0)
+S._HV_GUARD["tripped"] = {"source": "spellman"}
+t = S.time.monotonic()
+msg({"type": "pressure_point", "data": {"pressure_torr": 4e-5}}, t)
+S._vacuum_tick(t + 0.5)
+msg({"type": "pressure_point", "data": {"pressure_torr": 4e-5}}, t + 2)
+r4 = S._vacuum_tick(t + 2.5)
+check("guard already latched -> heating still to SLEEP", r4 and r4["action"] == "slept"
+      and 20 in r4["to_sleep"] and S._HV_GUARD["tripped"]["source"] == "spellman", r4)
+
+# 4c. Latched: recovering does NOT bring heating back -- a person clears it,
+# and only once the vacuum is within the limit. Survives a restart.
+check("latched and saved", S._VAC_LATCH[0] and S._vacuum_latch_load(), S._VAC_LATCH[0])
+check("still over -> clear refused", "still over" in (S.vacuum_latch_clear("test") or ""))
+msg({"type": "pressure_point", "data": {"pressure_torr": 6e-6}}, S.time.monotonic())
+S._vacuum_tick(S.time.monotonic())
+r = S.vacuum_heat_refusal("IDLE")
+check("recovered but latched -> IDLE still refused", r and "vacuum latch" in r, r)
+S._HV_GUARD["tripped"] = None
+check("...ACTIVE too, even with the HV latch cleared", "vacuum latch" in (S.heat_refusal("ACTIVE") or ""))
+check("...and the GUI still sees it tripped", S.hv_guard_snapshot()["tripped"]["source"] == "vacuum")
+check("recovered -> a person clears it", S.vacuum_latch_clear("test") is None and S._VAC_LATCH[0] is None
+      and S._vacuum_latch_load() is None)
+check("cleared -> IDLE allowed, next excursion sleeps again",
+      S.vacuum_heat_refusal("IDLE") is None and not S._VAC_OVER["slept"])
+reset()
+check("no reading -> IDLE NOT refused (IDLE keeps the vacuum)", S.vacuum_heat_refusal("IDLE") is None)
 
 # 5. The slow turn-off warning (FID 20: +2.43 mA 1-5 s after its 09:02 shot).
 def tail_case(after_ma):

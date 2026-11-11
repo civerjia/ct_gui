@@ -9,7 +9,14 @@ Only two things need a person, and they stay latched until one clears them:
 
 Arcs are normal transients, including big ones and a System Fault. The HV comes down, then goes back on by itself as soon as the arc is over (Spellman stable 1 s). Stable means no arc, no alarm bit and no HV-off read in that time, HV Ray On, and the kV steady within 2 %.
 
-The vacuum interlock is unchanged: it stays latched. Current flowing *during* a pulse is not judged.
+The vacuum interlock stays latched. Current flowing *during* a pulse is not judged.
+
+Vacuum over its limit (two new readings in a row):
+- emission and focus are switched off and the HV guard latches;
+- every filament not at STOP/SLEEP goes to SLEEP, IDLE included, and timed ACTIVEs are dropped;
+- a separate vacuum latch, saved in `state/vacuum_latch.json`, refuses all heating (STANDBY, IDLE, ACTIVE, VOLTAGE) until a person clears it. It survives a backend restart and does not clear itself when the vacuum recovers. Clear HV guard latch (`POST /api/hv-guard {"clear": true}`) clears it only while a fresh reading is within the limit; otherwise the reply says why it was kept;
+- if the HV guard was already latched for another reason, the heating still goes to SLEEP (event `vacuum_sleep`, an incident);
+- IDLE is brought back by hand.
 
 When the guard trips:
 
@@ -141,6 +148,8 @@ Every plotted reading goes to disk: Spellman kV and mA, vacuum, emission V and I
 | `logs/series/summary_<date>.csv` | `minute,name,n,min,max,mean` | for good |
 
 When a raw hour falls outside the kept window, it is compacted into the summary and deleted. A restart reads the last hour back into the plot.
+
+The trend plot zooms and pans over the last 24 h: the wheel zooms around the cursor, a drag pans, a double-click goes back to live. `GET /api/series?from=<epoch s>&to=<epoch s>&buckets=<n>` serves it with at most two points per bucket, the lowest and highest, so a one-sample spike shows at any zoom. A bucket shorter than 10 s uses the raw readings, from memory or from the hour files. A longer bucket uses a 10 s min/max envelope kept in memory for 24 h, rebuilt from the raw files at start-up.
 
 ### Incident evidence
 
