@@ -161,33 +161,47 @@ check("cleared -> IDLE allowed, next excursion sleeps again",
 reset()
 check("no reading -> IDLE NOT refused (IDLE keeps the vacuum)", S.vacuum_heat_refusal("IDLE") is None)
 
-# 4d. No reading at all for VACUUM_MISSING_TRIP_S trips like over-pressure.
+# 4d. Debug mode off: no reading at all (stale > 10 s) trips at once, like
+# over-pressure. Debug mode on: ignored.
 reset()
 slept.clear()
 rails.clear()
 S._VAC_LATCH[0] = None
+S.vacuum_set_debug(False, "test")
 S.LAST_POWER_STATE[21] = (int(S.POWER_STATE_IDLE), 0.0)
 t = S.time.monotonic()
 S._VAC_T0 = t - 1000                     # backend up long ago
-msg({"type": "pressure_point", "data": {"pressure_torr": 6e-6}}, t - 30)   # last one 30 s ago
-check("30 s without a reading -> nothing yet", S._vacuum_tick(t) is None and not slept)
-r5 = S._vacuum_tick(t + 31)
-check("61 s without a reading -> HV off, heating SLEEP, latched", r5 and r5["action"] == "tripped"
+msg({"type": "pressure_point", "data": {"pressure_torr": 6e-6}}, t - 5)    # 5 s old: still a reading
+check("a 5 s old reading -> nothing", S._vacuum_tick(t) is None and not slept)
+msg({"type": "pressure_point", "data": {"pressure_torr": 6e-6}}, t - 12)   # gone 12 s
+r5 = S._vacuum_tick(t)
+check("no reading (12 s) -> HV off, heating SLEEP, latched", r5 and r5["action"] == "tripped"
       and ("emission", False) in rails and 21 in r5["to_sleep"] and S._VAC_LATCH[0]
       and "no vacuum reading" in r5["message"], r5)
-check("...then quiet (slept, latched)", S._vacuum_tick(t + 40) is None and len(slept) == 1)
+check("...then quiet (slept, latched)", S._vacuum_tick(t + 5) is None and len(slept) == 1)
 check("...latch not clearable without a fresh reading", "no fresh" in (S.vacuum_latch_clear("t") or ""))
 check("...HV ON refused by the latch", "vacuum latch" in (S.vacuum_refusal("emission ON") or ""))
+S.vacuum_set_debug(True, "test")
+check("...debug mode on -> a person can clear it without a reading", S.vacuum_latch_clear("t") is None)
+S.vacuum_set_debug(False, "test")
+S._vacuum_trip(None, S.time.monotonic(), 12.0)
 msg({"type": "pressure_point", "data": {"pressure_torr": 6e-6}}, S.time.monotonic())
 check("reading back -> a person can clear it", S.vacuum_latch_clear("t") is None)
 reset()
-S._VAC_BYPASS["until"] = S.time.monotonic() + 600
 S._VAC_T0 = S.time.monotonic()
-check("just started, no reading yet -> waits the 60 s from start-up",
-      S._vacuum_tick(S.time.monotonic() + 30) is None)
+check("just started, no reading yet -> waits 10 s from start-up",
+      S._vacuum_tick(S.time.monotonic() + 5) is None)
 S._VAC_T0 = S.time.monotonic() - 1000
-check("debug bypass -> no reading never trips", S._vacuum_tick(S.time.monotonic() + 3600) is None)
-S._VAC_BYPASS["until"] = None
+r = S.vacuum_set_debug(True, "test")
+check("debug mode on: saved, in the snapshot", r["ok"] and S._vacuum_debug_load()
+      and S.vacuum_snapshot()["debug"] is True, r)
+check("debug mode -> no reading never trips", S._vacuum_tick(S.time.monotonic() + 3600) is None)
+check("debug mode -> no reading does not refuse HV ON", S.vacuum_refusal("emission ON") is None)
+msg({"type": "pressure_point", "data": {"pressure_torr": 4e-5}}, S.time.monotonic())
+check("debug mode -> a reading OVER the limit still refuses", S.vacuum_refusal("emission ON") is not None)
+S.vacuum_set_debug(False, "test")
+check("debug mode off: saved off", S._vacuum_debug_load() is None and S.vacuum_snapshot()["debug"] is False)
+reset()
 
 # 4e. The guard tick reaches the vacuum check even when latched by something else.
 reset()

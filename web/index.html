@@ -434,7 +434,7 @@
             </div>
             <div id="hvGuardMsg2" class="hw-status bad" hidden></div>
             <button id="hvGuardClear2" class="xs" hidden title="The switch / vacuum was dealt with: clear the latch (HV stays off; turn it on again yourself)">Clear HV guard latch</button>
-            <button id="vacBypass2" class="xs" hidden></button>
+            <label class="chk vac-debug" title="Debug mode for the vacuum gauge. On: a MISSING reading is ignored (HV ON / ACTIVE allowed, no trip) -- only while you know the vacuum is good. Off: no reading for 10 s = HV off, all heating to SLEEP, latched. A reading over the limit trips either way. Saved on the backend."><input autocomplete="off" type="checkbox" id="vacDebug2" data-nostick /> Vacuum debug (ignore a missing reading)</label>
           </details>
 
           <!-- Spellman V/I, emission V/I, vacuum over time: trends.js, from

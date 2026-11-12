@@ -11,12 +11,13 @@ Arcs are normal transients, including big ones and a System Fault. The HV comes 
 
 The vacuum interlock stays latched. Current flowing *during* a pulse is not judged.
 
-Vacuum over its limit (two new readings in a row), or no vacuum reading at all for 60 s (`CT_VACUUM_MISSING_TRIP_S`; counted from the last reading, or from start-up; held off while the vacuum debug bypass runs):
+Vacuum over its limit (two new readings in a row), or no vacuum reading at all (stale for 10 s, `CT_VACUUM_MISSING_TRIP_S`; counted from the last reading, or from start-up) while vacuum debug mode is off:
 - emission and focus are switched off and the HV guard latches;
 - every filament not at STOP/SLEEP goes to SLEEP, IDLE included, and timed ACTIVEs are dropped;
 - a separate vacuum latch, saved in `state/vacuum_latch.json`, refuses all heating (STANDBY, IDLE, ACTIVE, VOLTAGE) until a person clears it. It survives a backend restart and does not clear itself when the vacuum recovers. Clear HV guard latch (`POST /api/hv-guard {"clear": true}`) clears it only while a fresh reading is within the limit; otherwise the reply says why it was kept;
 - if the HV guard was already latched for another reason, the heating still goes to SLEEP (event `vacuum_sleep`, an incident); a Spellman arc waiting to recover is turned into a vacuum trip, so the HV does not come back;
 - while the vacuum latch is set, HV ON is refused too;
+- vacuum debug mode (the GUI checkbox "Vacuum debug", `POST /api/vacuum {"debug": true|false}`, saved in `state/vacuum_debug.json`) ignores a missing reading: no trip, no refusal, and a person may clear the latch without a reading. A reading over the limit trips either way;
 - IDLE is brought back by hand.
 
 When the guard trips:

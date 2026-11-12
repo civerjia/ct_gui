@@ -909,6 +909,8 @@ button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 
 /* supply & vacuum trend (trends.js) */
 /* the trend card is narrow: buttons and labels never break inside, the row wraps instead */
+.vac-debug { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; margin-top: 6px; }
+.vac-debug.on { color: #a15c00; font-weight: 600; }
 .trend-controls { row-gap: 6px; }
 .trend-controls .seg-btn, .trend-controls .hint { white-space: nowrap; }
 .trend-controls .seg.sm .seg-btn { padding: 5px 8px; }
