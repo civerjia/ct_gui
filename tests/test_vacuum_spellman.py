@@ -32,7 +32,7 @@ def reset():
                   "pressure_torr", "pressure_at", "pressure_raw"):
             S._SPELL[k] = None
     S._SPELL_MA_HIST.clear()
-    S._VAC_OVER.update(n=0, last_at=None, slept=False)
+    S._VAC_OVER.update(n=0, last_at=None, slept=False, tried_at=-1e9)
     S._HV_GUARD.update(enabled=True, tripped=None)
 
 
@@ -160,6 +160,49 @@ check("cleared -> IDLE allowed, next excursion sleeps again",
       S.vacuum_heat_refusal("IDLE") is None and not S._VAC_OVER["slept"])
 reset()
 check("no reading -> IDLE NOT refused (IDLE keeps the vacuum)", S.vacuum_heat_refusal("IDLE") is None)
+
+# 4d. No reading at all for VACUUM_MISSING_TRIP_S trips like over-pressure.
+reset()
+slept.clear()
+rails.clear()
+S._VAC_LATCH[0] = None
+S.LAST_POWER_STATE[21] = (int(S.POWER_STATE_IDLE), 0.0)
+t = S.time.monotonic()
+S._VAC_T0 = t - 1000                     # backend up long ago
+msg({"type": "pressure_point", "data": {"pressure_torr": 6e-6}}, t - 30)   # last one 30 s ago
+check("30 s without a reading -> nothing yet", S._vacuum_tick(t) is None and not slept)
+r5 = S._vacuum_tick(t + 31)
+check("61 s without a reading -> HV off, heating SLEEP, latched", r5 and r5["action"] == "tripped"
+      and ("emission", False) in rails and 21 in r5["to_sleep"] and S._VAC_LATCH[0]
+      and "no vacuum reading" in r5["message"], r5)
+check("...then quiet (slept, latched)", S._vacuum_tick(t + 40) is None and len(slept) == 1)
+check("...latch not clearable without a fresh reading", "no fresh" in (S.vacuum_latch_clear("t") or ""))
+check("...HV ON refused by the latch", "vacuum latch" in (S.vacuum_refusal("emission ON") or ""))
+msg({"type": "pressure_point", "data": {"pressure_torr": 6e-6}}, S.time.monotonic())
+check("reading back -> a person can clear it", S.vacuum_latch_clear("t") is None)
+reset()
+S._VAC_BYPASS["until"] = S.time.monotonic() + 600
+S._VAC_T0 = S.time.monotonic()
+check("just started, no reading yet -> waits the 60 s from start-up",
+      S._vacuum_tick(S.time.monotonic() + 30) is None)
+S._VAC_T0 = S.time.monotonic() - 1000
+check("debug bypass -> no reading never trips", S._vacuum_tick(S.time.monotonic() + 3600) is None)
+S._VAC_BYPASS["until"] = None
+
+# 4e. The guard tick reaches the vacuum check even when latched by something else.
+reset()
+slept.clear()
+S._VAC_LATCH[0] = None
+S.LAST_POWER_STATE[21] = (int(S.POWER_STATE_IDLE), 0.0)
+S._HV_GUARD["tripped"] = {"source": "grid"}
+t = S.time.monotonic()
+msg({"type": "pressure_point", "data": {"pressure_torr": 4e-5}}, t)
+S.hv_guard_tick(t + 0.5)
+msg({"type": "pressure_point", "data": {"pressure_torr": 4e-5}}, t + 2)
+S.hv_guard_tick(t + 2.5)
+check("hv_guard_tick while latched (grid) -> vacuum still SLEEPs heating", slept and 21 in slept[0][0], slept)
+S._VAC_LATCH[0] = None
+S._vacuum_latch_save()
 
 # 5. The slow turn-off warning (FID 20: +2.43 mA 1-5 s after its 09:02 shot).
 def tail_case(after_ma):
