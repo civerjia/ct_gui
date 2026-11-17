@@ -404,14 +404,18 @@ class _MeasureMixin:
     # independently duplicated 3+ times across this repo before and
     # drifted out of sync once already — see the JS side's tests.js).
 
-    def pulse_ma(self, raw: float, ref_mv: float | None = None) -> float:
+    def pulse_ma(self, raw: float, ref_mv: float | None = None,
+                 r_sense_ohm: float | None = None,   # shunt; None = CT_PULSE_R_SENSE_OHM
+                 adc_vref_v: float | None = None,    # STM32 ADC reference; None = CT_PULSE_ADC_VREF_V
+                 ) -> float:
         """Convert one raw STM32 ADC count (a pulse_events() peak/plateau/
         bg field) to emission current in mA.
 
         The STM32's OWN internal 12-bit ADC (PA0/ADC1_IN1, via the AMC3301
-        isolation amp) samples V = raw*3.3/4095; Ie = 2*(V - 0.5*ref_v) /
-        R_sense / G_amc A -> mA, with R_sense/G_amc from the class
-        constants above. This is NOT the formula an ESP32-ADC-scale
+        isolation amp) samples V = raw*Vref/4095; Ie = 2*(V - 0.5*ref_v) /
+        R_sense / G_amc A -> mA. R_sense and Vref are board-dependent:
+        pass them, or they come from CT_PULSE_R_SENSE_OHM (4.7 old HV board,
+        2.55 on 200V400V_V3) and CT_PULSE_ADC_VREF_V (3.3). This is NOT the formula an ESP32-ADC-scale
         constant (3.1 V / 6.8 ohm) would give you — those numbers belong
         to a different ADC entirely and overstated current by ~35% when
         they were still in use here.
@@ -434,8 +438,10 @@ class _MeasureMixin:
         if ref_mv is None:
             live = self.get_ads1115_ref_mv()
             ref_mv = live if live is not None else 1227.0   # last-known-good fallback
-        v = raw * 3.3 / 4095 - 0.5 * (ref_mv / 1000.0)
-        return 2 * v / self._PULSE_R_SENSE_OHM / self._PULSE_AMC3301_GAIN * 1000
+        r_sense = float(r_sense_ohm if r_sense_ohm is not None else self._PULSE_R_SENSE_OHM)
+        vref = float(adc_vref_v if adc_vref_v is not None else self._PULSE_ADC_VREF_V)
+        v = raw * vref / 4095 - 0.5 * (ref_mv / 1000.0)
+        return 2 * v / r_sense / self._PULSE_AMC3301_GAIN * 1000
 
     # Saturation markers the STM32 reports instead of a value it cannot hold.
     # integral is SIGNED, so both ends are markers, and both are REACHABLE: the
@@ -539,7 +545,9 @@ class _MeasureMixin:
 
     def _add_charge(self, e: dict, ref_mv: float,
                     integral_signed: bool | None = None,
-                    background_windowing: bool | None = None) -> None:
+                    background_windowing: bool | None = None,
+                    r_sense_ohm: float | None = None,
+                    adc_vref_v: float | None = None) -> None:
         """Add integral_mams (charge, mA*ms) and its scatter to one event.
 
         integral is round(Sigma(sample - background)) over the pulse -- signed,
@@ -620,7 +628,8 @@ class _MeasureMixin:
             return
         e["integral_saturated"] = False
         self._check_background(e)
-        slope = self.pulse_ma(1, ref_mv) - self.pulse_ma(0, ref_mv)   # mA per count
+        slope = (self.pulse_ma(1, ref_mv, r_sense_ohm, adc_vref_v)
+                 - self.pulse_ma(0, ref_mv, r_sense_ohm, adc_vref_v))   # mA per count
         # 9 decimals, not 6: a 1 ms pulse of a few mA is ~2e-4 mA*ms and its
         # sigma ~1e-5, which 6 decimals would flatten to one significant digit
         # and print as -0.0 for any small negative. Charge here spans several
@@ -662,7 +671,9 @@ class _MeasureMixin:
             e["integral_mams_sigma"] = _q(
                 slope * (sigma4 / 4.0) * math.sqrt(dur) * 1000.0 / rate)
 
-    def pulse_events_ma(self, since: int = 0) -> dict:
+    def pulse_events_ma(self, since: int = 0,
+                        r_sense_ohm: float | None = None,   # see pulse_ma()
+                        adc_vref_v: float | None = None) -> dict:
         """Like pulse_events(), but every event also gets peak_ma/
         plateau_ma/bg_ma/post_bg_ma fields, converted with ONE live ADS1115
         reference reading shared across the whole batch — cheaper and
@@ -733,7 +744,7 @@ class _MeasureMixin:
             # being converted into a plausible mA value.
             for key in keys:
                 if e.get(key) is not None:
-                    e[f"{key}_ma"] = round(self.pulse_ma(e[key], resolved_ref_mv), 3)
+                    e[f"{key}_ma"] = round(self.pulse_ma(e[key], resolved_ref_mv, r_sense_ohm, adc_vref_v), 3)
             # peak_ma/plateau_ma are ABSOLUTE levels -- the standing emission
             # is still in them. The pulse's OWN current is the difference, and
             # leaving every caller to remember that is how plateau_ma gets
@@ -744,15 +755,15 @@ class _MeasureMixin:
             # The background's noise in mA, next to bg_ma. bg_sigma4 is 4*sigma
             # in ADC counts, which cannot be compared with any current here.
             if e.get("bg_sigma4"):
-                slope = (self.pulse_ma(1.0, resolved_ref_mv)
-                         - self.pulse_ma(0.0, resolved_ref_mv))
+                slope = (self.pulse_ma(1.0, resolved_ref_mv, r_sense_ohm, adc_vref_v)
+                         - self.pulse_ma(0.0, resolved_ref_mv, r_sense_ohm, adc_vref_v))
                 e["bg_sigma_ma"] = round(e["bg_sigma4"] / 4.0 * slope, 4)
             bg_raw = e.get("bg")
             for key in ("peak", "plateau"):
                 if e.get(key) is not None and bg_raw is not None:
                     e[f"{key}_net_ma"] = round(
-                        self.pulse_ma(e[key], resolved_ref_mv)
-                        - self.pulse_ma(bg_raw, resolved_ref_mv), 3)
+                        self.pulse_ma(e[key], resolved_ref_mv, r_sense_ohm, adc_vref_v)
+                        - self.pulse_ma(bg_raw, resolved_ref_mv, r_sense_ohm, adc_vref_v), 3)
             # ...and the emission proper. plateau_net_ma is still not it: the
             # same MOSFET that gates the emission puts the sub-board's two
             # diodes and 100 kOhm across the rail for the duration of the
@@ -781,7 +792,8 @@ class _MeasureMixin:
                 # else: NO field at all. A net current with no background to
                 # subtract is not a measurement, and 0.0 would read as one.
             self._add_charge(e, resolved_ref_mv, r.get("integral_signed"),
-                             r.get("background_windowing"))
+                             r.get("background_windowing"),
+                             r_sense_ohm, adc_vref_v)
             # The charge, likewise: integral_mams is net of the BACKGROUND only,
             # so the diode path is still in it -- ~2 mA*ms of a 1 ms pulse at
             # 200 V, the whole reading for a cold filament. The diode current

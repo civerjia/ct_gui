@@ -1435,7 +1435,14 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
     # -- ADC -> emission current, the STM32's own scale (NOT an ESP32 ADC
     #    constant -- those belong to a different chip). mA = k*raw + c, and
     #    pulse_ma() builds both from these two plus a LIVE reference reading.
-    _PULSE_R_SENSE_OHM = 4.7      # shunt
+    #    Board-dependent, so they come from the backend's environment (the
+    #    client runs IN the backend) and every conversion takes them as
+    #    parameters too: old HV board = one 4.7 ohm shunt; 200V400V_V3 =
+    #    R1 || R25 = 5.1 || 5.1 = 2.55 ohm. The ADC reference is the STM32's
+    #    VREF+ (VDDA 3.3 V through R6 on the WeAct core, 2.048 V once VREFBUF
+    #    drives it).
+    _PULSE_R_SENSE_OHM = float(os.environ.get("CT_PULSE_R_SENSE_OHM", "4.7"))   # shunt
+    _PULSE_ADC_VREF_V = float(os.environ.get("CT_PULSE_ADC_VREF_V", "3.3"))     # STM32 ADC ref
     _PULSE_AMC3301_GAIN = 8.2     # AMC3301 fixed gain
 
     # -- Saturation markers the STM32 sends instead of a value it cannot hold.

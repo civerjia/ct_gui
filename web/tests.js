@@ -46,7 +46,19 @@ const emiLimitWiper = (mA) => Math.max(0, Math.min(127, Math.round(mA / EMI_FULL
 // every ADS1115 poll. 1.227 is only the fallback before the first read.
 export let liveRefV = 1.227;
 export function setLiveRefV(ref_mv) { if (ref_mv != null) liveRefV = ref_mv / 1000; }
-export const peakToMa = (peak) => 2 * (peak * 3.3 / 4095 - 0.5 * liveRefV) / 4.7 / 8.2 * 1000;
+// Shunt and ADC reference are BOARD constants (old HV board 4.7 ohm; the
+// 200V400V_V3 board 5.1||5.1 = 2.55 ohm). The backend sends them with every
+// ADS read (pulse_frontend, from CT_PULSE_R_SENSE_OHM / CT_PULSE_ADC_VREF_V);
+// 4.7 / 3.3 are only the defaults before the first read.
+export let pulseRSenseOhm = 4.7;
+export let pulseAdcVrefV = 3.3;
+export function setPulseFrontend(fe) {
+  if (!fe) return;
+  if (fe.r_sense_ohm > 0) pulseRSenseOhm = +fe.r_sense_ohm;
+  if (fe.adc_vref_v > 0) pulseAdcVrefV = +fe.adc_vref_v;
+}
+export const peakToMa = (peak) =>
+  2 * (peak * pulseAdcVrefV / 4095 - 0.5 * liveRefV) / pulseRSenseOhm / 8.2 * 1000;
 
 // ---- hardware helpers -------------------------------------------------------
 // Filaments marked DEAD in the backend are left out, unless "Include dead

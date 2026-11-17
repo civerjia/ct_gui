@@ -6,7 +6,7 @@
  * build_command_payload and proxied via POST /api/power-cmd {controller, command, …}.
  */
 
-import { calApi, liveRefV, setLiveRefV, peakToMa } from './tests.js';
+import { calApi, liveRefV, setLiveRefV, setPulseFrontend, peakToMa } from './tests.js';
 import { $ as $p, setMsg, clampNumberInputs } from './dom.js';
 import { postJ, sleep } from './net.js';
 import { state } from './state.js';
@@ -1700,6 +1700,7 @@ async function adsRead() {
     // peakToMa() (tests.js) reads liveRefV instead of a hardcoded constant
     // so the current conversion tracks the real reference.
     setLiveRefV(j.ref_mv);
+    setPulseFrontend(j.pulse_frontend);
     setM('adsRef', f(j.ref_mv, ' mV'));
     setM('adsFocus', f(j.focus_v, ' V'));
     setM('adsEmI', f(j.emiss_i_ma, ' mA'));

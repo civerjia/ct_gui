@@ -3336,6 +3336,13 @@ _HVG_LOW = {"since": None, "warned": False}
 _HVG_LAST_MODEL: dict = {}      # the last rail-on comparison, for the snapshot
 
 
+def pulse_frontend() -> dict:
+    """The STM32 pulse-current front end's board constants (see pulse_ma())."""
+    return {"r_sense_ohm": float(os.environ.get("CT_PULSE_R_SENSE_OHM", "4.7")),
+            "adc_vref_v": float(os.environ.get("CT_PULSE_ADC_VREF_V", "3.3")),
+            "amc_gain": 8.2}
+
+
 def hv_load_model(emiss_v: float) -> dict:
     """What the rail's loads draw at emiss_v (see the block comment above)."""
     av = abs(float(emiss_v))
@@ -6367,6 +6374,11 @@ class CtHandler(BaseHTTPRequestHandler):
             else:
                 r = shared_read(("stm32-ads1115", host), SHARED_TTL_STM32_S, lambda: stm32_ads1115(host))
                 series_from_ads(r)
+                # The pulse-current front end of THIS rig's HV board, so the GUI
+                # converts counts with the same shunt / ADC reference as the
+                # Python side (CT_PULSE_R_SENSE_OHM / CT_PULSE_ADC_VREF_V).
+                if isinstance(r, dict):
+                    r = dict(r, pulse_frontend=pulse_frontend())
                 self._json(r)
         elif path == "/api/stm32/adc-window":
             # Proxy to `/stm32/adc_window?n=` — a pulse-INDEPENDENT windowed
