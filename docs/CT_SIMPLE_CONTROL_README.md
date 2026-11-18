@@ -3853,6 +3853,35 @@ It is applied automatically:
 > The formula is the default because it is free, deterministic, and cannot be
 > contaminated by a filament that was already emitting when it was measured.
 
+### mAms cut — end a pulse at a set charge (v3)
+
+The master's STM32 sums each pulse's net emission charge as it happens — the
+same Σ(sample − background) that `pulse_events_ma()` reports as
+`integral_mams` — and once it reaches the set value it raises its CUT line
+(PA2 → U23 → the RP2350's GP46). The RP2350 takes /OE high at once, which ends
+the pulse; the next pulse fires normally. One cut per pulse. Needs STM32
+fw_build ≥ 0x00030002 and the v3 RP2350.
+
+```python
+ct.mams_cut(0.5)            # every pulse ends at 0.5 mA*ms from now on
+ct.mams_cut_status()        # {on, mams, threshold, rate_hz, ma_per_lsb, cuts, last_cut_us}
+ct.mams_cut(None)           # off
+ct.cut_pulse_test(200)      # wiring test, no HV: {rp2350_saw_it: True, ...}
+```
+
+- `mams` is converted with the same constants as `integral_mams`
+  (`CT_PULSE_R_SENSE_OHM`, `CT_PULSE_ADC_VREF_V`, the AMC3301 gain) and the
+  detector rate, so "cut at X" means X as the measurement would report it. The
+  STM32 threshold is an integer: the reply's `mams` is what is really set.
+- The cut stays set (on every pulse, measured or not) until changed; an STM32
+  reset turns it off.
+- Delay from the charge reaching the value to the cut: one detector block
+  (128 samples, 0.128 ms at 1 MSPS) plus interrupts. From CUT to the gate off it
+  is hardware plus one RP2350 GPIO interrupt.
+- `shv_status()` carries the RP2350's side: `cuts` (a pulse was on) and
+  `cutsLate` (a cut edge with no pulse on — what `cut_pulse_test` counts).
+- `cut_pulse_test` is refused while a cut is set: `mams_cut(None)` first.
+
 ### The measured pedestal — the cross-check
 
 **`measure_emission_pedestal(filament, heat_ma=1400, widths_us=(1000, 10000), ...)`**

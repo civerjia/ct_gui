@@ -6427,6 +6427,15 @@ class CtHandler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": err})
             else:
                 self._json(_adc_window_autoarm(host, n))
+        elif path == "/api/stm32/mams-cut":
+            # The STM32's mAms CUT: threshold (LSB*samples, 0 = off), cuts since
+            # its boot, samples from the rise to the last cut. Read-only here;
+            # POST sets it. The client converts to/from mA*ms.
+            host, err = self._master_stm32_host()
+            if err:
+                self._json({"ok": False, "error": err})
+            else:
+                self._json(stm32_mams_cut(host))
         elif path == "/api/stm32/hv-status":
             # Proxy to `/stm32/hv_status` — the ACTUAL HV enable GPIO levels
             # (emission_on/focus_on read from the pin, not the commanded state)
@@ -8612,6 +8621,32 @@ class CtHandler(BaseHTTPRequestHandler):
                 self._json(stm32_hv_set_target(host, str(body.get("chan", "emission")),
                                                int(body.get("target", 0)), int(body.get("tol", 4)),
                                                int(body.get("max_step", 1))))
+            elif path == "/api/stm32/mams-cut":
+                # body: {threshold: LSB*samples >= 0}; 0 turns the cut off. Setting
+                # a cut is an STM32 command (gated on it being online); the client's
+                # mams_cut(mams) does the mA*ms conversion.
+                try:
+                    thr = int(body["threshold"])
+                except (KeyError, TypeError, ValueError):
+                    return self._json({"ok": False, "error": "threshold (int, LSB*samples, 0 = off) "
+                                       "required"}, HTTPStatus.BAD_REQUEST)
+                if thr < 0:
+                    return self._json({"ok": False, "error": "threshold must be >= 0"},
+                                      HTTPStatus.BAD_REQUEST)
+                host, err = self._master_stm32_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                self._json(stm32_mams_cut(host, thr))
+            elif path == "/api/stm32/cut-pulse":
+                # body: {us: 1..10000} -- PA2 high that long now (wiring test, no HV).
+                us = int(body.get("us", 0) or 0)
+                if not (1 <= us <= 10000):
+                    return self._json({"ok": False, "error": "us must be 1..10000"},
+                                      HTTPStatus.BAD_REQUEST)
+                host, err = self._master_stm32_host()
+                if err:
+                    return self._json({"ok": False, "error": err}, HTTPStatus.OK)
+                self._json(stm32_cut_pulse(host, us))
             elif path == "/api/stm32/hv-clear-target":
                 # Proxy to `/stm32/hv_clear_target` — stops the closed HV loop
                 # for a channel (body: {chan}); the wiper is left wherever it

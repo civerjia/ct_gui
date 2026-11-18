@@ -404,6 +404,103 @@ class _MeasureMixin:
     # independently duplicated 3+ times across this repo before and
     # drifted out of sync once already — see the JS side's tests.js).
 
+    # ── mAms CUT (v3) ────────────────────────────────────────────────────────
+    # The STM32 sums each pulse's net charge (Σ(sample − background), the same
+    # integral pulse_events() reports) and, once it reaches a threshold, raises
+    # its PA2 -> U23 -> the RP2350's GP46, which takes /OE high at once and ends
+    # the pulse. One cut per pulse; the next pulse fires normally. The STM32 works
+    # in LSB*samples; these methods convert with the SAME constants as
+    # integral_mams, so a cut set at X mA*ms ends the pulse at X mA*ms as
+    # pulse_events_ma() would measure it.
+
+    def _ma_per_lsb(self, r_sense_ohm=None, adc_vref_v=None) -> float:
+        """Current per ADC LSB (mA), the slope integral_mams uses."""
+        r_sense = float(r_sense_ohm if r_sense_ohm is not None else self._PULSE_R_SENSE_OHM)
+        vref = float(adc_vref_v if adc_vref_v is not None else self._PULSE_ADC_VREF_V)
+        return 2.0 * (vref / 4095.0) / r_sense / self._PULSE_AMC3301_GAIN * 1000.0
+
+    def _cut_rate_hz(self) -> float:
+        rate = (self.ready_status() or {}).get("rate_hz")
+        return float(rate) if rate else 1_000_000.0
+
+    def _mams_cut_view(self, r: dict, rate: float, slope: float, requested=None) -> dict:
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error") or r.get("message") or "mAms cut failed"}
+        thr = int(r.get("threshold") or 0)
+        at = r.get("last_cut_at_samples")
+        out = {"ok": True,
+               "on": thr > 0,
+               "mams": round(thr * 1000.0 * slope / rate, 6) if thr else 0.0,
+               "threshold": thr, "rate_hz": rate, "ma_per_lsb": round(slope, 6),
+               "cuts": r.get("cuts"),
+               "last_cut_us": round(at * 1e6 / rate, 1) if at is not None else None}
+        if requested is not None:
+            out["requested_mams"] = requested
+        return out
+
+    def mams_cut(self, mams: float | None, rate_hz: float | None = None,
+                 r_sense_ohm: float | None = None, adc_vref_v: float | None = None) -> dict:
+        """End every pulse once its emission charge reaches `mams` (mA*ms);
+        None or 0 turns the cut off. Until changed it applies to every pulse on
+        the master controller (the one with the STM32), measured or not.
+
+        Returns {ok, on, mams (what is actually set -- the STM32 threshold is an
+        integer, so it can differ slightly from requested_mams), threshold
+        (LSB*samples), rate_hz, ma_per_lsb, cuts (since the STM32 booted),
+        last_cut_us (from the pulse's rise)}.
+
+        rate_hz: the detector's sample rate, default the armed relay's rate
+        (ready_status), else 1 MHz. r_sense_ohm / adc_vref_v: as pulse_ma().
+
+            ct.mams_cut(0.5)      # cut each pulse at 0.5 mA*ms
+            ct.mams_cut(None)     # off
+        """
+        rate = float(rate_hz) if rate_hz else self._cut_rate_hz()
+        slope = self._ma_per_lsb(r_sense_ohm, adc_vref_v)
+        if not mams:
+            thr = 0
+        else:
+            if float(mams) < 0:
+                return {"ok": False, "error": f"mams must be > 0 (or None/0 for off), got {mams}"}
+            thr = int(round(float(mams) * rate / (1000.0 * slope)))
+            if thr < 1:
+                return {"ok": False, "error": f"{mams} mA*ms is below one LSB*sample "
+                                             f"({1000.0 * slope / rate:.3g} mA*ms) -- too small to set"}
+            if thr > 0x7FFFFFFF:
+                return {"ok": False, "error": f"{mams} mA*ms is above the STM32's range"}
+        r = self._post("/api/stm32/mams-cut", {"threshold": thr})
+        return self._mams_cut_view(r, rate, slope, requested=mams)
+
+    def mams_cut_status(self, rate_hz: float | None = None,
+                        r_sense_ohm: float | None = None, adc_vref_v: float | None = None) -> dict:
+        """The mAms cut as set now, in mA*ms (see mams_cut for the fields)."""
+        rate = float(rate_hz) if rate_hz else self._cut_rate_hz()
+        return self._mams_cut_view(self._get("/api/stm32/mams-cut"), rate,
+                                   self._ma_per_lsb(r_sense_ohm, adc_vref_v))
+
+    def cut_pulse_test(self, us: int = 200, controller: int = 1) -> dict:
+        """Wiring test, no HV needed: drive the CUT line (STM32 PA2) high `us`
+        microseconds and check the RP2350 saw it on GP46 (its 'cut with no pulse
+        on' counter, cutsLate, must go up by one). Refused while a cut is armed
+        -- mams_cut(None) first. Returns {ok, rp2350_saw_it, cuts_late_before,
+        cuts_late_after}."""
+        before = (self.shv_status(controller) or {}).get("cutsLate")
+        r = self._post("/api/stm32/cut-pulse", {"us": int(us)})
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error") or r.get("message")}
+        time.sleep(0.2)
+        after = (self.shv_status(controller) or {}).get("cutsLate")
+        if before is None or after is None:
+            return {"ok": False, "error": "this RP2350 firmware does not report cut counts "
+                                          "(needs the v3 build with shv_status cuts)",
+                    "cuts_late_before": before, "cuts_late_after": after}
+        saw = after == before + 1
+        out = {"ok": saw, "rp2350_saw_it": saw, "cuts_late_before": before, "cuts_late_after": after}
+        if not saw:
+            out["error"] = ("the RP2350 did not count the CUT edge -- check PA2 -> U23 -> GP46"
+                            if after == before else f"cutsLate moved by {after - before}, expected 1")
+        return out
+
     def pulse_ma(self, raw: float, ref_mv: float | None = None,
                  r_sense_ohm: float | None = None,   # shunt; None = CT_PULSE_R_SENSE_OHM
                  adc_vref_v: float | None = None,    # STM32 ADC reference; None = CT_PULSE_ADC_VREF_V

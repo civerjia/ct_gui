@@ -2020,6 +2020,20 @@ def stm32_hv_clear_target(host: str, chan: str) -> dict[str, Any]:
     return _stm32_post(host, "/stm32/hv_clear_target", {"chan": str(chan)})
 
 
+def stm32_mams_cut(host: str, threshold: int | None = None) -> dict[str, Any]:
+    """The STM32's mAms CUT (fw_build >= 0x00030002): read it, or set the
+    threshold in LSB*samples (0 = off). {ok, threshold, cuts, last_cut_at_samples}."""
+    if threshold is None:
+        return _stm32_get_json(host, "/stm32/mams_cut")
+    return _stm32_post(host, "/stm32/mams_cut", {"threshold": str(int(threshold))})
+
+
+def stm32_cut_pulse(host: str, us: int) -> dict[str, Any]:
+    """Drive the CUT line (STM32 PA2) high `us` microseconds now -- a wiring test
+    of PA2 -> U23 -> RP2350 GP46 -> /OE with no HV. Refused while a cut is armed."""
+    return _stm32_post(host, "/stm32/cut_pulse", {"us": str(int(us))}, timeout=4.0)
+
+
 def stm32_i2c_scan(host: str) -> dict[str, Any]:
     """Scan the STM32's I2C bus (0x08..0x77); returns ACKed 7-bit addresses."""
     return _stm32_post(host, "/stm32/i2c_scan", {}, timeout=4.0)

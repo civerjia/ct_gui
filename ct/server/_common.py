@@ -58,6 +58,8 @@ from ct.protocol import (
     stm32_ds3502_set,
     stm32_hv_enable_set,
     stm32_hv_status,
+    stm32_mams_cut,
+    stm32_cut_pulse,
     stm32_ads1115,
     stm32_adc_window,
     stm32_hv_set_target,
@@ -610,4 +612,4 @@ __all__ = [
     "stm32_hv_set_target", "stm32_hv_status", "sync_get_burst_status",
     "sync_get_status", "sync_post_abort", "sync_post_burst", "sync_post_burst_stop",
     "sync_post_config", "sync_post_fire", "threading", "time",
-]
+"stm32_mams_cut", "stm32_cut_pulse", ]
