@@ -3798,6 +3798,17 @@ class _ScheduleMixin:
         event stream stands. Fails -> nothing has been armed; do not fire."""
         if not shot.get("ok"):
             return shot
+        # The master's STM32 is GONE (no heartbeat for minutes, or never seen):
+        # nothing can measure. Still refuse -- whether to fire unmeasured is the
+        # caller's decision (measure=False) -- but SAY why. 2026-11-18 the rig's
+        # STM32 had been silent 4.8 days and every fire failed with the relay's
+        # "already armed", which sent people looking for a stale arm.
+        offline = self._stm32_offline_reason()
+        if offline:
+            return {"ok": False, "fired": 0, "records": [], "status": {},
+                    "measured": [], "ref_mv": None,
+                    "error": (f"cannot measure, nothing fired: {offline}. To fire "
+                              f"without measuring, pass measure=False.")}
         # The longest gap the run allows between pulses (trigger_timeout_ms);
         # older shot dicts only have inter_pulse_ms.
         gap_ms = int(shot.get("trigger_timeout_ms") or shot.get("inter_pulse_ms") or 0)
@@ -3866,6 +3877,35 @@ class _ScheduleMixin:
         # SUPPLY clamped from real emission. None = unknown, check skipped.
         return {**shot, "measuring": True, "since": since, "rate_hz": rate_hz,
                 "em_limit_ma": self.read_emission_i_limit()}
+
+    # The master's STM32 counts as offline after this long without a heartbeat.
+    # Well above the ESP32's own 5 s "alive" window so a hiccup, an STM32 reset
+    # or an OTA never turns measurement off; only a board that is really gone.
+    _STM32_OFFLINE_MS = 60_000
+
+    def _stm32_offline_reason(self) -> str | None:
+        """Why the master's STM32 cannot measure, or None when it can (or when
+        that can't be told -- unknown is NOT offline, the arm then decides)."""
+        try:
+            st = self.status() or {}
+        except Exception:
+            return None
+        master = st.get("master")
+        rows = st.get("controllers") or {}
+        row = rows.get(str(master)) if master is not None else None
+        if not row or not row.get("connected"):
+            return None
+        stm = row.get("stm32")
+        if not isinstance(stm, dict) or stm.get("error"):
+            return None
+        if not stm.get("ever_seen"):
+            return f"the master's (Power {master}) STM32 has never been seen since its ESP32 booted"
+        age = stm.get("age_ms")
+        if isinstance(age, (int, float)) and age > self._STM32_OFFLINE_MS:
+            return (f"the master's (Power {master}) STM32 has been silent for "
+                    f"{age / 1000 / 3600:.1f} h" if age >= 3_600_000 else
+                    f"the master's (Power {master}) STM32 has been silent for {age / 1000:.0f} s")
+        return None
 
     def shot_measured(self, shot: dict, result: dict | None = None,
                       grace_s: float = 3.0, prefetched: tuple | None = None) -> dict:
