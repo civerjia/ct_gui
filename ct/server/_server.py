@@ -974,6 +974,9 @@ def shv_op(link: "ControllerLink", body: dict) -> dict:
         if why:
             return {"ok": False, "error": f"arm refused: {why}",
                     "trigger_delay_mismatch": True}
+        why = mams_cut_arm_check()
+        if why:
+            return {"ok": False, "error": f"arm refused: {why}", "mams_cut_mismatch": True}
         # A run in progress is active control of both the filaments and the
         # rails -- that is what a run IS -- so arming renews both timers.
         safety_touch_hv()
@@ -6435,7 +6438,9 @@ class CtHandler(BaseHTTPRequestHandler):
             if err:
                 self._json({"ok": False, "error": err})
             else:
-                self._json(stm32_mams_cut(host))
+                r = stm32_mams_cut(host)
+                r["backend_keep_threshold"] = MAMS_CUT_WANT["threshold"]
+                self._json(r)
         elif path == "/api/stm32/hv-status":
             # Proxy to `/stm32/hv_status` — the ACTUAL HV enable GPIO levels
             # (emission_on/focus_on read from the pin, not the commanded state)
@@ -7153,6 +7158,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 if why:
                     return self._json({"ok": False, "error": f"arm refused: {why}",
                                        "trigger_delay_mismatch": True}, HTTPStatus.OK)
+                why = mams_cut_arm_check()
+                if why:
+                    return self._json({"ok": False, "error": f"arm refused: {why}",
+                                       "mams_cut_mismatch": True}, HTTPStatus.OK)
                 # Arm the bound Simple-HV schedule on EVERY connected controller
                 # (SHV_ARM, 0x77). body: {repeats}. Firmware validates the
                 # loaded table (active-list coverage vs. board presence) before
@@ -8636,7 +8645,11 @@ class CtHandler(BaseHTTPRequestHandler):
                 host, err = self._master_stm32_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
-                self._json(stm32_mams_cut(host, thr))
+                r = stm32_mams_cut(host, thr)
+                if r.get("ok") and r.get("threshold") == thr:
+                    _mams_cut_remember(thr)
+                r["backend_keep_threshold"] = MAMS_CUT_WANT["threshold"]
+                self._json(r)
             elif path == "/api/stm32/cut-pulse":
                 # body: {us: 1..10000} -- PA2 high that long now (wiring test, no HV).
                 us = int(body.get("us", 0) or 0)
@@ -9400,6 +9413,81 @@ def _i2c_hz_check_one(cid: int, link) -> list:
     return out
 
 
+# The mAms CUT threshold lives in STM32 RAM. The ESP32 puts it back after an
+# STM32 reset (it remembers the last one set), but when BOTH restart -- a power
+# cycle -- nothing on the controller remembers it, and every pulse after that
+# runs uncut with nothing saying so. The backend keeps the wanted threshold on
+# disk (set through /api/stm32/mams-cut) and restores it, like the trigger delay.
+MAMS_CUT_STATE_PATH = STATE_DIR / "mams_cut.json"
+
+
+def _mams_cut_load() -> int:
+    try:
+        v = json.loads(MAMS_CUT_STATE_PATH.read_text()).get("threshold")
+        return int(v) if v is not None and int(v) > 0 else 0
+    except (OSError, ValueError, AttributeError, TypeError):
+        return 0
+
+
+MAMS_CUT_WANT: dict = {"threshold": _mams_cut_load()}
+
+
+def _mams_cut_remember(thr: int) -> None:
+    MAMS_CUT_WANT["threshold"] = int(thr)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        MAMS_CUT_STATE_PATH.write_text(json.dumps({"threshold": int(thr)}))
+    except OSError as exc:
+        log.warning("mAms cut setting not saved (%s) -- it holds until the backend restarts", exc)
+
+
+def _restore_mams_cut() -> dict | None:
+    """Put the wanted mAms cut back on the master's STM32 when it reads 0 (a
+    restart cleared it). Only that signature: a different non-zero value was
+    set some other way on purpose and is left alone. Returns the set result,
+    or None when nothing was done."""
+    want = MAMS_CUT_WANT.get("threshold") or 0
+    link = CONTROLLERS.get(MASTER)
+    if want <= 0 or not link or not link.client.connected or not link.host:
+        return None
+    if link.stm32_offline_reason():
+        return None
+    cur = stm32_mams_cut(link.host)
+    if not cur.get("ok") or cur.get("threshold") != 0:
+        return None
+    r = stm32_mams_cut(link.host, want)
+    log.warning("mAms cut: the master's STM32 read threshold 0 (it restarted, and the ESP32 "
+                "did not restore it) -- re-applied %d -> %s", want,
+                "ok" if r.get("ok") and r.get("threshold") == want else (r.get("error") or r))
+    return r
+
+
+def mams_cut_arm_check() -> str | None:
+    """Why arming now would fire pulses the user asked to have cut, or None.
+    Only when a cut is wanted (mams_cut was set through the backend): the
+    master's STM32 must be online and hold the threshold -- a 0 (restart) is
+    put back first. Anything else refuses the arm: a pulse that silently runs
+    its full width is exactly what the cut is there to prevent."""
+    want = MAMS_CUT_WANT.get("threshold") or 0
+    if want <= 0:
+        return None
+    link = CONTROLLERS.get(MASTER)
+    if not link or not link.client.connected or not link.host:
+        return None                       # no master: the arm is refused elsewhere
+    why = link.stm32_offline_reason()
+    if why:
+        return (f"a mAms cut is set but the master's STM32 is offline ({why}) -- nothing "
+                "would cut the pulses; mams_cut(None) to fire uncut")
+    _restore_mams_cut()
+    cur = stm32_mams_cut(link.host)
+    if not cur.get("ok"):
+        return f"a mAms cut is set but the STM32 did not report it ({cur.get('error') or cur})"
+    if cur.get("threshold") != want:
+        return (f"the STM32's mAms cut threshold is {cur.get('threshold')}, not the {want} set "
+                "through the backend -- set mams_cut() again")
+    return None
+
+
 def _slew_keeper_loop() -> None:
     while True:
         time.sleep(SLEW_KEEP_PERIOD_S)
@@ -9442,6 +9530,10 @@ def _slew_keeper_loop() -> None:
                 _restore_trigger_delay(trigger_delay_all())
         except Exception as exc:
             log.debug("trigger-delay keeper: %s", exc)
+        try:
+            _restore_mams_cut()
+        except Exception as exc:
+            log.debug("mAms-cut keeper: %s", exc)
 
 
 # ── Automatic discovery and connection ───────────────────────────────────────

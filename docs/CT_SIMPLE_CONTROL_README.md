@@ -3873,11 +3873,23 @@ ct.cut_pulse_test(200)      # wiring test, no HV: {rp2350_saw_it: True, ...}
   (`CT_PULSE_R_SENSE_OHM`, `CT_PULSE_ADC_VREF_V`, the AMC3301 gain) and the
   detector rate, so "cut at X" means X as the measurement would report it. The
   STM32 threshold is an integer: the reply's `mams` is what is really set.
-- The cut stays set (on every pulse, measured or not) until changed; an STM32
-  reset turns it off.
-- Delay from the charge reaching the value to the cut: one detector block
-  (128 samples, 0.128 ms at 1 MSPS) plus interrupts. From CUT to the gate off it
+- The cut stays set (on every pulse, measured or not) until changed. It lives
+  in STM32 RAM, so a restart clears it — and it is put back for you: the ESP32
+  re-sends it right after an STM32 reset, and the backend keeps it on disk
+  (`state/mams_cut.json`) and restores it within 30 s, and before every arm,
+  when both restarted. `mams_cut_status()` shows `esp32_keeps_mams`,
+  `backend_keeps_mams` and `esp32_restores`.
+- Arming is **refused** while a cut is set and the master's STM32 is offline or
+  holds a different threshold — nothing would cut the pulses. `mams_cut(None)`
+  to fire uncut.
+- Works for both controllers: the master's cut reaches controller 2 as well
+  (its `shv_status(2)["cuts"]` counts it).
+- Delay from the charge reaching the value to the cut: up to one detector block
+  (64 samples, 0.064 ms at 1 MSPS) plus a few µs. Measured on the v3 bench
+  (100 V, ~11.6 mA): the reported charge ends **+0.3 to +0.4 mA·ms** above the
+  setting on average (sd ~0.35); at 200 V about +1. From CUT to the gate off it
   is hardware plus one RP2350 GPIO interrupt.
+- Invalid values (`"abc"`, NaN, inf, negative) return `{ok: False, error}`.
 - `shv_status()` carries the RP2350's side: `cuts` (a pulse was on) and
   `cutsLate` (a cut edge with no pulse on — what `cut_pulse_test` counts).
 - `cut_pulse_test` is refused while a cut is set: `mams_cut(None)` first.

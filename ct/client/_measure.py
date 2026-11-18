@@ -434,6 +434,12 @@ class _MeasureMixin:
                "threshold": thr, "rate_hz": rate, "ma_per_lsb": round(slope, 6),
                "cuts": r.get("cuts"),
                "last_cut_us": round(at * 1e6 / rate, 1) if at is not None else None}
+        # What gets put back after a restart clears the STM32's threshold: the
+        # ESP32 restores after an STM32 reset, the backend after both restart.
+        for src, key in (("keep_threshold", "esp32_keeps_mams"), ("backend_keep_threshold", "backend_keeps_mams")):
+            k = r.get(src)
+            out[key] = round(int(k) * 1000.0 * slope / rate, 6) if k is not None else None
+        out["esp32_restores"] = r.get("restores")
         if requested is not None:
             out["requested_mams"] = requested
         return out
@@ -457,10 +463,16 @@ class _MeasureMixin:
         """
         rate = float(rate_hz) if rate_hz else self._cut_rate_hz()
         slope = self._ma_per_lsb(r_sense_ohm, adc_vref_v)
-        if not mams:
+        if mams is None or (not isinstance(mams, str) and mams == 0):
             thr = 0
         else:
-            if float(mams) < 0:
+            try:
+                mams = float(mams)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"mams must be a number in mA*ms (or None/0 for off), got {mams!r}"}
+            if mams != mams or mams in (float("inf"), float("-inf")):
+                return {"ok": False, "error": f"mams must be a finite number, got {mams}"}
+            if mams < 0:
                 return {"ok": False, "error": f"mams must be > 0 (or None/0 for off), got {mams}"}
             thr = int(round(float(mams) * rate / (1000.0 * slope)))
             if thr < 1:
