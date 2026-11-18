@@ -327,6 +327,24 @@ class _HvMixin:
             "test_byte": int(test_byte), "settle_ms": int(settle_ms),
         }, timeout=5.0)
 
+    def i2c_scan(self, controller: int = 1,
+                 channel: int = 0,          # 0-7 (CH1 = 0)
+                 ports=(0, 1, 2, 3, 4, 5, 6, 7, 8)) -> dict:  # 0 = main bus, 1-8 = behind that
+                                            # TCA9548 port
+        """Raw I2C address sweep, remote: what ACKs on a channel's main bus and
+        behind each mux port (CH_I2C_SCAN 0x67, same as the console 'i2cscan').
+        Read-only, no lease needed; refused (Busy) while a schedule runs.
+
+        Returns {"ok", "controller", "channel", "ports": {"0": {"addrs": [...]},
+        "1": {...}, ...}}; a port that failed carries "error" instead of "addrs".
+        Expected on a v3 filament board: main bus 0x20 0x21 0x22 0x70; behind a
+        port with a powered sub-board also its TPS55289 (0x74/0x75) and INA219
+        (0x40) -- those only answer with the sub-board's isolated power on (SLEEP+).
+        """
+        return self._post("/api/i2c-scan", {"controller": int(controller),
+                                            "channel": int(channel),
+                                            "ports": [int(p) for p in ports]}, timeout=30.0)
+
     def _set_hv_shift_hz_one(self, hz: int, controller: int = 1) -> dict:
         """Set the HC165 readback bit-bang SCK frequency (Hz) — for
         signal-integrity testing on long cables (e.g. drop it to 1 kHz to

@@ -101,6 +101,7 @@ _UNGATED_POSTS = {
     "/api/present",           # CH_GET_PRESENT     — I2C presence scan
     "/api/diagnosis",         # CH_GET_DIAGNOSIS   — per-chip classification
     "/api/tca9554-read",      # CH_READ_TCA9554    — expander registers
+    "/api/i2c-scan",          # CH_I2C_SCAN        — raw address sweep
     "/api/verify-schedule",   # ShvGetTableInfo / ShvHeatGetInfo readback
     # Remote CTClient sessions: they only CARRY calls; every hardware request
     # a call makes is a normal, gated, audited request of its own.

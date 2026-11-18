@@ -8758,7 +8758,34 @@ class CtHandler(BaseHTTPRequestHandler):
                             "r0": raw[3] if len(raw) > 3 else None,
                             "r1": raw[4] if len(raw) > 4 else None,
                             "r2": raw[5] if len(raw) > 5 else None,
-                            "r3": raw[6] if len(raw) > 6 else None})
+                            "r3": raw[6] if len(raw) > 6 else None,
+                            # v3 firmware appends the second 165 (MOSFET Vg
+                            # feedback) of each read; None = older firmware.
+                            "vg": list(raw[7:11]) if len(raw) >= 11 else None})
+            elif path == "/api/i2c-scan":
+                # Raw I2C address sweep (CH_I2C_SCAN 0x67) -- the remote twin of
+                # the RP2350 console 'i2cscan'. body: {controller, channel 0-7,
+                # ports: [0..8]} (0 = main bus, 1-8 = behind that mux port).
+                cid = int(body.get("controller", 1))
+                link = CONTROLLERS.get(cid)
+                if not link or not link.client.connected:
+                    return self._json({"ok": False, "error": f"controller {cid} not connected"}, HTTPStatus.OK)
+                channel = int(body.get("channel", 0))
+                ports = [int(p) for p in (body.get("ports") or [0])]
+                if not (0 <= channel < 8) or any(not (0 <= p <= 8) for p in ports):
+                    return self._json({"ok": False, "error": "channel 0-7, ports 0-8"}, HTTPStatus.BAD_REQUEST)
+                out = {}
+                for port in ports:
+                    raw = link.request(0x67, bytes([channel, port]), flags=0, timeout=3.0).get("raw") or []
+                    if len(raw) < 19 or raw[0] != 0x00:
+                        st = raw[0] if raw else None
+                        out[str(port)] = {"error": "no reply" if st is None else
+                                          f"status {st} ({UART_STATUS_NAMES.get(st, 'unknown')})"}
+                        continue
+                    bm = raw[3:19]
+                    out[str(port)] = {"addrs": [a for a in range(128) if bm[a >> 3] & (1 << (a & 7))]}
+                self._json({"ok": all("addrs" in v for v in out.values()),
+                            "controller": cid, "channel": channel, "ports": out})
             elif path == "/api/hv-shift-hz":
                 # SET-only (HvSetShiftHz 0x80): the 165-readback bit-bang SCK
                 # frequency, for signal-integrity testing on long cables.

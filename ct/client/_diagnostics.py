@@ -1406,9 +1406,15 @@ class _DiagnosticsMixin:
     def pin_probe(self, controller: int | None = None) -> dict:
         """ACTIVE test of the HV shift chain's safe pins (console `pinprobe`):
         drives SCK, MOSI, LOAD_N, CLKINH, S0-S2 high and low and times each pad
-        edge, then clocks the 165 read-back chain 64 bits. The LATCH pins and
-        SRCLR_N are never touched, so no grid switch can move -- but it DRIVES
-        pins, so it takes the lease and is refused while a schedule runs.
+        edge, then clocks the 165 read-back chain 64 bits. Since RP2350 fw
+        d34d343+ it also drives each channel's LATCH (RCLK) line 0->1->0 with
+        /SRCLR held low, so only zeros can reach the 595 outputs: no grid switch
+        can CLOSE, but a channel whose switch is ON is skipped (latching zeros
+        would open it). A LATCH line that will not come back low freezes its
+        595 -- every later OFF on that channel is lost -- and is a FAIL here
+        ("latches" in the result; "latch_bad_since_boot" = failed on any latch
+        since boot). It DRIVES pins, so it takes the lease and is refused while
+        a schedule runs.
 
             with ct.lease(note="pin probe"):
                 r = ct.pin_probe()
@@ -1444,7 +1450,28 @@ class _DiagnosticsMixin:
                                                                else "slow edge")}
             chain = "".join("1" if (bits >> i) & 1 else "0" for i in range(64))
             bad = [f"{n} (gp{p['gpio']}): {p['note']}" for n, p in pins.items() if p["verdict"] == "FAIL"]
+            latches, sticky = None, None
+            o = 12 + 7 * 7
+            if len(raw) >= o + 3 + 8 * 4:          # fw d34d343+: LATCH lines appended
+                tested, lbad, sticky_m = raw[o], raw[o + 1], raw[o + 2]
+                latches = {}
+                for ch in range(8):
+                    q = o + 3 + ch * 4
+                    rise, fall = raw[q] | (raw[q + 1] << 8), raw[q + 2] | (raw[q + 3] << 8)
+                    name = f"LATCH{ch} (CH{ch + 1})"
+                    if not (tested >> ch) & 1:
+                        latches[name] = {"verdict": "SKIPPED", "note": "a switch is ON (or PIO owns it)"}
+                        continue
+                    ok = not (lbad >> ch) & 1
+                    latches[name] = {"verdict": "OK" if ok else "FAIL", "rise": f"{rise} us", "fall": f"{fall} us",
+                                     "note": None if ok else ("will not go HIGH" if rise >= 2000 else
+                                                              "will not go LOW: the 595 freezes, OFFs are lost"
+                                                              if fall >= 2000 else "slow edge")}
+                    if not ok:
+                        bad.append(f"{name}: {latches[name]['note']}")
+                sticky = [f"CH{ch + 1}" for ch in range(8) if (sticky_m >> ch) & 1]
             return {"ok": not bad, "fail": bad, "pins": pins,
+                    "latches": latches, "latch_bad_since_boot": sticky,
                     "chain_165": chain, "chain_transitions": raw[3],
                     # The clock-out reads whichever channel S0-S2 address right now,
                     # and with every grid switch off all its sense inputs are equal:

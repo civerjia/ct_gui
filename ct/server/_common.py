@@ -220,6 +220,7 @@ CH_TCA9554_SELF_TEST = 0x60     # per-pin TCA9554 toggle test
 
 
 CH_READ_TCA9554 = 0x61          # read-only TCA9554 Config/Input/Output dump
+CH_I2C_SCAN = 0x67              # raw I2C address sweep, one channel bus / mux port (fw d34d343+)
 
 
 CH_GET_BOARD_BITMAPS = 0x26     # iso/tps enable + tps fault + hv overcurrent masks
