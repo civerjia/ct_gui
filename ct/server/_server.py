@@ -1452,6 +1452,7 @@ def _safety_loop() -> None:
     # nobody reads.
     _safety_held_for_run = False
     _safety_unknown_run = False
+    _safety_grid_held_hv_off = False
     # Ends with the process's restart (_STOPPING): on Windows the old process
     # stays alive behind the new one, and a watchdog left running there acts
     # on the state it had -- 2026-10-27 it retried a timed VOLTAGE every second
@@ -1526,7 +1527,22 @@ def _safety_loop() -> None:
             if hv_stale:
                 with _SAFETY_LOCK:
                     _SAFETY_TOUCH_HV = now
-                _safety_open_grid()
+                rails = _hv_rails_known_off()
+                if rails is True:
+                    # Both HV rails confirmed OFF: a closed grid switch has
+                    # nothing behind it, and it is what a manual switch test
+                    # looks like. Held (the clock above restarts, so this asks
+                    # again in hv_timeout_s), not opened. Unknown rails, or
+                    # either rail on, open as before.
+                    if not _safety_grid_held_hv_off:
+                        _safety_record("grid_held_hv_off",
+                                       {"note": "grid switch(es) closed with no command, but "
+                                                "emission and focus are both OFF -- left as set; "
+                                                "the dead-man opens them once HV is on"})
+                        _safety_grid_held_hv_off = True
+                else:
+                    _safety_grid_held_hv_off = False
+                    _safety_open_grid()
         except Exception as exc:          # never let the watchdog die
             log.exception("safety-watchdog tick failed: %s", exc)
 
@@ -3434,6 +3450,25 @@ def _hv_guard_stm32_flags() -> dict | None:
     if isinstance(r, dict) and r.get("ok") and not (r.get("flags", 0) & STM32_FLAG_HV_GUARD):
         _HVG_RAILS.update(emission=bool(r.get("emission_on")), focus=bool(r.get("focus_on")))
     return r if isinstance(r, dict) and r.get("ok") else None
+
+
+def _hv_rails_known_off() -> bool | None:
+    """True only when the master STM32 says emission AND focus are both off,
+    right now (shared 0.1 s cache). False = a rail is on. None = unknown (no
+    master, STM32 offline, read failed) -- callers must treat None as ON."""
+    link = CONTROLLERS.get(MASTER)
+    if not link or not link.client.connected or not link.host:
+        return None
+    if link.stm32_offline_reason():
+        return None
+    host = link.host
+    try:
+        r = shared_read(("stm32-hv-status", host), SHARED_TTL_STM32_S, lambda: stm32_hv_status(host))
+    except Exception:
+        return None
+    if not (isinstance(r, dict) and r.get("ok")) or "emission_on" not in r or "focus_on" not in r:
+        return None
+    return not r["emission_on"] and not r["focus_on"]
 
 
 _HVG_RAILS = {"emission": False, "focus": False}   # last rail state seen BEFORE a trip
