@@ -1333,7 +1333,9 @@ class _PowerMixin:
                                                     # this long, then the BACKEND
                                                     # returns it to IDLE
                     then_idle_ma: float | None = None,
-                    then_idle_voltage: bool = False) -> dict:   # back to its voltage IDLE
+                    then_idle_voltage: bool = False,   # back to its voltage IDLE
+                    wait_arrival: bool = True) -> dict:  # timed only: return once the
+                                                          # load voltage has ARRIVED
         """Drive a single filament to manual VOLTAGE mode (PowerState 6) at
         `millivolts` mV -- a fixed voltage hold, NOT current-regulated
         (unlike IDLE/ACTIVE, which hold a commanded mA via the closed CC
@@ -1352,6 +1354,17 @@ class _PowerMixin:
         result["heating"]:
             {"ok": bool, "cc_mode": int, "elapsed_s": float, "present": bool}
         cc_mode: 0=voltage (expected here), 1=current, 2/3=fault.
+
+        Timed (active_s given): returns only once the filament is HEATED --
+        the RP2350 voltage loop reports the load voltage "settled" within
+        +-150 mV of `millivolts` (or "capped" / a fault / `timeout_s` runs out),
+        the same arrival fire_single_pulse(active_mv=) waits for. The verdict
+        is always in result["heating"] (`verify` is not needed):
+            {"ok", "arrival", "elapsed_s", "measured_ma", "cc_mode", "error"?}
+        active_s is the heating time LIMIT, not a wait: the backend drops the
+        filament back to IDLE when it runs out, and any later state command for
+        it (idle_one, ...) ends the hold earlier. wait_arrival=False returns at
+        once (fire_single_pulse does its own wait).
 
         active_s (2026-10-14): VOLTAGE as a stand-in for a timed ACTIVE --
         heat to a known voltage with no CC loop. Treated exactly like a timed
@@ -1372,9 +1385,55 @@ class _PowerMixin:
             return {"ok": False, "filament": int(filament),
                     "error": f"millivolts={mv} out of range 800-15000 (firmware clamps to 0.8-15 V)"}
         r = self._state_one(filament, VOLTAGE, mv, "voltage_one", extra=extra)
-        if verify and not r.get("dead"):
+        if not r.get("ok") or r.get("dead"):
+            return r
+        if active_s is not None and wait_arrival:
+            h = self._wait_voltage_arrival(filament, mv, timeout_s)
+            r = {**r, "heating": h}
+            if not h["ok"]:
+                r = {**r, "ok": False, "error": h["error"]}
+        elif verify:
             r = {**r, "heating": self._wait_for_voltage_mode(filament, timeout_s)}
         return r
+
+    def _wait_voltage_arrival(self, filament: int, mv: int, timeout_s: float,
+                              fast_poll: bool = False) -> dict:
+        """Poll the cached current read (no I2C on the RP2350) until the
+        firmware's voltage loop reports arrival for a VOLTAGE board: "settled"
+        (load within +-150 mV of mv, held for the arrival settle time) is ok;
+        "capped", an output fault or the deadline is not, with the reason."""
+        deadline = time.monotonic() + float(timeout_s)
+        naps = iter(lambda: 0.05, None) if fast_poll else self._poll_intervals(0.1, 0.3)
+        t0 = time.monotonic()
+        d, arrival, mode = {}, None, None
+        while True:
+            d = (self.read_filament_current_cached(filament) or {}).get(int(filament)) or {}
+            arrival, mode = d.get("arrival"), d.get("cc_mode")
+            if mode in (2, 3) or arrival in ("settled", "capped") or time.monotonic() >= deadline:
+                break
+            time.sleep(next(naps))
+        ma = d.get("current_mA")
+        h = {"ok": arrival == "settled", "mode": "voltage", "commanded_mv": int(mv),
+             "arrival": arrival, "elapsed_s": round(time.monotonic() - t0, 3),
+             "measured_ma": ma, "measured_valid": ma is not None, "cc_mode": mode,
+             "measured_from": "cached"}
+        if mode in (2, 3):
+            h.update(ok=False, faulted=True,
+                     error=f"output faulted at {mv} mV (cc_mode {mode}: "
+                           f"{'open filament' if mode == 2 else 'OCP/short'})")
+        elif arrival == "capped":
+            h.update(error=f"{mv} mV not reached on the load: the output is at its "
+                           f"limit (voltage cap or +1.5 V drop compensation) and the load "
+                           f"is still more than 150 mV short ({ma} mA)")
+        elif arrival == "settling":
+            h.update(error=f"{mv} mV arrived but did not stay within +-150 mV for the "
+                           f"settle time before the {timeout_s} s deadline")
+        elif arrival != "settled":
+            h.update(error=f"{mv} mV not reached within {timeout_s} s "
+                           f"(arrival {arrival!r}, {ma} mA). Firmware without the "
+                           f"voltage loop (before feat/pulse-instant-heat) never "
+                           f"reports arrival in VOLTAGE mode")
+        return h
 
     def _wait_for_voltage_mode(self, filament: int, timeout_s: float,
                                poll_interval_s: float = 0.2) -> dict:

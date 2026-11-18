@@ -3165,7 +3165,7 @@ class _ScheduleMixin:
         def raise_voltage():
             r = self.voltage_one(filament, active_mv,
                                  active_s=float(heat_timeout_s) + float(kw["timeout_s"]) + 5.0,
-                                 **back)
+                                 wait_arrival=False, **back)   # its own wait follows
             heat["active"] = r
             if not r.get("ok"):
                 heat["raised"] = False       # refused: nothing applied to drop
@@ -3904,6 +3904,10 @@ class _ScheduleMixin:
             if not row or not row.get("connected"):
                 return None
             stm = row.get("stm32")
+            if isinstance(stm, dict) and "offline" in stm:
+                # The backend's own verdict, from its LAST GOOD reading (a fetch
+                # that timed out does not hide it): one call, no retry.
+                return stm["offline"] or None
             if isinstance(stm, dict) and not stm.get("error"):
                 break
         else:
