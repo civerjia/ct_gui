@@ -3885,10 +3885,13 @@ ct.cut_pulse_test(200)      # wiring test, no HV: {rp2350_saw_it: True, ...}
 - Works for both controllers: the master's cut reaches controller 2 as well
   (its `shv_status(2)["cuts"]` counts it).
 - Delay from the charge reaching the value to the cut: up to one detector block
-  (64 samples, 0.064 ms at 1 MSPS) plus a few µs. Measured on the v3 bench
-  (100 V, ~11.6 mA): the reported charge ends **+0.3 to +0.4 mA·ms** above the
-  setting on average (sd ~0.35); at 200 V about +1. From CUT to the gate off it
+  (64 samples, 0.064 ms at 1 MSPS) plus a few µs. From CUT to the gate off it
   is hardware plus one RP2350 GPIO interrupt.
+- A cut pulse's `integral_mams` covers rise → 200 µs after the cut, which
+  collects the turn-off charge; `on_us` is still the full envelope. Measured on
+  the v3 bench, 20 shots each: 100 V (~11.6 mA) cut 30 → **+0.65 mA·ms** mean
+  (sd 0.19); 200 V (~22 mA) cut 100 → **+1.4** (sd 0.4). The overshoot is
+  roughly 60 µs of current, so it scales with the current.
 - Invalid values (`"abc"`, NaN, inf, negative) return `{ok: False, error}`.
 - `shv_status()` carries the RP2350's side: `cuts` (a pulse was on) and
   `cutsLate` (a cut edge with no pulse on — what `cut_pulse_test` counts).
