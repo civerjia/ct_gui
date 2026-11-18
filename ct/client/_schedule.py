@@ -1395,6 +1395,22 @@ class _ScheduleMixin:
                                [raw[3 + 2 * i] for i in range(n)])
         return out
 
+    @staticmethod
+    def _vacuum_refusal(vac) -> str | None:
+        """Why the vacuum forbids a run, or None. Over the limit always refuses.
+        NO reading (within_limit None) refuses too -- unless the backend's
+        vacuum debug mode or a timed bypass is on, which exist exactly so a
+        missing reading is ignored (bench, no gauge). 2026-11-18 this read None
+        as "over its limit" and refused every scan_view on the bench with debug on."""
+        vac = vac or {}
+        wl = vac.get("within_limit")
+        if wl is False:
+            return f"vacuum over its limit: {vac.get('raw')} (limit {vac.get('limit_torr')} Torr)"
+        if wl is None and not vac.get("debug") and not vac.get("bypass_missing_s"):
+            return ("no vacuum reading (" + str(vac.get("error") or "no gauge data") + ") -- "
+                    "the run needs one; on a bench without a gauge turn on vacuum debug mode")
+        return None
+
     def scan_view(self,
                   filaments,                       # filament numbers, fired in THIS order
                   active_mv: dict,                 # {filament: mV} -- every filament its own
@@ -1648,8 +1664,9 @@ class _ScheduleMixin:
         # counter cannot be missed.
         trips0 = guard.get("trips")
         wall0 = datetime.datetime.now().astimezone()
-        if not ((guard.get("vacuum") or {}).get("within_limit", True)):
-            return refuse(f"vacuum over its limit: {(guard.get('vacuum') or {}).get('raw')}")
+        why = self._vacuum_refusal(guard.get("vacuum"))
+        if why:
+            return refuse(why)
 
         # A board the firmware's pre-arm check would refuse -- at STOP (isolated
         # rail off), absent, lost, or on a dark channel -- refused the WHOLE arm:
@@ -1921,8 +1938,9 @@ class _ScheduleMixin:
                     raise self._ScanStop("the HV guard acted during the run (it forced every grid "
                                          "open; it may already have recovered): "
                                          + self._guard_last_action(since=wall0))
-                if not ((g.get("vacuum") or {}).get("within_limit", True)):
-                    raise self._ScanStop(f"vacuum over its limit: {(g.get('vacuum') or {}).get('raw')}")
+                why = self._vacuum_refusal(g.get("vacuum"))
+                if why:
+                    raise self._ScanStop(why)
                 if first_armed_at is not None and time.monotonic() - last_pulse_at > no_pulse_s:
                     raise self._ScanStop(f"no pulse at all for {no_pulse_s:g} s "
                                          f"(no_pulse_timeout_s) -- is the trigger source alive?")
