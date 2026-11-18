@@ -144,6 +144,9 @@ class ControllerLink:
         self.rp_last = 0.0                       # unix time of last good PING
         self.rp_rtt_ms: float | None = None
         self.stm: dict[str, Any] = {}
+        self.stm_good: dict | None = None         # last STM32 status the ESP32 returned
+        self.stm_good_at = 0.0                    # monotonic time of that reading
+        self.stm_unseen_since: float | None = None  # first good reading with ever_seen False
         self.bridge_name: str | None = None       # ESP32 AP SSID (MAC-derived identity)
         self._last_stm_uptime: int | None = None  # for restart detection, see _note_stm_reset
         self._stm_resets = 0
@@ -180,6 +183,9 @@ class ControllerLink:
             self.rp_last = 0.0
             self.rp_rtt_ms = None
             self.stm = {}
+            self.stm_good = None          # last STM32 status the ESP32 actually returned
+            self.stm_good_at = 0.0        # time.monotonic() of that reading
+            self.stm_unseen_since = None  # first good reading with ever_seen False
             self.bridge_name = None
             self._running = True
             self._poll_thread = threading.Thread(target=self._poll, daemon=True)
@@ -335,6 +341,12 @@ class ControllerLink:
                     stm = fetch_stm32_status(host)
                     self._note_stm_reset(stm)
                     self.stm = stm
+                    if isinstance(stm, dict) and not stm.get("error"):
+                        self.stm_good, self.stm_good_at = stm, time.monotonic()
+                        if stm.get("ever_seen"):
+                            self.stm_unseen_since = None
+                        elif self.stm_unseen_since is None:
+                            self.stm_unseen_since = self.stm_good_at
                 except Exception as exc:
                     stm = self.stm = {"ever_seen": False, "error": str(exc)}
                 err = str(stm.get("error") or "")
@@ -347,6 +359,37 @@ class ControllerLink:
                     w["at"] = time.time()
                     self.wifi = w
             time.sleep(1.0)
+
+    # The STM32 counts as OFFLINE after this long without a heartbeat. Well
+    # above the ESP32's own 5 s window, so a hiccup, an STM32 reset or its OTA
+    # never does it -- only a board that is really gone.
+    STM32_OFFLINE_S = 60.0
+
+    def stm32_offline_reason(self) -> str | None:
+        """Why this link's STM32 cannot answer, from the LAST GOOD status: a fetch
+        that times out (on the rig, with its STM32 dead, 4 in 6 did, 2026-11-18)
+        no longer hides that the STM32 has been silent for days. None = alive,
+        or not known yet (never a good reading: unknown is not offline)."""
+        good = self.stm_good
+        if not isinstance(good, dict) or not self.host:
+            return None
+        since_read = time.monotonic() - self.stm_good_at
+        if not good.get("ever_seen"):
+            # A freshly booted ESP32 also says never-seen until the STM32's first
+            # 1 Hz heartbeat: only a never-seen that LASTS counts.
+            since = self.stm_unseen_since
+            if since is None or time.monotonic() - since < self.STM32_OFFLINE_S:
+                return None
+            return (f"{self.name}'s STM32 has not been seen for "
+                    f"{time.monotonic() - since:.0f} s (never since its ESP32 booted)")
+        age = good.get("age_ms")
+        if not isinstance(age, (int, float)):
+            return None
+        silent = age / 1000.0 + since_read
+        if silent < self.STM32_OFFLINE_S:
+            return None
+        span = f"{silent / 3600:.1f} h" if silent >= 3600 else f"{silent:.0f} s"
+        return f"{self.name}'s STM32 has been silent for {span}"
 
     def _note_stm_reset(self, stm: dict) -> None:
         """Log every STM32 restart WITH ITS CAUSE, at the moment it happens.
@@ -425,6 +468,10 @@ class ControllerLink:
                 "fault_type": stm.get("fault_type"),
                 "fault_pc": stm.get("fault_pc"),
                 "resets_observed": self._stm_resets,
+                # Non-null = the STM32 is GONE (see stm32_offline_reason); the
+                # backend then refuses STM32 reads/sets at once instead of
+                # timing out on each.
+                "offline": self.stm32_offline_reason(),
             },
         }
 

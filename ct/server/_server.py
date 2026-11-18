@@ -6368,7 +6368,7 @@ class CtHandler(BaseHTTPRequestHandler):
             # (see config_portal.cpp) — reads all 4 ADS1115 channels (raw codes,
             # mV, and engineering units) over the STM32's I2C bus. Routed to
             # whichever controller is MASTER (STM32 hangs off one power only).
-            host, err = self._master_host()
+            host, err = self._master_stm32_host()
             if err:
                 self._json({"ok": False, "error": err})
             else:
@@ -6386,7 +6386,7 @@ class CtHandler(BaseHTTPRequestHandler):
             # samples (1000 = 1 ms @ 1 MSPS). Requires the STM32 high-speed ADC
             # already streaming (arm a ring/pulse/spi-shot first) — this is
             # ground truth read straight off the STM32, not from any host cache.
-            host, err = self._master_host()
+            host, err = self._master_stm32_host()
             n = int(self._query().get("n", "1000"))
             if err:
                 self._json({"ok": False, "error": err})
@@ -6397,7 +6397,7 @@ class CtHandler(BaseHTTPRequestHandler):
             # (emission_on/focus_on read from the pin, not the commanded state)
             # plus ads1115_alert and amc3301_diag fault flags. This pin-level
             # read is what the GUI's Emission/Focus On/Off tiles display.
-            host, err = self._master_host()
+            host, err = self._master_stm32_host()
             if err:
                 self._json({"ok": False, "error": err})
             else:
@@ -6407,7 +6407,7 @@ class CtHandler(BaseHTTPRequestHandler):
             # Proxy to `/stm32/ds3502?ch=` — reads back one DS3502 digital-pot
             # wiper (0-127) over I2C. ch selects the pot: 'ev'=emission voltage,
             # 'ei'=emission current, 'fv'=focus voltage (or numeric 0|1|2).
-            host, err = self._master_host()
+            host, err = self._master_stm32_host()
             self._json({"ok": False, "error": err} if err else stm32_ds3502_get(host, self._query().get("ch", "ev")))
         elif path == "/api/sync/status":
             # Read the ESP32 bridge's own SyncIn/SyncOut hardware-trigger
@@ -6422,7 +6422,7 @@ class CtHandler(BaseHTTPRequestHandler):
             # active, at_target). The loop itself is started by POST
             # /api/stm32/hv-set-target; noted elsewhere as unreliable versus
             # the host-side LUT+direct-wiper approach POST /api/hv/set-v uses.
-            host, err = self._master_host()
+            host, err = self._master_stm32_host()
             self._json({"ok": False, "error": err} if err else stm32_hv_get_target(host, self._query().get("chan", "emission")))
         elif path == "/api/hv-lut":
             # Host-side HV setpoint LUT: wiper→measured-V samples from a Calibrate
@@ -8239,7 +8239,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # measurement/calibration where only /api/pulse-events matters.
                 # body: {rate (Hz, default 1 MSPS)}. Shares the arm with
                 # Record measurement (detector_arm) — see its comment.
-                host, err = self._master_host()
+                host, err = self._master_stm32_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(detector_arm(host, int(body.get("rate", 1000000)), "stream"))
@@ -8247,7 +8247,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # Arm the pulse-envelope RELAY (and the STM32 detector inside it).
                 # Distinct from /api/adc/pulse-arm, which arms only the detector:
                 # without the relay, PA4 never moves and nothing gets measured.
-                host, err = self._master_host()
+                host, err = self._master_stm32_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 # ONE symmetric pair, in SAMPLES, applied to BOTH sides of the
@@ -8464,7 +8464,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # wiper (0-127) directly over I2C. body: {ch, wiper}. Raw/manual
                 # set; /api/hv/set-v and /api/hv/set-i wrap this with LUT/linear
                 # conversion from a physical unit (volts/mA) instead.
-                host, err = self._master_host()
+                host, err = self._master_stm32_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(stm32_ds3502_set(host, str(body.get("ch", "ev")), int(body.get("wiper", 0))))
@@ -8472,7 +8472,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # LUT-based voltage set: chan=emission|focus, volts=magnitude.
                 # Loads the calibrated wiper→V LUT, interpolates, writes DS3502.
                 # Falls back to linear approximation when no LUT is available.
-                host, err = self._master_host()
+                host, err = self._master_stm32_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 raw_chan = str(body.get("chan", "emission"))
@@ -8504,7 +8504,7 @@ class CtHandler(BaseHTTPRequestHandler):
             elif path == "/api/hv/set-i":
                 # Linear emission-current set: ma=target mA (0–85.7).
                 # DS3502 "ei" wiper is linearly proportional to current reference.
-                host, err = self._master_host()
+                host, err = self._master_stm32_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 try:
@@ -8540,6 +8540,10 @@ class CtHandler(BaseHTTPRequestHandler):
                 _hv_ch, _hv_on = str(body.get("ch", "emission")), bool(body.get("on"))
                 preflight = None
                 if _hv_on:
+                    # ON needs the STM32; OFF always goes out (see _master_stm32_host).
+                    _, off_err = self._master_stm32_host()
+                    if off_err:
+                        return self._json({"ok": False, "error": off_err}, HTTPStatus.OK)
                     vr = vacuum_refusal(f"{_hv_ch} ON")
                     if vr:
                         return self._json({"ok": False, "error": vr, "vacuum": vacuum_snapshot()},
@@ -8567,7 +8571,7 @@ class CtHandler(BaseHTTPRequestHandler):
                 # tol counts of target. body: {chan, target (ADC counts), tol,
                 # max_step}. Noted elsewhere as unreliable versus the
                 # host-side LUT+direct-wiper approach POST /api/hv/set-v uses.
-                host, err = self._master_host()
+                host, err = self._master_stm32_host()
                 if err:
                     return self._json({"ok": False, "error": err}, HTTPStatus.OK)
                 self._json(stm32_hv_set_target(host, str(body.get("chan", "emission")),
@@ -8897,6 +8901,20 @@ class CtHandler(BaseHTTPRequestHandler):
         if not link or not link.client.connected or not link.host:
             return None, f"master (Power {MASTER}) not connected"
         return link.host, None
+
+    def _master_stm32_host(self):
+        """_master_host() for a request the STM32 must ANSWER (ADS reads, HV
+        sets, HV ON, detector arms): refused at once when the master's STM32 is
+        offline, instead of a 1.5 s timeout-and-retry per call (2026-11-18, the
+        rig's STM32 silent 4.8 days; a script read the ADS before every shot).
+        Never used for an OFF / disarm: those always go out."""
+        host, err = self._master_host()
+        if err:
+            return host, err
+        why = self._master_link().stm32_offline_reason()
+        if why:
+            return None, f"STM32 offline: {why} -- nothing sent (fire with measure=False)"
+        return host, None
 
     def _read_json(self) -> dict[str, Any]:
         try:
