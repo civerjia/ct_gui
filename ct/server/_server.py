@@ -9361,6 +9361,17 @@ def _slew_keeper_loop() -> None:
                                 want // 1000, "ok" if after == want else f"read back {after}")
             except Exception as exc:
                 log.debug("slew keeper on %s: %s", getattr(link, "name", cid), exc)
+        # The trigger delay, rig-wide (one value for every controller): an RP2350
+        # reset zeroes it. Restored here, like the slew rates and the voltage cap,
+        # instead of only at the next arm -- until then every read said 0 us.
+        # Not while any controller is armed or running.
+        try:
+            live = [l for l in CONTROLLERS.values() if l.client.connected]
+            if live and TRIGGER_DELAY_WANT.get("us") and \
+                    all((shv_status_retry(l) or {}).get("state") not in (1, 2) for l in live):
+                _restore_trigger_delay(trigger_delay_all())
+        except Exception as exc:
+            log.debug("trigger-delay keeper: %s", exc)
 
 
 # ── Automatic discovery and connection ───────────────────────────────────────

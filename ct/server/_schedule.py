@@ -90,11 +90,32 @@ def _trigger_delay_one(link: "ControllerLink", delay_us=None) -> dict:
 
 
 # The trigger delay the whole rig is meant to run at: the last value SET
-# through trigger_delay_all(), or -- before any set since this backend started
-# -- the first non-zero value every controller agreed on. A dict, not a bare
-# int, so the star-importing modules see updates. Not persisted: after a
-# backend restart the first consistent read fills it again.
-TRIGGER_DELAY_WANT: dict = {"us": None}
+# through trigger_delay_all(), or -- before any set -- the first non-zero value
+# every controller agreed on. A dict, not a bare int, so the star-importing
+# modules see updates. SAVED (state/trigger_delay.json): 2026-11-18 a backend
+# restart followed by an RP2350 reflash left the bench at 0 us for hours -- the
+# wanted value had died with the old process, and nothing could restore it.
+TRIGGER_DELAY_STATE_PATH = STATE_DIR / "trigger_delay.json"
+
+
+def _trigger_delay_load():
+    try:
+        v = json.loads(TRIGGER_DELAY_STATE_PATH.read_text()).get("us")
+        return int(v) if v is not None else None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _trigger_delay_save() -> None:
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        TRIGGER_DELAY_STATE_PATH.write_text(json.dumps({"us": TRIGGER_DELAY_WANT["us"]}))
+    except OSError as exc:
+        log.warning("trigger delay setting not saved (%s) -- it holds until the backend "
+                    "restarts", exc)
+
+
+TRIGGER_DELAY_WANT: dict = {"us": _trigger_delay_load()}
 
 
 def trigger_delay_all(delay_us=None) -> dict:
@@ -139,9 +160,12 @@ def trigger_delay_all(delay_us=None) -> dict:
     else:
         out["ok"] = True
         if delay_us is not None:
-            TRIGGER_DELAY_WANT["us"] = int(delay_us)
+            if TRIGGER_DELAY_WANT["us"] != int(delay_us):
+                TRIGGER_DELAY_WANT["us"] = int(delay_us)
+                _trigger_delay_save()
         elif TRIGGER_DELAY_WANT["us"] is None and out["delayUs"]:
             TRIGGER_DELAY_WANT["us"] = int(out["delayUs"])
+            _trigger_delay_save()
     return out
 
 
