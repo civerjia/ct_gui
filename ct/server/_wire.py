@@ -404,6 +404,11 @@ def decode_shv_status(resp) -> dict[str, Any] | None:
         "droppedEdges": le32(70) if len(p) >= 74 else None,
         "suppressedNotHot": le32(74) if len(p) >= 78 else None,
         "skippedRows": le16(78) if len(p) >= 80 else None,
+        # mAms CUT (v3 RP2350, appended): cuts applied (a pulse was on and /OE
+        # went up from GP46) and cut edges that came with no pulse on, since
+        # the RP2350 booted. None = firmware without it, not zero.
+        "cuts": le32(80) if len(p) >= 84 else None,
+        "cutsLate": le32(84) if len(p) >= 88 else None,
     }
 
 
