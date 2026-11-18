@@ -84,6 +84,7 @@ body {
 .badge.check:hover { color: var(--accent); border-color: var(--accent); }
 .badge.check:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .badge.check[disabled] { cursor: progress; opacity: 0.7; }
+a.badge.check { text-decoration: none; display: inline-block; }
 .badge.heartbeat-idle { background: #efece5; color: var(--muted); }
 .badge.heartbeat-alive { background: var(--accent-soft); color: var(--accent); animation: pulse 1s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }

@@ -3882,21 +3882,31 @@ class _ScheduleMixin:
     # Well above the ESP32's own 5 s "alive" window so a hiccup, an STM32 reset
     # or an OTA never turns measurement off; only a board that is really gone.
     _STM32_OFFLINE_MS = 60_000
+    _STM32_STATUS_TRIES = 5
 
     def _stm32_offline_reason(self) -> str | None:
         """Why the master's STM32 cannot measure, or None when it can (or when
-        that can't be told -- unknown is NOT offline, the arm then decides)."""
-        try:
-            st = self.status() or {}
-        except Exception:
-            return None
-        master = st.get("master")
-        rows = st.get("controllers") or {}
-        row = rows.get(str(master)) if master is not None else None
-        if not row or not row.get("connected"):
-            return None
-        stm = row.get("stm32")
-        if not isinstance(stm, dict) or stm.get("error"):
+        that can't be told -- unknown is NOT offline, the arm then decides).
+        The backend's STM32 field is fetched from the ESP32 over HTTP, and on
+        the rig with its STM32 dead that fetch timed out 4 times in 6
+        (2026-11-18), so an error is retried a few times before giving up."""
+        stm = row = master = None
+        for attempt in range(self._STM32_STATUS_TRIES):
+            if attempt:
+                time.sleep(0.3)
+            try:
+                st = self.status() or {}
+            except Exception:
+                continue
+            master = st.get("master")
+            rows = st.get("controllers") or {}
+            row = rows.get(str(master)) if master is not None else None
+            if not row or not row.get("connected"):
+                return None
+            stm = row.get("stm32")
+            if isinstance(stm, dict) and not stm.get("error"):
+                break
+        else:
             return None
         if not stm.get("ever_seen"):
             return f"the master's (Power {master}) STM32 has never been seen since its ESP32 booted"
