@@ -195,7 +195,6 @@ export function initTrends() {
       const f = s.log ? (v) => Math.log10(Math.max(v, 1e-12)) : (v) => v;
       let lo = Infinity, hi = -Infinity;
       for (const p of pts) { const v = f(p[1]); if (v < lo) lo = v; if (v > hi) hi = v; }
-      if (s.limit) { hi = Math.max(hi, f(s.limit)); }
       if (hi - lo < (s.log ? 0.2 : 1e-6)) { const m = (hi + lo) / 2, d = s.log ? 0.1 : Math.max(Math.abs(m) * 0.01, 1e-3); lo = m - d; hi = m + d; }
       const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
       const yOf = (v) => y0 + STRIP_H - 3 - ((f(v) - lo) / (hi - lo)) * (STRIP_H - 6);
@@ -204,7 +203,9 @@ export function initTrends() {
       // Decimals from the span, not the size: -197.6..-198.0 must not both read "-198".
       const dec = Math.max(0, Math.min(4, Math.ceil(-Math.log10(Math.max(hi - lo - 2 * pad, 1e-9))) + 1));
       const lab = (x) => (s.log ? Math.pow(10, x).toExponential(1) : x.toFixed(dec));
-      if (s.limit) {
+      // auto range like every other strip; the limit line shows only when it
+      // falls inside the range (the over-limit check is the backend's, not this)
+      if (s.limit && f(s.limit) >= lo && f(s.limit) <= hi) {
         const yl = yOf(s.limit);
         ctx.strokeStyle = '#d0453d'; ctx.setLineDash([4, 3]);
         ctx.beginPath(); ctx.moveTo(LEFT, yl); ctx.lineTo(LEFT + pw, yl); ctx.stroke(); ctx.setLineDash([]);
