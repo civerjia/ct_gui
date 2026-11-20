@@ -51,9 +51,10 @@ export function drawHud(r) {
   ctx.font = '700 10.5px var(--mono, monospace)';
   ctx.textAlign = 'left'; ctx.fillStyle = neutral;
   ctx.fillText(board, colL, yy); yy += lh;
-  kv(colL, 'V', V.toFixed(2) + ' V', '#5fd0bb');
-  kv(colR, 'I', I.toFixed(0) + ' mA', '#f2c14e'); yy += lh;
-  kv(colL, 'R', R == null ? '—' : R.toFixed(1) + ' Ω', neutral);
-  kv(colR, 'P', P.toFixed(2) + ' W', neutral); yy += lh;
+  const na = !!f.absent;   // no board / controller offline: no numbers
+  kv(colL, 'V', na ? '—' : V.toFixed(2) + ' V', '#5fd0bb');
+  kv(colR, 'I', na ? '—' : I.toFixed(0) + ' mA', '#f2c14e'); yy += lh;
+  kv(colL, 'R', na || R == null ? '—' : R.toFixed(1) + ' Ω', neutral);
+  kv(colR, 'P', na ? '—' : P.toFixed(2) + ' W', neutral); yy += lh;
   kv(colL, 'mAs', f.mAs.toFixed(3), '#c48cff');
 }

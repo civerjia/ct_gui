@@ -6087,6 +6087,10 @@ class CtHandler(BaseHTTPRequestHandler):
             RUN_RECORDER.observe(rows.values())
             self._json({"telemetry": list(rows.values()), "firing": list(_PUSH_FIRING),
                         "view": dict(_PUSH_VIEW),
+                        # 0-based controllers whose rows can appear here: the
+                        # ring blanks every filament of the others (no link =
+                        # no reading -- never its last value)
+                        "connected": [c - 1 for c, l in CONTROLLERS.items() if l.client.connected],
                         "run": {str(c): {"state": 2} for c in _LIVE_PUSH}})
         elif path == "/api/telemetry":
             # Real per-filament telemetry for the ring: batch INA219 (V/I) per
@@ -6164,7 +6168,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 RUN_RECORDER.observe(rows.values())
             elif RUN_RECORDER.active:
                 RUN_RECORDER.stop()
-            self._json({"telemetry": list(rows.values()), "firing": firing, "run": run_state})
+            self._json({"telemetry": list(rows.values()), "firing": firing, "run": run_state,
+                        "connected": [c - 1 for c, l in CONTROLLERS.items() if l.client.connected]})
         elif path == "/api/board-snapshot":
             # 64-board matrix for the selected controller (?controller=N).
             # ?vi=1 → lightweight V/I-only refresh (skips the two bitmap reads); the

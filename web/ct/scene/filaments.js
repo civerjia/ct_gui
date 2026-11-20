@@ -84,6 +84,25 @@ export function drawFilaments(r) {
       continue;
     }
 
+    // absent (no board / controller not connected): a hollow dim dot and no
+    // bars -- never the last numbers of a board that is not there
+    if (f.absent) {
+      r._radialBar(a, viBase, viBase + 2, hw, offV, 'rgba(120,150,162,0.10)');
+      r._radialBar(a, viBase, viBase + 2, hw, offI, 'rgba(120,150,162,0.10)');
+      const p = r._filamentPos(i), sx = r._x(p.x), sy = r._y(p.y);
+      ctx.strokeStyle = 'rgba(120,130,138,0.45)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(sx, sy, 2.4, 0, 2 * Math.PI); ctx.stroke();
+      if (isHover) { ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.4; r._annulusStroke((masBase + viTop) / 2, a - CT.STEP_DEG / 2, a + CT.STEP_DEG / 2); }
+      if ((i % LABEL_EVERY === 0) || (r.opts.indices && i % 4 === 0)) {
+        const lr = viTop + 9, ar = a * D2R;
+        ctx.fillStyle = 'rgba(170,190,200,0.4)';
+        ctx.font = (i % LABEL_EVERY === 0 ? '700 ' : '') + '9px var(--mono, monospace)';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(String(i), r._x(lr * Math.cos(ar)), r._y(lr * Math.sin(ar)));
+      }
+      continue;
+    }
+
     // dim baseline stubs so the ring always reads full
     r._radialBar(a, viBase, viBase + 2, hw, offV, 'rgba(120,150,162,0.16)');
     r._radialBar(a, viBase, viBase + 2, hw, offI, 'rgba(120,150,162,0.16)');

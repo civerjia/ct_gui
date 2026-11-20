@@ -198,6 +198,7 @@ function refreshStates() {
   const t = currentTrigger();
   for (let i = 0; i < N; i++) {
     const f = filaments[i];
+    f.absent = false;
     if (f.dead) { f.state = STATE.STOP; f.voltage_mV = 0; f.current_mA = 0; continue; }
     if (isActiveAt(i, t)) {
       f.state = STATE.ACTIVE;
@@ -227,6 +228,12 @@ function ingestTelemetry(rows) {
   for (const r of rows) {
     const f = filaments[r.index];
     if (!f) continue;
+    // absent = positively no reading this poll: no board in the slot, or its
+    // controller is not connected. Blank it -- the last known numbers of a
+    // board that is not there are ghosts (2026-11-20: C2 offline for 84 min
+    // still showed its 8 boards on the ring).
+    if (r.absent) { f.absent = true; f.voltage_mV = 0; f.current_mA = 0; f.vi_live = false; f.lost = false; continue; }
+    f.absent = false;
     if (r.state != null) f.state = r.state;
     if (r.bus_mV != null) f.voltage_mV = r.bus_mV;
     if (r.current_mA != null) f.current_mA = r.current_mA;
@@ -774,7 +781,7 @@ function setViewMode(mode) {
 // per-board reads in Debug. Prevents Plan's design values from lingering.
 function clearLiveData() {
   for (const f of filaments) {
-    f.lost = false;
+    f.lost = false; f.absent = false;
     if (f.dead) continue;
     f.state = STATE.STOP; f.voltage_mV = 0; f.current_mA = 0;
   }
@@ -839,9 +846,22 @@ async function pollTelemetry() {
     // guess from the current: a guess painted every cold IDLE as STOP. null =
     // not reported -> ingestTelemetry keeps the last known state.
     const state = t.power_state || null;
+    if (!t.present && !t.lost && !t.channel_dark) return { index: ring, absent: true };
     return { index: ring, state, bus_mV: t.bus_mV, current_mA: t.current_mA,
              lost: !!(t.lost || t.channel_dark) };
   }).filter(Boolean);
+  // A disconnected controller sends no rows at all: its filaments are absent,
+  // not "last known". (Push mode sends only the boards it heard from, so a
+  // missing row alone is not proof -- only a missing controller is.)
+  if (Array.isArray(data.connected)) {
+    const conn = new Set(data.connected), seen = new Set(rows.map((r) => r.index));
+    const getCtrl = ctState.filamentController;
+    for (let i = 0; i < filaments.length; i++) {
+      if (seen.has(i)) continue;
+      const c = getCtrl ? getCtrl(fidOfRing(i)) : undefined;
+      if (!conn.has(c)) rows.push({ index: i, absent: true });
+    }
+  }
   // the firmware-reported firing filament(s) are authoritative ACTIVE
   const firing = (data.firing || []).map(ringOfFid);
   for (const fi of firing) { const r = rows.find((x) => x.index === fi); if (r) r.state = STATE.ACTIVE; }
