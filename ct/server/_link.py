@@ -177,6 +177,10 @@ class ControllerLink:
         with self._lock:
             self._stop_poll()
             self.client.connect(host, BRIDGE_PORT)
+            if host != getattr(self, "_uptime_host", None):
+                # another controller's STM32 uptime is no reset baseline
+                self._last_stm_uptime = None
+                self._uptime_host = host
             self.host = host
             self.down_since = None
             self._poll_pause_until = 0.0             # a fresh connection always polls
@@ -187,6 +191,7 @@ class ControllerLink:
             self.stm_good_at = 0.0        # time.monotonic() of that reading
             self.stm_unseen_since = None  # first good reading with ever_seen False
             self.bridge_name = None
+            self._forget_host_readings()
             self._running = True
             self._poll_thread = threading.Thread(target=self._poll, daemon=True)
             self._poll_thread.start()
@@ -220,6 +225,21 @@ class ControllerLink:
                 self.client.disconnect()
             self.host = None
             self.down_since = None
+            self.bridge_name = None
+            self._forget_host_readings()
+
+    def _forget_host_readings(self) -> None:
+        """Drop what was read FROM the previous host's ESP32 (WiFi signal, HTTP
+        latency, STM32 status). Kept across a disconnect or a host change, the
+        panel went on showing a gone or different controller's numbers
+        (2026-11-20: C2's -22 dBm under Power 2 after it was disconnected)."""
+        self.wifi = {}
+        self._wifi_at = 0.0
+        self._http_hist.clear()
+        self.stm = {}
+        self.stm_good = None
+        self.stm_good_at = 0.0
+        self.stm_unseen_since = None
 
     def request(self, frame_type: int, payload: bytes = b"", flags: int = 0, timeout: float = 2.0):
         """Send one framed command and return the decoded response (raises if down)."""
@@ -427,7 +447,7 @@ class ControllerLink:
         cut = time.monotonic() - window_s
         h = [ms for t, ms in list(self._http_hist) if t >= cut]
         ok = sorted(ms for ms in h if ms is not None)
-        w = self.wifi or {}
+        w = (self.wifi or {}) if self.host else {}   # no host = nothing to report
         t = self.client.timing_summary(window_s)
         return {
             "window_s": window_s,
