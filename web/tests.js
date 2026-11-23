@@ -999,13 +999,7 @@ async function test6() {
 // ---- markup (descriptions live in the title tooltip, not on-screen) ---------
 const TESTS_HTML = `
   <div class="dead-box">
-    <div class="block-title" title="Filaments the backend refuses to power — for every script and this GUI. Stored on the backend's disk, so they survive restarts. Physical filament numbers.">Dead filaments <span class="hint">— refused power everywhere ⓘ</span></div>
-    <div id="deadList" class="dead-list"><span class="hint">loading…</span></div>
-    <div class="row compact dead-add">
-      <label class="numlabel">filament<input id="deadAddFid" type="number" min="0" max="95" data-nostick /></label>
-      <input id="deadAddReason" class="dead-reason" type="text" placeholder="reason (required)" data-nostick />
-      <button class="xs" id="deadAddBtn">Mark dead</button>
-    </div>
+    <div class="block-title" title="Filaments the backend refuses to power. Mark, clear and annotate them in the Filaments card.">Dead filaments <span class="hint">— managed in the Filaments card</span></div>
     <label class="chk dead-force" title="Run the tests on the dead filaments too, e.g. to re-check one before clearing it. Every power command is then sent with allow_dead, and the backend logs each one. The ACTIVE ladder still applies. Resets when the page reloads."><input type="checkbox" id="tIncludeDead" data-nostick /> Include dead filaments in the tests (force)</label>
     <div id="deadMsg" class="summary"></div>
   </div>
@@ -1212,43 +1206,6 @@ export const calApi = {
 // Physical filament numbers (FID), the backend's own. A script that calls
 // set_dead() at start-up (combined_backend does) puts its list back.
 const deadMsg = (m, kind) => { const e = $t('deadMsg'); if (e) { e.textContent = m; e.className = 'summary ' + (kind || ''); } };
-async function renderDeadList() {
-  const host = $t('deadList'); if (!host) return;
-  const [d, m] = await Promise.all([tGetJ('/api/dead-fids'), tGetJ('/api/mapping')]);
-  if (!d || !d.ok) { host.innerHTML = '<span class="hint">could not read the dead list</span>'; return; }
-  const where = {};
-  ((m && m.mapping && m.mapping.filaments) || []).forEach((r) => {
-    if (r.controller === 0 || r.controller === 1) where[r.filament] = `P${r.controller + 1} CH${r.channel + 1}.${r.position + 1}`;
-  });
-  const ids = Object.keys(d.dead || {}).map(Number).sort((a, b) => a - b);
-  if (!ids.length) { host.innerHTML = '<span class="hint">none — every filament may be powered</span>'; return; }
-  host.innerHTML = ids.map((f) => {
-    const e = d.dead[String(f)] || {};
-    const at = e.at ? String(e.at).replace('T', ' ').slice(0, 16) : '';
-    const esc = (x) => String(x || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-    return `<div class="dead-row"><span class="dead-id">#${f}</span><span class="dead-where">${where[f] || '—'}</span>`
-      + `<span class="dead-why" title="${esc(e.reason)}">${esc(e.reason) || '(no reason)'}</span>`
-      + `<span class="dead-by">${esc(e.by)} · ${esc(at)}</span>`
-      + `<button class="xs dead-clear" data-fid="${f}" title="Allow filament ${f} to be powered again">Clear</button></div>`;
-  }).join('');
-  host.querySelectorAll('.dead-clear').forEach((b) => { b.onclick = () => clearDead(+b.dataset.fid); });
-}
-async function clearDead(f) {
-  if (!confirm(`Clear filament ${f} from the dead list?\n\nEvery script and this GUI may then power it again. `
-    + 'A script that sets the dead list at start-up will put it back.')) return;
-  const r = await tPostJ('/api/dead-fids', { op: 'remove', fids: [f] });
-  deadMsg(r && r.ok ? `Filament ${f} cleared — it may be powered again.` : `Not cleared: ${(r && r.error) || 'no reply'}`, r && r.ok ? 'ok' : 'bad');
-  renderDeadList();
-}
-async function addDead() {
-  const f = parseInt($t('deadAddFid').value, 10), reason = $t('deadAddReason').value.trim();
-  if (!Number.isInteger(f) || f < 0 || f > 95) { deadMsg('Filament must be 0–95 (physical number).', 'bad'); return; }
-  if (!reason) { deadMsg('Give a reason — an entry nothing clears on its own has to say why.', 'bad'); return; }
-  const r = await tPostJ('/api/dead-fids', { op: 'add', fids: [f], reason });
-  deadMsg(r && r.ok ? `Filament ${f} marked dead — it will be refused power.` : `Not marked: ${(r && r.error) || 'no reply'}`, r && r.ok ? 'ok' : 'bad');
-  if (r && r.ok) { $t('deadAddFid').value = ''; $t('deadAddReason').value = ''; }
-  renderDeadList();
-}
 async function toggleIncludeDead(e) {
   if (!e.target.checked) { includeDead = false; deadMsg('Tests skip dead filaments again.'); return; }
   const d = await tGetJ('/api/dead-fids');
@@ -1275,7 +1232,5 @@ export function initTests() {
   $t('t6Run').onclick = () => runTest(test6, false);   // voltage-mode, no HV
   $t('t7Run').onclick = () => test7();
   $t('testAbort').onclick = () => { abortFlag = true; tMsg('Aborting after the current step…'); };
-  $t('deadAddBtn').onclick = addDead;
   $t('tIncludeDead').addEventListener('change', toggleIncludeDead);
-  renderDeadList(); setInterval(renderDeadList, 15000);   // a file read on the backend, no hardware
 }

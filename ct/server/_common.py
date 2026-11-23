@@ -109,6 +109,7 @@ GEOMETRY = {
 
 DEAD_STATE_PATH = STATE_DIR / "dead_fids.json"
 ORDER_STATE_PATH = STATE_DIR / "filament_order.json"
+NOTES_STATE_PATH = STATE_DIR / "filament_notes.json"   # free-text note per filament (FID)
 
 
 TPS_STATUS_TIMEOUT_S = 8.0   # bulk CH_GET_TPS_STATUS (verify only) -- see read_tps_status()
@@ -509,6 +510,7 @@ _SINGLE_0X3A_TRUSTED: dict[int, bool] = {}
 # per-script remapping, and a set stored in one script's numbering would mean
 # something different to the next. Clients cross at their own boundary.
 _DEAD_LOCK = threading.Lock()
+_NOTES_LOCK = threading.Lock()
 
 
 def parse_power_state(value) -> tuple["PowerState | None", str]:
@@ -580,7 +582,7 @@ __all__ = [
     "CH_GET_CACHED_CURRENTS", "CH_GET_DIAGNOSIS", "CH_GET_I2C_ENABLE_MASK",
     "CH_GET_INA219", "CH_GET_PRESENT", "CH_READ_TCA9554", "CH_RESET_MUX",
     "CH_SET_I2C_ENABLE_MASK", "CH_SET_POWER_STATE", "CH_TCA9554_SELF_TEST",
-    "DEAD_STATE_PATH", "ORDER_STATE_PATH", "DEFAULT_CHANNELS", "DEFAULT_GROUP_SIZE", "ENERGISING_STATES",
+    "DEAD_STATE_PATH", "NOTES_STATE_PATH", "ORDER_STATE_PATH", "DEFAULT_CHANNELS", "DEFAULT_GROUP_SIZE", "ENERGISING_STATES",
     "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT", "EspCmdClient", "FILAMENTS_PER_CONTROLLER",
     "FILAMENT_COUNT", "FLAG_SINGLE", "GEOMETRY", "HTTPStatus", "HV_REFRESH_FEEDBACK",
     "HV_SET_SHIFT_HZ", "IDLE_CEILING_MA", "LAST_POWER_STATE", "LOCK_TTL_DEFAULT_S",
@@ -597,7 +599,7 @@ __all__ = [
     "SHV_SET_ACTIVE_LIST", "SHV_SET_CONFIG", "SHV_SET_ENTRIES", "SHV_TRIGGER_DELAY",
     "STATE_DIR", "STATIC_DIR", "TELEMETRY_MODE_CACHED", "TPS_STATUS_TIMEOUT_S",
     "TYPE_NAMES", "TcpProtocolClient", "ThreadingHTTPServer", "UART_STATUS_NAMES",
-    "_DEAD_LOCK", "_DIAG_CHIPS", "_DailySizeRotatingHandler", "_EM_I_FULL_MA",
+    "_DEAD_LOCK", "_NOTES_LOCK", "_DIAG_CHIPS", "_DailySizeRotatingHandler", "_EM_I_FULL_MA",
     "_HV_DS_CH", "_HV_FULL_V", "_OCP_MA_PER_CODE", "_OCP_SENSE_RESISTOR_OHMS",
     "_ORDER_LOCK", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG", "_setup_logging",
     "adc_get_burst", "adc_pulse_arm", "adc_pulse_diag", "adc_pulse_disarm",

@@ -850,6 +850,17 @@ ct.dead_details()              # ... with {reason, by, at} for each
 print(ct.dead)                 # {3, 12, 20, 21, 55}
 ```
 
+Every filament can also carry a free-text **note** (what was seen, what was
+swapped, why it is dead), by physical number, kept on the backend's disk with
+who and when. Notes decide nothing, so writing one needs no lease. The GUI's
+**Filaments** card shows all 96 with their dead state and note, and edits both.
+
+```python
+ct.set_filament_note(26, "emits ~30 % low since 2026-11-02; sub-board swapped 11-05")
+ct.filament_notes()["notes"][26]   # {"note": ..., "by": ..., "at": ...}
+ct.set_filament_note(26, "")       # delete it
+```
+
 ### Power state
 
 Every filament sits in one of five states: STOP → SLEEP → STANDBY → IDLE →

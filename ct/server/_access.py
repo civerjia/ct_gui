@@ -95,6 +95,7 @@ _UNGATED_POSTS = {
                                # only question this watchdog asks.
     "/api/calibration/save",  # writes a host file
     "/api/hv-lut/save",       # writes a host file
+    "/api/filament-notes",    # free-text note per filament: host file, decides nothing
     # Read-only hardware queries that happen to be POSTs. A lease reserves the
     # right to CHANGE the hardware, not to look at it — so the GUI's background
     # presence/diagnosis polling keeps working while a script drives the bench.
@@ -361,7 +362,7 @@ __all__ = [
     "CH_GET_BOARD_HEALTH", "CH_GET_CACHED_CURRENTS", "CH_GET_DIAGNOSIS",
     "CH_GET_I2C_ENABLE_MASK", "CH_GET_INA219", "CH_GET_PRESENT", "CH_READ_TCA9554",
     "CH_RESET_MUX", "CH_SET_I2C_ENABLE_MASK", "CH_SET_POWER_STATE",
-    "CH_TCA9554_SELF_TEST", "DEAD_STATE_PATH", "ORDER_STATE_PATH", "DEFAULT_CHANNELS", "DEFAULT_GROUP_SIZE",
+    "CH_TCA9554_SELF_TEST", "DEAD_STATE_PATH", "NOTES_STATE_PATH", "ORDER_STATE_PATH", "DEFAULT_CHANNELS", "DEFAULT_GROUP_SIZE",
     "ENERGISING_STATES", "ESPCMD", "EVENT_TELEMETRY_ENABLE_BIT", "EspCmdClient",
     "FILAMENTS_PER_CONTROLLER", "FILAMENT_COUNT", "FLAG_SINGLE", "GEOMETRY",
     "HTTPStatus", "HV_REFRESH_FEEDBACK", "HV_SET_SHIFT_HZ", "IDLE_CEILING_MA",
@@ -379,7 +380,7 @@ __all__ = [
     "SHV_SET_CONFIG", "SHV_SET_ENTRIES", "SHV_TRIGGER_DELAY", "STATE_DIR", "STATIC_DIR",
     "TELEMETRY_MODE_CACHED", "TPS_STATUS_TIMEOUT_S", "TYPE_NAMES", "TcpProtocolClient",
     "ThreadingHTTPServer", "UART_STATUS_NAMES", "_ACCESS_LOCK", "_AUDIT_LAST",
-    "_AUDIT_LOCK", "_CLIENTS", "_DEAD_LOCK", "_DEENERGISE_PATHS", "_DIAG_CHIPS",
+    "_AUDIT_LOCK", "_CLIENTS", "_DEAD_LOCK", "_NOTES_LOCK", "_DEENERGISE_PATHS", "_DIAG_CHIPS",
     "_DailySizeRotatingHandler", "_EM_I_FULL_MA", "_HV_DS_CH", "_HV_FULL_V", "_LEASE",
     "_OCP_MA_PER_CODE", "_OCP_SENSE_RESISTOR_OHMS", "_ORDER_LOCK",
     "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG", "_UNGATED_POSTS", "_audit_outcome",

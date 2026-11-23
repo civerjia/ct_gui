@@ -1353,6 +1353,26 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
                                      for f, v in (r.get("dead") or {}).items()},
                 "stale": False}
 
+    def filament_notes(self) -> dict:
+        """Every filament's note: {"ok": True, "notes": {PHYSICAL filament:
+        {"note", "by", "at"}}}. Filaments without a note are left out.
+        Physical numbers, like `dead` -- a note belongs to the hardware."""
+        r = self._get("/api/filament-notes", timeout=5.0)
+        if not r.get("ok"):
+            return r
+        return {"ok": True, "notes": {int(f): dict(v) for f, v in (r.get("notes") or {}).items()},
+                "max_chars": r.get("max_chars"), "read_only": r.get("read_only")}
+
+    def set_filament_note(self, filament: int, note: str) -> dict:
+        """Write the note of one PHYSICAL filament (0-95); "" deletes it.
+        Stored on the backend's disk with who and when, shown in the GUI's
+        Filaments card. Notes decide nothing and need no lease.
+
+        Example:
+            ct.set_filament_note(26, "emits ~30 % low since 2026-11-02; sub-board swapped 11-05")
+        """
+        return self._post("/api/filament-notes", {"fid": int(filament), "note": note}, timeout=10.0)
+
     def _live(self, filaments=None) -> list[int] | None:
         """Return the filament list with dead filaments removed and the
         filament-order swap applied (USER_INDEX -> FID).

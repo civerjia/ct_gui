@@ -18,6 +18,7 @@ export const state = {
   renderBoardMask: null,    // fn (power.js) <- app.js
   refreshBoards: null,      // fn (power.js) <- app.js
   syncHvButtons: null,      // fn (power.js) <- tests.js
+  syncBackendDead: null,    // fn (app.js) <- filaments.js -- re-read the dead mask for the ring
   testRunning: false,       // shared busy flag (power.js/tests.js)
   scheduleRunning: false,   // a REAL hardware schedule is armed/running (app.js's
                              // runMonitorTimer/pollRunStatus) -> power.js; distinct

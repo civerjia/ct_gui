@@ -27,6 +27,7 @@ import { initPower, renderMaskBits } from './power.js';
 import { initTrends } from './trends.js';
 import { initMapping } from './mapping.js';
 import { initTests } from './tests.js';
+import { initFilaments } from './filaments.js';
 import { initSticky } from './sticky.js';
 import { $, setMsg, clampNumberInputs } from './dom.js';
 import { postJ as postJSON } from './net.js';
@@ -1231,6 +1232,7 @@ async function syncBackendDead() {
   }
   if (changed) { refreshFilList(); rebuildSchedule(); } else sync();
 }
+ctState.syncBackendDead = syncBackendDead;   // the Filaments card, after a change
 function refuseHwDead(i) {
   const f = filaments[i];
   if (!f.hwDead) return false;
@@ -2296,7 +2298,8 @@ function init() {
   // One panel failing to set up must not leave the rest of the GUI (and the
   // ring, drawn by sync() at the end of init) dead.
   for (const [name, fn] of [['controllers', initControllers], ['power', initPower],
-                            ['trends', initTrends], ['mapping', initMapping], ['tests', initTests]]) {
+                            ['trends', initTrends], ['mapping', initMapping], ['tests', initTests],
+                            ['filaments', initFilaments]]) {
     try { fn(); } catch (e) { console.error(`init ${name} failed:`, e); setStatus(`⚠ the ${name} panel failed to start: ${e && e.message || e}`); }
   }
 

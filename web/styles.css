@@ -919,3 +919,27 @@ button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 .trend-controls #vacLimitMsg { white-space: normal; }
 .trend-canvas { display: block; width: 100%; margin-top: 6px; cursor: crosshair; touch-action: none; }
 .vac-limit { width: 70px; font-family: var(--mono); }
+
+/* ── Filaments card: dead list + a note per filament ─────────────────────── */
+.film-tools { gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
+.film-search { flex: 1 1 14em; min-width: 10em; }
+.film-table-wrap { max-height: 420px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.film-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.film-table th { position: sticky; top: 0; background: var(--card); text-align: left; font-weight: 700;
+  color: var(--muted); padding: 5px 8px; border-bottom: 1px solid var(--line); z-index: 1; }
+.film-table td { padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.film-table tr.is-dead td { background: var(--danger-soft); }
+.film-id, .film-ring, .film-where { font-family: var(--mono); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.film-id { font-weight: 800; }
+.film-ring, .film-where { color: var(--muted); }
+.film-dead { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 12em; }
+.film-dead-chip { font-size: 10px; font-weight: 800; letter-spacing: 0.06em; color: #fff;
+  background: var(--danger); border-radius: 4px; padding: 1px 5px; }
+.film-why { overflow-wrap: anywhere; }
+.film-by { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.film-reason { flex: 1 1 10em; min-width: 8em; }
+.film-note { width: 45%; min-width: 14em; }
+.film-note-in { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; font-size: 12px; min-height: 1.9em; }
+.film-note-meta { font-size: 11px; color: var(--muted); min-height: 1.2em; }
+.film-note-meta.ok { color: var(--accent); }
+.film-note-meta.bad { color: var(--danger); }

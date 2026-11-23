@@ -1208,6 +1208,80 @@ def _dead_save() -> None:
                   json.dumps({"dead": {str(k): v for k, v in sorted(DEAD_FIDS.items())}}, indent=2))
 
 
+# ── Filament notes ──────────────────────────────────────────────────────────
+# A free-text note per PHYSICAL filament (FID): what was seen, what was
+# swapped, why it is dead. Bookkeeping only -- nothing reads a note to decide
+# anything, so writing one needs no lease. fid -> {"note", "by", "at"}.
+FILAMENT_NOTES: dict[int, dict] = {}
+#: Longest note accepted, in characters. source: a few sentences of history;
+#: longer belongs in a document that the note can name.
+NOTE_MAX_CHARS = 2000
+# Set when the file exists but cannot be read: writes are then refused, so a
+# save never replaces notes this process could not load.
+_NOTES_LOAD_ERROR: list = [None]
+
+
+def _notes_load() -> None:
+    global FILAMENT_NOTES
+    try:
+        raw = json.loads(NOTES_STATE_PATH.read_text(encoding="utf-8"))
+        entries = raw.get("notes") if isinstance(raw, dict) else None
+        if not isinstance(entries, dict):
+            raise ValueError('no "notes" table')
+        FILAMENT_NOTES = {int(k): dict(v) for k, v in entries.items()
+                          if 0 <= int(k) < FILAMENT_COUNT and isinstance(v, dict)}
+        _NOTES_LOAD_ERROR[0] = None
+    except FileNotFoundError:
+        _NOTES_LOAD_ERROR[0] = None
+    except Exception as e:
+        # Not a safety mask, so the backend still starts -- but read-only for
+        # notes until the file is fixed (a save would erase what is in it).
+        _NOTES_LOAD_ERROR[0] = f"{NOTES_STATE_PATH} is unreadable ({e}); fix or move it"
+        log.error("filament notes: %s -- notes are read-only until then", _NOTES_LOAD_ERROR[0])
+
+
+def _notes_save() -> None:
+    _atomic_write(NOTES_STATE_PATH,
+                  json.dumps({"notes": {str(k): v for k, v in sorted(FILAMENT_NOTES.items())}},
+                             indent=2))   # ASCII (\\u escapes): _atomic_write uses the
+                                          # platform encoding, cp1252 on the rig PC
+
+
+def filament_note_set(fid, note, who: str) -> dict:
+    """Set (or, with an empty note, delete) the note of one PHYSICAL filament."""
+    try:
+        f = int(fid)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"fid must be an integer 0..{FILAMENT_COUNT - 1}, got {fid!r}"}
+    if not 0 <= f < FILAMENT_COUNT:
+        return {"ok": False, "error": f"fid {f} outside 0..{FILAMENT_COUNT - 1}"}
+    if note is not None and not isinstance(note, str):
+        return {"ok": False, "error": f"note must be text, got {type(note).__name__}"}
+    text = (note or "").strip()
+    if len(text) > NOTE_MAX_CHARS:
+        return {"ok": False, "error": f"note is {len(text)} characters; the limit is {NOTE_MAX_CHARS}"}
+    with _NOTES_LOCK:
+        if _NOTES_LOAD_ERROR[0]:
+            return {"ok": False, "error": _NOTES_LOAD_ERROR[0]}
+        before = FILAMENT_NOTES.get(f)
+        if text:
+            FILAMENT_NOTES[f] = {"note": text, "by": who,
+                                 "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+        else:
+            FILAMENT_NOTES.pop(f, None)
+        try:
+            _notes_save()
+        except OSError as exc:
+            if before is None:
+                FILAMENT_NOTES.pop(f, None)
+            else:
+                FILAMENT_NOTES[f] = before
+            return {"ok": False, "error": f"not saved: {exc}"}
+        entry = FILAMENT_NOTES.get(f)
+    log.info("filament %d note %s by %s", f, "set" if text else "cleared", who)
+    return {"ok": True, "fid": f, "note": entry}
+
+
 # PowerState values that put power ON the filament, so the ones a dead filament
 # must be refused. STOP(1)/SLEEP(2) leave the output off; STANDBY(3) enables it
 # at the firmware's 0.8 V floor, so it is NOT a no-power state and is included.
@@ -2110,6 +2184,7 @@ def split_dead(fids) -> tuple[list[int], list[int]]:
 
 
 _dead_load()
+_notes_load()
 _order_load()
 
 
@@ -6064,6 +6139,12 @@ class CtHandler(BaseHTTPRequestHandler):
                     out.setdefault("errors", {})[str(cid)] = str(exc)
             self._json(out)
 
+        elif path == "/api/filament-notes":
+            # Free-text note per PHYSICAL filament (FID), with who/when.
+            with _NOTES_LOCK:
+                notes = {str(k): dict(v) for k, v in sorted(FILAMENT_NOTES.items())}
+            self._json({"ok": True, "space": "fid", "notes": notes, "max_chars": NOTE_MAX_CHARS,
+                        "read_only": _NOTES_LOAD_ERROR[0], "path": str(NOTES_STATE_PATH)})
         elif path == "/api/dead-fids":
             # Filaments that must not be energised, in FID space, with the
             # provenance of each decision. See the DEAD_FIDS comment.
@@ -8198,6 +8279,9 @@ class CtHandler(BaseHTTPRequestHandler):
                             log.info("filament order set by %s (%d entries differ from identity)",
                                      self._client(), swapped)
                         self._json(order_snapshot())
+            elif path == "/api/filament-notes":
+                # body: {fid, note}; an empty note deletes it. No hardware.
+                self._json(filament_note_set(body.get("fid"), body.get("note"), self._client()))
             elif path == "/api/dead-fids":
                 # Mark filaments as must-not-energise, or clear them. FID space.
                 # body: {op: "set"|"add"|"remove", fids: [...], reason: str}
