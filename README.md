@@ -41,6 +41,22 @@ controller connections, the safety watchdog and the logs.
 Only ONE backend may run per bench: each ESP32 bridge accepts a single
 connection, and a second backend is refused ("bridge slot already owned").
 
+**This bench's settings go in `state/rig_env.toml`, not in the start script.**
+The backend reads it at every start, before anything else, so a setting can be
+changed from another machine: edit the file (ssh/scp), then restart remotely
+(`POST /api/restart`, or the GUI's Update). A variable set only in a `.bat`
+needs someone at the machine to reopen the window, because a remote restart
+reuses the window's original environment. The auto-update never touches
+`state/`. Only `CT_*` names are accepted; values in the file win over the
+environment, and a file that cannot be read stops the start with the reason.
+`GET /api/version` shows what was applied (`rig_env`).
+
+```toml
+[env]
+CT_PULSE_R_SENSE_OHM = "2.55"   # v3 HV board: pulse shunt 2x 5.1 ohm in parallel
+CT_PULSE_ADC_VREF_V = "3.3"     # STM32 ADC reference
+```
+
 ## 3. Connect the two controllers
 
 **Automatic -- nothing to type.** On start the backend scans the LAN, connects

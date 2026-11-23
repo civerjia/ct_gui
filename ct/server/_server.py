@@ -6688,7 +6688,11 @@ class CtHandler(BaseHTTPRequestHandler):
             # the periodic GitHub check ("update", see _update_watch_loop).
             with _UPDATE_LOCK:
                 upd = dict(_UPDATE_STATUS)
-            self._json({"ok": True, **_BACKEND_VERSION, "update": upd})
+            # rig_env: the CT_* settings state/rig_env.toml applied at start-up
+            # (ct/rig_env.py) -- what this process actually runs with.
+            from ct import rig_env as _rig_env
+            self._json({"ok": True, **_BACKEND_VERSION, "update": upd,
+                        "rig_env": dict(_rig_env.APPLIED)})
         elif path == "/api/run-status":
             # Poll ShvGetStatus (0x79) from each connected controller. totalPulsesDone
             # is the shared global playhead; filamentIndex is the live firing filament.
@@ -9937,6 +9941,10 @@ def main() -> None:
     # remote proxy here would only call back into this same process.
     os.environ["CT_CLIENT_LOCAL"] = "1"
     _setup_logging()
+    from ct import rig_env as _rig_env
+    if _rig_env.APPLIED:
+        log.info("rig settings from %s: %s", _rig_env.RIG_ENV_PATH,
+                 ", ".join(f"{k}={v}" for k, v in sorted(_rig_env.APPLIED.items())))
     # The update ran before logging existed: repeat what it said, so a failed
     # update is in backend.log and not only in update.log and the console.
     for level, msg in ct_update.RUN_MESSAGES:
