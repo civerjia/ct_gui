@@ -254,11 +254,15 @@ lists the scripts connected this way, with each one's `version` and `stale`.
    list, per-filament history, vacuum limit) and `calibration/` (HV LUTs).
    Use a local clone, not a synced folder another PC also runs from --
    both would write the same state files.
-4. **Spellman / vacuum.** On control2 itself (backend not on 8770) the local
+4. **Spellman / vacuum.** The vacuum is read straight from the Lesker gauge's
+   own WebSocket, `ws://raspberrypi5:8769` (`CT_LESKER_WS`), read-only. The
+   Spellman backend's relay of the same gauge is used only while that feed is
+   silent, so the vacuum interlock does not depend on the Spellman backend.
+   The Spellman supply itself: on control2 (backend not on 8770) the local
    Spellman backend is tried first (`ws://127.0.0.1:8770`), then
-   `ws://control2:8770`; `CT_SPELLMAN_WS` overrides both. The `websockets`
-   package must be installed, or the vacuum interlock has no reading and
-   refuses HV ON / ACTIVE.
+   `ws://control2:8770`; `CT_SPELLMAN_WS` overrides both. `GET /api/vacuum`
+   shows both feeds (`feeds`). The `websockets` package must be installed,
+   or the vacuum interlock has no reading and refuses HV ON / ACTIVE.
 5. **Point everything at the new address:** scripts (`CTClient(host, port)`),
    browser bookmarks, other programs that call the API, and any port
    forwarding to the old PC.

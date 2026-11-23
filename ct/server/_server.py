@@ -4930,6 +4930,12 @@ _SPELL: dict = {"connected": False, "error": None, "last_msg": None,
                 "status_bits": None, "status_at": None,
                 "pressure_torr": None, "pressure_at": None, "pressure_raw": None,
                 "lesker": None,
+                # Where the current pressure came from: "gauge" = the Lesker
+                # gauge's own WebSocket on raspberrypi5:8769 (read directly),
+                # "spellman" = spellman_backend's relay of that same gauge.
+                "pressure_src": None,
+                "lesker_ws_at": None, "lesker_ws_connected": False,
+                "lesker_ws_error": None, "lesker_ws_status": None,
                 # GMC-300S Geiger counter: its own WebSocket on raspberrypi5:8771
                 # (combined_backend's GMCBackend, 2026-10-30) -- cpm_update every
                 # ~1 s. spellman_backend's gmc_point (counter on a control2 COM
@@ -4986,7 +4992,14 @@ def _spellman_on_message(m: dict, now: float) -> None:
                 series_add("sp_ma", float(d["measured_mA"]))
         elif t == "pressure_point" and isinstance(m.get("data"), dict):
             p = m["data"].get("pressure_torr")
+            # The relay of the gauge this backend also reads directly: taken
+            # only while the direct feed is silent, else every reading would
+            # count twice towards VACUUM_TRIP_READINGS.
+            direct = _SPELL["lesker_ws_at"]
+            if direct is not None and now - direct <= SPELLMAN_STALE_S:
+                p = None
             if isinstance(p, (int, float)) and not isinstance(p, bool):
+                _SPELL["pressure_src"] = "spellman"
                 _SPELL["pressure_torr"], _SPELL["pressure_at"] = float(p), now
                 _SPELL["pressure_raw"] = m["data"].get("raw")
                 series_add("vac", float(p))
@@ -5155,6 +5168,73 @@ def _gmc_loop() -> None:
         _STOPPING.wait(SPELLMAN_RECONNECT_S)
 
 
+# ── Lesker vacuum gauge, READ-ONLY, straight from its own WebSocket ──────────
+# raspberrypi5:8769 broadcasts {"type": "pressure_update", "pressure_torr",
+# "is_range", "timestamp"} about once a second to every client, with nothing
+# sent to it (measured 2026-11-23). It is the gauge's source: spellman_backend
+# only relays it, so reading through that alone made the vacuum interlock
+# depend on a program it does not need -- 2026-11-23 spellman_backend stopped
+# (with the VS Code it ran in) and this backend had no vacuum while every page
+# reading the Pi still did. Never sends (no connect_port): the gauge's port is
+# the Pi backend's business.
+LESKER_WS_URL = os.environ.get("CT_LESKER_WS", "ws://raspberrypi5:8769")
+
+
+def _lesker_on_message(m: dict, now: float) -> None:
+    t = m.get("type")
+    with _SPELL_LOCK:
+        if t == "pressure_update":
+            p = m.get("pressure_torr")
+            _SPELL["lesker_ws_at"] = now
+            if m.get("is_range"):
+                # over range: no number, which the interlock treats as no reading
+                _SPELL["pressure_raw"] = str(m.get("raw") or "VAC=RANGE")
+                return
+            if not isinstance(p, (int, float)) or isinstance(p, bool):
+                return
+            _SPELL["pressure_torr"], _SPELL["pressure_at"] = float(p), now
+            _SPELL["pressure_raw"] = str(m.get("raw") or f"VAC={p}")
+            _SPELL["pressure_src"] = "gauge"
+        elif t in ("status", "error"):
+            _SPELL["lesker_ws_status"] = str(m.get("data") or "")
+            return
+        else:
+            return
+    series_add("vac", float(p))
+
+
+def _lesker_loop() -> None:
+    try:
+        from websockets.sync.client import connect as ws_connect
+    except ImportError:
+        return
+    while not _STOPPING.is_set():
+        try:
+            with ws_connect(LESKER_WS_URL, open_timeout=5, close_timeout=1, max_size=None) as ws:
+                with _SPELL_LOCK:
+                    _SPELL["lesker_ws_connected"], _SPELL["lesker_ws_error"] = True, None
+                log.info("vacuum gauge reader connected to %s (read-only)", LESKER_WS_URL)
+                while not _STOPPING.is_set():
+                    try:
+                        raw = ws.recv(timeout=SPELLMAN_STALE_S)
+                    except TimeoutError:
+                        continue
+                    try:
+                        m = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(m, dict):
+                        _lesker_on_message(m, time.monotonic())
+        except Exception as exc:
+            with _SPELL_LOCK:
+                was = _SPELL["lesker_ws_connected"]
+                _SPELL["lesker_ws_connected"] = False
+                _SPELL["lesker_ws_error"] = f"{LESKER_WS_URL}: {type(exc).__name__}: {exc}"
+            if was:
+                log.warning("vacuum gauge reader lost %s: %s", LESKER_WS_URL, exc)
+        _STOPPING.wait(SPELLMAN_RECONNECT_S)
+
+
 def radiation_snapshot() -> dict:
     """The Geiger counter (GMC-300S on control2), read-only. cpm / usvh are
     None -- never a stale number -- once no reading came for SPELLMAN_STALE_S."""
@@ -5175,8 +5255,18 @@ def vacuum_snapshot() -> dict:
     with _SPELL_LOCK:
         p, at, raw, les, conn, err = (_SPELL["pressure_torr"], _SPELL["pressure_at"], _SPELL["pressure_raw"],
                                       _SPELL["lesker"], _SPELL["connected"], _SPELL["error"])
+        src, g_conn, g_err, g_st = (_SPELL["pressure_src"], _SPELL["lesker_ws_connected"],
+                                    _SPELL["lesker_ws_error"], _SPELL["lesker_ws_status"])
     fresh = at is not None and now - at <= SPELLMAN_STALE_S
-    return {"ok": True, "source": SPELLMAN_WS_URL, "connected": conn, "error": err,
+    # source/connected/error describe the feed the reading comes from: the
+    # gauge directly when it delivers, else spellman_backend's relay.
+    use_gauge = src == "gauge" or (src is None and g_conn)
+    return {"ok": True, "source": LESKER_WS_URL if use_gauge else SPELLMAN_WS_URL,
+            "connected": bool(g_conn or conn),
+            "error": None if fresh else ("; ".join(e for e in (g_err, err) if e) or None),
+            "feeds": {"gauge": {"url": LESKER_WS_URL, "connected": g_conn, "error": g_err,
+                                "status": g_st},
+                      "spellman": {"url": SPELLMAN_WS_URL, "connected": conn, "error": err}},
             "pressure_torr": p if fresh else None, "age_s": _age(at, now), "raw": raw if fresh else None,
             "limit_torr": vacuum_limit(), "interlock": VACUUM_INTERLOCK,
             "within_limit": (p <= vacuum_limit()) if fresh else None, "lesker": les,
@@ -9993,6 +10083,7 @@ def main() -> None:
     threading.Thread(target=_incident_loop, name="incident_writer", daemon=True).start()
     threading.Thread(target=_spellman_loop, name="spellman_reader", daemon=True).start()
     threading.Thread(target=_gmc_loop, name="gmc_reader", daemon=True).start()
+    threading.Thread(target=_lesker_loop, name="vacuum_gauge_reader", daemon=True).start()
     # One reader per controller for the ring and the matrix (see MONITOR_*).
     threading.Thread(target=_board_monitor_loop, name="board_monitor", daemon=True).start()
     # Timed ACTIVE (active_s): returns filaments to IDLE when their time is up.
