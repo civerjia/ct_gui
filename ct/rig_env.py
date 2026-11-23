@@ -55,7 +55,8 @@ def load(path: Path = RIG_ENV_PATH) -> dict[str, str]:
     if tomllib is None:
         raise SystemExit(f"[rig_env] {path} needs Python 3.11+ (tomllib) to be read")
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig: Windows editors / PowerShell 5.1 write a BOM, tomllib refuses it
+        data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise SystemExit(f"[rig_env] cannot read {path}: {exc}") from exc
     env = data.get("env", {})
