@@ -1366,6 +1366,47 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
         included) until a person clears it. Read-only."""
         return self._get("/api/hv-guard", timeout=5.0)
 
+    def bake_start(self, mv: int = 5000, hold_s: float = 5.0, idle_ma: int = 1000, *,
+                   gap_s: float = 0.5, cycles: int = 0, skip=None, only=None,
+                   pause_above: float | None = None, resume_below: float | None = None,
+                   cut_above: float | None = None) -> dict:
+        """Start the BACKEND's bake-out: every filament rests at its CC IDLE
+        (idle_ma) and takes a turn at `mv` for `hold_s`, around the ring, one
+        at a time, `cycles` rounds (0 = until bake_stop()). It runs in the
+        backend: this script may exit, the bake goes on.
+
+        The vacuum sets the pace (Torr; None = 0.5 / 0.4 / 0.8 x the backend's
+        limit): a turn waits while the pressure is above `pause_above`, until it
+        is under `resume_below`; a turn is cut short above `cut_above`. A
+        latched trip stops it. `skip` / `only`: PHYSICAL filament numbers; dead
+        filaments are always skipped. No HV is touched. CSV in logs/bake/.
+
+        Example (after the tube was opened):
+            ct.bake_start(5000, 5, 1000, skip=[26], pause_above=1.4e-5,
+                          resume_below=1.2e-5, cut_above=1.7e-5)
+        """
+        body = {"action": "start", "mv": int(mv), "hold_s": float(hold_s),
+                "idle_ma": int(idle_ma), "gap_s": float(gap_s), "cycles": int(cycles),
+                "skip": [int(f) for f in (skip or [])]}
+        if only is not None:
+            body["only"] = [int(f) for f in only]
+        for k, v in (("pause_above", pause_above), ("resume_below", resume_below),
+                     ("cut_above", cut_above)):
+            if v is not None:
+                body[k] = float(v)
+        return self._post("/api/bake", body, timeout=10.0)
+
+    def bake_stop(self) -> dict:
+        """Stop the bake-out: the current turn ends at once, that filament goes
+        back to IDLE. Never refused, whoever holds the lease."""
+        return self._post("/api/bake", {"action": "stop"}, timeout=10.0)
+
+    def bake_status(self) -> dict:
+        """The bake-out: running, params, cycle, current filament (FID), the
+        vacuum wait if any, the last 50 turns, a summary per cycle (gassiest
+        five), the CSV path, and how it ended."""
+        return self._get("/api/bake", timeout=5.0)
+
     def filament_notes(self) -> dict:
         """Every filament's note: {"ok": True, "notes": {PHYSICAL filament:
         {"note", "by", "at"}}}. Filaments without a note are left out.

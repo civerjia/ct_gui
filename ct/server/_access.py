@@ -232,6 +232,8 @@ def is_deenergising_post(path: str, body: dict) -> bool:
         return True
     if path == "/api/tests/heat-short":
         return body.get("action") == "abort"
+    if path == "/api/bake":
+        return body.get("action") == "stop"
 
     def low_state(v) -> bool:
         try:

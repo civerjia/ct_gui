@@ -28,6 +28,7 @@ import { initTrends } from './trends.js';
 import { initMapping } from './mapping.js';
 import { initTests } from './tests.js';
 import { initFilaments } from './filaments.js';
+import { initBake } from './bake.js';
 import { initSticky } from './sticky.js';
 import { $, setMsg, clampNumberInputs } from './dom.js';
 import { postJ as postJSON } from './net.js';
@@ -2313,7 +2314,7 @@ function init() {
   // ring, drawn by sync() at the end of init) dead.
   for (const [name, fn] of [['controllers', initControllers], ['power', initPower],
                             ['trends', initTrends], ['mapping', initMapping], ['tests', initTests],
-                            ['filaments', initFilaments]]) {
+                            ['filaments', initFilaments], ['bake', initBake]]) {
     try { fn(); } catch (e) { console.error(`init ${name} failed:`, e); setStatus(`⚠ the ${name} panel failed to start: ${e && e.message || e}`); }
   }
 

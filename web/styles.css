@@ -943,3 +943,15 @@ button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 .film-note-meta { font-size: 11px; color: var(--muted); min-height: 1.2em; }
 .film-note-meta.ok { color: var(--accent); }
 .film-note-meta.bad { color: var(--danger); }
+
+/* ── Bake-out card ───────────────────────────────────────────────────────── */
+.bake-form { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-bottom: 6px; }
+.bake-form input { width: 5.5em; }
+.bake-skip input { width: 8em; }
+.bake-adv { margin-bottom: 6px; font-size: 12px; }
+.bake-adv summary { cursor: pointer; color: var(--muted); }
+.bake-actions { gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.bake-state { font-size: 12px; color: var(--muted); }
+.bake-on { color: var(--accent); }
+.bake-wait { color: var(--warn); }
+.bake-table-wrap { max-height: 300px; }

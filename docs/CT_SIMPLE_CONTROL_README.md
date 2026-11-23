@@ -861,6 +861,24 @@ ct.filament_notes()["notes"][26]   # {"note": ..., "by": ..., "at": ...}
 ct.set_filament_note(26, "")       # delete it
 ```
 
+### Bake-out (after the tube was opened)
+
+A backend job, so it needs no script, terminal or open browser: every
+filament rests at its CC IDLE and takes a turn at a fixed voltage for a few
+seconds, around the ring, ONE at a time, round and round. The vacuum sets the
+pace -- a turn waits while the pressure is above `pause_above` (until it is
+under `resume_below`) and is cut short above `cut_above` (defaults 0.5 / 0.4
+/ 0.8 x the vacuum limit), so the vacuum latch is never what paces it; a
+latched trip stops it. No HV is touched. GUI: the **Bake-out** card. CSV per
+run in `logs/bake/`, and a summary per cycle with the gassiest five.
+
+```python
+ct.bake_start(5000, 5, 1000, skip=[26],          # 5 V for 5 s each, IDLE 1 A between
+              pause_above=1.4e-5, resume_below=1.2e-5, cut_above=1.7e-5)
+ct.bake_status()["cycles"][-1]                    # {"ok", "turns", "vac_peak", "gassiest": [...]}
+ct.bake_stop()                                    # current turn ends now, back to IDLE
+```
+
 ### Power state
 
 Every filament sits in one of five states: STOP → SLEEP → STANDBY → IDLE →

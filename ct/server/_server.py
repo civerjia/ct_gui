@@ -2965,6 +2965,291 @@ def heat_short_status() -> dict:
         return {"ok": True, **copy.deepcopy({k: v for k, v in _HEAT_SHORT.items()})}
 
 
+# ── Bake-out job ─────────────────────────────────────────────────────────────
+# After the tube was opened: every filament rests at its CC IDLE and takes a
+# turn at a fixed voltage for a few seconds, around the ring, round and round,
+# so at most ONE filament is above IDLE and the gas comes out one filament at
+# a time. The vacuum sets the pace: a turn waits while the pressure is above
+# pause_above (until it is under resume_below), and a turn is cut short above
+# cut_above -- the vacuum latch (over the limit: everything to SLEEP) stays
+# the last line and should never be reached. Runs here, in the backend, so it
+# needs no process, terminal or open browser anywhere: started, watched and
+# stopped through /api/bake (GUI card, or ct.bake_start / bake_stop). Each turn
+# is a TIMED voltage hold, so the backend puts the filament back to IDLE when
+# the hold runs out even if this thread is gone. Emission and focus are never
+# touched. CSV per run in logs/bake/.
+BAKE_CLIENT = "bake-out"
+BAKE_LOG_DIR = LOG_DIR / "bake"
+#: Turn rows kept for /api/bake (the CSV has all of them).
+BAKE_RECENT_ROWS = 200
+#: Cycle summaries kept for /api/bake.
+BAKE_CYCLES_KEPT = 50
+#: Vacuum poll during a turn and while waiting, s. source: the gauge sends ~1/s.
+BAKE_POLL_S = 0.5
+#: Default thresholds as fractions of the vacuum limit. source: user 2026-11-23
+#: (bake-out after opening; the latch must never be the pacing mechanism).
+BAKE_PAUSE_FRAC, BAKE_RESUME_FRAC, BAKE_CUT_FRAC = 0.5, 0.4, 0.8
+_BAKE_LOCK = threading.Lock()
+_BAKE: dict[str, Any] = {"running": False, "stop": False, "params": None, "started": None,
+                         "finished": None, "by": None, "cycle": 0, "turns": 0,
+                         "current": None, "waiting": None, "recent": [], "cycles": [],
+                         "error": None, "stopped_by": None, "log": None}
+
+
+class _BakeStop(Exception):
+    """A stop request (or a latched trip) ended the bake-out."""
+
+
+def _bake_params(body: dict) -> tuple[dict | None, str | None]:
+    """Validated parameters, or the reason they are refused. Nothing is
+    clamped: a value out of range is an error, never silently changed."""
+    def num(key, default, lo, hi, kind=float):
+        v = body.get(key, default)
+        try:
+            v = kind(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a number, got {body.get(key)!r}")
+        if not lo <= v <= hi:
+            raise ValueError(f"{key}={v} outside {lo}..{hi}")
+        return v
+
+    def fids(key):
+        v = body.get(key)
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise ValueError(f"{key} must be a list of filament numbers")
+        out = [int(x) for x in v]
+        bad = [x for x in out if not 0 <= x < FILAMENT_COUNT]
+        if bad:
+            raise ValueError(f"{key}: {bad} outside 0..{FILAMENT_COUNT - 1}")
+        return out
+    try:
+        limit = vacuum_limit()
+        p = {"mv": num("mv", 5000, 800, 15000, int),
+             "hold_s": num("hold_s", 5.0, 1.0, 60.0),
+             "gap_s": num("gap_s", 0.5, 0.0, 30.0),
+             "idle_ma": num("idle_ma", 1000, 100, IDLE_CEILING_MA, int),
+             "cycles": num("cycles", 0, 0, 100000, int),
+             "skip": fids("skip") or [], "only": fids("only"),
+             "pause_above": num("pause_above", BAKE_PAUSE_FRAC * limit, 1e-9, limit),
+             "resume_below": num("resume_below", BAKE_RESUME_FRAC * limit, 1e-9, limit),
+             "cut_above": num("cut_above", BAKE_CUT_FRAC * limit, 1e-9, limit)}
+    except ValueError as exc:
+        return None, str(exc)
+    if not p["resume_below"] < p["pause_above"] < p["cut_above"] < limit:
+        return None, (f"need resume_below < pause_above < cut_above < the vacuum limit "
+                      f"{limit:.1e}; got {p['resume_below']:.2e} / {p['pause_above']:.2e} / "
+                      f"{p['cut_above']:.2e}")
+    return p, None
+
+
+def _bake_tripped() -> str | None:
+    t = _HV_GUARD.get("tripped")
+    if t:
+        return f"HV guard tripped ({t.get('source')}, {t.get('at')})"
+    if _VAC_LATCH[0]:
+        return "vacuum latch set"
+    return None
+
+
+def _bake_wait_vacuum(p: dict) -> None:
+    """Return once the pressure is under pause_above; when it is not, wait
+    until it is under resume_below. A stop request or a trip raises."""
+    v = vacuum_snapshot()["pressure_torr"]
+    if v is not None and v < p["pause_above"]:
+        return
+    with _BAKE_LOCK:
+        _BAKE["waiting"] = {"since": time.strftime("%H:%M:%S"), "pressure_torr": v,
+                            "resume_below": p["resume_below"]}
+    try:
+        while True:
+            if _BAKE["stop"]:
+                raise _BakeStop("stop requested")
+            why = _bake_tripped()
+            if why:
+                raise _BakeStop(why + " -- clearing it is a person's decision")
+            v = vacuum_snapshot()["pressure_torr"]
+            with _BAKE_LOCK:
+                _BAKE["waiting"]["pressure_torr"] = v
+            if v is not None and v < p["resume_below"]:
+                return
+            _STOPPING.wait(2.0)
+            if _STOPPING.is_set():
+                raise _BakeStop("backend stopping")
+    finally:
+        with _BAKE_LOCK:
+            _BAKE["waiting"] = None
+
+
+def _bake_turn(ct, f: int, fid: int, p: dict) -> dict:
+    """One filament: p["mv"] for p["hold_s"] (cut short by the vacuum or a
+    stop), then back to IDLE -- always, whatever happened."""
+    v0 = vacuum_snapshot()["pressure_torr"]
+    row = {"time": time.strftime("%H:%M:%S"), "fid": fid, "ok": False, "arrived_s": None,
+           "mA": None, "vac_before": v0, "vac_peak": v0, "rise": None, "cut_short": False,
+           "error": ""}
+    with _BAKE_LOCK:
+        _BAKE["current"] = fid
+    t0 = time.monotonic()
+    r = {}
+    try:
+        r = ct.voltage_one(f, p["mv"], active_s=p["hold_s"], then_idle_ma=p["idle_ma"],
+                           timeout_s=max(3.0, p["hold_s"]))
+        h = r.get("heating") or {}
+        row["arrived_s"], row["mA"] = h.get("elapsed_s"), h.get("measured_ma")
+        if not r.get("ok"):
+            row["error"] = str(r.get("error") or h.get("error") or "refused")[:200]
+        else:
+            while time.monotonic() - t0 < p["hold_s"] and not _BAKE["stop"]:
+                v = vacuum_snapshot()["pressure_torr"]
+                if v is not None:
+                    row["vac_peak"] = max(row["vac_peak"] or 0.0, v)
+                    if v >= p["cut_above"]:
+                        row["cut_short"] = True
+                        break
+                if _bake_tripped():
+                    break
+                time.sleep(BAKE_POLL_S)
+    finally:
+        back = ct.idle_one(f, p["idle_ma"])        # explicit: ends the hold now
+        if not back.get("ok"):
+            row["error"] = (row["error"] + " | back to IDLE: " + str(back.get("error")))[:300]
+        with _BAKE_LOCK:
+            _BAKE["current"] = None
+    row["ok"] = bool(r.get("ok")) and bool(back.get("ok"))
+    if row["vac_before"] is not None and row["vac_peak"] is not None:
+        row["rise"] = row["vac_peak"] - row["vac_before"]
+    return row
+
+
+def bake_start(body: dict, who: str) -> dict:
+    """Start the bake-out in a backend thread. Refused while it or another job
+    runs, while someone else holds the lease, while a schedule runs, while a
+    trip is latched, or without a vacuum reading."""
+    p, err = _bake_params(body)
+    if err:
+        return {"ok": False, "error": err}
+    if _HEAT_SHORT["running"]:
+        return {"ok": False, "error": "the heat-short test is running"}
+    if _EMISSION_CAL["running"]:
+        return {"ok": False, "error": "the emission calibration is running"}
+    held = _lease_blocking(BAKE_CLIENT)
+    if held:
+        return {"ok": False, "error": f"the write lease is held by {held['owner']}"
+                                      + (f" ({held['note']})" if held.get("note") else "")}
+    running, why = _safety_schedule_running()
+    if running:
+        return {"ok": False, "error": f"a schedule is running ({why or 'armed'})"}
+    why = _bake_tripped()
+    if why:
+        return {"ok": False, "error": why + " -- clear it first"}
+    if vacuum_snapshot()["pressure_torr"] is None:
+        return {"ok": False, "error": "no vacuum reading -- the bake-out is paced by it"}
+    with _BAKE_LOCK:
+        if _BAKE["running"]:
+            return {"ok": False, "error": "a bake-out is already running"}
+        BAKE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        logf = BAKE_LOG_DIR / time.strftime("bake_%Y%m%d_%H%M%S.csv")
+        _BAKE.update(running=True, stop=False, params=p, by=who,
+                     started=time.strftime("%Y-%m-%d %H:%M:%S"), finished=None, cycle=0,
+                     turns=0, current=None, waiting=None, recent=[], cycles=[], error=None,
+                     stopped_by=None, log=str(logf))
+    log.warning("bake-out started by %s: %s", who, p)
+
+    def _run():
+        from ct.client._client import CTClient
+        cols = ["time", "cycle", "fid", "ok", "arrived_s", "mA", "vac_before", "vac_peak",
+                "rise", "cut_short", "error"]
+        err, stopped = None, None
+        try:
+            port = int(os.environ.get("CT_GUI_PORT", "8770"))
+            ct = CTClient("127.0.0.1", port=port, client_id=BAKE_CLIENT, _local=True)
+            with open(logf, "w", newline="", encoding="utf-8") as fh, \
+                    ct.lease(ttl=120, note="bake-out, one filament at a time"):
+                w = csv.DictWriter(fh, fieldnames=cols)
+                w.writeheader()
+                order = ct.filament_order            # this client's number -> FID (sparse)
+                ring = [(i, int(order.get(i, i))) for i in range(FILAMENT_COUNT)]
+                ring = [(i, fid) for i, fid in ring if fid not in set(p["skip"])
+                        and (p["only"] is None or fid in set(p["only"]))]
+                if not ring:
+                    raise _BakeStop("no filament left (all skipped or not in only)")
+                cycle = 0
+                while p["cycles"] == 0 or cycle < p["cycles"]:
+                    cycle += 1
+                    with _BAKE_LOCK:
+                        _BAKE["cycle"] = cycle
+                    rows = []
+                    for i, fid in ring:
+                        if fid in dead_fids():           # the live mask, every turn
+                            continue
+                        if _BAKE["stop"]:
+                            raise _BakeStop("stop requested")
+                        _bake_wait_vacuum(p)
+                        row = _bake_turn(ct, i, fid, p)
+                        row["cycle"] = cycle
+                        w.writerow(row)
+                        fh.flush()
+                        rows.append(row)
+                        with _BAKE_LOCK:
+                            _BAKE["turns"] += 1
+                            _BAKE["recent"].append(row)
+                            del _BAKE["recent"][:-BAKE_RECENT_ROWS]
+                        why = _bake_tripped()
+                        if why:
+                            raise _BakeStop(why + " -- clearing it is a person's decision")
+                        _STOPPING.wait(p["gap_s"])
+                    gassy = sorted((r for r in rows if r["rise"] is not None),
+                                   key=lambda r: -r["rise"])[:5]
+                    peaks = [r["vac_peak"] for r in rows if r["vac_peak"] is not None]
+                    summary = {"cycle": cycle, "finished": time.strftime("%H:%M:%S"),
+                               "turns": len(rows), "ok": sum(1 for r in rows if r["ok"]),
+                               "cut_short": [r["fid"] for r in rows if r["cut_short"]],
+                               "failed": [r["fid"] for r in rows if not r["ok"]],
+                               "vac_peak": max(peaks) if peaks else None,
+                               "gassiest": [{"fid": r["fid"], "rise": r["rise"]} for r in gassy]}
+                    with _BAKE_LOCK:
+                        _BAKE["cycles"].append(summary)
+                        del _BAKE["cycles"][:-BAKE_CYCLES_KEPT]
+                    log.info("bake-out cycle %d: %d/%d ok, peak %s Torr, gassiest %s",
+                             cycle, summary["ok"], summary["turns"], summary["vac_peak"],
+                             summary["gassiest"])
+        except _BakeStop as exc:
+            stopped = str(exc)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            log.exception("bake-out failed")
+        with _BAKE_LOCK:
+            _BAKE.update(running=False, current=None, waiting=None, error=err,
+                         stopped_by=stopped or ("finished" if not err else None),
+                         finished=time.strftime("%Y-%m-%d %H:%M:%S"))
+        log.warning("bake-out ended: %s", err or stopped or "finished")
+
+    threading.Thread(target=_run, name="bake-out", daemon=True).start()
+    return {"ok": True, "params": p, "log": str(logf)}
+
+
+def bake_stop(who: str) -> dict:
+    """Ask the bake-out to stop: the current turn ends at once and that
+    filament goes back to IDLE. Never refused."""
+    with _BAKE_LOCK:
+        running = _BAKE["running"]
+        _BAKE["stop"] = True
+    if running:
+        log.warning("bake-out stop requested by %s", who)
+    return {"ok": True, "running": running}
+
+
+def bake_status() -> dict:
+    with _BAKE_LOCK:
+        out = copy.deepcopy({k: v for k, v in _BAKE.items() if k != "recent"})
+        out["recent"] = copy.deepcopy(_BAKE["recent"][-50:])
+    v = vacuum_snapshot()
+    out["vacuum"] = {"pressure_torr": v["pressure_torr"], "limit_torr": v["limit_torr"]}
+    return {"ok": True, **out}
+
+
 # ── Emission calibration job (CTClient.emission_calibration, run for the GUI) ─
 # Same shape as the heat-short job: minutes to hours, so the GUI starts it here
 # and polls; a closed browser does not stop it. A script can call
@@ -6437,6 +6722,8 @@ class CtHandler(BaseHTTPRequestHandler):
                         "note": "boards left at Sleep (iso on) after the scan"})
         elif path == "/api/tests/heat-short":
             self._json(heat_short_status())
+        elif path == "/api/bake":
+            self._json(bake_status())
         elif path == "/api/tests/emission-cal":
             self._json(emission_cal_status())
         elif path == "/api/hv-snapshot":
@@ -7435,6 +7722,15 @@ class CtHandler(BaseHTTPRequestHandler):
                     out["error"] = ("arm failed, nothing left armed: " if results else "arm failed: ") \
                         + ("; ".join(why) or "no controller connected")
                 self._json(out)
+            elif path == "/api/bake":
+                # Bake-out: {action: "start", mv?, hold_s?, gap_s?, idle_ma?, cycles?,
+                # skip?, only?, pause_above?, resume_below?, cut_above?} or
+                # {action: "stop"} (never refused: ends the current turn at once).
+                if body.get("action") == "stop":
+                    return self._json(bake_stop(self._client()))
+                if body.get("action") != "start":
+                    return self._json({"ok": False, "error": 'action must be "start" or "stop"'})
+                self._json(bake_start(body, self._client()))
             elif path == "/api/tests/heat-short":
                 # Heat-short test: body {action: "start", filaments?, heat_ma?,
                 # heat_s?, emission_v?, limit_ma?, focus_v?, recover_s?,
@@ -9987,7 +10283,8 @@ def _rig_busy() -> list[str]:
     if busy:
         why.append(f"schedule armed/running on {busy}")
     why += _remote.activity()
-    for name, state in (("heat-short test", _HEAT_SHORT), ("emission calibration", _EMISSION_CAL)):
+    for name, state in (("heat-short test", _HEAT_SHORT), ("emission calibration", _EMISSION_CAL),
+                        ("bake-out", _BAKE)):
         if state.get("running"):
             why.append(f"{name} running")
     if _GRID_CLOSED:
