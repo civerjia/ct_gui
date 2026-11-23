@@ -1138,12 +1138,25 @@ function applyDrag(p) {
   sync();
 }
 
+// The ring HUD's folded state, per browser (a viewing preference).
+const HUD_FOLD_KEY = 'ct.hudCollapsed';
+
 function attachPlotDrag(cv) {
   const at = (e) => {
     const rect = cv.getBoundingClientRect();
     return geo.screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
   };
   cv.addEventListener('mousedown', (e) => {
+    if (e.button === 0) {
+      const rect = cv.getBoundingClientRect();
+      if (geo.hudToggleAt(e.clientX - rect.left, e.clientY - rect.top)) {
+        const on = !geo.opts.hudCollapsed;
+        geo.setHudCollapsed(on);
+        try { localStorage.setItem(HUD_FOLD_KEY, on ? '1' : '0'); } catch { /* private window */ }
+        e.preventDefault();
+        return;                                          // a fold click, not a drag
+      }
+    }
     if (e.button !== 0 || viewMode === 'live') return; // live is hardware-driven
     stopPlay();
     const p = at(e);
@@ -1171,7 +1184,7 @@ function attachPlotDrag(cv) {
     if (drag) { applyDrag(geo.screenToWorld(mx, my)); return; }
     const i = geo.hitTest(mx, my);
     if (i !== hoverFil) { hoverFil = i; sync(); }
-    cv.style.cursor = i >= 0 ? 'grab' : 'crosshair';
+    cv.style.cursor = geo.hudToggleAt(mx, my) ? 'pointer' : i >= 0 ? 'grab' : 'crosshair';
   });
   window.addEventListener('mouseup', () => { if (drag) { drag = null; cv.style.cursor = 'crosshair'; resyncSchedule(); } });
   cv.addEventListener('mouseleave', () => { if (!drag && hoverFil !== -1) { hoverFil = -1; sync(); } });
@@ -2295,6 +2308,7 @@ async function i2cMuxReset() {
 
 function init() {
   geo = new CTGeometry($('ctCanvas'));
+  try { if (localStorage.getItem(HUD_FOLD_KEY) === '1') geo.opts.hudCollapsed = true; } catch { /* private window */ }
   // One panel failing to set up must not leave the rest of the GUI (and the
   // ring, drawn by sync() at the end of init) dead.
   for (const [name, fn] of [['controllers', initControllers], ['power', initPower],

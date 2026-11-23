@@ -75,6 +75,9 @@ export class CTGeometry {
     ctx.clearRect(0, 0, this.cssW, this.cssH);
 
     drawBackground(this);
+    // HUD right above the background: the ring, beam and filaments draw OVER
+    // it, so it never hides them (2026-11-23).
+    if (this.state) drawHud(this);
     drawDetectorRing(this);
     drawFOV(this);
     if (this.state) {
@@ -85,8 +88,19 @@ export class CTGeometry {
       drawRotationCues(this);
     }
     this._ring(CT.R_SOURCE, 'rgba(150,170,180,0.28)', 1.2);
-    if (this.state) drawHud(this);
     ctx.restore();
+  }
+
+  // The HUD's fold toggle (set by drawHud): the ▾ button when open, the whole
+  // chip when folded. Only that spot takes the click, so dragging over the
+  // rest of the HUD still moves the geometry underneath.
+  hudToggleAt(cssX, cssY) {
+    const t = this._hudToggle;
+    return !!t && cssX >= t.x && cssX <= t.x + t.w && cssY >= t.y && cssY <= t.y + t.h;
+  }
+  setHudCollapsed(on) {
+    this.opts.hudCollapsed = !!on;
+    this.draw();
   }
 
   // --- primitives -------------------------------------------------------------

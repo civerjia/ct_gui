@@ -26,6 +26,20 @@ export function drawHud(r) {
 
   const x = 10, y = 10, w = 150, pad = 8, lh = 14;
   const h = pad * 2 + lh * 5;
+
+  // folded: one chip, "FIL n ▸" -- the whole chip unfolds it
+  if (r.opts.hudCollapsed) {
+    ctx.font = '700 10.5px var(--mono, monospace)';
+    const label = `FIL ${idx} ▸`;
+    const cw = ctx.measureText(label).width + 16, ch = 20;
+    ctx.fillStyle = 'rgba(8,13,18,0.62)';
+    r._rrect(x, y, cw, ch, 6); ctx.fill();
+    ctx.fillStyle = sc; r._rrect(x, y, 3, ch, 1.5); ctx.fill();
+    ctx.fillStyle = neutral; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, x + 9, y + ch / 2);
+    r._hudToggle = { x, y, w: cw, h: ch };
+    return;
+  }
   ctx.fillStyle = 'rgba(8,13,18,0.74)';
   r._rrect(x, y, w, h, 7); ctx.fill();
   ctx.strokeStyle = 'rgba(120,150,162,0.28)'; ctx.lineWidth = 1; ctx.stroke();
@@ -57,4 +71,10 @@ export function drawHud(r) {
   kv(colL, 'R', na || R == null ? '—' : R.toFixed(1) + ' Ω', neutral);
   kv(colR, 'P', na ? '—' : P.toFixed(2) + ' W', neutral); yy += lh;
   kv(colL, 'mAs', f.mAs.toFixed(3), '#c48cff');
+
+  // fold button, top-right corner
+  const bx = x + w - 18, by = y + 3;
+  ctx.font = '11px var(--mono, monospace)'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = muted; ctx.fillText('▾', bx + 8, by + 8);
+  r._hudToggle = { x: bx, y: by, w: 16, h: 16 };
 }
