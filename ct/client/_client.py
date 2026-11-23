@@ -1353,6 +1353,19 @@ class CTClient(_PowerMixin, _HvMixin, _ScheduleMixin, _MeasureMixin, _EmissionMi
                                      for f, v in (r.get("dead") or {}).items()},
                 "stale": False}
 
+    def vacuum(self) -> dict:
+        """The vacuum as the backend sees it, read-only: "pressure_torr" (None =
+        no fresh reading -- never an old number), "limit_torr",
+        "within_limit" (None when there is no reading), "source" and
+        "feeds" (the gauge read directly, the Spellman relay), "debug"."""
+        return self._get("/api/vacuum", timeout=5.0)
+
+    def hv_guard(self) -> dict:
+        """The HV guard / vacuum latch: "tripped" is None, or {"at", "source",
+        "pressure_torr", ...} while latched -- heating stays off (IDLE
+        included) until a person clears it. Read-only."""
+        return self._get("/api/hv-guard", timeout=5.0)
+
     def filament_notes(self) -> dict:
         """Every filament's note: {"ok": True, "notes": {PHYSICAL filament:
         {"note", "by", "at"}}}. Filaments without a note are left out.
