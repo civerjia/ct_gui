@@ -3686,7 +3686,19 @@ def hv_preflight_switches(reason: str) -> dict:
     return out
 
 
-GRID_SWEEP_S = 5.0     # how often every grid switch is really read back (165)
+def _grid_sweep_period() -> float:
+    try:
+        return max(0.5, float(os.environ.get("CT_GRID_SWEEP_S", "1.0")))
+    except ValueError:
+        return 1.0
+
+
+#: How often every grid switch is really read back (both 165s), s. Was 5.0;
+#: 1.0 since 2026-11-24 (user: shorter). Cost measured that day: one 0x14 is
+#: ~10 ms on the link (36 ms incl. HTTP over Tailscale), a sweep = status +
+#: 0x14 + 0x13 per controller, so ~5 % of each link at 1 s. A controller that
+#: is armed/running is skipped. CT_GRID_SWEEP_S overrides (floor 0.5 s).
+GRID_SWEEP_S = _grid_sweep_period()
 
 
 def grid_sweep_once() -> list[dict]:
@@ -3723,7 +3735,7 @@ def grid_sweep_once() -> list[dict]:
         stray, ev = _grid_strays(cid, link, desired, feedback)
         _vg_stuck_update(cid, link, ev, time.monotonic())
         # A gate already marked STUCK ON (595 off, both Vg sources on): forcing
-        # it again every 5 s changes nothing and would only repeat the log.
+        # it again every sweep changes nothing and would only repeat the log.
         stray = {ch: m & ~sum(1 << pos for pos in range(8)
                               if gate_stuck_at(cid, ch, pos) and not ev[ch]["readback"] & (1 << pos))
                  for ch, m in stray.items()}
