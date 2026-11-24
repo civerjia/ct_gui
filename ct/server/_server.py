@@ -3756,7 +3756,12 @@ def _grid_strays(cid: int, link, desired: list, feedback: list) -> tuple[dict, d
         if not (used >> ch) & 1:
             continue
         rb = feedback[ch] & ~desired[ch] & 0xFF
-        g = (vg[ch] & ~desired[ch] & 0xFF) if vg is not None else 0
+        # Vg only where a sub-board is mapped: MOS_VG_FB_n has no pull-down on
+        # the filament board (netlist v3.1 2026-11-16: only J, U5, U13 and the
+        # TVS), so an EMPTY slot floats and the TCA9554 pull-up reads it ON.
+        fitted = sum(1 << pos for pos in range(8)
+                     if MAPPING.filament_for_board(cid - 1, ch, pos) is not None)
+        g = (vg[ch] & ~desired[ch] & fitted & 0xFF) if vg is not None else 0
         if not (rb | g):
             continue
         act[ch] = rb | g
