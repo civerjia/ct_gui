@@ -969,3 +969,8 @@ button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 .live-dot.beat { animation: live-beat 0.6s ease-out; }
 @keyframes live-beat { 0% { transform: scale(1.9); box-shadow: 0 0 0 4px currentColor; } 100% { transform: scale(1); box-shadow: 0 0 0 0 transparent; } }
 @media (prefers-reduced-motion: reduce) { .live-dot.beat { animation: none; outline: 2px solid currentColor; } }
+
+/* listed absent by the firmware, output read ON: real V/I, nobody regulating */
+.status-tile.unregulated { background: repeating-linear-gradient(135deg, #f8cce6 0 5px, #fff0f8 5px 10px); border: 2px solid #c2187a; animation: tile-alarm 1.6s ease-in-out infinite; }
+.status-tile.unregulated .tile-measure, .status-tile.unregulated .tile-title { color: #8a0f56; font-weight: 800; }
+.status-tile.unregulated .ps-chip { background: #c2187a; color: #fff; }

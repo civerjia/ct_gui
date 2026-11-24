@@ -260,6 +260,15 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
                    "from_cc_loop": bool(b and b.get("from_cc_loop")),
                    "present_valid": bool(b and b.get("known")),
                    "current_mA_valid": bool(b) and b.get("current_mA") is not None}
+            # Listed ABSENT by the firmware but its output read ON directly
+            # (see ORPHAN_READ_S): the real V/I, flagged -- never hidden.
+            orph = (snap.get("orphans") or {}).get((ch, mux))
+            row["unregulated"] = bool(b is not None and not row["present"] and orph and orph.get("on")
+                                      and (now - orph["at"]) <= 6.0)
+            if row["unregulated"]:
+                row["bus_mV"], row["current_mA"] = orph["bus_mV"], orph["current_mA"]
+                row["age_ms"] = round((now - orph["at"]) * 1000)
+                row["current_mA_valid"] = True
             for name in ("iso_enabled", "tps_enabled", "tps_fault", "hv_overcurrent"):
                 v = bm.get(name)
                 ok = v is not None and (now - v[1]) <= MONITOR_BITMAP_HOLD_S

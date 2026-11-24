@@ -418,6 +418,51 @@ def _cold_board_cause(fid: int) -> tuple[dict | None, str]:
     return board, ""
 
 
+# ORPHANS: a board the firmware lists ABSENT while its output may be ON. Seen
+# 2026-11-24 on P1 CH5.4: the firmware cache said "not present" (so no V/I and
+# no CC regulation), but a direct INA219 read gave 4.42 V / 1640 mA at IDLE
+# 1200 mA -- a filament heated unregulated all night while the GUI showed it
+# as gone. Such a board is read DIRECTLY (one INA219 read each) every
+# ORPHAN_READ_S while idle, and served with its real V/I and "unregulated".
+#: How often an orphan board is read directly, s. source: cheap (one I2C read
+#: each), and a heating problem must not wait long to be seen.
+ORPHAN_READ_S = 2.0
+#: A direct reading is served this long, s.
+ORPHAN_STALE_S = 6.0
+
+
+def _read_ina_one(link: "ControllerLink", ch: int, mux: int) -> dict | None:
+    """One board's INA219 read now (I2C on the RP2350): {"present", "bus_mV",
+    "current_mA"}, or None when the read failed."""
+    mask = bytearray(8)
+    mask[ch] = 1 << mux
+    resp = link.request(CH_GET_INA219, bytes(mask) + bytes([0, 1]), flags=0, timeout=1.5)
+    entries = ((resp.get("decoded") if isinstance(resp, dict) else None) or {}).get("entries") or []
+    e = next((x for x in entries if x.get("channel") == ch and x.get("mux_port") == mux), None)
+    if e is None:
+        return None
+    return {"present": bool(e.get("present")), "bus_mV": e.get("bus_mV"),
+            "current_mA": e.get("current_mA")}
+
+
+def _orphan_candidates(cache: dict, bitmaps: dict, now: float) -> list:
+    """Boards the firmware lists absent although their output may be on: a
+    powering state, or the isolated rail reads enabled."""
+    out = []
+    for (ch, mux), b in cache.items():
+        if not b.get("known") or b.get("present"):
+            continue
+        iso = (bitmaps.get((ch, mux)) or {}).get("iso_enabled")
+        iso_on = bool(iso and iso[0] and (now - iso[1]) <= MONITOR_BITMAP_HOLD_S)
+        try:
+            powering = PowerState(int(b.get("power_state") or 0)) in ENERGISING_STATES
+        except ValueError:
+            powering = False
+        if powering or iso_on:
+            out.append((ch, mux))
+    return out
+
+
 def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict) -> dict:
     snap = dict(prev) if prev else {"boards": {}, "boards_at": 0.0, "bitmaps": {},
                                     "bitmaps_at": 0.0, "status": None, "status_at": 0.0}
@@ -483,6 +528,34 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
     if cache is not None:
         snap["boards"], snap["boards_at"], snap["source"] = cache, now, "cache"
         _adopt_firmware_power_states(cid - 1, cache, read_at)
+        if (now - snap.get("orphans_at", 0.0)) >= ORPHAN_READ_S and not held():
+            snap["orphans_at"] = now
+            orphans = dict(snap.get("orphans") or {})
+            cands = _orphan_candidates(cache, snap.get("bitmaps") or {}, now)
+            for key in list(orphans):
+                if key not in cands:            # listed present again, or powered off
+                    gone = orphans.pop(key)
+                    if gone.get("on"):
+                        log.warning("Power %d CH%d.%d: no longer an unregulated orphan "
+                                    "(listed present again or switched off)", cid, key[0] + 1, key[1] + 1)
+            for ch, mux in cands:
+                if held():
+                    break
+                try:
+                    r = _read_ina_one(link, ch, mux)
+                except Exception:
+                    r = None
+                if r is None:
+                    continue
+                on = bool(r["present"]) and ((r["bus_mV"] or 0) > 300 or abs(r["current_mA"] or 0) > 20)
+                was = (orphans.get((ch, mux)) or {}).get("on")
+                orphans[(ch, mux)] = {**r, "at": now, "on": on}
+                if on and not was:
+                    log.error("Power %d CH%d.%d: the firmware lists this board ABSENT but its output "
+                              "is ON (%s mV, %s mA, state %s) -- it is NOT regulated. Shown in the GUI "
+                              "as unregulated; STOP it or re-command its state.", cid, ch + 1, mux + 1,
+                              r["bus_mV"], r["current_mA"], cache[(ch, mux)].get("power_state"))
+            snap["orphans"] = orphans
     if (now - snap["bitmaps_at"]) >= MONITOR_BITMAP_PERIOD_S and not held():
         try:
             bm = _read_bitmaps(link)
@@ -6612,7 +6685,9 @@ class CtHandler(BaseHTTPRequestHandler):
                                  "power_state_src": b["power_state_src"],
                                  "dead": b["dead"], "dead_reason": b["dead_reason"],
                                  "lost": bool(b.get("lost")),
-                                 "channel_dark": bool(b.get("channel_dark"))}
+                                 "channel_dark": bool(b.get("channel_dark")),
+                                 # listed absent, output read ON directly
+                                 "unregulated": bool(b.get("unregulated"))}
             # Feed the run recorder so an end-of-run report can confirm each active
             # filament actually reached its target current. Auto start on the first
             # running poll (if a sim didn't already start it with the scheduled set)

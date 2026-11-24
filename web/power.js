@@ -394,7 +394,9 @@ function renderBoardGrid() {
     // IDLE (b.idle_voltage) -- coloured as IDLE, named "IDLE(V)".
     const psName = b.power_state_name || null;
     const psClass = b.idle_voltage ? 'idle' : (psName ? psName.toLowerCase() : 'unknown');
-    const cls = b.channel_dark ? 'dark' : b.lost ? 'lost'
+    // UNREGULATED: the firmware lists it absent, but a direct read found its
+    // output ON -- its real V/I are shown, never hidden behind "absent".
+    const cls = b.channel_dark ? 'dark' : b.lost ? 'lost' : b.unregulated ? 'unregulated'
       : b.tps_fault ? 'fault' : b.dead ? 'dead'
       : b.present ? `present ps-${psClass}` : 'absent';
     tile.className = 'status-tile ' + cls + (boardSel.has(k) ? ' selected' : '')
@@ -402,19 +404,23 @@ function renderBoardGrid() {
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');
     const p = tile._parts;
     p.title.textContent = b.label;   // the filament number is in the tooltip
-    p.ps.textContent = b.channel_dark ? 'DARK' : b.lost ? 'LOST' : b.dead ? 'DEAD'
+    p.ps.textContent = b.channel_dark ? 'DARK' : b.lost ? 'LOST' : b.unregulated ? 'UNREG' : b.dead ? 'DEAD'
       : !b.present ? '' : (PS_SHORT[psName] || '?');
-    p.ps.hidden = !b.channel_dark && !b.lost && !b.dead && !b.present;
+    p.ps.hidden = !b.channel_dark && !b.lost && !b.unregulated && !b.dead && !b.present;
     setDot(p.dotP, b.present, 'P');
     setDot(p.dotI, b.iso_enabled, 'I', false, b.iso_enabled_valid);
     setDot(p.dotT, b.tps_enabled, 'T', b.tps_fault, b.tps_enabled_valid);
     setDot(p.dotF, b.tps_fault, 'F', b.tps_fault, b.tps_fault_valid);
     // A lost/dark board's last V/I are not current -- show the failure instead.
-    const showVi = b.present && !b.lost && !b.channel_dark;
+    const showVi = (b.present || b.unregulated) && !b.lost && !b.channel_dark;
     p.dash.hidden = showVi; p.vSpan.hidden = !showVi; p.iSpan.hidden = !showVi;
     const secs = (ms) => (ms == null ? '?' : (ms / 1000).toFixed(ms < 10000 ? 1 : 0));
     p.dash.textContent = b.channel_dark ? 'dark' : b.lost ? `lost ${secs(b.lost_for_ms)}s` : '—';
-    tile.title = b.channel_dark
+    tile.title = b.unregulated
+      ? `${b.label} (filament #${b.fid}): the firmware lists it ABSENT, but a direct read finds its output ON `
+        + `(${b.bus_mV} mV, ${b.current_mA} mA; commanded ${psName || '?'}). It is not being regulated -- `
+        + 'the firmware rebuilds it to its commanded state; if this stays, STOP it.'
+      : b.channel_dark
       ? `CH${b.channel + 1} is DARK: its mux stopped answering. The firmware probes it and restores every board when it returns.`
       : b.lost
         ? `${b.label} LOST for ${secs(b.lost_for_ms)} s (${b.probe_fails} failed probes, next in ${secs(b.next_probe_ms)} s). `

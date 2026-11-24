@@ -61,7 +61,11 @@ export function drawHud(r) {
   ctx.font = '700 10.5px var(--mono, monospace)';
   ctx.textAlign = 'left'; ctx.fillStyle = sc;
   ctx.fillText(`FIL ${idx}`, colL, yy);
-  kv(colR, 'θ', ang.toFixed(1) + '°', neutral); yy += lh;
+  if (f.unregulated) {   // listed absent, output ON: say it where the eye lands first
+    ctx.font = '800 10.5px var(--mono, monospace)'; ctx.fillStyle = '#ff5cb8';
+    ctx.fillText('UNREG', colR, yy);
+  } else kv(colR, 'θ', ang.toFixed(1) + '°', neutral);
+  yy += lh;
   ctx.font = '700 10.5px var(--mono, monospace)';
   ctx.textAlign = 'left'; ctx.fillStyle = neutral;
   ctx.fillText(board, colL, yy); yy += lh;

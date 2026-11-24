@@ -143,6 +143,13 @@ export function drawFilaments(r) {
       ctx.strokeStyle = '#ff7a1a'; ctx.lineWidth = 2.2;
       ctx.beginPath(); ctx.arc(sx, sy, rad + 3, 0, 2 * Math.PI); ctx.stroke();
     }
+    // UNREGULATED: listed absent by the firmware, output read ON -- its real
+    // V/I bars are drawn above; this ring says nobody is regulating them.
+    if (f.unregulated) {
+      ctx.strokeStyle = '#e0309a'; ctx.lineWidth = 2.4; ctx.setLineDash([3, 2]);
+      ctx.beginPath(); ctx.arc(sx, sy, rad + 4, 0, 2 * Math.PI); ctx.stroke();
+      ctx.setLineDash([]);
+    }
 
     // index labels every 24 (bold), plus every-4 when the option is on
     const label = (i % LABEL_EVERY === 0) || (r.opts.indices && i % 4 === 0) || isActive;

@@ -237,6 +237,7 @@ function ingestTelemetry(rows) {
     // still showed its 8 boards on the ring).
     if (r.absent) { f.absent = true; f.voltage_mV = 0; f.current_mA = 0; f.vi_live = false; f.lost = false; continue; }
     f.absent = false;
+    f.unregulated = !!r.unregulated;
     if (r.state != null) f.state = r.state;
     if (r.bus_mV != null) f.voltage_mV = r.bus_mV;
     if (r.current_mA != null) f.current_mA = r.current_mA;
@@ -852,9 +853,9 @@ async function pollTelemetry() {
     // guess from the current: a guess painted every cold IDLE as STOP. null =
     // not reported -> ingestTelemetry keeps the last known state.
     const state = t.power_state || null;
-    if (!t.present && !t.lost && !t.channel_dark) return { index: ring, absent: true };
+    if (!t.present && !t.lost && !t.channel_dark && !t.unregulated) return { index: ring, absent: true };
     return { index: ring, state, bus_mV: t.bus_mV, current_mA: t.current_mA,
-             lost: !!(t.lost || t.channel_dark) };
+             lost: !!(t.lost || t.channel_dark), unregulated: !!t.unregulated };
   }).filter(Boolean);
   // A disconnected controller sends no rows at all: its filaments are absent,
   // not "last known". (Push mode sends only the boards it heard from, so a
@@ -890,6 +891,12 @@ async function pollTelemetry() {
   // firing rows are already marked ACTIVE above; the live active pointer is
   // driven through geometry by gotoSeq()/pollRunStatus().
   ingestTelemetry(rows);   // calls sync()
+  const unreg = tele.filter((t) => t.unregulated).map((t) => t.index);
+  if (unreg.length) {
+    setStatus(`⚠ NOT REGULATED: filament ${unreg.join(', ')} -- listed absent by the firmware, but its output is ON `
+      + '(real V/I on the ring, magenta ring). The firmware rebuilds it to its commanded state; if it stays, STOP it.');
+    return;
+  }
   setStatus(present === 0 && !running
     ? `Live — connected, but 0/${tele.length} boards present (no filament daughter-boards detected). Run I2C Self-Test to check the controller chips.`
     : `Live — ${present}/${tele.length} boards present${firing.length ? `, firing ${firing.join(',')}` : ''}.`);
