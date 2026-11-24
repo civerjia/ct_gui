@@ -3715,26 +3715,78 @@ def grid_sweep_once() -> list[dict]:
         if got is None:
             continue
         desired, feedback = got
-        used = used_channel_mask(cid)   # an unused channel floats to 0xFF
-        stray = {ch: feedback[ch] & ~desired[ch] & 0xFF for ch in range(8)
-                 if (used >> ch) & 1 and feedback[ch] & ~desired[ch] & 0xFF}
+        # an unused channel floats to 0xFF: _grid_strays only looks at used ones
+        stray, ev = _grid_strays(cid, link, desired, feedback)
         if not stray:
             continue
         fids = [MAPPING.filament_for_board(cid - 1, ch, pos)
                 for ch, m in sorted(stray.items()) for pos in range(8) if m & (1 << pos)]
-        log.warning("grid sweep: Power %d switch(es) %s CLOSED with no command (desired %s, "
+        log.warning("grid sweep: Power %d switch(es) %s CLOSED with no command [%s] (desired %s, "
                     "read-back %s, filaments %s) -- forcing open", cid, _masks_text(stray),
-                    desired, feedback, fids)
+                    _strays_text(cid, ev), desired, feedback, fids)
         r = force_grid_off(link, cid, stray, reason="grid sweep: closed with no command")
         if r.get("ok"):
             _note_forced_open(cid, stray)
         rec = {"controller": cid, "switches": _masks_text(stray), "filaments": fids,
-               "desired": desired, "read_back": feedback, "opened": bool(r.get("ok"))}
+               "desired": desired, "read_back": feedback, "opened": bool(r.get("ok")),
+               "sources": _strays_text(cid, ev),
+               "vg": {ch: e["vg"] for ch, e in ev.items()},
+               "tca": {ch: e["tca"] for ch, e in ev.items() if "tca" in e}}
         if not r.get("ok"):
             rec["error"] = r.get("error")
         _safety_record("grid_stray_closed", rec)
         found.append(rec)
     return found
+
+
+def _grid_strays(cid: int, link, desired: list, feedback: list) -> tuple[dict, dict]:
+    """Switches CLOSED with no command, from BOTH 165s.
+
+    Returns (act, evidence). act = {ch: mask} to force open: the 595 read-back
+    (first 165) OR the MOSFET Vg feedback (second 165, trusted controllers
+    only -- see vg_trusted) says ON while desired says off. Opening is
+    harmless, so either source is enough to act. evidence is for the log:
+    per channel the two masks, and where they disagree the TCA9554 re-check
+    (the third source, slow I2C, read only then). Still evidence, not the
+    verdict: the HV guard judges by current."""
+    used = used_channel_mask(cid)
+    vg = hv_vg_of(link, cid)
+    act, ev = {}, {}
+    for ch in range(8):
+        if not (used >> ch) & 1:
+            continue
+        rb = feedback[ch] & ~desired[ch] & 0xFF
+        g = (vg[ch] & ~desired[ch] & 0xFF) if vg is not None else 0
+        if not (rb | g):
+            continue
+        act[ch] = rb | g
+        e = {"readback": rb, "vg": None if vg is None else vg[ch]}
+        if vg is not None and rb != g:
+            e["tca"] = tca_vg_channel(link, ch)
+        ev[ch] = e
+    return act, ev
+
+
+def _strays_text(cid: int, ev: dict) -> str:
+    """'CH5.1 595+Vg, CH5.2 595 only (Vg off, TCA off)' -- what each source said."""
+    out = []
+    for ch, e in sorted(ev.items()):
+        vg, tca = e.get("vg"), e.get("tca")
+        for pos in range(8):
+            bit = 1 << pos
+            rb = bool(e["readback"] & bit)
+            if vg is None:
+                if rb:
+                    out.append(f"CH{ch + 1}.{pos + 1} 595 (no Vg)")
+                continue
+            g = bool(vg & bit)
+            if not (rb or g):
+                continue
+            t = "" if tca is None and "tca" not in e else \
+                (", TCA ?" if tca is None else f", TCA {'ON' if tca & bit else 'off'}")
+            out.append(f"CH{ch + 1}.{pos + 1} " + ("595+Vg" if rb and g else
+                       f"595 only (Vg off{t})" if rb else f"Vg ONLY (595 off{t})"))
+    return ", ".join(out)
 
 
 # ── HV guard: a grid switch that will not turn off -> HV off, latched ────────
@@ -3941,12 +3993,14 @@ def _hv_guard_strays() -> dict:
         if got is None:
             continue
         desired, feedback = got
-        used = used_channel_mask(cid)
-        stray = {ch: feedback[ch] & ~desired[ch] & 0xFF for ch in range(8)
-                 if (used >> ch) & 1 and feedback[ch] & ~desired[ch] & 0xFF}
+        stray, ev = _grid_strays(cid, link, desired, feedback)
         if stray:
             out[cid] = stray
+            _HVG_STRAY_SOURCES[cid] = _strays_text(cid, ev)
     return out
+
+
+_HVG_STRAY_SOURCES: dict = {}   # cid -> what each 165 / the TCA said at the last trip read
 
 
 def _hv_guard_force_open_all() -> dict:
@@ -4063,9 +4117,11 @@ def _hv_guard_after_stm32_trip_(now: float) -> dict:
     base_x16 = int(g.get("trip_base_x16") or 0)
     rise_ma = ((int(g.get("trip_mean_x16") or 0) - base_x16) / 16.0 * STM32_MA_PER_COUNT
                if g.get("ok") and base_x16 else None)
+    _HVG_STRAY_SOURCES.clear()
     strays = _hv_guard_strays()                     # logged only (the 165 is not trusted)
     opened = _hv_guard_force_open_all()
-    stray_txt = "; ".join(f"Power {cid} {_masks_text(m)}" for cid, m in sorted(strays.items()))
+    stray_txt = "; ".join(f"Power {cid} {_masks_text(m)} [{_HVG_STRAY_SOURCES.get(cid, '')}]"
+                          for cid, m in sorted(strays.items()))
     rec = {"source": "stm32", "stm32_guard": g,
            "rise_ma_approx": None if rise_ma is None else round(rise_ma, 2),
            "suspects": suspects, "forced_open": opened, "read_back_165": stray_txt or "all open",

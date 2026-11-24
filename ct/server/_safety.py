@@ -150,11 +150,46 @@ def _hv_bytes(link: "ControllerLink") -> tuple[list[int], list[int]] | None:
     fraw = fb.get("raw") if isinstance(fb, dict) else None
     if not fraw or len(fraw) < 9 or fraw[0] != 0x00:
         return None
+    # RP2350 v3 (2026-11-24) appends 8 bytes: the second 165 = MOSFET Vg
+    # feedback, read in the same shift. Kept on the link (hv_vg_of); only
+    # controllers whose sub-boards really carry it are trusted (vg_trusted).
+    link.last_vg = (time.monotonic(), list(fraw[9:17])) if len(fraw) >= 17 else None
     cur = link.request(0x13, b"", flags=0, timeout=2.0)
     craw = cur.get("raw") if isinstance(cur, dict) else None
     if not craw or len(craw) < 9 or craw[0] != 0x00:
         return None
     return list(craw[1:9]), list(fraw[1:9])
+
+
+#: Which controllers' sub-boards report MOSFET Vg on the second 165 (v3.1
+#: sub-boards). The rig: P1 only -- P2 keeps OLD sub-boards whose pin is TPS
+#: FAULT# (reads high, meaningless). From CT_VG_FEEDBACK_CONTROLLERS ("1",
+#: "1,2"; empty = none) in state/rig_env.toml.
+def vg_trusted(controller: int) -> bool:
+    raw = os.environ.get("CT_VG_FEEDBACK_CONTROLLERS", "")
+    return str(int(controller)) in {x.strip() for x in raw.replace(";", ",").split(",") if x.strip()}
+
+
+def hv_vg_of(link: "ControllerLink", controller: int, max_age_s: float = 2.0) -> list[int] | None:
+    """The Vg bytes the last _hv_bytes read brought, if this controller's Vg is
+    trusted and the read is fresh; else None (unknown -- never 'all off')."""
+    got = getattr(link, "last_vg", None)
+    if not got or not vg_trusted(controller) or time.monotonic() - got[0] > max_age_s:
+        return None
+    return got[1]
+
+
+def tca_vg_channel(link: "ControllerLink", ch: int) -> int | None:
+    """Re-check source: the TCA9554 U13 on the Vg feedback lines (0x61, input
+    register of the 2nd chip). Slow I2C; for disagreements only. None = failed."""
+    try:
+        resp = link.client.send_request(CH_READ_TCA9554, bytes([ch]), timeout=2.0)
+    except Exception:
+        return None
+    raw = resp.get("raw") or []
+    if resp.get("status_code") != 0x00 or len(raw) < 22 or not raw[2 + 5 + 4]:
+        return None
+    return int(raw[2 + 5 + 1])
 
 
 def used_channel_mask(controller: int) -> int:
@@ -654,7 +689,7 @@ __all__ = [
     "_OCP_SENSE_RESISTOR_OHMS", "_ORDER_LOCK", "_SAFETY", "_SAFETY_EVENTS",
     "_SAFETY_LOCK", "_SAFETY_TOUCH_FIL", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG",
     "_coerce_bytes", "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable",
-    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "force_grid_off", "used_channel_mask", "_masks_text", "_safety_record", "_safety_schedule_running",
+    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "vg_trusted", "hv_vg_of", "tca_vg_channel", "force_grid_off", "used_channel_mask", "_masks_text", "_safety_record", "_safety_schedule_running",
     "_setup_logging", "_status_err", "_status_ok", "_suppress", "_u16", "_u32",
     "_unpack_spi_shot", "_with_dead_stopped", "adc_get_burst", "adc_pulse_arm",
     "adc_pulse_diag", "adc_pulse_disarm", "adc_ready_arm", "adc_ready_disarm",
