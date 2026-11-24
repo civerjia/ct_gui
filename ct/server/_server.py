@@ -6206,13 +6206,130 @@ def _tail_judge(ended: float) -> dict | None:
     return {"action": "warning", **rec}
 
 
+# ── Firmware HV guard (RP2350 0x86 / 0x87, fw 2026-11-24) ───────────────────
+# The firmware re-reads both 165s every few ms while idle and rewrites a switch
+# that is ON with nothing commanded (uart_protocol.md 17A.1h). The backend tells
+# it which slots carry a real Vg (vg_trusted + fitted slots) and pulls its
+# correction log into this log. Older firmware: not supported, said once.
+HV_GUARD_FW_CONFIG = 0x86
+HV_GUARD_FW_STATUS = 0x87
+HV_GUARD_FW_PERIOD_US = 5000
+HV_GUARD_FW_POLL_S = 5.0
+_HVG_FW: dict = {}        # cid -> {"since": seq, "status": last summary, "unsupported": bool}
+
+
+def _hv_guard_fw_want(cid: int) -> list[int]:
+    return [fitted_mask(cid, ch) if vg_trusted(cid) else 0 for ch in range(8)]
+
+
+def _hv_guard_fw_config_one(cid: int, link) -> dict | None:
+    """GET the firmware guard config; SET it when it differs from the wanted
+    one (an RP2350 reset restores period 5000 and NO Vg trust). None = this
+    firmware has no guard."""
+    st = _HVG_FW.setdefault(cid, {"since": 0})
+    resp = link.request(HV_GUARD_FW_CONFIG, b"", flags=0, timeout=2.0)
+    raw = (resp.get("raw") if isinstance(resp, dict) else None) or []
+    if not raw:
+        return None                             # no reply: try again next time
+    if len(raw) < 11 or raw[0] != 0x00:
+        if not st.get("unsupported"):
+            log.info("%s: RP2350 firmware has no HV guard (0x86 -> status %s) -- the backend "
+                     "sweep only", link.name, raw[0])
+        st["unsupported"] = True
+        return None
+    if st.pop("unsupported", None):
+        st["since"] = 0                         # new firmware: its log starts at 1
+    have = {"period_us": raw[1] | (raw[2] << 8), "vg_trust": list(raw[3:11])}
+    want = {"period_us": HV_GUARD_FW_PERIOD_US, "vg_trust": _hv_guard_fw_want(cid)}
+    if have != want:
+        payload = bytes([want["period_us"] & 0xFF, want["period_us"] >> 8]) + bytes(want["vg_trust"])
+        r = link.request(HV_GUARD_FW_CONFIG, payload, flags=0, timeout=2.0)
+        rr = (r.get("raw") if isinstance(r, dict) else None) or []
+        ok = len(rr) >= 11 and rr[0] == 0 and list(rr[3:11]) == want["vg_trust"]
+        log.warning("%s: firmware HV guard was %s -- set to period %d us, Vg trusted %s -> %s",
+                    link.name, have, want["period_us"],
+                    [f"CH{c + 1}:{m:#04x}" for c, m in enumerate(want["vg_trust"]) if m] or "nowhere",
+                    "ok" if ok else f"reply {rr[:12]}")
+        have = want if ok else have
+    st["config"] = have
+    return have
+
+
+def _hv_guard_fw_poll_one(cid: int, link) -> None:
+    """Pull new correction events and log them (one WARNING each)."""
+    st = _HVG_FW.setdefault(cid, {"since": 0})
+    if st.get("unsupported"):
+        return
+    for _ in range(4):                          # at most 4 pages (32 events) a poll
+        since = int(st.get("since", 0))
+        resp = link.request(HV_GUARD_FW_STATUS, since.to_bytes(4, "little"), flags=0, timeout=2.0)
+        raw = bytes((resp.get("raw") if isinstance(resp, dict) else None) or [])
+        if len(raw) < 50 or raw[0] != 0x00:
+            return
+        u32 = lambda o: int.from_bytes(raw[o:o + 4], "little")
+        u16 = lambda o: int.from_bytes(raw[o:o + 2], "little")
+        seq = u32(5)
+        if seq < since:                         # the RP2350 was reset: its log restarted
+            st["since"] = 0
+            continue
+        st["status"] = {"scans": u32(1), "seq": seq, "read_glitches": u32(9),
+                        "max_gap_us": u32(13),
+                        "corrections": [u16(17 + 2 * c) for c in range(8)],
+                        "vg_write_mismatch": [u16(33 + 2 * c) for c in range(8)]}
+        n, off = raw[49], 50
+        for _i in range(n):
+            if off + 28 > len(raw):
+                break
+            e = raw[off:off + 28]
+            off += 28
+            ev = {"seq": int.from_bytes(e[0:4], "little"), "t_ms": int.from_bytes(e[4:8], "little"),
+                  "channel": e[8], "desired": e[9], "read_back": e[10], "vg": e[11], "stray": e[12],
+                  "after": e[13], "last_read_ch": e[14],
+                  "since_write_us": int.from_bytes(e[16:20], "little"),
+                  "since_latch_us": int.from_bytes(e[20:24], "little"),
+                  "since_read_us": int.from_bytes(e[24:28], "little")}
+            st["since"] = max(int(st.get("since", 0)), ev["seq"])
+            ch = ev["channel"]
+            sw = {ch: ev["stray"]}
+            fids = [MAPPING.filament_for_board(cid - 1, ch, p) for p in range(8) if ev["stray"] & (1 << p)]
+            ms = lambda us: "never" if us > 4_000_000_000 else f"{us / 1000:.1f} ms"
+            log.warning("Power %d %s: firmware guard found the switch ON with nothing commanded and "
+                        "rewrote it -> %s (595 %#04x, Vg %#04x, desired %#04x; filaments %s). Last on "
+                        "this channel: write %s, latch %s ago; last 165 read %s ago on CH%s",
+                        cid, _masks_text(sw), "fixed" if not ev["after"] else
+                        f"STILL ON {_masks_text({ch: ev['after']})}", ev["read_back"], ev["vg"],
+                        ev["desired"], fids, ms(ev["since_write_us"]), ms(ev["since_latch_us"]),
+                        ms(ev["since_read_us"]),
+                        ev["last_read_ch"] + 1 if ev["last_read_ch"] < 8 else "?")
+            _safety_record("grid_guard_corrected", {"controller": cid, "switches": _masks_text(sw),
+                                                    "filaments": fids, **ev})
+        if n < 8 or st["since"] >= seq:
+            return
+
+
+def hv_guard_fw_snapshot() -> dict:
+    return {str(c): {k: v for k, v in s.items() if k != "since"} for c, s in sorted(_HVG_FW.items())}
+
+
 def _grid_sweep_loop() -> None:
+    last_fw = 0.0
     while not _STOPPING.is_set():          # see _safety_loop
         time.sleep(GRID_SWEEP_S)
         try:
             grid_sweep_once()
         except Exception as exc:          # never let the sweep die
             log.exception("grid sweep failed: %s", exc)
+        if time.monotonic() - last_fw >= HV_GUARD_FW_POLL_S:
+            last_fw = time.monotonic()
+            for cid, link in sorted(CONTROLLERS.items()):
+                if _STOPPING.is_set() or not link or not link.client.connected:
+                    continue
+                try:
+                    if "config" not in _HVG_FW.get(cid, {}) and not _HVG_FW.get(cid, {}).get("unsupported"):
+                        _hv_guard_fw_config_one(cid, link)
+                    _hv_guard_fw_poll_one(cid, link)
+                except Exception as exc:
+                    log.debug("firmware HV guard poll on Power %d: %s", cid, exc)
 
 
 def hv_write_off_masks(command: str, body: dict) -> dict[int, int] | None:
@@ -6734,6 +6851,7 @@ class CtHandler(BaseHTTPRequestHandler):
         elif path == "/api/hv-guard":
             snap = hv_guard_snapshot()
             snap["gate_stuck"] = gate_stuck_list()
+            snap["firmware_guard"] = hv_guard_fw_snapshot()
             link = CONTROLLERS.get(MASTER)
             try:
                 snap["stm32"] = stm32_hv_guard(link.host) if link and link.host else None
@@ -10227,6 +10345,7 @@ def _slew_keeper_loop() -> None:
                                 "its firmware default) — set to the rig's %s mV -> %s", link.name,
                                 v["before"], VCAP_WANT["mv"],
                                 "ok" if v["after"] == VCAP_WANT["mv"] else f"read back {v['after']}")
+                _hv_guard_fw_config_one(cid, link)
                 for ch, before, after in _i2c_hz_check_one(cid, link):
                     want = I2C_HZ_WANT[str(cid)][str(ch)]
                     log.warning("%s: CH%d I2C clock was %d kHz (an RP2350 reset restores 400) "
