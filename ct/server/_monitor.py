@@ -263,7 +263,7 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
             # Listed ABSENT by the firmware but its output read ON directly
             # (see ORPHAN_READ_S): the real V/I, flagged -- never hidden.
             orph = (snap.get("orphans") or {}).get((ch, mux))
-            row["unregulated"] = bool(b is not None and not row["present"] and orph and orph.get("on")
+            row["unregulated"] = bool(b is not None and not row["present"] and orph and orph.get("confirmed")
                                       and (now - orph["at"]) <= 6.0)
             if row["unregulated"]:
                 row["bus_mV"], row["current_mA"] = orph["bus_mV"], orph["current_mA"]

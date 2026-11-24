@@ -429,6 +429,13 @@ def _cold_board_cause(fid: int) -> tuple[dict | None, str]:
 ORPHAN_READ_S = 2.0
 #: A direct reading is served this long, s.
 ORPHAN_STALE_S = 6.0
+#: An orphan counts (ERROR log, "unregulated" in the GUI) only once its output
+#: has read ON for this long, s -- three direct reads in a row. source: the
+#: night of 2026-11-23/24 logged 16 orphans that were all ONE cache tick
+#: (gone at the next read, 2 s later) at ~975 mA for a 1000 mA IDLE, i.e.
+#: still regulated -- 7 of them at once on P2 right after a 96-filament IDLE
+#: current change. The real case (P1 CH5.4) lasted hours.
+ORPHAN_CONFIRM_S = 3.5
 
 
 def _read_ina_one(link: "ControllerLink", ch: int, mux: int) -> dict | None:
@@ -535,7 +542,7 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
             for key in list(orphans):
                 if key not in cands:            # listed present again, or powered off
                     gone = orphans.pop(key)
-                    if gone.get("on"):
+                    if gone.get("confirmed"):
                         log.warning("Power %d CH%d.%d: no longer an unregulated orphan "
                                     "(listed present again or switched off)", cid, key[0] + 1, key[1] + 1)
             for ch, mux in cands:
@@ -548,13 +555,19 @@ def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict
                 if r is None:
                     continue
                 on = bool(r["present"]) and ((r["bus_mV"] or 0) > 300 or abs(r["current_mA"] or 0) > 20)
-                was = (orphans.get((ch, mux)) or {}).get("on")
-                orphans[(ch, mux)] = {**r, "at": now, "on": on}
-                if on and not was:
+                prev_o = orphans.get((ch, mux)) or {}
+                since = (prev_o.get("since") or now) if on and prev_o.get("on") else now
+                was = bool(prev_o.get("confirmed"))
+                confirmed = on and (was or (now - since) >= ORPHAN_CONFIRM_S)
+                orphans[(ch, mux)] = {**r, "at": now, "on": on, "since": since, "confirmed": confirmed}
+                if was and not on:
+                    log.warning("Power %d CH%d.%d: no longer an unregulated orphan (output off)",
+                                cid, ch + 1, mux + 1)
+                if confirmed and not was:
                     log.error("Power %d CH%d.%d: the firmware lists this board ABSENT but its output "
-                              "is ON (%s mV, %s mA, state %s) -- it is NOT regulated. Shown in the GUI "
+                              "is ON (%s mV, %s mA, state %s) for %.0f s -- it is NOT regulated. Shown in the GUI "
                               "as unregulated; STOP it or re-command its state.", cid, ch + 1, mux + 1,
-                              r["bus_mV"], r["current_mA"], cache[(ch, mux)].get("power_state"))
+                              r["bus_mV"], r["current_mA"], cache[(ch, mux)].get("power_state"), now - since)
             snap["orphans"] = orphans
     if (now - snap["bitmaps_at"]) >= MONITOR_BITMAP_PERIOD_S and not held():
         try:
