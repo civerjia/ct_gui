@@ -9181,6 +9181,13 @@ class CtHandler(BaseHTTPRequestHandler):
                 # Not watched by the dead-man timer: the rails are only ever
                 # turned off by a person (see SAFETY_HV_TIMEOUT_S).
                 out = stm32_hv_enable_set(host, _hv_ch, _hv_on)
+                # Record the rail as commanded at once: the status poll only
+                # updates _HVG_RAILS when it happens to run before a trip, and
+                # 2026-11-24 12:38 focus tripped the STM32 guard within 1 s of
+                # ON four times -- each recovery saw focus "off" and restored
+                # emission only.
+                if isinstance(out, dict) and out.get("ok") and _hv_ch in _HVG_RAILS:
+                    _HVG_RAILS[_hv_ch] = bool(_hv_on)
                 if preflight and (preflight.get("opened") or preflight.get("unchecked")):
                     out = {**out, "preflight": preflight}
                 self._json(out)
