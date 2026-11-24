@@ -16,6 +16,7 @@
  */
 import { $ } from './dom.js';
 import { postJ } from './net.js';
+import { beat } from './liveness.js';
 
 const KEEP_S = 3600;
 const RANGE_S = 24 * 3600, MIN_SPAN_S = 20;
@@ -150,6 +151,11 @@ export function initTrends() {
         if (i) a.splice(0, i);
       }
       last = Math.max(last, ...STRIPS.map((s) => { const a = data[s.key]; return a.length ? a[a.length - 1][0] : 0; }));
+      // heartbeat: how old the newest sample of each source is, on the backend's clock
+      for (const [stream, key] of [['vac', 'vac'], ['spellman', 'sp_kv'], ['hvmon', 'em_i']]) {
+        const a = data[key];
+        beat(stream, a.length ? (r.now - a[a.length - 1][0]) * 1000 : null);
+      }
     } catch { /* keep the last data; try again next tick */ }
   }
 

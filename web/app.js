@@ -29,6 +29,7 @@ import { initMapping } from './mapping.js';
 import { initTests } from './tests.js';
 import { initFilaments } from './filaments.js';
 import { initBake } from './bake.js';
+import { initLiveness, beat } from './liveness.js';
 import { initSticky } from './sticky.js';
 import { $, setMsg, clampNumberInputs } from './dom.js';
 import { postJ as postJSON } from './net.js';
@@ -830,6 +831,9 @@ async function pollTelemetry() {
   let data;
   try { data = await (await fetch('/api/telemetry')).json(); } catch { return; }
   const tele = data.telemetry || [];
+  // heartbeat: the newest board reading's own age (firmware cache), not this poll's
+  const ages = tele.filter((t) => t.present && Number.isFinite(t.age_ms)).map((t) => t.age_ms);
+  beat('boards', ages.length ? Math.min(...ages) : null);
   const running = Object.values(data.run || {}).some((s) => s && s.state === 2);
   lastRunActive = running;   // drives the adaptive telemetry cadence
   if (!tele.length && !running) { setStatus('Live — no telemetry (controllers disconnected or bridge slot busy).'); return; }
@@ -2314,7 +2318,8 @@ function init() {
   // ring, drawn by sync() at the end of init) dead.
   for (const [name, fn] of [['controllers', initControllers], ['power', initPower],
                             ['trends', initTrends], ['mapping', initMapping], ['tests', initTests],
-                            ['filaments', initFilaments], ['bake', initBake]]) {
+                            ['filaments', initFilaments], ['bake', initBake],
+                            ['liveness', initLiveness]]) {
     try { fn(); } catch (e) { console.error(`init ${name} failed:`, e); setStatus(`⚠ the ${name} panel failed to start: ${e && e.message || e}`); }
   }
 

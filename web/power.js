@@ -10,6 +10,7 @@ import { calApi, liveRefV, setLiveRefV, setPulseFrontend, peakToMa } from './tes
 import { $ as $p, setMsg, clampNumberInputs } from './dom.js';
 import { postJ, sleep } from './net.js';
 import { state } from './state.js';
+import { beat } from './liveness.js';
 import { filamentToBoard, ringOfFid } from './app.js';
 
 let pwTarget = 1;                       // selected controller (1 or 2) — boards/HV-grid
@@ -626,6 +627,9 @@ async function refreshBoards() {
   // push off): keep what is on screen and say why, rather than blanking.
   if (!j.ok) { bmMsg(j.error || 'snapshot failed'); return; }
   boardCache = (j.boards && j.boards.length) ? j.boards : emptyBoards();
+  // heartbeat: snapshot age + the freshest board's own firmware age
+  const bAges = boardCache.filter((b) => b.present && Number.isFinite(b.age_ms)).map((b) => b.age_ms);
+  beat('boards', bAges.length ? (Number(j.age_ms) || 0) + Math.min(...bAges) : null);
   renderBoardGrid(); renderOneBoard();
   const lost = boardCache.filter((b) => b.lost).map((b) => b.label);
   const dark = j.dark_channels && j.dark_channels.length ? ` · DARK: CH${j.dark_channels.join(', CH')}` : '';
