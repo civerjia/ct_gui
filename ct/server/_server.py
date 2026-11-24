@@ -3756,9 +3756,12 @@ def _grid_strays(cid: int, link, desired: list, feedback: list) -> tuple[dict, d
         if not (used >> ch) & 1:
             continue
         rb = feedback[ch] & ~desired[ch] & 0xFF
-        # Vg only where a sub-board is mapped: MOS_VG_FB_n has no pull-down on
-        # the filament board (netlist v3.1 2026-11-16: only J, U5, U13 and the
-        # TVS), so an EMPTY slot floats and the TCA9554 pull-up reads it ON.
+        # Vg only where a sub-board is mapped. MOS_VG_FB_n has NO pull-down on
+        # purpose (user 2026-11-24): a missing or dead sub-board must read ON
+        # (unknown = closed), never a false "off" -- the pull-down that matters
+        # is on the gate drive (595 -> 33R -> 10k to GND, R11-R18). So an empty
+        # slot reads ON too, and is left out here; a MAPPED board that reads Vg
+        # ON with nothing commanded is reported, which is the point.
         fitted = sum(1 << pos for pos in range(8)
                      if MAPPING.filament_for_board(cid - 1, ch, pos) is not None)
         g = (vg[ch] & ~desired[ch] & fitted & 0xFF) if vg is not None else 0
