@@ -2021,6 +2021,7 @@ def _annotate_board_rows(cid: int, rows: list) -> None:
     for r in rows:
         fid = MAPPING.filament_for_board(cid - 1, r["channel"], r["mux_port"])
         r["fid"] = fid
+        r["gate_stuck"] = gate_stuck_at(cid, r["channel"], r["mux_port"])
         d = dead.get(fid) if fid is not None else None
         r["dead"] = d is not None
         r["dead_reason"] = (d or {}).get("reason")
@@ -3674,6 +3675,9 @@ def hv_preflight_switches(reason: str) -> dict:
             opened[str(cid)] = _masks_text(closed)
         else:
             problems.append(r.get("error") or f"Power {cid}: could not open {_masks_text(closed)}")
+    for g in gate_stuck_list():
+        problems.append(f"Power {g['controller']} {g['switch']} (filament {g['filament']}): MOSFET gate "
+                        f"reads ON on both Vg sources with nothing commanded since {g['since']}")
     out = {"ok": not problems, "opened": opened, "unchecked": unchecked}
     if problems:
         out["error"] = ("HV NOT turned on: grid switch(es) closed or unreadable before the "
@@ -3717,6 +3721,13 @@ def grid_sweep_once() -> list[dict]:
         desired, feedback = got
         # an unused channel floats to 0xFF: _grid_strays only looks at used ones
         stray, ev = _grid_strays(cid, link, desired, feedback)
+        _vg_stuck_update(cid, link, ev, time.monotonic())
+        # A gate already marked STUCK ON (595 off, both Vg sources on): forcing
+        # it again every 5 s changes nothing and would only repeat the log.
+        stray = {ch: m & ~sum(1 << pos for pos in range(8)
+                              if gate_stuck_at(cid, ch, pos) and not ev[ch]["readback"] & (1 << pos))
+                 for ch, m in stray.items()}
+        stray = {ch: m for ch, m in stray.items() if m}
         if not stray:
             continue
         fids = [MAPPING.filament_for_board(cid - 1, ch, pos)
@@ -3762,17 +3773,69 @@ def _grid_strays(cid: int, link, desired: list, feedback: list) -> tuple[dict, d
         # is on the gate drive (595 -> 33R -> 10k to GND, R11-R18). So an empty
         # slot reads ON too, and is left out here; a MAPPED board that reads Vg
         # ON with nothing commanded is reported, which is the point.
-        fitted = sum(1 << pos for pos in range(8)
-                     if MAPPING.filament_for_board(cid - 1, ch, pos) is not None)
+        fitted = fitted_mask(cid, ch)
         g = (vg[ch] & ~desired[ch] & fitted & 0xFF) if vg is not None else 0
         if not (rb | g):
             continue
         act[ch] = rb | g
-        e = {"readback": rb, "vg": None if vg is None else vg[ch]}
-        if vg is not None and rb != g:
-            e["tca"] = tca_vg_channel(link, ch)
+        e = {"readback": rb, "vg": None if vg is None else vg[ch], "vg_on": g}
+        if vg is not None and (g or rb != g):
+            e["tca"] = tca_vg_channel(link, ch)      # the third source
         ev[ch] = e
     return act, ev
+
+
+# ── A MOSFET gate that stays ON with nothing commanded (Vg + TCA9554) ────────
+# With the HV off there is no current to judge by, so the gate feedback is the
+# only evidence; with the HV on the HV guard (current) stays the judge. A
+# switch counts as STUCK when BOTH Vg sources (second 165 + TCA9554 U13) read
+# it ON with nothing commanded, in sweeps VG_STUCK_CONFIRM_S apart -- across a
+# force-open in between, so a 595 that flipped and was reopened does not count.
+# Then: one ERROR, HV ON refused by the preflight, flagged in the GUI. Neither
+# source alone, and a Vg the TCA does not confirm, is only logged. It clears by
+# itself once Vg reads off. A rail already on is not turned off by this.
+VG_STUCK_CONFIRM_S = 8.0
+_VG_STUCK: dict = {}      # (cid, ch, pos) -> {"since", "confirmed", "fid", "at"}
+
+
+def _vg_stuck_update(cid: int, link, ev: dict, now: float) -> None:
+    if hv_vg_of(link, cid) is None:
+        return                                  # no Vg this time: unknown, keep state
+    both = set()
+    for ch, e in ev.items():
+        tca = e.get("tca")
+        if tca is None:
+            continue
+        for pos in range(8):
+            if e.get("vg_on", 0) & tca & (1 << pos):
+                both.add((cid, ch, pos))
+    for key in [k for k in _VG_STUCK if k[0] == cid and k not in both]:
+        gone = _VG_STUCK.pop(key)
+        if gone.get("confirmed"):
+            log.warning("Power %d CH%d.%d (filament %s): MOSFET gate reads OFF again -- the stuck-ON "
+                        "mark is cleared, HV ON allowed again", cid, key[1] + 1, key[2] + 1, gone.get("fid"))
+    for key in both:
+        st = _VG_STUCK.setdefault(key, {"since": now, "confirmed": False,
+                                        "fid": MAPPING.filament_for_board(cid - 1, key[1], key[2])})
+        st["at"] = now
+        if not st["confirmed"] and now - st["since"] >= VG_STUCK_CONFIRM_S:
+            st["confirmed"] = True
+            st["since_iso"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            log.error("Power %d CH%d.%d (filament %s): MOSFET gate reads ON on BOTH Vg sources (second "
+                      "165 + TCA9554) with nothing commanded, for %.0f s and across a force-open -- marked "
+                      "STUCK ON; emission/focus ON is refused until it reads off", cid, key[1] + 1,
+                      key[2] + 1, st["fid"], now - st["since"])
+            _safety_record("grid_gate_stuck_on", {"controller": cid, "switch": f"CH{key[1] + 1}.{key[2] + 1}",
+                                                  "filament": st["fid"], "seconds": round(now - st["since"], 1)})
+
+
+def gate_stuck_list() -> list[dict]:
+    return [{"controller": k[0], "switch": f"CH{k[1] + 1}.{k[2] + 1}", "filament": v.get("fid"),
+             "since": v.get("since_iso")} for k, v in sorted(_VG_STUCK.items()) if v.get("confirmed")]
+
+
+def gate_stuck_at(cid: int, ch: int, pos: int) -> bool:
+    return bool((_VG_STUCK.get((cid, ch, pos)) or {}).get("confirmed"))
 
 
 def _strays_text(cid: int, ev: dict) -> str:
@@ -6658,6 +6721,7 @@ class CtHandler(BaseHTTPRequestHandler):
             self._json(idle_voltage_snapshot())
         elif path == "/api/hv-guard":
             snap = hv_guard_snapshot()
+            snap["gate_stuck"] = gate_stuck_list()
             link = CONTROLLERS.get(MASTER)
             try:
                 snap["stm32"] = stm32_hv_guard(link.host) if link and link.host else None
@@ -6764,7 +6828,8 @@ class CtHandler(BaseHTTPRequestHandler):
                                  "lost": bool(b.get("lost")),
                                  "channel_dark": bool(b.get("channel_dark")),
                                  # listed absent, output read ON directly
-                                 "unregulated": bool(b.get("unregulated"))}
+                                 "unregulated": bool(b.get("unregulated")),
+                                 "gate_stuck": bool(b.get("gate_stuck"))}
             # Feed the run recorder so an end-of-run report can confirm each active
             # filament actually reached its target current. Auto start on the first
             # running poll (if a sim didn't already start it with the scheduled set)

@@ -971,6 +971,8 @@ button.xs { padding: 4px 9px; font-size: 11px; border-radius: 8px; }
 @media (prefers-reduced-motion: reduce) { .live-dot.beat { animation: none; outline: 2px solid currentColor; } }
 
 /* listed absent by the firmware, output read ON: real V/I, nobody regulating */
+.status-tile.gate-stuck { background: repeating-linear-gradient(45deg, #ffd6d6 0 5px, #fff2f2 5px 10px); border: 2px solid #b3001b; animation: tile-alarm 1.6s ease-in-out infinite; }
+.status-tile.gate-stuck .ps-chip { background: #b3001b; color: #fff; }
 .status-tile.unregulated { background: repeating-linear-gradient(135deg, #f8cce6 0 5px, #fff0f8 5px 10px); border: 2px solid #c2187a; animation: tile-alarm 1.6s ease-in-out infinite; }
 .status-tile.unregulated .tile-measure, .status-tile.unregulated .tile-title { color: #8a0f56; font-weight: 800; }
 .status-tile.unregulated .ps-chip { background: #c2187a; color: #fff; }

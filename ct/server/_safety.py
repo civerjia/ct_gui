@@ -192,6 +192,18 @@ def tca_vg_channel(link: "ControllerLink", ch: int) -> int | None:
     return int(raw[2 + 5 + 1])
 
 
+def fitted_mask(controller: int, ch: int) -> int:
+    """Positions on Power `controller` (1-based) channel `ch` with a mapped
+    sub-board. An empty slot's Vg line floats ON by design (no pull-down)."""
+    import sys
+    srv = sys.modules.get("ct.server._server")
+    try:
+        return sum(1 << pos for pos in range(8)
+                   if srv.MAPPING.filament_for_board(int(controller) - 1, ch, pos) is not None)
+    except Exception:
+        return 0
+
+
 def used_channel_mask(controller: int) -> int:
     """Bitmask of the channels that carry boards on Power `controller` (1-based),
     from the active-list mapping; 0xFF when the mapping names none (unknown --
@@ -264,7 +276,19 @@ def force_grid_off(link: "ControllerLink", controller: int, masks: dict[int, int
         time.sleep(0.2)
     ok = not still_on and last_err is None
     out = {"ok": ok, "rounds": rounds, "disarmed": disarmed}
-    if ok:
+    # "Confirmed" above is the 595 read-back (upstream of the 33R). Where the
+    # sub-board reports its MOSFET gate (Vg, second 165; trusted controllers,
+    # fitted slots), a gate still ON is said -- not "confirmed OPEN". It does
+    # not change ok: what conducts is judged by current (HV guard).
+    vg = hv_vg_of(link, controller) if ok else None
+    vg_on = {ch: vg[ch] & m & fitted_mask(controller, ch) for ch, m in confirm.items()
+             if vg is not None and vg[ch] & m & fitted_mask(controller, ch)}
+    if vg_on:
+        out["vg_still_on"] = {str(c): m for c, m in vg_on.items()}
+        log.warning("HV force-off P%d %s: 595 read-back OPEN after %d round(s), but the MOSFET "
+                    "Vg still reads ON at %s -- the gate may still be open (%s)",
+                    controller, _masks_text(want), rounds, _masks_text(vg_on), reason or "requested")
+    elif ok:
         if rounds > 1 or reason:
             log.warning("HV force-off P%d %s: confirmed OPEN after %d round(s)%s (%s)",
                         controller, _masks_text(want), rounds,
@@ -689,7 +713,7 @@ __all__ = [
     "_OCP_SENSE_RESISTOR_OHMS", "_ORDER_LOCK", "_SAFETY", "_SAFETY_EVENTS",
     "_SAFETY_LOCK", "_SAFETY_TOUCH_FIL", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG",
     "_coerce_bytes", "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable",
-    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "vg_trusted", "hv_vg_of", "tca_vg_channel", "force_grid_off", "used_channel_mask", "_masks_text", "_safety_record", "_safety_schedule_running",
+    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "vg_trusted", "hv_vg_of", "tca_vg_channel", "fitted_mask", "force_grid_off", "used_channel_mask", "_masks_text", "_safety_record", "_safety_schedule_running",
     "_setup_logging", "_status_err", "_status_ok", "_suppress", "_u16", "_u32",
     "_unpack_spi_shot", "_with_dead_stopped", "adc_get_burst", "adc_pulse_arm",
     "adc_pulse_diag", "adc_pulse_disarm", "adc_ready_arm", "adc_ready_disarm",

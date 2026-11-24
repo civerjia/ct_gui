@@ -891,6 +891,12 @@ async function pollTelemetry() {
   // firing rows are already marked ACTIVE above; the live active pointer is
   // driven through geometry by gotoSeq()/pollRunStatus().
   ingestTelemetry(rows);   // calls sync()
+  const stuck = tele.filter((t) => t.gate_stuck).map((t) => t.index);
+  if (stuck.length) {
+    setStatus(`⚠ GATE STUCK ON: filament ${stuck.join(', ')} -- its MOSFET gate reads ON on both feedback sources `
+      + '(165 Vg + TCA9554) with nothing commanded. Emission/focus ON is refused until it reads off.');
+    return;
+  }
   const unreg = tele.filter((t) => t.unregulated).map((t) => t.index);
   if (unreg.length) {
     setStatus(`⚠ NOT REGULATED: filament ${unreg.join(', ')} -- listed absent by the firmware, but its output is ON `

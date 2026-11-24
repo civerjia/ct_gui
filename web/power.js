@@ -396,7 +396,7 @@ function renderBoardGrid() {
     const psClass = b.idle_voltage ? 'idle' : (psName ? psName.toLowerCase() : 'unknown');
     // UNREGULATED: the firmware lists it absent, but a direct read found its
     // output ON -- its real V/I are shown, never hidden behind "absent".
-    const cls = b.channel_dark ? 'dark' : b.lost ? 'lost' : b.unregulated ? 'unregulated'
+    const cls = b.gate_stuck ? 'gate-stuck' : b.channel_dark ? 'dark' : b.lost ? 'lost' : b.unregulated ? 'unregulated'
       : b.tps_fault ? 'fault' : b.dead ? 'dead'
       : b.present ? `present ps-${psClass}` : 'absent';
     tile.className = 'status-tile ' + cls + (boardSel.has(k) ? ' selected' : '')
@@ -404,9 +404,9 @@ function renderBoardGrid() {
       + (b.channel === boardPrimary.channel && b.mux_port === boardPrimary.mux_port ? ' active' : '');
     const p = tile._parts;
     p.title.textContent = b.label;   // the filament number is in the tooltip
-    p.ps.textContent = b.channel_dark ? 'DARK' : b.lost ? 'LOST' : b.unregulated ? 'UNREG' : b.dead ? 'DEAD'
+    p.ps.textContent = b.gate_stuck ? 'GATE ON' : b.channel_dark ? 'DARK' : b.lost ? 'LOST' : b.unregulated ? 'UNREG' : b.dead ? 'DEAD'
       : !b.present ? '' : (PS_SHORT[psName] || '?');
-    p.ps.hidden = !b.channel_dark && !b.lost && !b.unregulated && !b.dead && !b.present;
+    p.ps.hidden = !b.gate_stuck && !b.channel_dark && !b.lost && !b.unregulated && !b.dead && !b.present;
     setDot(p.dotP, b.present, 'P');
     setDot(p.dotI, b.iso_enabled, 'I', false, b.iso_enabled_valid);
     setDot(p.dotT, b.tps_enabled, 'T', b.tps_fault, b.tps_enabled_valid);
@@ -416,7 +416,10 @@ function renderBoardGrid() {
     p.dash.hidden = showVi; p.vSpan.hidden = !showVi; p.iSpan.hidden = !showVi;
     const secs = (ms) => (ms == null ? '?' : (ms / 1000).toFixed(ms < 10000 ? 1 : 0));
     p.dash.textContent = b.channel_dark ? 'dark' : b.lost ? `lost ${secs(b.lost_for_ms)}s` : '—';
-    tile.title = b.unregulated
+    tile.title = b.gate_stuck
+      ? `${b.label} (filament #${b.fid}): its MOSFET gate reads ON on BOTH feedback sources (165 Vg + TCA9554) `
+        + 'with nothing commanded, across a force-open. Emission/focus ON is refused until it reads off.'
+      : b.unregulated
       ? `${b.label} (filament #${b.fid}): the firmware lists it ABSENT, but a direct read finds its output ON `
         + `(${b.bus_mV} mV, ${b.current_mA} mA; commanded ${psName || '?'}). It is not being regulated -- `
         + 'the firmware rebuilds it to its commanded state; if this stays, STOP it.'
