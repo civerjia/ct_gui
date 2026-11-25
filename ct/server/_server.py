@@ -510,6 +510,10 @@ def _channel_dark_update(cid: int, snap: dict, now: float) -> None:
                           now - st["since"], fids)
                 _safety_record("channel_dark", {"controller": cid, "channel": ch + 1,
                                                 "filaments": fids, "firmware_flag": fw_dark})
+                link = CONTROLLERS.get(cid)
+                if link is not None:
+                    threading.Thread(target=capture_i2c_evidence, daemon=True, name=f"dark-ev-{cid}",
+                                     args=(cid, link, [ch], f"CH{ch + 1} went dark")).start()
             darks[ch] = st
         elif st:
             darks.pop(ch)
@@ -517,6 +521,82 @@ def _channel_dark_update(cid: int, snap: dict, now: float) -> None:
                 log.warning("Power %d CH%d: answering again after %.0f s dark", cid, ch + 1,
                             now - st["since"])
     snap["dark"] = darks
+
+
+# ── I2C evidence for a dark channel (0x3F CH_GET_I2C_STATS, no I2C itself) ───
+# Which of: a wedged PIO state machine (timeouts/recoveries climbing), a slave
+# holding SDA (bus_clears/sda_stuck), or chips that stopped answering (nak
+# streak growing, 0 timeouts -- cable/power/mux). 2026-11-24 P2 CH5/CH6 went
+# dark and were reset before anyone read these; now they are read first.
+I2C_STATS_CMD = 0x3F
+DARK_EVIDENCE_REREAD_S = 5.0
+
+
+def i2c_stats_read(link, channels) -> dict:
+    """{"CH5": {...counters...}} per channel; a channel whose read failed maps
+    to {"error": ...} -- never to zeros."""
+    out = {}
+    for ch in channels:
+        try:
+            resp = link.request(I2C_STATS_CMD, bytes([int(ch), 0]), flags=0, timeout=1.5)
+            raw = (resp.get("raw") if isinstance(resp, dict) else None) or []
+        except Exception as exc:
+            out[f"CH{ch + 1}"] = {"error": f"{type(exc).__name__}: {exc}"}
+            continue
+        if len(raw) < 54 or raw[0] != 0:
+            out[f"CH{ch + 1}"] = {"error": f"reply {list(raw[:4])} ({len(raw)} bytes)"}
+            continue
+        u32 = lambda i: raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24)
+        ago = lambda v: None if v == 0xFFFFFFFF else v
+        out[f"CH{ch + 1}"] = {
+            "timeouts": u32(3), "nacks": u32(7), "recoveries": u32(11), "bus_clears": u32(15),
+            "sda_stuck": u32(19), "retry_fails": u32(23), "nak_streak": u32(38),
+            "max_nak_streak": u32(42), "last_ok_ms_ago": ago(u32(46)), "bad_ina_reads": u32(50),
+            "last_timeout_ms_ago": ago(u32(34)),
+            "last_timeout_addr": f"0x{raw[31]:02X}" if u32(3) else None,
+            "bus": "hw" if raw[2] else "pio"}
+    return out
+
+
+def _i2c_verdict(a: dict, b: dict | None) -> str:
+    """One line from a first read `a` and a later read `b` of one channel."""
+    if "error" in a:
+        return f"stats unreadable ({a['error']})"
+    if b is None or "error" in b:
+        d = {k: 0 for k in ("timeouts", "recoveries", "bus_clears", "sda_stuck", "nacks")}
+    else:
+        d = {k: b[k] - a[k] for k in ("timeouts", "recoveries", "bus_clears", "sda_stuck", "nacks")}
+    if d["sda_stuck"] or d["bus_clears"]:
+        why = "SDA held low by a slave (bus clears / sda_stuck climbing) -- hardware on that bus"
+    elif d["timeouts"] or d["recoveries"]:
+        why = "transfers TIME OUT (state machine or bus wedged) -- a reboot may clear it"
+    elif d["nacks"] and not d["timeouts"]:
+        why = "everything NAKs, no timeouts -- the chips stopped answering (mux / cable / power)"
+    else:
+        why = "no new bus activity between the reads"
+    return (f"{why}; deltas {d}; nak_streak {a['nak_streak']}, last OK "
+            f"{a['last_ok_ms_ago']} ms ago, timeouts {a['timeouts']}, sda_stuck {a['sda_stuck']}")
+
+
+def capture_i2c_evidence(cid: int, link, channels, why: str, reread_s: float = DARK_EVIDENCE_REREAD_S) -> dict:
+    """Read 0x3F (and the board-health dark flags) for `channels`, again after
+    `reread_s`, log one WARNING per channel and keep a safety record."""
+    first = i2c_stats_read(link, channels)
+    if reread_s > 0:
+        time.sleep(reread_s)
+    second = i2c_stats_read(link, channels) if reread_s > 0 else {}
+    try:
+        health = read_board_health(link, list(channels)) or {}
+    except Exception:
+        health = {}
+    rec = {"controller": cid, "why": why, "first": first, "second": second,
+           "dark": {f"CH{c + 1}": (health.get(c) or {}).get("dark") for c in channels}}
+    for ch in channels:
+        k = f"CH{ch + 1}"
+        log.warning("Power %d %s I2C evidence (%s): %s", cid, k, why,
+                    _i2c_verdict(first.get(k, {"error": "not read"}), second.get(k)))
+    _safety_record("i2c_evidence", rec)
+    return rec
 
 
 # ── Remote RP2350 reset (ESP32 POST /rp2350/reset, fw 99c3426) ───────────────
@@ -571,6 +651,14 @@ def rp2350_reset_start(cid: int, by: str, restore: bool = True) -> dict:
             plan[int(fid)] = {"state": int(cur[0]) if cur else None,
                               "idle_ma": LAST_IDLE_MA.get(int(fid)) or tgt,
                               "idle_v": int(fid) in IDLE_VOLT_NOW}
+    # Evidence first: after the reset the counters are gone.
+    dark = channel_dark_confirmed(cid)
+    try:
+        evidence = capture_i2c_evidence(cid, link, dark or list(_scan_channels()),
+                                        f"before an RP2350 reset by {by}",
+                                        reread_s=DARK_EVIDENCE_REREAD_S if dark else 0)
+    except Exception as exc:
+        evidence = {"error": f"{type(exc).__name__}: {exc}"}
     try:
         rq = urllib.request.Request(f"http://{link.host}/rp2350/reset", data=b"", method="POST")
         with urllib.request.urlopen(rq, timeout=5) as r:
@@ -585,7 +673,7 @@ def rp2350_reset_start(cid: int, by: str, restore: bool = True) -> dict:
         return {"ok": False, "error": f"Power {cid}: ESP32 refused: {esp.get('error') or esp}"}
     job = {"controller": cid, "by": by, "running": True, "restore": bool(restore),
            "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-           "phase": "reset", "plan": plan, "error": None,
+           "phase": "reset", "plan": plan, "error": None, "evidence": evidence,
            "before": dict(collections.Counter(
                power_state_name(v["state"]) if v["state"] else "unknown" for v in plan.values()))}
     _RP_RESET[cid] = job
