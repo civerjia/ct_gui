@@ -807,8 +807,14 @@ class _DiagnosticsMixin:
                      progress=None,
                      pulse_interval_ms: int | None = None,  # spacing (ms); default
                                        # SHOT_PULSE_INTERVAL_MS = 500; sim 1..2147483597
+                     allow_gate_stuck: bool = False,
                      ) -> dict:
         """The MOSFET test at n >= 3 emission voltages, judged on the SLOPE.
+
+        allow_gate_stuck=True runs it although a gate is marked STUCK ON (the
+        backend refuses HV ON then) -- to test exactly that switch; the backend
+        allows it only up to 100 V. A stuck-ON switch conducts between pulses
+        too, so its net reads ~0 ("dead") while the all-off baseline is higher.
 
             r = ct.mosfet_sweep()                      # -50/-60/-70/-80 V, 30 mA limit
             r = ct.mosfet_sweep([0, 1, 2], v_start=40, v_step=10, n=5)
@@ -869,7 +875,10 @@ class _DiagnosticsMixin:
                     for i, v in enumerate(volts):
                         if i == 0:
                             self.set_emission_v(v)
-                            self.enable_emission(True)
+                            on = self.enable_emission(True, allow_gate_stuck=allow_gate_stuck)
+                            if not on.get("ok"):
+                                problems.append(f"emission did not come on: {on.get('error')}")
+                                break
                         v_read, bad = self._mosfet_rail(v)
                         rail.append(v_read)
                         if bad:
