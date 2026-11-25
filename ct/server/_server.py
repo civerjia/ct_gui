@@ -6215,11 +6215,21 @@ HV_GUARD_FW_CONFIG = 0x86
 HV_GUARD_FW_STATUS = 0x87
 HV_GUARD_FW_PERIOD_US = 5000
 HV_GUARD_FW_POLL_S = 5.0
+HV_GUARD_FW_REPEAT_S = 60.0   # the same correction again: one line per minute, with a count
 _HVG_FW: dict = {}        # cid -> {"since": seq, "status": last summary, "unsupported": bool}
+_HVG_FW_SEEN: dict = {}   # (cid, ch, stray, still_on) -> {"t": monotonic, "n": suppressed}
 
 
 def _hv_guard_fw_want(cid: int) -> list[int]:
-    return [fitted_mask(cid, ch) if vg_trusted(cid) else 0 for ch in range(8)]
+    """Vg trust per channel. A switch whose gate is confirmed STUCK ON is left
+    out: the 595 already reads OFF there, so a rewrite cannot help and the
+    firmware would redo it every period (2026-11-24: P1 CH1.2, 1.78 M rewrites
+    in 2.7 h, log rotated every 23 min). The backend sweep keeps watching it
+    and the trust comes back once the stuck mark clears."""
+    if not vg_trusted(cid):
+        return [0] * 8
+    return [fitted_mask(cid, ch) & ~sum(1 << p for p in range(8) if gate_stuck_at(cid, ch, p)) & 0xFF
+            for ch in range(8)]
 
 
 def _hv_guard_fw_config_one(cid: int, link) -> dict | None:
@@ -6276,6 +6286,11 @@ def _hv_guard_fw_poll_one(cid: int, link) -> None:
                         "max_gap_us": u32(13),
                         "corrections": [u16(17 + 2 * c) for c in range(8)],
                         "vg_write_mismatch": [u16(33 + 2 * c) for c in range(8)]}
+        if seq - since > 32:                    # more than one poll can fetch: skip to the newest
+            log.warning("Power %d: firmware guard made %d corrections since the last poll -- only "
+                        "the newest are read", cid, seq - since)
+            st["since"] = seq - 8
+            continue
         n, off = raw[49], 50
         for _i in range(n):
             if off + 28 > len(raw):
@@ -6293,9 +6308,17 @@ def _hv_guard_fw_poll_one(cid: int, link) -> None:
             sw = {ch: ev["stray"]}
             fids = [MAPPING.filament_for_board(cid - 1, ch, p) for p in range(8) if ev["stray"] & (1 << p)]
             ms = lambda us: "never" if us > 4_000_000_000 else f"{us / 1000:.1f} ms"
+            key = (cid, ch, ev["stray"], bool(ev["after"]))
+            seen = _HVG_FW_SEEN.get(key)
+            now = time.monotonic()
+            if seen and now - seen["t"] < HV_GUARD_FW_REPEAT_S:
+                seen["n"] += 1
+                continue
+            again = f" (+{seen['n']} identical in the last {now - seen['t']:.0f} s)" if seen and seen["n"] else ""
+            _HVG_FW_SEEN[key] = {"t": now, "n": 0}
             log.warning("Power %d %s: firmware guard found the switch ON with nothing commanded and "
                         "rewrote it -> %s (595 %#04x, Vg %#04x, desired %#04x; filaments %s). Last on "
-                        "this channel: write %s, latch %s ago; last 165 read %s ago on CH%s",
+                        "this channel: write %s, latch %s ago; last 165 read %s ago on CH%s" + again,
                         cid, _masks_text(sw), "fixed" if not ev["after"] else
                         f"STILL ON {_masks_text({ch: ev['after']})}", ev["read_back"], ev["vg"],
                         ev["desired"], fids, ms(ev["since_write_us"]), ms(ev["since_latch_us"]),
@@ -6325,8 +6348,11 @@ def _grid_sweep_loop() -> None:
                 if _STOPPING.is_set() or not link or not link.client.connected:
                     continue
                 try:
-                    if "config" not in _HVG_FW.get(cid, {}) and not _HVG_FW.get(cid, {}).get("unsupported"):
-                        _hv_guard_fw_config_one(cid, link)
+                    fw = _HVG_FW.get(cid, {})
+                    if not fw.get("unsupported") and (
+                            "config" not in fw
+                            or fw["config"].get("vg_trust") != _hv_guard_fw_want(cid)):
+                        _hv_guard_fw_config_one(cid, link)   # also when a stuck mark set/cleared
                     _hv_guard_fw_poll_one(cid, link)
                 except Exception as exc:
                     log.debug("firmware HV guard poll on Power %d: %s", cid, exc)
