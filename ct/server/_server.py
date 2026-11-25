@@ -470,6 +470,59 @@ def _orphan_candidates(cache: dict, bitmaps: dict, now: float) -> list:
     return out
 
 
+#: A whole channel counts as DARK once every mapped board on it has read absent
+#: (while not at STOP) or the firmware flags it dark, for this long, s.
+#: 2026-11-24 15:01 P2 CH5 went dark for 70 min with no log line at all (CH6 at
+#: 14:55 was only seen because a STANDBY failed).
+DARK_CONFIRM_S = 5.0
+
+
+def _channel_dark_update(cid: int, snap: dict, now: float) -> None:
+    cache = snap.get("boards") or {}
+    if not cache or now - snap.get("boards_at", 0.0) > MONITOR_STALE_S:
+        return                                  # nothing fresh: unknown, keep state
+    health = snap.get("health") or {}
+    health_ok = bool(health) and (now - snap.get("health_at", 0.0)) <= MONITOR_HEALTH_STALE_S
+    darks = dict(snap.get("dark") or {})
+    for ch in _scan_channels():
+        fitted = fitted_mask(cid, ch)
+        if not fitted:
+            continue
+        slots = [cache.get((ch, m)) for m in range(8) if fitted & (1 << m)]
+        if any(b is None for b in slots):
+            continue
+        fw_dark = bool(health_ok and (health.get(ch) or {}).get("dark"))
+        live = [b for b in slots if int(b.get("power_state") or 0) != int(PowerState.STOP)]
+        gone = bool(live) and not any(b.get("present") for b in live)   # boards at STOP read absent
+        st = darks.get(ch)
+        if fw_dark or gone:
+            st = st or {"since": now, "confirmed": False}
+            if not st["confirmed"] and now - st["since"] >= DARK_CONFIRM_S:
+                st["confirmed"] = True
+                fids = [MAPPING.filament_for_board(cid - 1, ch, m) for m in range(8) if fitted & (1 << m)]
+                log.error("Power %d CH%d is DARK: none of its %d boards answers (%s) for %.0f s -- "
+                          "filaments %s are not regulated or read. A reboot of this RP2350 usually "
+                          "brings it back.", cid, ch + 1, len(slots),
+                          "firmware flags the channel dark" if fw_dark else "all listed absent, not at STOP",
+                          now - st["since"], fids)
+                _safety_record("channel_dark", {"controller": cid, "channel": ch + 1,
+                                                "filaments": fids, "firmware_flag": fw_dark})
+            darks[ch] = st
+        elif st:
+            darks.pop(ch)
+            if st.get("confirmed"):
+                log.warning("Power %d CH%d: answering again after %.0f s dark", cid, ch + 1,
+                            now - st["since"])
+    snap["dark"] = darks
+
+
+def channel_dark_confirmed(cid: int) -> list[int]:
+    """0-based channels of Power `cid` the backend has confirmed dark."""
+    with _BOARD_MON_LOCK:
+        snap = _BOARD_MON.get(cid) or {}
+    return sorted(ch for ch, st in (snap.get("dark") or {}).items() if st.get("confirmed"))
+
+
 def _board_monitor_tick(cid: int, link: "ControllerLink", now: float, prev: dict) -> dict:
     snap = dict(prev) if prev else {"boards": {}, "boards_at": 0.0, "bitmaps": {},
                                     "bitmaps_at": 0.0, "status": None, "status_at": 0.0}
@@ -601,6 +654,10 @@ def _board_monitor_loop() -> None:
                     prev = _BOARD_MON.get(cid)
                 prev_boards = (prev or {}).get("boards")
                 snap = _board_monitor_tick(cid, link, time.monotonic(), prev)
+                try:
+                    _channel_dark_update(cid, snap, time.monotonic())
+                except Exception as exc:
+                    log.debug("dark-channel check Power %s: %s", cid, exc)
                 with _BOARD_MON_LOCK:
                     _BOARD_MON[cid] = snap
                 if snap.get("boards") is not None and snap.get("boards") is not prev_boards:
@@ -3618,7 +3675,12 @@ def pulse_events_ma_get(since: int) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def hv_preflight_switches(reason: str) -> dict:
+#: A diagnostic emission ON may pass a STUCK gate (hv-enable allow_gate_stuck)
+#: only at or below this rail, |V| -- the MOSFET test runs at 40-70 V.
+GATE_STUCK_DIAG_MAX_V = 100.0
+
+
+def hv_preflight_switches(reason: str, allow_gate_stuck: bool = False) -> dict:
     """Before a rail goes ON: every grid switch on every connected controller
     must READ open (real 165 read + the firmware's desired byte). Any that is
     closed is forced open and confirmed (force_grid_off); if that cannot be
@@ -3676,6 +3738,10 @@ def hv_preflight_switches(reason: str) -> dict:
         else:
             problems.append(r.get("error") or f"Power {cid}: could not open {_masks_text(closed)}")
     for g in gate_stuck_list():
+        if allow_gate_stuck:
+            log.warning("HV preflight %s: Power %d %s (filament %s) gate is STUCK ON -- passed for a "
+                        "low-voltage diagnostic", reason, g["controller"], g["switch"], g["filament"])
+            continue
         problems.append(f"Power {g['controller']} {g['switch']} (filament {g['filament']}): MOSFET gate "
                         f"reads ON on both Vg sources with nothing commanded since {g['since']}")
     out = {"ok": not problems, "opened": opened, "unchecked": unchecked}
@@ -9458,8 +9524,19 @@ class CtHandler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "hv_guard": tripped,
                                        "error": "HV guard tripped -- refusing HV ON. "
                                                 + tripped.get("message", "")}, HTTPStatus.OK)
+                _diag = bool(body.get("allow_gate_stuck")) and _hv_on
+                if _diag:
+                    # Low-voltage diagnostic of a stuck gate (the MOSFET test): emission
+                    # only, and only with the wiper at or below GATE_STUCK_DIAG_MAX_V.
+                    w_max = _lut_wiper_for_v("emission", GATE_STUCK_DIAG_MAX_V)[0]
+                    w = stm32_ds3502_get(host, "ev") if _hv_ch == "emission" else {}
+                    if _hv_ch != "emission" or not w.get("ok") or int(w.get("wiper", 999)) > w_max:
+                        return self._json({"ok": False, "error": (
+                            f"allow_gate_stuck is for an emission ON at <= {GATE_STUCK_DIAG_MAX_V:.0f} V "
+                            f"only (ch {_hv_ch}, ev wiper {w.get('wiper')}, max {w_max})")}, HTTPStatus.OK)
                 if _hv_on:
-                    preflight = hv_preflight_switches(f"before {_hv_ch} ON (by {self._client(body)})")
+                    preflight = hv_preflight_switches(f"before {_hv_ch} ON (by {self._client(body)})",
+                                                      allow_gate_stuck=_diag)
                     if not preflight["ok"]:
                         return self._json({"ok": False, "error": preflight["error"],
                                            "preflight": preflight}, HTTPStatus.OK)

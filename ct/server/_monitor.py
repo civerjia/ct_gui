@@ -279,7 +279,8 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
             hc = health.get(ch) if health_ok else None
             hb = (hc or {}).get("boards", {}).get(mux)
             row["health_valid"] = hb is not None
-            row["channel_dark"] = hc["dark"] if hc else None
+            dark_conf = bool(((snap.get("dark") or {}).get(ch) or {}).get("confirmed"))
+            row["channel_dark"] = (bool(hc["dark"]) or dark_conf) if hc else (True if dark_conf else None)
             for k in ("lost", "recovering", "lost_for_ms", "next_probe_ms", "probe_fails",
                       "lost_count", "recover_count"):
                 row[k] = hb[k] if hb else None
@@ -287,8 +288,10 @@ def monitor_board_rows(cid: int) -> tuple[list, dict]:
     meta = {"age_ms": round((now - snap.get("boards_at", 0.0)) * 1000) if boards else None,
             "source": snap.get("source"), "run_owns": bool(snap.get("run_owns")),
             "fresh": fresh, "held": held,
-            "dark_channels": sorted(ch + 1 for ch, h in health.items() if h.get("dark"))
-            if health_ok else None}
+            "dark_channels": sorted({ch + 1 for ch, h in health.items() if h.get("dark")}
+                                    | {ch + 1 for ch, st in (snap.get("dark") or {}).items()
+                                       if st.get("confirmed")})
+            if health_ok or snap.get("dark") else None}
     return rows, meta
 
 

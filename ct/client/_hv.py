@@ -442,9 +442,16 @@ class _HvMixin:
 
     # ── HV enable / disable ───────────────────────────────────────────────────
 
-    def enable_emission(self, on: bool) -> dict:
-        """Enable or disable the emission HV output."""
-        return self._post("/api/stm32/hv-enable", {"ch": "emission", "on": on})
+    def enable_emission(self, on: bool, allow_gate_stuck: bool = False) -> dict:
+        """Enable or disable the emission HV output.
+
+        allow_gate_stuck=True lets an ON pass a MOSFET gate marked STUCK ON --
+        for the low-voltage MOSFET test of that switch only: the backend
+        refuses it unless the emission wiper is at or below 100 V."""
+        body = {"ch": "emission", "on": on}
+        if allow_gate_stuck:
+            body["allow_gate_stuck"] = True
+        return self._post("/api/stm32/hv-enable", body)
 
     def enable_focus(self, on: bool) -> dict:
         """Enable or disable the focus HV output."""
