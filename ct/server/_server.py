@@ -27,6 +27,7 @@ import logging
 import logging.handlers
 import os
 import gzip
+import re
 import shutil
 import socket
 import struct
@@ -3851,7 +3852,7 @@ def _grid_strays(cid: int, link, desired: list, feedback: list) -> tuple[dict, d
         # is on the gate drive (595 -> 33R -> 10k to GND, R11-R18). So an empty
         # slot reads ON too, and is left out here; a MAPPED board that reads Vg
         # ON with nothing commanded is reported, which is the point.
-        fitted = fitted_mask(cid, ch)
+        fitted = vg_mask(cid, ch)              # fitted, minus the Vg-ignore list
         g = (vg[ch] & ~desired[ch] & fitted & 0xFF) if vg is not None else 0
         if not (rb | g):
             continue
@@ -3874,6 +3875,75 @@ def _grid_strays(cid: int, link, desired: list, feedback: list) -> tuple[dict, d
 # itself once Vg reads off. A rail already on is not turned off by this.
 VG_STUCK_CONFIRM_S = 8.0
 _VG_STUCK: dict = {}      # (cid, ch, pos) -> {"since", "confirmed", "fid", "at"}
+
+# ── Vg-ignore list: switches whose Vg feedback a person ruled wrong ──────────
+# Physical (controller, CHc.p), never FID. Each entry needs a reason; nothing
+# clears one automatically. The 595 read-back, the firmware guard's 595 check
+# and the current-based HV guard still cover the switch -- only its Vg (second
+# 165 + TCA9554) stops counting. 2026-11-24: P1 CH1.2 Vg read ON from the 16:11
+# power cycle on while the low-voltage MOSFET test showed it switching normally.
+VG_IGNORE_PATH = STATE_DIR / "vg_ignore.json"
+_VG_IGNORE_LOCK = threading.Lock()
+VG_IGNORE: dict = {}      # "P1 CH1.2" -> {"controller", "channel", "position", "reason", "by", "at"}
+
+
+def _vg_ignore_load() -> None:
+    try:
+        data = json.loads(VG_IGNORE_PATH.read_text(encoding="utf-8"))
+        VG_IGNORE.update({k: dict(v) for k, v in (data.get("ignore") or {}).items()})
+        if VG_IGNORE:
+            log.warning("Vg-ignore list: %s", "; ".join(f"{k} ({v.get('reason')})" for k, v in VG_IGNORE.items()))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log.error("Vg-ignore list %s unreadable (%s) -- every fitted Vg counts", VG_IGNORE_PATH, exc)
+
+
+_vg_ignore_load()
+
+
+def vg_ignored_mask(cid: int, ch: int) -> int:
+    with _VG_IGNORE_LOCK:
+        return sum(1 << int(v["position"]) for v in VG_IGNORE.values()
+                   if int(v["controller"]) == int(cid) and int(v["channel"]) == int(ch)) & 0xFF
+
+
+def vg_ignore_snapshot() -> dict:
+    with _VG_IGNORE_LOCK:
+        return {k: dict(v) for k, v in sorted(VG_IGNORE.items())}
+
+
+def vg_ignore_set(op: str, controller, switch, reason: str, by: str) -> dict:
+    """op add|remove; switch "CH1.2" (1-based). add needs a reason."""
+    m = re.fullmatch(r"\s*CH([1-8])\.([1-8])\s*", str(switch or ""), re.I)
+    try:
+        cid = int(controller)
+    except (TypeError, ValueError):
+        cid = 0
+    if op not in ("add", "remove") or not m or cid not in (1, 2):
+        return {"ok": False, "error": "body: {op: add|remove, controller: 1|2, switch: 'CH1.2', reason}"}
+    ch, pos = int(m.group(1)) - 1, int(m.group(2)) - 1
+    key = f"P{cid} CH{ch + 1}.{pos + 1}"
+    reason = str(reason or "").strip()
+    if op == "add" and not reason:
+        return {"ok": False, "error": "reason is required -- say why this Vg is not believed"}
+    with _VG_IGNORE_LOCK:
+        if op == "add":
+            VG_IGNORE[key] = {"controller": cid, "channel": ch, "position": pos, "reason": reason,
+                              "fid": MAPPING.filament_for_board(cid - 1, ch, pos), "by": by,
+                              "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+        else:
+            VG_IGNORE.pop(key, None)
+        text = json.dumps({"ignore": VG_IGNORE}, indent=1, sort_keys=True)
+    _atomic_write(VG_IGNORE_PATH, text)
+    if op == "add":
+        gone = _VG_STUCK.pop((cid, ch, pos), None)
+        log.warning("Vg of %s IGNORED by %s: %s%s", key, by, reason,
+                    " -- its STUCK ON mark is cleared" if gone and gone.get("confirmed") else "")
+    else:
+        log.warning("Vg of %s counts again (removed from the ignore list by %s)", key, by)
+    _safety_record("vg_ignore", {"op": op, "switch": key, "reason": reason, "by": by})
+    return {"ok": True, "ignore": vg_ignore_snapshot()}
 
 
 def _vg_stuck_update(cid: int, link, ev: dict, now: float) -> None:
@@ -6294,7 +6364,7 @@ def _hv_guard_fw_want(cid: int) -> list[int]:
     and the trust comes back once the stuck mark clears."""
     if not vg_trusted(cid):
         return [0] * 8
-    return [fitted_mask(cid, ch) & ~sum(1 << p for p in range(8) if gate_stuck_at(cid, ch, p)) & 0xFF
+    return [vg_mask(cid, ch) & ~sum(1 << p for p in range(8) if gate_stuck_at(cid, ch, p)) & 0xFF
             for ch in range(8)]
 
 
@@ -6864,6 +6934,8 @@ class CtHandler(BaseHTTPRequestHandler):
                 notes = {str(k): dict(v) for k, v in sorted(FILAMENT_NOTES.items())}
             self._json({"ok": True, "space": "fid", "notes": notes, "max_chars": NOTE_MAX_CHARS,
                         "read_only": _NOTES_LOAD_ERROR[0], "path": str(NOTES_STATE_PATH)})
+        elif path == "/api/vg-ignore":
+            self._json({"ok": True, "ignore": vg_ignore_snapshot(), "path": str(VG_IGNORE_PATH)})
         elif path == "/api/dead-fids":
             # Filaments that must not be energised, in FID space, with the
             # provenance of each decision. See the DEAD_FIDS comment.
@@ -6943,6 +7015,7 @@ class CtHandler(BaseHTTPRequestHandler):
         elif path == "/api/hv-guard":
             snap = hv_guard_snapshot()
             snap["gate_stuck"] = gate_stuck_list()
+            snap["vg_ignored"] = vg_ignore_snapshot()
             snap["firmware_guard"] = hv_guard_fw_snapshot()
             link = CONTROLLERS.get(MASTER)
             try:
@@ -9017,6 +9090,10 @@ class CtHandler(BaseHTTPRequestHandler):
             elif path == "/api/filament-notes":
                 # body: {fid, note}; an empty note deletes it. No hardware.
                 self._json(filament_note_set(body.get("fid"), body.get("note"), self._client()))
+            elif path == "/api/vg-ignore":
+                # body: {op: add|remove, controller, switch: "CH1.2", reason}. No hardware.
+                self._json(vg_ignore_set(str(body.get("op", "add")).lower(), body.get("controller"),
+                                         body.get("switch"), body.get("reason"), self._client()))
             elif path == "/api/dead-fids":
                 # Mark filaments as must-not-energise, or clear them. FID space.
                 # body: {op: "set"|"add"|"remove", fids: [...], reason: str}

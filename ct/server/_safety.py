@@ -204,6 +204,18 @@ def fitted_mask(controller: int, ch: int) -> int:
         return 0
 
 
+def vg_mask(controller: int, ch: int) -> int:
+    """Positions whose Vg feedback counts: fitted (fitted_mask) and not put on
+    the Vg-ignore list by a person (/api/vg-ignore, state/vg_ignore.json)."""
+    import sys
+    srv = sys.modules.get("ct.server._server")
+    try:
+        ign = srv.vg_ignored_mask(int(controller), ch)
+    except Exception:
+        ign = 0
+    return fitted_mask(controller, ch) & ~ign & 0xFF
+
+
 def used_channel_mask(controller: int) -> int:
     """Bitmask of the channels that carry boards on Power `controller` (1-based),
     from the active-list mapping; 0xFF when the mapping names none (unknown --
@@ -281,8 +293,8 @@ def force_grid_off(link: "ControllerLink", controller: int, masks: dict[int, int
     # fitted slots), a gate still ON is said -- not "confirmed OPEN". It does
     # not change ok: what conducts is judged by current (HV guard).
     vg = hv_vg_of(link, controller) if ok else None
-    vg_on = {ch: vg[ch] & m & fitted_mask(controller, ch) for ch, m in confirm.items()
-             if vg is not None and vg[ch] & m & fitted_mask(controller, ch)}
+    vg_on = {ch: vg[ch] & m & vg_mask(controller, ch) for ch, m in confirm.items()
+             if vg is not None and vg[ch] & m & vg_mask(controller, ch)}
     if vg_on:
         out["vg_still_on"] = {str(c): m for c, m in vg_on.items()}
         log.warning("HV force-off P%d %s: 595 read-back OPEN after %d round(s), but the MOSFET "
@@ -713,7 +725,7 @@ __all__ = [
     "_OCP_SENSE_RESISTOR_OHMS", "_ORDER_LOCK", "_SAFETY", "_SAFETY_EVENTS",
     "_SAFETY_LOCK", "_SAFETY_TOUCH_FIL", "_SINGLE_0X3A_TRUSTED", "_TPS_IOUT_LIMIT_REG",
     "_coerce_bytes", "_coerce_int", "_is_read_command", "_le", "_pipeline_reliable",
-    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "vg_trusted", "hv_vg_of", "tca_vg_channel", "fitted_mask", "force_grid_off", "used_channel_mask", "_masks_text", "_safety_record", "_safety_schedule_running",
+    "_popcount", "_safety_open_grid", "FORCE_OFF_DEADLINE_S", "_hv_bytes", "vg_trusted", "hv_vg_of", "tca_vg_channel", "fitted_mask", "vg_mask", "force_grid_off", "used_channel_mask", "_masks_text", "_safety_record", "_safety_schedule_running",
     "_setup_logging", "_status_err", "_status_ok", "_suppress", "_u16", "_u32",
     "_unpack_spi_shot", "_with_dead_stopped", "adc_get_burst", "adc_pulse_arm",
     "adc_pulse_diag", "adc_pulse_disarm", "adc_ready_arm", "adc_ready_disarm",
