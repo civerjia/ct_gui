@@ -528,6 +528,8 @@
           <button id="i2cTcaReadBtn" class="sm" title="Read raw TCA9554 registers via CH_READ_TCA9554 (0x61), per channel: config (dir) / input (live GPIO) / output / polarity + per-read ACK. Read-only.">Read TCA9554</button>
           <button id="i2cSelftestBtn" class="sm" title="Per-channel TCA9554 chip-liveness test: checks each expander (Enable/Fault/Iso/HV) responds on I²C → pol ✓/✗ per chip in the matrix (✗ = dead/unresponsive chip). Uses the 0x60 polarity round-trip when the firmware supports it, else falls back to the 0x61 register-read ACK. Non-destructive — drives no output pins. (This tests the CHIP; use the HV grid 'Toggle test' to verify the HV SWITCH actuates.)">Chip test</button>
           <button id="i2cMuxResetBtn" class="sm" title="Pulse the TCA9548A reset line and re-detect. Power-cutting: all outputs drop low.">Mux reset</button>
+          <button id="rpReset1Btn" class="sm" title="Full-chip reset of Power 1's RP2350 (the ESP32 pulses its RUN pin), e.g. when a whole channel is DARK. Every board drops to STOP; the backend then walks each filament back to the state it had (SLEEP → STANDBY → IDLE at its IDLE current; ACTIVE comes back as IDLE). Refused while HV is on or a schedule is armed.">Reset RP2350 P1</button>
+          <button id="rpReset2Btn" class="sm" title="Full-chip reset of Power 2's RP2350 (the ESP32 pulses its RUN pin), e.g. when a whole channel is DARK. Every board drops to STOP; the backend then walks each filament back to the state it had (SLEEP → STANDBY → IDLE at its IDLE current; ACTIVE comes back as IDLE). Refused while HV is on or a schedule is armed.">Reset RP2350 P2</button>
         </div>
       </div>
 

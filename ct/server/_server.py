@@ -28,6 +28,8 @@ import logging.handlers
 import os
 import gzip
 import re
+import urllib.error
+import urllib.request
 import shutil
 import socket
 import struct
@@ -515,6 +517,153 @@ def _channel_dark_update(cid: int, snap: dict, now: float) -> None:
                 log.warning("Power %d CH%d: answering again after %.0f s dark", cid, ch + 1,
                             now - st["since"])
     snap["dark"] = darks
+
+
+# ── Remote RP2350 reset (ESP32 POST /rp2350/reset, fw 99c3426) ───────────────
+# A full-chip reset through RUN, for a channel gone dark with nobody on site.
+# The reset drops every board of that controller to STOP, so the power state of
+# each filament is recorded first and walked back up the ladder (SLEEP ->
+# STANDBY -> IDLE at its last IDLE current) once the RP2350 answers again --
+# the machine must stay warm for the vacuum. ACTIVE is never restored (it comes
+# back as IDLE). Refused with HV on (or unknown) or a schedule armed/running.
+RP_RESET_ANSWER_S = 60.0
+_RP_RESET: dict = {}      # cid -> job status (GET /api/rp2350-reset)
+
+
+def _rp_reset_note(job: dict, msg: str, level=logging.INFO) -> None:
+    job.setdefault("log", []).append(f"{time.strftime('%H:%M:%S')} {msg}")
+    log.log(level, "Power %s RP2350 reset: %s", job["controller"], msg)
+
+
+def rp2350_reset_snapshot() -> dict:
+    return {str(c): {k: v for k, v in j.items() if k != "plan"} for c, j in sorted(_RP_RESET.items())}
+
+
+def rp2350_reset_start(cid: int, by: str, restore: bool = True) -> dict:
+    link = CONTROLLERS.get(cid)
+    if not link or not link.client.connected or not link.host:
+        return {"ok": False, "error": f"Power {cid} is not connected"}
+    if (_RP_RESET.get(cid) or {}).get("running"):
+        return {"ok": False, "error": f"Power {cid}: a reset is already in progress"}
+    if _hv_rails_known_off() is not True:
+        return {"ok": False, "error": "emission or focus HV is on (or its state is unknown) -- "
+                                      "turn HV off before resetting an RP2350"}
+    try:
+        st = shv_status_retry(link)
+    except Exception:
+        st = None
+    if st and st.get("state") in (1, 2):
+        return {"ok": False, "error": f"Power {cid}: a schedule is armed or running -- disarm first"}
+    plan = {}
+    for ch in range(8):
+        for pos in range(8):
+            fid = MAPPING.filament_for_board(cid - 1, ch, pos)
+            if fid is None:
+                continue
+            cur = LAST_POWER_STATE.get(int(fid))
+            plan[int(fid)] = {"state": int(cur[0]) if cur else None,
+                              "idle_ma": LAST_IDLE_MA.get(int(fid)),
+                              "idle_v": int(fid) in IDLE_VOLT_NOW}
+    try:
+        rq = urllib.request.Request(f"http://{link.host}/rp2350/reset", data=b"", method="POST")
+        with urllib.request.urlopen(rq, timeout=5) as r:
+            esp = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        why = ("this ESP32 firmware has no /rp2350/reset (needs fw 99c3426 or later)"
+               if exc.code == 404 else f"ESP32 answered HTTP {exc.code}")
+        return {"ok": False, "error": f"Power {cid}: {why}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Power {cid}: ESP32 {link.host} not reachable ({exc})"}
+    if not esp.get("ok"):
+        return {"ok": False, "error": f"Power {cid}: ESP32 refused: {esp.get('error') or esp}"}
+    job = {"controller": cid, "by": by, "running": True, "restore": bool(restore),
+           "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+           "phase": "reset", "plan": plan, "error": None,
+           "before": dict(collections.Counter(
+               power_state_name(v["state"]) if v["state"] else "unknown" for v in plan.values()))}
+    _RP_RESET[cid] = job
+    _rp_reset_note(job, f"RUN pulsed by {by} (ESP32 reset #{esp.get('resets')}); boards before: "
+                        f"{job['before']}", logging.WARNING)
+    _safety_record("rp2350_reset", {"controller": cid, "by": by, "before": job["before"]})
+    threading.Thread(target=_rp_reset_restore, args=(cid, link, job), daemon=True,
+                     name=f"rp-reset-{cid}").start()
+    return {"ok": True, "job": {k: v for k, v in job.items() if k != "plan"}}
+
+
+def _rp_reset_restore(cid: int, link, job: dict) -> None:
+    try:
+        time.sleep(3.0)                         # boot + bring-up
+        t_end = time.monotonic() + RP_RESET_ANSWER_S
+        st = None
+        while time.monotonic() < t_end and not _STOPPING.is_set():
+            try:
+                if link.client.connected:
+                    st = shv_status_retry(link)
+                    if st is not None:
+                        break
+            except Exception:
+                pass
+            time.sleep(1.0)
+        if st is None:
+            job["phase"], job["error"] = "failed", f"the RP2350 did not answer within {RP_RESET_ANSWER_S:.0f} s"
+            _rp_reset_note(job, job["error"], logging.ERROR)
+            return
+        _rp_reset_note(job, "RP2350 answers again")
+        for name, fn in (("slew rates", lambda: _slew_check_one(link)),
+                         ("voltage cap", lambda: _vcap_check_one(link)),
+                         ("firmware HV guard", lambda: _hv_guard_fw_config_one(cid, link)),
+                         ("I2C clocks", lambda: _i2c_hz_check_one(cid, link))):
+            try:
+                fn()
+            except Exception as exc:
+                _rp_reset_note(job, f"restoring {name} failed: {exc}", logging.WARNING)
+        if not job["restore"]:
+            job["phase"] = "done"
+            _rp_reset_note(job, "done (heating NOT restored, as asked): every board is at STOP")
+            return
+        plan = job["plan"]
+        job["phase"] = "restoring"
+        time.sleep(2.0)                         # first board-cache pass
+        steps = [(POWER_STATE_SLEEP, [f for f, v in plan.items() if (v["state"] or 0) >= POWER_STATE_SLEEP]),
+                 (POWER_STATE_STANDBY, [f for f, v in plan.items() if (v["state"] or 0) >= POWER_STATE_STANDBY])]
+        idle_c = [f for f, v in plan.items() if (v["state"] or 0) >= POWER_STATE_IDLE and not v["idle_v"]]
+        idle_v = [f for f, v in plan.items() if (v["state"] or 0) >= POWER_STATE_IDLE and v["idle_v"]]
+        failed = []
+        for state, fids in steps:
+            if not fids:
+                continue
+            if state >= POWER_STATE_STANDBY:
+                vr = vacuum_heat_refusal(f"restoring {power_state_name(state)} after an RP2350 reset")
+                if vr:
+                    job["phase"], job["error"] = "failed", vr
+                    _rp_reset_note(job, vr, logging.ERROR)
+                    return
+            r = prep_filaments(link, cid - 1, state, fids, allow_dead=True)
+            failed += [int(f) for f in (r.get("failed") or [])]
+            _rp_reset_note(job, f"{power_state_name(state)}: {r.get('applied')}/{len(fids)} applied")
+        if idle_c:
+            no_ma = [f for f in idle_c if not plan[f]["idle_ma"]]
+            go = [f for f in idle_c if plan[f]["idle_ma"]]
+            if no_ma:
+                _rp_reset_note(job, f"no IDLE current known for {no_ma} -- left at STANDBY", logging.WARNING)
+            if go:
+                r = prep_filaments(link, cid - 1, POWER_STATE_IDLE, go,
+                                   {f: int(plan[f]["idle_ma"]) for f in go}, allow_dead=True)
+                failed += [int(f) for f in (r.get("failed") or [])]
+                _rp_reset_note(job, f"IDLE: {r.get('applied')}/{len(go)} applied")
+        if idle_v:
+            r = prep_filaments(link, cid - 1, POWER_STATE_IDLE, idle_v, allow_dead=True, idle_v=True)
+            failed += [int(f) for f in (r.get("failed") or [])]
+            _rp_reset_note(job, f"voltage IDLE: {r.get('applied')}/{len(idle_v)} applied")
+        job["failed"] = sorted(set(failed))
+        job["phase"] = "done"
+        _rp_reset_note(job, "heating restored" + (f"; FAILED {job['failed']}" if failed else ""),
+                       logging.WARNING if failed else logging.INFO)
+    except Exception as exc:
+        job["phase"], job["error"] = "failed", f"{type(exc).__name__}: {exc}"
+        _rp_reset_note(job, job["error"], logging.ERROR)
+    finally:
+        job["running"] = False
 
 
 def channel_dark_confirmed(cid: int) -> list[int]:
@@ -6936,6 +7085,8 @@ class CtHandler(BaseHTTPRequestHandler):
                         "read_only": _NOTES_LOAD_ERROR[0], "path": str(NOTES_STATE_PATH)})
         elif path == "/api/vg-ignore":
             self._json({"ok": True, "ignore": vg_ignore_snapshot(), "path": str(VG_IGNORE_PATH)})
+        elif path == "/api/rp2350-reset":
+            self._json({"ok": True, "jobs": rp2350_reset_snapshot()})
         elif path == "/api/dead-fids":
             # Filaments that must not be energised, in FID space, with the
             # provenance of each decision. See the DEAD_FIDS comment.
@@ -9090,6 +9241,14 @@ class CtHandler(BaseHTTPRequestHandler):
             elif path == "/api/filament-notes":
                 # body: {fid, note}; an empty note deletes it. No hardware.
                 self._json(filament_note_set(body.get("fid"), body.get("note"), self._client()))
+            elif path == "/api/rp2350-reset":
+                # body: {controller: 1|2, restore: true}. Full-chip reset via the ESP32's
+                # RUN pin, then the heating walked back up (see rp2350_reset_start).
+                try:
+                    cid = int(body.get("controller"))
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "controller must be 1 or 2"}, HTTPStatus.OK)
+                self._json(rp2350_reset_start(cid, self._client(body), bool(body.get("restore", True))))
             elif path == "/api/vg-ignore":
                 # body: {op: add|remove, controller, switch: "CH1.2", reason}. No hardware.
                 self._json(vg_ignore_set(str(body.get("op", "add")).lower(), body.get("controller"),

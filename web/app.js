@@ -2324,6 +2324,36 @@ async function i2cMuxReset() {
   } catch (e) { i2cMsg('Mux reset failed: ' + e); }
 }
 
+// Full-chip RP2350 reset via its ESP32 (RUN pin), then the backend restores
+// every filament's heating. Progress comes from GET /api/rp2350-reset.
+async function rpReset(cid) {
+  if (!confirm(`Reset Power ${cid}'s RP2350?\n\nEvery board on Power ${cid} drops to STOP for a few seconds; `
+    + 'the backend then brings each filament back to its previous state (SLEEP → STANDBY → IDLE). '
+    + 'Refused while emission/focus HV is on or a schedule is armed.')) return;
+  i2cMsg(`Power ${cid}: resetting the RP2350…`);
+  let j;
+  try { j = await postJSON('/api/rp2350-reset', { controller: cid, restore: true }); }
+  catch (e) { i2cMsg(`Power ${cid} RP2350 reset failed: ${e}`); return; }
+  if (!j.ok) { i2cMsg(`Power ${cid} RP2350 reset refused: ${j.error}`); return; }
+  for (let i = 0; i < 90; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    let s;
+    try { s = await (await fetch('/api/rp2350-reset')).json(); } catch { continue; }
+    const job = (s.jobs || {})[String(cid)];
+    if (!job) continue;
+    const last = (job.log || []).slice(-1)[0] || '';
+    i2cMsg(`Power ${cid} RP2350 reset — ${job.phase}: ${last}`);
+    if (!job.running) {
+      i2cMsg(`Power ${cid} RP2350 reset — ${job.phase}${job.error ? ': ' + job.error : ''}`
+        + (job.failed && job.failed.length ? ` · FAILED filaments ${job.failed.join(', ')}` : '')
+        + ` · ${(job.log || []).slice(-3).join(' | ')}`);
+      if (ctState.refreshBoards) ctState.refreshBoards();
+      return;
+    }
+  }
+  i2cMsg(`Power ${cid} RP2350 reset: still running after 3 min — see the backend log.`);
+}
+
 function init() {
   geo = new CTGeometry($('ctCanvas'));
   try { if (localStorage.getItem(HUD_FOLD_KEY) === '1') geo.opts.hudCollapsed = true; } catch { /* private window */ }
@@ -2359,6 +2389,8 @@ function init() {
   $('i2cTcaReadBtn').addEventListener('click', i2cTcaRead);
   $('i2cSelftestBtn').addEventListener('click', i2cSelftest);
   $('i2cMuxResetBtn').addEventListener('click', i2cMuxReset);
+  $('rpReset1Btn').addEventListener('click', () => rpReset(1));
+  $('rpReset2Btn').addEventListener('click', () => rpReset(2));
   $('i2cMaskGetBtn').addEventListener('click', i2cPresent);
   $('i2cMaskSetBtn').addEventListener('click', i2cSetMask);
   // Let the Boards-matrix card (power.js) reuse the same get (present scan,
