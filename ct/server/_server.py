@@ -554,6 +554,12 @@ def rp2350_reset_start(cid: int, by: str, restore: bool = True) -> dict:
         st = None
     if st and st.get("state") in (1, 2):
         return {"ok": False, "error": f"Power {cid}: a schedule is armed or running -- disarm first"}
+    # The IDLE current from this backend's last command, else the CC loop's own
+    # target (0x3A): LAST_IDLE_MA is empty after a backend restart.
+    try:
+        fw_cur = read_cached_currents_by_board(link, range(8))
+    except Exception:
+        fw_cur = {}
     plan = {}
     for ch in range(8):
         for pos in range(8):
@@ -561,8 +567,9 @@ def rp2350_reset_start(cid: int, by: str, restore: bool = True) -> dict:
             if fid is None:
                 continue
             cur = LAST_POWER_STATE.get(int(fid))
+            tgt = (fw_cur.get((ch, pos)) or {}).get("target_mA") or None
             plan[int(fid)] = {"state": int(cur[0]) if cur else None,
-                              "idle_ma": LAST_IDLE_MA.get(int(fid)),
+                              "idle_ma": LAST_IDLE_MA.get(int(fid)) or tgt,
                               "idle_v": int(fid) in IDLE_VOLT_NOW}
     try:
         rq = urllib.request.Request(f"http://{link.host}/rp2350/reset", data=b"", method="POST")
